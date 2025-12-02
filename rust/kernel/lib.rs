@@ -109,6 +109,7 @@ pub mod interrupt;
 pub mod io;
 pub mod ioctl;
 pub mod iommu;
+pub mod iosys_map;
 pub mod iov;
 pub mod irq;
 pub mod jump_label;
