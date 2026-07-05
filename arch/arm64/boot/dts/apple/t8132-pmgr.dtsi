@@ -152,7 +152,7 @@
 		#reset-cells = <0>;
 		label = "dispext0_cpu";
 		power-domains = <&ps_dispext0_fe>;
-		apple,min-state = <4>;
+		status = "disabled"; /* Locked, don't touch it */
 	};
 
 	ps_scodec: power-controller@228 {
@@ -785,6 +785,7 @@
 		#reset-cells = <0>;
 		label = "dispext1_cpu";
 		power-domains = <&ps_dispext1_fe>;
+		status = "disabled"; /* Locked, don't touch it */
 	};
 
 	ps_ans: power-controller@538 {
@@ -793,6 +794,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ans";
+		apple,always-on; /* Device reboots after 3 mintues if disabled */
 	};
 
 	ps_apcie_st: power-controller@540 {
@@ -960,7 +962,7 @@
 		#reset-cells = <0>;
 		label = "disp_cpu";
 		power-domains = <&ps_disp_fe>;
-		apple,min-state = <4>;
+		status = "disabled"; /* Locked, don't touch it */
 	};
 };
 
