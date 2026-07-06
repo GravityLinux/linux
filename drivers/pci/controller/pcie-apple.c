@@ -30,6 +30,7 @@
 #include <linux/msi.h>
 #include <linux/of_irq.h>
 #include <linux/pci-ecam.h>
+#include <linux/pci-pwrctrl.h>
 
 #include "pci-host-common.h"
 
@@ -902,6 +903,28 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 	pcie = apple_pcie_lookup(dev);
 	if (WARN_ON(!pcie))
 		return -ENOENT;
+
+	// Ensure all ports can be powered on before attempting initialization
+	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
+		ret = pci_pwrctrl_create_device(of_port, pcie->dev);
+		if (ret) {
+			dev_err(pcie->dev, "Failed to create pwrctrl device: %pe\n", ERR_PTR(ret));
+			return ret;
+		}
+
+		ret = pci_pwrctrl_power_on_device(of_port);
+		if (ret) {
+			if (ret != -EPROBE_DEFER) {
+				dev_err(pcie->dev,
+					"Failed to power on device: %pe\n",
+					ERR_PTR(ret));
+				for_each_available_child_of_node_scoped(dev->of_node, of_port) {
+					pci_pwrctrl_destroy_device(of_port);
+				}
+			}
+			return ret;
+		}
+	}
 
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
 		ret = apple_pcie_setup_port(pcie, of_port);

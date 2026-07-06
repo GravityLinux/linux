@@ -47,6 +47,7 @@ config PCIE_APPLE
 	depends on PCI_MSI
 	depends on PAGE_SIZE_16KB || COMPILE_TEST
 	select PCI_HOST_COMMON
+	select PCI_PWRCTRL_GENERIC
 	select IRQ_MSI_LIB
 	help
 	  Say Y here if you want to enable PCIe controller support on Apple
