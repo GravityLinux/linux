@@ -149,7 +149,7 @@ static int __pci_pwrctrl_power_off_device(struct device *dev)
 	return pwrctrl->power_off(pwrctrl);
 }
 
-static void pci_pwrctrl_power_off_device(struct device_node *np)
+void pci_pwrctrl_power_off_device(struct device_node *np)
 {
 	struct platform_device *pdev;
 	int ret;
@@ -171,6 +171,7 @@ static void pci_pwrctrl_power_off_device(struct device_node *np)
 
 	platform_device_put(pdev);
 }
+EXPORT_SYMBOL_GPL(pci_pwrctrl_power_off_device);
 
 /**
  * pci_pwrctrl_power_off_devices - Power off pwrctrl devices
@@ -204,7 +205,7 @@ static int __pci_pwrctrl_power_on_device(struct device *dev)
  * Power on the devices in a depth first manner. Before powering on the device,
  * make sure its driver is bound.
  */
-static int pci_pwrctrl_power_on_device(struct device_node *np)
+int pci_pwrctrl_power_on_device(struct device_node *np)
 {
 	struct platform_device *pdev;
 	int ret = 0;
@@ -233,6 +234,7 @@ static int pci_pwrctrl_power_on_device(struct device_node *np)
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(pci_pwrctrl_power_on_device);
 
 /**
  * pci_pwrctrl_power_on_devices - Power on pwrctrl devices
@@ -314,8 +316,7 @@ static bool pci_pwrctrl_is_required(struct device_node *np)
 	return false;
 }
 
-static int pci_pwrctrl_create_device(struct device_node *np,
-				     struct device *parent)
+int pci_pwrctrl_create_device(struct device_node *np, struct device *parent)
 {
 	struct platform_device *pdev;
 	int ret;
@@ -347,6 +348,7 @@ static int pci_pwrctrl_create_device(struct device_node *np,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(pci_pwrctrl_create_device);
 
 /**
  * pci_pwrctrl_create_devices - Create pwrctrl devices
@@ -375,7 +377,7 @@ int pci_pwrctrl_create_devices(struct device *parent)
 }
 EXPORT_SYMBOL_GPL(pci_pwrctrl_create_devices);
 
-static void pci_pwrctrl_destroy_device(struct device_node *np)
+void pci_pwrctrl_destroy_device(struct device_node *np)
 {
 	struct platform_device *pdev;
 
@@ -391,6 +393,7 @@ static void pci_pwrctrl_destroy_device(struct device_node *np)
 
 	of_node_clear_flag(np, OF_POPULATED);
 }
+EXPORT_SYMBOL_GPL(pci_pwrctrl_destroy_device);
 
 /**
  * pci_pwrctrl_destroy_devices - Destroy pwrctrl devices
