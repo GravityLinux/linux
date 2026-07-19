@@ -3,6 +3,11 @@
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
 
+__rust_helper bool rust_helper_vma_starts_at_kernel_page(const struct vm_area_struct *vma)
+{
+	return vma_starts_at_kernel_page(vma);
+}
+
 __rust_helper unsigned int rust_helper_mm_pte_shift(const struct mm_struct *mm)
 {
 	return mm_pte_shift(mm);

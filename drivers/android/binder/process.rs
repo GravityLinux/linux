@@ -1775,6 +1775,9 @@ impl Process {
         if this.task != kernel::current!().group_leader() {
             return Err(EINVAL);
         }
+        if !vma.starts_at_kernel_page() {
+            return Err(EINVAL);
+        }
         if vma.start() == 0 {
             return Err(EINVAL);
         }

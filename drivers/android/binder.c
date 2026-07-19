@@ -6043,6 +6043,9 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct binder_proc *proc = filp->private_data;
 
+	if (!vma_starts_at_kernel_page(vma))
+		return -EINVAL;
+
 	if (!same_thread_group(proc->tsk, current))
 		return -EINVAL;
 

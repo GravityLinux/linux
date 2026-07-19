@@ -99,6 +99,20 @@ static inline void vma_desc_set_slice_off(struct vm_area_desc *desc,
 }
 #endif
 
+/**
+ * vma_starts_at_kernel_page - Check alignment for native-page insertion
+ * @vma: VMA receiving native backing pages
+ *
+ * The virtual start must be native-page aligned and its slice offset zero.
+ * Otherwise the first backing page would start below vm_start, or insertion
+ * and later zapping would disagree about which slices belong to the VMA.
+ * Native VMAs always satisfy both conditions.
+ */
+static inline bool vma_starts_at_kernel_page(const struct vm_area_struct *vma)
+{
+	return PAGE_ALIGNED_KERNEL(vma->vm_start) && !vma_slice_off(vma);
+}
+
 /*
  * vma_slice_offset - Slice of the 16KB page that backs @addr
  * @vma: Pointer to struct vm_area_struct
