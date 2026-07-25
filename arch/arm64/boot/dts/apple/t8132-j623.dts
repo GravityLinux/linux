@@ -16,3 +16,15 @@
 	compatible = "apple,j623", "apple,t8132", "apple,arm-platform";
 	model = "Apple iMac (24-inch, 2x USB-C, M4, 2024)";
 };
+
+/*
+ * Provide labels for the USB type C ports.
+ */
+
+&typec0 {
+	label = "USB-C Back-right";
+};
+
+&typec1 {
+	label = "USB-C Back-left";
+};
