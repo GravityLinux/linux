@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple DockChannel UART driver
+ * Apple DockChannel UART early console
  * Copyright The Asahi Linux Contributors
  */
 
@@ -29,16 +29,11 @@ static void dockchannel_uart_early_write(struct console *con, const char *s,
 static int __init dockchannel_uart_early_setup(struct earlycon_device *device,
 					       const char *opt)
 {
-	struct uart_port *port = &device->port;
-
-	unsigned long mapbase = port->mapbase;
-	if (!mapbase)
+	if (!device->port.mapbase)
 		return -ENODEV;
 
 	device->con->write = dockchannel_uart_early_write;
 	return 0;
 }
 
-OF_EARLYCON_DECLARE(dockchannel, "apple,dockchannel-uart",
-		    dockchannel_uart_early_setup);
 EARLYCON_DECLARE(dockchannel, dockchannel_uart_early_setup);

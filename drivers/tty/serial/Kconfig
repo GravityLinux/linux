@@ -103,7 +103,7 @@ config SERIAL_APPLE_DOCKCHANNEL_EARLYCON
 	select SERIAL_EARLYCON
 	default ARCH_APPLE
 	help
-	  Support for early console on the Apple DockChannel UART
+	  Support for early console output on the Apple DockChannel UART.
 
 config SERIAL_SB1250_DUART
 	tristate "BCM1xxx on-chip DUART serial support"
