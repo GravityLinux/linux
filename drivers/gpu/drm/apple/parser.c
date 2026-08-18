@@ -366,11 +366,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr_rgb.score = -1;
 	out->sdr.score = -1;
 	out->best.score = -1;
+	out->bootstrap.score = -1;
 
 	dcp_parse_foreach_in_array(handle, outer_it) {
 		struct iterator it;
 		bool is_virtual = true;
-		struct color_mode cmode;
+		struct color_mode cmode = {
+			.score = -1,
+			.id = -1,
+			.depth = -1,
+			.pixel_encoding = -1,
+			.dynamic_range = -1,
+			.colorimetry = -1,
+			.eotf = -1,
+		};
 
 		dcp_parse_foreach_in_dict(handle, it) {
 			char *key = parse_string(it.handle);
@@ -403,14 +412,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				return ret;
 		}
 
-		/* Skip virtual or partial entries */
-		if (is_virtual || cmode.score < 0 || cmode.id < 0)
+		/* Skip partial entries.  26.6 uses a virtual color element to
+		 * bootstrap the generic pipe before selecting a real color mode. */
+		if (cmode.score < 0 || cmode.id < 0)
 			continue;
 
 		trace_iomfb_color_mode(handle->dcp, cmode.id, cmode.score,
 				       cmode.depth, cmode.colorimetry,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
+
+		if (is_virtual) {
+			fill_color_mode(&out->bootstrap, &cmode);
+			continue;
+		}
 
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA) {
 			if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
