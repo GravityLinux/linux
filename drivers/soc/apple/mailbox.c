@@ -34,6 +34,7 @@
 
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_ASC_MBOX_CONTROL_EMPTY BIT(17)
+#define APPLE_ASC_MBOX_CONTROL_ENABLE BIT(0)
 
 #define APPLE_ASC_MBOX_A2I_CONTROL 0x110
 #define APPLE_ASC_MBOX_A2I_SEND0 0x800
@@ -250,6 +251,21 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret)
 		return ret;
+
+	/*
+	 * A firmware handoff can leave the I2A FIFO enabled with stale read and
+	 * write pointers from the previous RTKit client.  T8132 DCP firmware does
+	 * not consume a new INIT message until the AP has reinitialized its receive
+	 * FIFO.  Native clients reset only OUTBOX (I2A) here; resetting A2I would
+	 * race the IOP-owned read pointer and could discard an AP message.
+	 */
+	if (of_property_read_bool(mbox->dev->of_node,
+				  "apple,reset-recv-fifo-on-start")) {
+		writel_relaxed(APPLE_ASC_MBOX_CONTROL_EMPTY |
+			       APPLE_ASC_MBOX_CONTROL_ENABLE,
+			       mbox->regs + mbox->hw->i2a_control);
+		readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+	}
 
 	/*
 	 * Only some variants of this mailbox HW provide interrupt control

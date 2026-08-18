@@ -333,6 +333,9 @@ apple_plane_duplicate_state(struct drm_plane *plane)
         __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
+	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
+	apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
+	apple_plane_state->iova = old_apple_plane_state->iova;
 
 	return &apple_plane_state->base;
 }

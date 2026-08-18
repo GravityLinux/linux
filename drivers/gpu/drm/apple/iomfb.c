@@ -8,7 +8,6 @@
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/iommu.h>
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
@@ -191,6 +190,9 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 	ch->output[depth] = out + sizeof(header) + in_len;
 	ch->end[depth] = offset + ALIGN(data_len, DCP_PACKET_ALIGNMENT);
 
+	/* RTKit-provided firmware buffers can be mapped WC rather than allocated
+	 * by dma_alloc_coherent(). Publish the packet before ringing DCP. */
+	dma_wmb();
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_msg(context, data_len, offset));
 }
@@ -220,6 +222,8 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
 	dcp_pop_depth(&ch->depth);
+	/* Publish callback output before the acknowledgement makes it visible. */
+	dma_wmb();
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_ack(context));
 }
@@ -287,8 +291,9 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	ch->output[depth] = out;
 	ch->end[depth] = offset + ALIGN(length, DCP_PACKET_ALIGNMENT);
 
-	if (dcp->cb_handlers[tag](dcp, tag, out, in))
+	if (dcp->cb_handlers[tag](dcp, tag, out, in)) {
 		dcp_ack(dcp, context);
+	}
 }
 
 static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
@@ -336,6 +341,9 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 	}
 
 	data = dcp->shmem + channel_offset + offset;
+	/* Pair with firmware's mailbox notification before consuming the packet
+	 * from the retained WC mapping. */
+	dma_rmb();
 
 	if (FIELD_GET(IOMFB_MSG_ACK, message))
 		dcpep_handle_ack(dcp, ctx_id, data, length);
@@ -436,6 +444,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_13_5:
 		ret = iomfb_modeset_v13_3(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_26_6:
+		ret = iomfb_modeset_v26_6_0(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -485,6 +496,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_flush_v13_3(dcp, crtc, state);
 		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_flush_v26_6_0(dcp, crtc, state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -499,6 +513,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_start_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_start_v26_6_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -528,10 +545,16 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
-	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
 
-	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
-					GFP_KERNEL);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6)
+		apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE,
+					 &shmem_iova, GFP_KERNEL);
+	if (!dcp->shmem)
+		return -ENOMEM;
+
+	memset(dcp->shmem, 0, DCP_SHMEM_SIZE);
+	dma_wmb();
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
 
@@ -550,6 +573,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_shutdown_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_shutdown_v26_6_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

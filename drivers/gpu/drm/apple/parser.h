@@ -93,6 +93,8 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr_444;
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
+	/* Virtual color element used to bootstrap the generic display pipe. */
+	struct dcp_color_mode bootstrap;
 	bool vrr;
 };
 

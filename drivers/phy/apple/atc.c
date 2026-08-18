@@ -615,6 +615,8 @@ struct atcphy_hw {
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
  * @pipehandler_up: True if the PIPE mux ("pipehandler") is set to USB3 or USB4 mode
+ * @fixed_usb3: True for a permanently attached, host-only USB3 connection
+ * @fixed_lane_swap: True if a fixed USB3 connection uses the swapped orientation
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -651,6 +653,8 @@ struct apple_atcphy {
 	int dp_link_rate;
 	bool swap_lanes;
 	bool pipehandler_up;
+	bool fixed_usb3;
+	bool fixed_lane_swap;
 
 	struct {
 		void __iomem *core;
@@ -1299,7 +1303,7 @@ static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode
 	core_mask32(atcphy, atcphy->hw->aciophy_crossbar, ACIOPHY_CROSSBAR_PROTOCOL,
 		    FIELD_PREP(ACIOPHY_CROSSBAR_PROTOCOL, mode_cfg->crossbar));
 
-	if (mode_cfg->set_swap)
+	if (mode_cfg->set_swap || atcphy->fixed_lane_swap)
 		core_set32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP);
 	else
 		core_clear32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP);
@@ -2008,6 +2012,7 @@ static int atcphy_usb3_power_off(struct phy *phy)
 static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
@@ -2018,6 +2023,12 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	 */
 	if (atcphy->pipehandler_up)
 		return 0;
+
+	if (atcphy->fixed_usb3 && atcphy->mode == APPLE_ATCPHY_MODE_OFF) {
+		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB3);
+		if (ret)
+			return ret;
+	}
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
@@ -2188,6 +2199,11 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
 
 	guard(mutex)(&atcphy->lock);
+
+	if (atcphy->fixed_usb3) {
+		atcphy_usb2_power_on(atcphy);
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+	}
 
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
@@ -2436,12 +2452,14 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	ret = atcphy_probe_rcdev(atcphy);
 	if (ret)
 		return dev_err_probe(atcphy->dev, ret, "Probing rcdev failed");
-	ret = atcphy_probe_mux(atcphy);
-	if (ret)
-		return dev_err_probe(atcphy->dev, ret, "Probing mux failed");
-	ret = atcphy_probe_switch(atcphy);
-	if (ret)
-		return dev_err_probe(atcphy->dev, ret, "Probing switch failed");
+	if (!atcphy->fixed_usb3) {
+		ret = atcphy_probe_mux(atcphy);
+		if (ret)
+			return dev_err_probe(atcphy->dev, ret, "Probing mux failed");
+		ret = atcphy_probe_switch(atcphy);
+		if (ret)
+			return dev_err_probe(atcphy->dev, ret, "Probing switch failed");
+	}
 	ret = atcphy_probe_phy(atcphy);
 	if (ret)
 		return dev_err_probe(atcphy->dev, ret, "Probing phy failed");
@@ -2477,6 +2495,8 @@ static int atcphy_probe(struct platform_device *pdev)
 
 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
 	atcphy->pipehandler_up = false;
+	atcphy->fixed_usb3 = device_property_read_bool(dev, "apple,fixed-usb3");
+	atcphy->fixed_lane_swap = device_property_read_bool(dev, "apple,fixed-lane-swap");
 
 	return atcphy_probe_finalize(atcphy);
 }

@@ -846,10 +846,11 @@ static void dwc3_ep0_inspect_setup(struct dwc3 *dwc,
 		dwc->ep0_next_event = DWC3_EP0_NRDY_DATA;
 	}
 
-	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD)
+	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD) {
 		ret = dwc3_ep0_std_request(dwc, ctrl);
-	else
+	} else {
 		ret = dwc3_ep0_delegate_req(dwc, ctrl);
+	}
 
 	if (ret == USB_GADGET_DELAYED_STATUS)
 		dwc->delayed_status = true;
@@ -953,6 +954,7 @@ static void dwc3_ep0_complete_status(struct dwc3 *dwc,
 		dwc->setup_packet_pending = true;
 
 	dwc->ep0state = EP0_SETUP_PHASE;
+
 	dwc3_ep0_out_start(dwc);
 }
 

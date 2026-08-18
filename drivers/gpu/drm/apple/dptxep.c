@@ -5,12 +5,23 @@
 #include <linux/completion.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
+#include <linux/moduleparam.h>
 
 #include "afk.h"
 #include "dcp.h"
 #include "dptxep.h"
 #include "parser.h"
 #include "trace.h"
+
+/*
+ * Diagnostic switch for separating the DCP-side DPTX lifecycle from AP PHY
+ * MMIO.  The T8132 DPTX windows are inaccessible until DCP has raised its
+ * internal PHY gate, so first establish that the callback transaction itself
+ * completes before allowing the callbacks to touch the PHY.
+ */
+static bool dptx_bypass_phy;
+module_param_named(dptx_bypass_phy, dptx_bypass_phy, bool, 0644);
+MODULE_PARM_DESC(dptx_bypass_phy, "Acknowledge DPTX PHY callbacks without MMIO");
 
 struct dcpdptx_connection_cmd {
 	__le32 unk;
@@ -257,6 +268,13 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
+	if (dptx_bypass_phy) {
+		dptx->lane_count = 4;
+		reply->retcode = cpu_to_le32(0);
+		reply->lane_count = cpu_to_le64(dptx->lane_count);
+		return 0;
+	}
+
 	ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &phy_ops);
 	if (ret < 0) {
 		dev_err(dcp->dev, "phy_validate failed: %d\n", ret);
@@ -318,7 +336,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 	}
 
 	if (dptx->phy_ops.dp.set_lanes) {
-		if (dptx->atcphy) {
+		if (dptx->atcphy && !dptx_bypass_phy) {
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
 			if (ret)
 				return ret;
@@ -425,7 +443,7 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 		dptx->phy_ops.dp.link_rate = phy_link_rate;
 		dptx->phy_ops.dp.set_rate = 1;
 
-		if (dptx->atcphy) {
+		if (dptx->atcphy && !dptx_bypass_phy) {
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
 			if (ret)
 				return ret;
@@ -477,17 +495,24 @@ dptxport_call_activate(struct apple_epic_service *service,
 {
 	struct dptx_port *dptx = service->cookie;
 	const struct apple_dcp *dcp = service->ep->dcp;
+	int ret = 0;
 
 	// TODO: hack, use phy_set_mode to select the correct DCP(EXT) input
 	// for standalone phy (i.e. not atc phy).
-	if (!dcp->typec_mux)
-		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+	dev_info(dcp->dev, "DPTXPort: activating PHY\n");
+	if (!dcp->typec_mux && !dptx_bypass_phy) {
+		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+		if (ret)
+			dev_err(dcp->dev, "DPTXPort: PHY activation failed: %d\n",
+				ret);
+	}
+	dev_info(dcp->dev, "DPTXPort: PHY activation returned: %d\n", ret);
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
 		memset(reply, 0, 4);
 
-	return 0;
+	return ret;
 }
 
 static int
@@ -498,7 +523,8 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 
 	/* deactivate phy */
-	phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+	if (!dptx_bypass_phy)
+		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -570,11 +596,17 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
-
-	if (strcmp(name, "dcpdptx-port-epic"))
-		return;
-	if (strcmp(class, "AppleDCPDPTXRemotePort"))
-		return;
+	if (service->ep->compact) {
+		if (unit < 0)
+			return;
+		if (unit == 0)
+			service->defer_start = true;
+	} else {
+		if (strcmp(name, "dcpdptx-port-epic"))
+			return;
+		if (strcmp(class, "AppleDCPDPTXRemotePort"))
+			return;
+	}
 
 	trace_dptxport_init(service->ep->dcp, unit);
 
@@ -601,6 +633,11 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
+	{
+		.name = "dcpdptx-port-epic",
 		.init = dptxport_init,
 		.call = dptxport_call,
 	},
@@ -634,6 +671,12 @@ int dptxep_init(struct apple_dcp *dcp)
 		else if (ret < 0)
 			return ret;
 		timeout = ret;
+	}
+
+	if (dcp->dptxep->compact && dcp->dptxport[0].service) {
+		ret = afk_start_service(dcp->dptxport[0].service);
+		if (ret)
+			return ret;
 	}
 
 	return 0;

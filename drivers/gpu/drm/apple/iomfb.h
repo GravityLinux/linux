@@ -187,6 +187,21 @@ struct dcp_set_digital_out_mode_req {
 	u32 timing_mode_id;
 } __packed;
 
+struct dcp_get_mode_info_req_v26_6 {
+	u8 mode[0x64];
+	u8 mode_null;
+	u8 padding0[3];
+	u64 opaque;
+	u32 timing_mode_id;
+	u32 color_mode_id;
+	u8 result_null;
+	u8 padding1[3];
+} __packed;
+
+struct dcp_get_mode_info_resp_v26_6 {
+	u8 opaque[0x74];
+} __packed;
+
 struct dcp_map_buf_req {
 	u64 buffer;
 	u8 unk;
@@ -290,6 +305,14 @@ struct dcp_set_power_state_req {
 	u8 padding[2];
 } __packed;
 
+struct dcp_set_power_state_req_v26_6 {
+	u64 state;
+	/* Four independent transition flags on 26.6, not a u32 boolean. */
+	u8 flags[4];
+	u8 result_is_null;
+	u8 padding[3];
+} __packed;
+
 struct dcp_set_power_state_resp {
 	u32 unkint;
 	u32 ret;
@@ -307,7 +330,7 @@ struct dcp_set_dcpav_prop_end_req {
 
 struct dcp_set_parameter_dcp {
 	u32 param;
-	u32 value[8];
+	u64 value[4];
 	u32 count;
 } __packed;
 
@@ -317,6 +340,15 @@ struct dcp_swap_complete_intent_gated {
 	u32 unkInt;
 	u32 width;
 	u32 height;
+} __packed;
+
+struct dcp_swap_complete_intent_gated_v26_6 {
+	u32 swap_id;
+	u8 unkBool;
+	u32 unkInt;
+	u32 width;
+	u32 height;
+	u8 padding[3];
 } __packed;
 
 struct dcp_read_edt_data_req {
@@ -330,9 +362,30 @@ struct dcp_read_edt_data_resp {
 	u8 ret;
 } __packed;
 
+struct dcp_read_edt_data_resp_v26_6 {
+	u32 value[8];
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
 struct iomfb_property {
 	u32 id;
 	u32 value;
+	u8 opaque[8];
+} __packed;
+
+struct dcp_hotplug_req_v26_6 {
+	u64 connected;
+	u8 opaque[0x50];
+} __packed;
+
+struct dcp_hotplug_resp_v26_6 {
+	u8 opaque[0x4c];
+} __packed;
+
+struct dcp_bool_arg {
+	u8 value;
+	u8 padding[3];
 } __packed;
 
 struct iomfb_get_color_remap_mode_req {
@@ -371,6 +424,14 @@ struct iomfb_abort_swaps_dcp_req {
 
 struct iomfb_abort_swaps_dcp_resp {
 	struct io_user_client client;
+	u32 ret;
+} __packed;
+
+struct iomfb_abort_swaps_dcp_req_v26_6 {
+	u64 client;
+} __packed;
+
+struct iomfb_abort_swaps_dcp_resp_v26_6 {
 	u32 ret;
 } __packed;
 

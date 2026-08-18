@@ -9,6 +9,7 @@
 
 #include <linux/completion.h>
 #include <linux/kconfig.h>
+#include <linux/list.h>
 #include <linux/types.h>
 
 #include "dcp.h"
@@ -38,6 +39,8 @@ struct epic_cmd_info {
 struct apple_epic_service {
 	const struct apple_epic_service_ops *ops;
 	struct apple_dcp_afkep *ep;
+	char name[33];
+	s64 unit;
 
 	struct epic_cmd_info cmds[MAX_PENDING_CMDS];
 	DECLARE_BITMAP(cmd_map, MAX_PENDING_CMDS);
@@ -47,6 +50,8 @@ struct apple_epic_service {
 	u32 channel;
 	bool enabled;
 	bool torndown;
+	bool defer_start;
+	bool started;
 
 	void *cookie;
 
@@ -73,12 +78,7 @@ struct apple_epic_service_ops {
 
 struct afk_ringbuffer_header {
 	__le32 bufsz;
-	u32 unk;
-	u32 _pad1[14];
-	__le32 rptr;
-	u32 _pad2[15];
-	__le32 wptr;
-	u32 _pad3[15];
+	__le32 unk;
 };
 
 struct afk_qe {
@@ -130,6 +130,27 @@ struct epic_service_call {
 } __attribute__((packed));
 static_assert(sizeof(struct epic_service_call) == 64);
 
+struct epic_compact_hdr {
+	u8 seq;
+	u8 flags;
+	__le16 intf_id;
+	__le32 length;
+	__le64 timestamp;
+} __packed;
+
+struct epic_compact_sub_hdr {
+	u8 type;
+	u8 category;
+	u8 unk;
+	u8 flags;
+	__le32 reserved;
+} __packed;
+
+struct epic_compact_desc {
+	__le32 status;
+	__le32 length;
+} __packed;
+
 enum epic_type {
 	EPIC_TYPE_NOTIFY = 0,
 	EPIC_TYPE_COMMAND = 3,
@@ -145,6 +166,7 @@ enum epic_category {
 };
 
 enum epic_subtype {
+	EPIC_SUBTYPE_NOTIFY = 0x14,
 	EPIC_SUBTYPE_ANNOUNCE = 0x30,
 	EPIC_SUBTYPE_TEARDOWN = 0x32,
 	EPIC_SUBTYPE_STD_SERVICE = 0xc0,
@@ -153,9 +175,11 @@ enum epic_subtype {
 struct afk_ringbuffer {
 	bool ready;
 	struct afk_ringbuffer_header *hdr;
-	u32 rptr;
+	__le32 *rptr;
+	__le32 *wptr;
 	void *buf;
 	size_t bufsz;
+	size_t block_size;
 };
 
 struct apple_dcp_afkep {
@@ -177,6 +201,10 @@ struct apple_dcp_afkep {
 
 	spinlock_t lock;
 	u16 qe_seq;
+	bool compact;
+
+	struct list_head compact_cmds;
+	bool compact_shutting_down;
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
@@ -190,6 +218,8 @@ struct apple_dcp_afkep {
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
 int afk_start(struct apple_dcp_afkep *ep);
+int afk_start_service(struct apple_epic_service *service);
+void afk_cancel_commands(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
@@ -201,4 +231,9 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 		     const void *data, size_t data_len, size_t data_pad,
 		     void *output, size_t output_len, size_t output_pad);
+int afk_service_call_status(struct apple_epic_service *service, u16 group,
+			    u32 command, const void *data, size_t data_len,
+			    size_t data_pad, void *output, size_t output_len,
+			    size_t output_pad, u32 *status,
+			    unsigned long timeout);
 #endif

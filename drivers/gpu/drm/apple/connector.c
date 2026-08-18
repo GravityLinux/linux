@@ -4,6 +4,7 @@
  */
 
 #include "connector.h"
+#include "dcp.h"
 
 #include "linux/err.h"
 #include <linux/debugfs.h>
@@ -79,6 +80,127 @@ CONNECTOR_DEBUGFS_ENTRY(timing, DCP_CHUNK_TIMING_ELELMENTS);
 CONNECTOR_DEBUGFS_ENTRY(display_attribs, DCP_CHUNK_DISPLAY_ATTRIBUTES);
 CONNECTOR_DEBUGFS_ENTRY(transport, DCP_CHUNK_TRANSPORT);
 
+static ssize_t dptx_connect_write(struct file *file, const char __user *buf,
+				  size_t len, loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+	int ret;
+
+	ret = dcp_dptx_connect_oob(apple_con->dcp, 0);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dptx_connect_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_connect_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t dptx_disconnect_write(struct file *file,
+				     const char __user *buf, size_t len,
+				     loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+	int ret;
+
+	ret = dcp_dptx_disconnect_oob(apple_con->dcp, 0);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dptx_disconnect_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_disconnect_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t dptx_mark_disconnected_write(struct file *file,
+					    const char __user *buf, size_t len,
+					    loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+
+	dcp_hotplug_mark_disconnected_oob(apple_con->dcp);
+	return len;
+}
+
+static const struct file_operations dptx_mark_disconnected_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_mark_disconnected_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t dptx_av_disconnect_write(struct file *file,
+					const char __user *buf, size_t len,
+					loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+
+	dcp_av_disconnect_oob(apple_con->dcp);
+	return len;
+}
+
+static const struct file_operations dptx_av_disconnect_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_av_disconnect_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t dptx_hpd_low_write(struct file *file, const char __user *buf,
+				  size_t len, loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+	int ret;
+
+	ret = dcp_dptx_set_hpd_oob(apple_con->dcp, 0, false);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dptx_hpd_low_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_hpd_low_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t dptx_release_write(struct file *file, const char __user *buf,
+				  size_t len, loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+	int ret;
+
+	ret = dcp_dptx_release_oob(apple_con->dcp, 0);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dptx_release_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_release_write,
+	.llseek = noop_llseek,
+};
+
+static ssize_t dptx_phy_activate_write(struct file *file,
+				       const char __user *buf, size_t len,
+				       loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+	int ret;
+
+	ret = dcp_dptx_phy_activate_oob(apple_con->dcp);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dptx_phy_activate_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_phy_activate_write,
+	.llseek = noop_llseek,
+};
+
 static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct dentry *root)
 {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DEBUG)
@@ -115,6 +237,20 @@ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry
 	case DRM_MODE_CONNECTOR_DisplayPort:
 	case DRM_MODE_CONNECTOR_HDMIA:
 		dcp_afk_debugfs_root(apple_con->dcp, AV_ENDPOINT, root);
+		debugfs_create_file("dptx_connect", 0200, root, apple_con,
+				    &dptx_connect_fops);
+		debugfs_create_file("dptx_disconnect", 0200, root, apple_con,
+				    &dptx_disconnect_fops);
+		debugfs_create_file("dptx_mark_disconnected", 0200, root,
+				    apple_con, &dptx_mark_disconnected_fops);
+		debugfs_create_file("dptx_av_disconnect", 0200, root, apple_con,
+				    &dptx_av_disconnect_fops);
+		debugfs_create_file("dptx_hpd_low", 0200, root, apple_con,
+				    &dptx_hpd_low_fops);
+		debugfs_create_file("dptx_release", 0200, root, apple_con,
+				    &dptx_release_fops);
+		debugfs_create_file("dptx_phy_activate", 0200, root, apple_con,
+				    &dptx_phy_activate_fops);
 		break;
 	default:
 		break;

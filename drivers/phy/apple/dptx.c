@@ -16,11 +16,14 @@
 #include <asm/io.h>
 #include "linux/of.h"
 #include <dt-bindings/phy/phy.h>
+#include <linux/delay.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/phy/phy.h>
 #include <linux/phy/phy-dp.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/types.h>
 
 #define DPTX_MAX_LANES    4
@@ -31,6 +34,7 @@
 enum apple_dptx_type {
 	DPTX_PHY_T8112,
 	DPTX_PHY_T6020,
+	DPTX_PHY_T8122,
 };
 
 struct apple_dptx_phy_hw {
@@ -56,7 +60,18 @@ struct apple_dptx_phy {
 
 	// TODO: m1n1 port things to clean up
 	u32 active_lanes;
+	bool activation_complete;
 };
+
+/*
+ * Bound the T8122 cold activation sequence while bringing up new SoCs.  A
+ * partial sequence deliberately ACKs DCP but suppresses later lane/rate MMIO,
+ * making each register group independently testable on a direct Linux boot.
+ */
+static unsigned int t8122_activation_stage = 6;
+module_param(t8122_activation_stage, uint, 0644);
+MODULE_PARM_DESC(t8122_activation_stage,
+		 "T8122 activation stage to execute (0-6, 6 is complete)");
 
 
 static inline void mask32(void __iomem *reg, u32 mask, u32 set)
@@ -122,6 +137,96 @@ static int dptx_phy_set_active_lane_count(struct apple_dptx_phy *phy, u32 num_la
 	return 0;
 }
 
+static int dptx_phy_activate_t8122(struct apple_dptx_phy *phy, u32 dcp_index)
+{
+	u32 val;
+
+	phy->activation_complete = false;
+	dev_info(phy->dev, "T8122 PHY activation: begin (DCP %u)\n",
+		 dcp_index);
+	if (!t8122_activation_stage)
+		return 0;
+
+	/* Firmware raises the private PHY gate immediately before this callback. */
+	usleep_range(5000, 6000);
+
+	readl(phy->regs.core + 0x10);
+	writel(dcp_index, phy->regs.core + 0x10);
+	dev_info(phy->dev, "T8122 PHY activation: DCP input selected\n");
+	if (t8122_activation_stage == 1)
+		return 0;
+
+	set32(phy->regs.core + 0x48, 0x010);
+	set32(phy->regs.core + 0x48, 0x020);
+	clear32(phy->regs.core + 0x48, 0x040);
+	set32(phy->regs.core + 0x48, 0x100);
+	set32(phy->regs.core + 0x48, 0x200);
+	clear32(phy->regs.core + 0x48, 0x400);
+	set32(phy->regs.core + 0x48, 0x001);
+	set32(phy->regs.core + 0x48, 0x002);
+	clear32(phy->regs.core + 0x48, 0x004);
+	dev_info(phy->dev, "T8122 PHY activation: core reset sequence complete\n");
+	if (t8122_activation_stage == 2)
+		return 0;
+
+	val = readl(phy->regs.dptx + 0x2014);
+	writel((val & ~0x3f0000) | (0x30 << 16),
+	       phy->regs.dptx + 0x2014);
+	set32(phy->regs.dptx + 0x20b8, 0x010000);
+	clear32(phy->regs.dptx + 0x2220, 0x0000002);
+	set32(phy->regs.dptx + 0x222c, 0x000800);
+	set32(phy->regs.dptx + 0x222c, 0x000100);
+	set32(phy->regs.dptx + 0x2230, 0x0200000);
+	clear32(phy->regs.dptx + 0x2278, 0x08000000);
+	set32(phy->regs.dptx + 0x22a4, 0x0000001);
+	dev_info(phy->dev, "T8122 PHY activation: common registers configured\n");
+	if (t8122_activation_stage == 3)
+		return 0;
+
+	for (u32 loff = DPTX_LANE0_OFFSET; loff < DPTX_LANE_END;
+	     loff += DPTX_LANE_STRIDE) {
+		val = readl(phy->regs.dptx + loff + 0x40);
+		writel((val & ~0xe00000) | 0x200000,
+		       phy->regs.dptx + loff + 0x40);
+	}
+	for (u32 loff = DPTX_LANE0_OFFSET; loff < DPTX_LANE_END;
+	     loff += DPTX_LANE_STRIDE)
+		set32(phy->regs.dptx + loff + 0x40, 0x080000);
+	for (u32 loff = DPTX_LANE0_OFFSET; loff < DPTX_LANE_END;
+	     loff += DPTX_LANE_STRIDE)
+		clear32(phy->regs.dptx + loff + 0x244, 0x10);
+	dev_info(phy->dev, "T8122 PHY activation: lane registers configured\n");
+	if (t8122_activation_stage == 4)
+		return 0;
+
+	set32(phy->regs.dptx + 0x2218, 0x001);
+	clear32(phy->regs.dptx + 0x2234, 0x00000001);
+	set32(phy->regs.dptx + 0x2200, 0x0002);
+	clear32(phy->regs.dptx + 0x1000, 0x00000002);
+	set32(phy->regs.dptx + 0x4004, 0x08);
+
+	dptx_phy_set_active_lane_count(phy, 0);
+	dev_info(phy->dev, "T8122 PHY activation: lanes parked\n");
+	if (t8122_activation_stage == 5)
+		return 0;
+
+	set32(phy->regs.dptx + 0xd000, 0);
+	dev_info(phy->dev, "T8122 PHY activation: calibration start\n");
+	set32(phy->regs.dptx + 0x4224, 0);
+	set32(phy->regs.dptx + 0x4224, 1);
+	set32(phy->regs.dptx + 0x4200, 0x3c0);
+	set32(phy->regs.dptx + 0x4200, 1);
+	readl(phy->regs.dptx + 0x4204);
+	clear32(phy->regs.dptx + 0x4200, 1);
+	readl(phy->regs.dptx + 0x4210);
+	writel(0x2b0000, phy->regs.dptx + 0x4228);
+	set32(phy->regs.dptx + 0x4228, 0x8000);
+	phy->activation_complete = true;
+	dev_info(phy->dev, "T8122 PHY activation: complete\n");
+
+	return 0;
+}
+
 static int dptx_phy_activate(struct apple_dptx_phy *phy, u32 dcp_index)
 {
 	u32 val_2014;
@@ -129,6 +234,8 @@ static int dptx_phy_activate(struct apple_dptx_phy *phy, u32 dcp_index)
 	u32 val_4408;
 
 	dev_dbg(phy->dev, "activate(dcp:%u)\n", dcp_index);
+	if (phy->hw.type == DPTX_PHY_T8122)
+		return dptx_phy_activate_t8122(phy, dcp_index);
 
 	// MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
 	// MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
@@ -378,13 +485,17 @@ static int dptx_phy_set_link_rate(struct apple_dptx_phy *phy, u32 link_rate)
 
 	// MMIO: R.4   0x23c542220 (dptx-phy[0], offset 0x2220) = 0x11090a0
 	// MMIO: W.4   0x23c542220 (dptx-phy[0], offset 0x2220) = 0x1109020
-	clear32(phy->regs.dptx + 0x2220, 0x0000080);
+	if (phy->hw.type == DPTX_PHY_T8122)
+		clear32(phy->regs.dptx + 0x222c, 0x0000002);
+	else
+		clear32(phy->regs.dptx + 0x2220, 0x0000080);
 
 	// MMIO: R.4   0x23c5420b0 (dptx-phy[0], offset 0x20b0) = 0x1e0e01c2
 	// MMIO: W.4   0x23c5420b0 (dptx-phy[0], offset 0x20b0) = 0x1e0e01c2
 	val_20b0 = readl(phy->regs.dptx + 0x20b0);
 	/* TODO: what happens on dptx-phy */
-	if (phy->hw.type == DPTX_PHY_T6020)
+	if (phy->hw.type == DPTX_PHY_T6020 ||
+	    phy->hw.type == DPTX_PHY_T8122)
 		val_20b0 = (val_20b0 & ~0x3ff) | 0x2a3;
 	writel(val_20b0, phy->regs.dptx + 0x20b0);
 
@@ -392,7 +503,8 @@ static int dptx_phy_set_link_rate(struct apple_dptx_phy *phy, u32 link_rate)
 	// MMIO: W.4   0x23c5420b4 (dptx-phy[0], offset 0x20b4) = 0x7fffffe
 	val_20b4 = readl(phy->regs.dptx + 0x20b4);
 	/* TODO: what happens on dptx-phy */
-	if (phy->hw.type == DPTX_PHY_T6020)
+	if (phy->hw.type == DPTX_PHY_T6020 ||
+	    phy->hw.type == DPTX_PHY_T8122)
 		val_20b4 = (val_20b4 | 0x4000000) & ~0x0008000;
 	writel(val_20b4, phy->regs.dptx + 0x20b4);
 
@@ -400,7 +512,9 @@ static int dptx_phy_set_link_rate(struct apple_dptx_phy *phy, u32 link_rate)
 	// MMIO: W.4   0x23c5420b4 (dptx-phy[0], offset 0x20b4) = 0x7fffffe
 	val_20b4 = readl(phy->regs.dptx + 0x20b4);
 	/* TODO: what happens on dptx-phy */
-	if (phy->hw.type == DPTX_PHY_T6020)
+	if (phy->hw.type == DPTX_PHY_T8122)
+		val_20b4 &= ~0x0000002;
+	else if (phy->hw.type == DPTX_PHY_T6020)
 		val_20b4 = (val_20b4 | 0x0000001) & ~0x0000004;
 	writel(val_20b4, phy->regs.dptx + 0x20b4);
 
@@ -415,13 +529,15 @@ static int dptx_phy_set_link_rate(struct apple_dptx_phy *phy, u32 link_rate)
 	// MMIO: R.4   0x23c5420b8 (dptx-phy[0], offset 0x20b8) = 0x654800
 	// MMIO: W.4   0x23c5420b8 (dptx-phy[0], offset 0x20b8) = 0x654800
 	/* TODO: unclear */
-	if (phy->hw.type == DPTX_PHY_T6020)
+	if (phy->hw.type == DPTX_PHY_T6020 ||
+	    phy->hw.type == DPTX_PHY_T8122)
 		set32(phy->regs.dptx + 0x20b8, 0x010000);
 	else
 		set32(phy->regs.dptx + 0x20b8, 0);
 	// MMIO: R.4   0x23c5420b8 (dptx-phy[0], offset 0x20b8) = 0x654800
 	// MMIO: W.4   0x23c5420b8 (dptx-phy[0], offset 0x20b8) = 0x454800
-	clear32(phy->regs.dptx + 0x20b8, 0x200000);
+	if (phy->hw.type != DPTX_PHY_T8122)
+		clear32(phy->regs.dptx + 0x20b8, 0x200000);
 
 	// MMIO: R.4   0x23c5420b8 (dptx-phy[0], offset 0x20b8) = 0x454800
 	// MMIO: W.4   0x23c5420b8 (dptx-phy[0], offset 0x20b8) = 0x454800
@@ -529,6 +645,9 @@ static int dptx_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 
 	switch (mode) {
 	case PHY_MODE_INVALID:
+		if (dptx_phy->hw.type == DPTX_PHY_T8122 &&
+		    !dptx_phy->activation_complete)
+			return 0;
 		return dptx_phy_deactivate(dptx_phy);
 	case PHY_MODE_DP:
 		if (submode < 0 || submode > 5)
@@ -573,6 +692,10 @@ static int dptx_phy_configure(struct phy *phy, union phy_configure_opts *opts_)
 	struct apple_dptx_phy *dptx_phy = phy_get_drvdata(phy);
 	enum dptx_phy_link_rate link_rate;
 	int ret = 0;
+
+	if (dptx_phy->hw.type == DPTX_PHY_T8122 &&
+	    !dptx_phy->activation_complete)
+		return 0;
 
 	if (opts->set_lanes) {
 		mutex_lock(&dptx_phy->lock);
@@ -623,6 +746,7 @@ static int dptx_phy_probe(struct platform_device *pdev)
 {
 	struct apple_dptx_phy *dptx_phy;
 	struct device *dev = &pdev->dev;
+	int ret;
 
 	dptx_phy = devm_kzalloc(dev, sizeof(*dptx_phy), GFP_KERNEL);
 	if (!dptx_phy)
@@ -634,6 +758,14 @@ static int dptx_phy_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, dptx_phy);
 
 	mutex_init(&dptx_phy->lock);
+
+	/*
+	 * The generic PHY core only propagates runtime-PM references to the
+	 * provider when runtime PM was enabled before devm_phy_create().
+	 */
+	ret = devm_pm_runtime_enable(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable runtime PM\n");
 
 	dptx_phy->regs.core =
 		devm_platform_ioremap_resource_byname(pdev, "core");
@@ -667,9 +799,14 @@ static const struct apple_dptx_phy_hw apple_dptx_hw_t8112 = {
 	.type = DPTX_PHY_T8112,
 };
 
+static const struct apple_dptx_phy_hw apple_dptx_hw_t8122 = {
+	.type = DPTX_PHY_T8122,
+};
+
 static const struct of_device_id dptx_phy_match[] = {
 	{ .compatible = "apple,t6020-dptx-phy", .data = &apple_dptx_hw_t6020 },
 	{ .compatible = "apple,t8112-dptx-phy", .data = &apple_dptx_hw_t8112 },
+	{ .compatible = "apple,t8122-dptx-phy", .data = &apple_dptx_hw_t8122 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, dptx_phy_match);

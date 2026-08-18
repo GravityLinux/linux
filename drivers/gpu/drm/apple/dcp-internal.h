@@ -18,6 +18,7 @@
 #include "iomfb.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "iomfb_v26_6.h"
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES 4
@@ -25,12 +26,15 @@
 struct apple_dcp;
 struct apple_dcp_afkep;
 
+extern bool dcp_disable_rt_bandwidth;
+
 struct dcpav_service_epic;
 
 enum dcp_firmware_version {
 	DCP_FIRMWARE_UNKNOWN,
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
+	DCP_FIRMWARE_V_26_6,
 };
 
 enum {
@@ -38,10 +42,15 @@ enum {
 	TEST_ENDPOINT = 0x21,
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
+	DPAVCTRL_ENDPOINT = 0x24,
+	EPIC25_ENDPOINT = 0x25,
+	DPSAC_ENDPOINT = 0x26,
+	DPDEV_ENDPOINT = 0x27,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
 	HDCP_ENDPOINT = 0x2b,
+	EPIC2C_ENDPOINT = 0x2c,
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
@@ -178,6 +187,7 @@ struct apple_dcp {
 	union {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
+		struct dcp_swap_submit_req_v26_6_0 v26_6_0;
 	} swap;
 
 	/* swap id of the last completed swap */
@@ -187,6 +197,13 @@ struct apple_dcp {
 	/* Current display mode */
 	bool during_modeset;
 	bool valid_mode;
+	/*
+	 * Diagnostic 26.6 external-hotplug path: the link can disappear while
+	 * IOMFB remains powered.  Remember that atomic_disable deliberately
+	 * skipped the firmware power-off sequence so atomic_enable does not send
+	 * a mismatched power-on sequence on reconnect.
+	 */
+	bool hotplug_keepalive;
 	bool use_timestamps;
 	struct dcp_set_digital_out_mode_req mode;
 
@@ -239,6 +256,25 @@ struct apple_dcp {
 	struct completion systemep_done;
 
 	struct apple_dcp_afkep *ibootep;
+	struct apple_epic_service *iboot_service;
+	struct apple_dcp_afkep *dpavctrlep;
+	struct apple_dcp_afkep *dpdevep;
+	struct apple_epic_service *dpdev_service;
+	struct completion dpdev_ready;
+	struct apple_dcp_afkep *avauxep;
+	struct apple_dcp_afkep *dpsacep;
+	struct apple_dcp_afkep *remoteallocep;
+	struct apple_dcp_afkep *epicep2c;
+	struct apple_dcp_afkep *expertep;
+	struct apple_dcp_afkep *epicep25;
+	struct apple_dcp_afkep *hdcpep;
+	struct completion hdcp_ready;
+	struct apple_epic_service *hdcp_service[2];
+	u32 hdcp_teardown_interface;
+	bool hdcp_mprime_attempted;
+	struct completion dpavctrl_ready;
+	struct apple_epic_service *dpavctrl_av_controller[2];
+	struct apple_epic_service *dpavctrl_late_service;
 	struct apple_dcp_afkep *dcpavservep;
 	struct dcpavserv dcpavserv;
 
@@ -267,6 +303,8 @@ struct apple_dcp {
 	u32 dptx_die;
 	int hdmi_hpd_irq;
 };
+
+void *dcp_vmap_wc(phys_addr_t phys, size_t size, void **map_base);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 

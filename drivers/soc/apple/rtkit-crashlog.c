@@ -14,6 +14,9 @@
 #define APPLE_RTKIT_CRASHLOG_MBOX FOURCC('C', 'm', 'b', 'x')
 #define APPLE_RTKIT_CRASHLOG_TIME FOURCC('C', 't', 'i', 'm')
 #define APPLE_RTKIT_CRASHLOG_REGS FOURCC('C', 'r', 'g', '8')
+#define APPLE_RTKIT_CRASHLOG_STACK FOURCC('C', 'c', 's', 't')
+#define APPLE_RTKIT_CRASHLOG_ASYNC_ERROR FOURCC('C', 'a', 's', 'C')
+#define APPLE_RTKIT_CRASHLOG_DCP_MAP FOURCC('C', 'c', 'd', 'p')
 
 /* For COMPILE_TEST on non-ARM64 architectures */
 #ifndef PSR_MODE_EL0t
@@ -59,6 +62,29 @@ struct apple_rtkit_crashlog_regs {
 	u64 unk_Z;
 } __packed;
 static_assert(sizeof(struct apple_rtkit_crashlog_regs) == 0x350);
+
+struct apple_rtkit_crashlog_dcp_map {
+	u64 va;
+	u64 dva;
+	u32 flags;
+} __packed;
+static_assert(sizeof(struct apple_rtkit_crashlog_dcp_map) == 0x14);
+
+struct apple_rtkit_crashlog_stack {
+	u32 task;
+	u32 unknown;
+} __packed;
+static_assert(sizeof(struct apple_rtkit_crashlog_stack) == 0x8);
+
+struct apple_rtkit_crashlog_async_error {
+	u64 l2c_err_sts;
+	u64 l2c_err_adr;
+	u64 l2c_err_inf;
+	u64 lsu_err_sts;
+	u64 fed_err_sts;
+	u64 mmu_err_sts;
+} __packed;
+static_assert(sizeof(struct apple_rtkit_crashlog_async_error) == 0x30);
 
 static void apple_rtkit_crashlog_dump_str(struct apple_rtkit *rtk, u8 *bfr,
 					  size_t size)
@@ -183,9 +209,78 @@ static void apple_rtkit_crashlog_dump_regs(struct apple_rtkit *rtk, u8 *bfr,
 	dev_warn(rtk->dev, "\n");
 }
 
+static void apple_rtkit_crashlog_dump_dcp_map(struct apple_rtkit *rtk,
+					       u8 *bfr, size_t size)
+{
+	struct apple_rtkit_crashlog_dcp_map entry;
+	size_t offset;
+
+	for (offset = 0; offset + sizeof(entry) <= size;
+	     offset += sizeof(entry)) {
+		memcpy(&entry, bfr + offset, sizeof(entry));
+		dev_warn(rtk->dev,
+			 "RTKit: DCP map: VA 0x%016llx -> DVA 0x%016llx flags 0x%x",
+			 entry.va, entry.dva, entry.flags);
+	}
+}
+
+static void apple_rtkit_crashlog_dump_stack(struct apple_rtkit *rtk, u8 *bfr,
+					     size_t size)
+{
+	struct apple_rtkit_crashlog_stack stack;
+	size_t offset;
+	u64 address;
+
+	if (size < sizeof(stack)) {
+		dev_warn(rtk->dev, "RTKit: Stack section too small: 0x%zx",
+			 size);
+		return;
+	}
+
+	memcpy(&stack, bfr, sizeof(stack));
+	dev_warn(rtk->dev,
+		 "RTKit: Call stack (task %u, unknown 0x%x):",
+		 stack.task, stack.unknown);
+
+	for (offset = sizeof(stack); offset + sizeof(address) <= size;
+	     offset += sizeof(address)) {
+		memcpy(&address, bfr + offset, sizeof(address));
+		if (!address)
+			break;
+		dev_warn(rtk->dev, "RTKit:   0x%016llx", address);
+	}
+}
+
+static void apple_rtkit_crashlog_dump_async_error(struct apple_rtkit *rtk,
+						   u8 *bfr, size_t size)
+{
+	struct apple_rtkit_crashlog_async_error error;
+
+	if (size < sizeof(error)) {
+		dev_warn(rtk->dev,
+			 "RTKit: Async error section too small: 0x%zx", size);
+		return;
+	}
+
+	memcpy(&error, bfr, sizeof(error));
+	dev_warn(rtk->dev, "RTKit: Async error info:");
+	dev_warn(rtk->dev, "RTKit:   L2C_ERR_STS = 0x%016llx",
+		 error.l2c_err_sts);
+	dev_warn(rtk->dev, "RTKit:   L2C_ERR_ADR = 0x%016llx",
+		 error.l2c_err_adr);
+	dev_warn(rtk->dev, "RTKit:   L2C_ERR_INF = 0x%016llx",
+		 error.l2c_err_inf);
+	dev_warn(rtk->dev, "RTKit:   LSU_ERR_STS = 0x%016llx",
+		 error.lsu_err_sts);
+	dev_warn(rtk->dev, "RTKit:   FED_ERR_STS = 0x%016llx",
+		 error.fed_err_sts);
+	dev_warn(rtk->dev, "RTKit:   MMU_ERR_STS = 0x%016llx",
+		 error.mmu_err_sts);
+}
+
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 {
-	size_t offset;
+	size_t offset, payload_size;
 	u32 section_fourcc, section_size;
 	struct apple_rtkit_crashlog_header header;
 
@@ -208,6 +303,13 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 	while (offset < size) {
 		memcpy(&section_fourcc, bfr + offset, 4);
 		memcpy(&section_size, bfr + offset + 12, 4);
+		if (section_size < 16 || section_size > size - offset) {
+			dev_warn(rtk->dev,
+				 "RTKit: Invalid crashlog section size 0x%x at 0x%zx",
+				 section_size, offset);
+			return;
+		}
+		payload_size = section_size - 16;
 
 		switch (section_fourcc) {
 		case APPLE_RTKIT_CRASHLOG_HEADER:
@@ -215,23 +317,35 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 			return;
 		case APPLE_RTKIT_CRASHLOG_STR:
 			apple_rtkit_crashlog_dump_str(rtk, bfr + offset + 16,
-						      section_size);
+						      payload_size);
 			break;
 		case APPLE_RTKIT_CRASHLOG_VERSION:
 			apple_rtkit_crashlog_dump_version(
-				rtk, bfr + offset + 16, section_size);
+				rtk, bfr + offset + 16, payload_size);
 			break;
 		case APPLE_RTKIT_CRASHLOG_MBOX:
 			apple_rtkit_crashlog_dump_mailbox(
-				rtk, bfr + offset + 16, section_size);
+				rtk, bfr + offset + 16, payload_size);
 			break;
 		case APPLE_RTKIT_CRASHLOG_TIME:
 			apple_rtkit_crashlog_dump_time(rtk, bfr + offset + 16,
-						       section_size);
+						       payload_size);
 			break;
 		case APPLE_RTKIT_CRASHLOG_REGS:
 			apple_rtkit_crashlog_dump_regs(rtk, bfr + offset + 16,
-						       section_size);
+						       payload_size);
+			break;
+		case APPLE_RTKIT_CRASHLOG_STACK:
+			apple_rtkit_crashlog_dump_stack(rtk, bfr + offset + 16,
+							payload_size);
+			break;
+		case APPLE_RTKIT_CRASHLOG_ASYNC_ERROR:
+			apple_rtkit_crashlog_dump_async_error(
+				rtk, bfr + offset + 16, payload_size);
+			break;
+		case APPLE_RTKIT_CRASHLOG_DCP_MAP:
+			apple_rtkit_crashlog_dump_dcp_map(
+				rtk, bfr + offset + 16, payload_size);
 			break;
 		default:
 			dev_warn(rtk->dev,

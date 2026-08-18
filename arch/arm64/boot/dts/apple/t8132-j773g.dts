@@ -21,11 +21,83 @@
 	};
 };
 
+/* Persistent console capture for early T8132 bring-up failures.  Keep this
+ * near the top of RAM, outside m1n1's kernel/initramfs load area. */
+&{/reserved-memory} {
+	ramoops@103e0000000 {
+		compatible = "ramoops";
+		reg = <0x103 0xe0000000 0x0 0x200000>;
+		record-size = <0x40000>;
+		console-size = <0x100000>;
+		pmsg-size = <0x40000>;
+	};
+};
+
 /*
  * Keep the power-domains used for the HDMI port on.
  */
 &framebuffer0 {
 	power-domains = <&ps_dispext0_cpu>, <&ps_dptx_phy>;
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dcpext0_mbox {
+	status = "okay";
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dptxphy {
+	status = "okay";
+};
+
+&dcp {
+	status = "okay";
+	/* Expose the primary and overlay surfaces. */
+	apple,iomfb-surfaces = <1 1 0 0>;
+	apple,iomfb-surface-order = <0 1>;
+	apple,iomfb-primary-surface = <0>;
+	apple,connector-type = "HDMI-A";
+	phys = <&dptxphy>;
+	phy-names = "dp-phy";
+	apple,dptx-phy = <4>;
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+};
+
+/* This desktop experiment is entirely RAM/network backed. Do not expose the
+ * internal SSD to userspace or desktop automounters. */
+&nvme {
+	status = "disabled";
 };
 
 /*
@@ -119,8 +191,37 @@
 	};
 };
 
+/* The two front ports are behind a permanently attached host-only hub. */
+&dwc3_2 {
+	dr_mode = "host";
+	/delete-property/ role-switch-default-mode;
+};
+
+&atcphy2 {
+	apple,fixed-usb3;
+	apple,fixed-lane-swap;
+	/delete-property/ orientation-switch;
+	/delete-property/ mode-switch;
+};
+
+&pinctrl_ap {
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <101 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <198 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
+	};
+};
+
 &wifi0 {
-       brcm,board-type = "apple,asakhali";
+	brcm,board-type = "apple,sakhalin";
 };
 
 &bluetooth0 {
@@ -145,3 +246,6 @@
 	iommu-map = <0x100 &pcie0_dart 1 1>,
 	            <0x200 &pcie2_dart 1 1>;
 };
+
+#include "hwmon-common.dtsi"
+#include "hwmon-mini.dtsi"

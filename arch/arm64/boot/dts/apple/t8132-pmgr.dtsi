@@ -45,6 +45,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pmc";
+		/* DCP accesses its PMGR dashboard while handling external unplug. */
+		apple,always-on;
 	};
 
 	ps_pms_fpwm0: power-controller@140 {
@@ -152,7 +154,8 @@
 		#reset-cells = <0>;
 		label = "dispext0_cpu";
 		power-domains = <&ps_dispext0_fe>;
-		status = "disabled"; /* Locked, don't touch it */
+		/* This firmware-owned domain is locked on T8132. */
+		status = "disabled";
 	};
 
 	ps_scodec: power-controller@228 {
@@ -785,7 +788,8 @@
 		#reset-cells = <0>;
 		label = "dispext1_cpu";
 		power-domains = <&ps_dispext1_fe>;
-		status = "disabled"; /* Locked, don't touch it */
+		/* This firmware-owned domain is locked on T8132. */
+		status = "disabled";
 	};
 
 	ps_ans: power-controller@538 {
@@ -794,7 +798,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ans";
-		apple,always-on; /* Device reboots after 3 mintues if disabled */
+		/* Turning ANS off triggers a watchdog reset after a few minutes. */
+		apple,always-on;
 	};
 
 	ps_apcie_st: power-controller@540 {
@@ -962,7 +967,8 @@
 		#reset-cells = <0>;
 		label = "disp_cpu";
 		power-domains = <&ps_disp_fe>;
-		status = "disabled"; /* Locked, don't touch it */
+		/* This firmware-owned domain is locked on T8132. */
+		status = "disabled";
 	};
 };
 
