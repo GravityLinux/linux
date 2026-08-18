@@ -436,6 +436,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct dwc3_apple *appledwc;
+	enum usb_dr_mode dr_mode;
 	int ret;
 
 	appledwc = devm_kzalloc(&pdev->dev, sizeof(*appledwc), GFP_KERNEL);
@@ -444,6 +445,8 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 
 	appledwc->dev = &pdev->dev;
 	mutex_init(&appledwc->lock);
+	dr_mode = usb_get_dr_mode(dev);
+	appledwc->dwc.dr_mode = dr_mode;
 
 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
@@ -475,6 +478,20 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+	if (dr_mode == USB_DR_MODE_HOST) {
+		/*
+		 * Host-only instances have no cable event to start the core. Mark
+		 * the role before core probe so dwc3_core_soft_reset() does not try
+		 * to reset the unused gadget side of the controller.
+		 */
+		appledwc->dwc.current_dr_role = DWC3_GCTL_PRTCAP_HOST;
+		guard(mutex)(&appledwc->lock);
+		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to start fixed host controller\n");
+		return 0;
+	}
+
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
@@ -489,7 +506,8 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 
 	guard(mutex)(&appledwc->lock);
 
-	usb_role_switch_unregister(appledwc->role_sw);
+	if (appledwc->role_sw)
+		usb_role_switch_unregister(appledwc->role_sw);
 
 	/*
 	 * If we're still in DWC3_APPLE_PROBE_PENDING we never got any cable connected event and
