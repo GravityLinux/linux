@@ -166,6 +166,28 @@ static const struct file_operations dptx_hpd_low_fops = {
 	.llseek = noop_llseek,
 };
 
+static ssize_t dptx_hpd_write(struct file *file, const char __user *buf,
+			      size_t len, loff_t *ppos)
+{
+	struct apple_connector *apple_con = file->private_data;
+	bool hpd;
+	int ret;
+
+	ret = kstrtobool_from_user(buf, len, &hpd);
+	if (ret)
+		return ret;
+
+	ret = dcp_dptx_set_hpd_oob(apple_con->dcp, 0, hpd);
+	return ret ? ret : len;
+}
+
+static const struct file_operations dptx_hpd_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = dptx_hpd_write,
+	.llseek = noop_llseek,
+};
+
 static ssize_t dptx_release_write(struct file *file, const char __user *buf,
 				  size_t len, loff_t *ppos)
 {
@@ -247,6 +269,8 @@ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry
 				    &dptx_av_disconnect_fops);
 		debugfs_create_file("dptx_hpd_low", 0200, root, apple_con,
 				    &dptx_hpd_low_fops);
+		debugfs_create_file("dptx_hpd", 0200, root, apple_con,
+				    &dptx_hpd_fops);
 		debugfs_create_file("dptx_release", 0200, root, apple_con,
 				    &dptx_release_fops);
 		debugfs_create_file("dptx_phy_activate", 0200, root, apple_con,
