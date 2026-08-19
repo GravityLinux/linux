@@ -438,6 +438,65 @@
 			status = "disabled";
 		};
 
+		sio_dart: iommu@3ad060000 {
+			compatible = "apple,t8132-dart", "apple,t8110-dart";
+			reg = <0x3 0xad060000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1074 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_sio_cpu>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		sio_mbox: mailbox@3ade08000 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0xade08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1078 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1079 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1080 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1081 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_sio_cpu>;
+			status = "disabled";
+		};
+
+		sio: dma-controller@3ade00000 {
+			compatible = "apple,t8132-sio", "apple,sio";
+			reg = <0x3 0xade00000 0x0 0x8000>;
+			dma-channels = <128>;
+			#dma-cells = <1>;
+			mboxes = <&sio_mbox>;
+			iommus = <&sio_dart 0>;
+			power-domains = <&ps_sio_cpu>;
+			status = "disabled";
+		};
+
+		dpaudio0: audio-controller {
+			compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+			dmas = <&sio 0x64>;
+			dma-names = "tx";
+			power-domains = <&ps_dpa0>;
+			reset-domains = <&ps_dpa0>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					dpaudio0_dcp: endpoint {
+						remote-endpoint = <&dcp_audio>;
+					};
+				};
+			};
+		};
+
 		pmgr_dcp: power-management@382800000 {
 			reg = <0x3 0x82800000 0x0 0xbc000>;
 			reg-names = "dcp-fw-pmgr";
@@ -474,6 +533,19 @@
 			disp0_piodma: piodma {
 				iommus = <&disp0_dart 16>;
 				phandle = <&disp0_piodma>;
+			};
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					dcp_audio: endpoint {
+						remote-endpoint = <&dpaudio0_dcp>;
+					};
+				};
 			};
 		};
 
