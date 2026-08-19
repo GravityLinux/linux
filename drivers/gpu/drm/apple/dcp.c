@@ -672,10 +672,14 @@ static void dcp_compact_aux_init(struct apple_epic_service *service,
 		service->ep->endpoint, name ?: "", class ?: "", unit);
 }
 
-static int dcp_compact_aux_call(struct apple_epic_service *service, u32 idx,
+static int dcp_compact_aux_call(struct apple_epic_service *service, u16 group,
+				u32 idx,
 				const void *data, size_t data_size,
 				void *reply, size_t reply_size)
 {
+	if (group)
+		return -ENOSYS;
+
 	if (reply && reply_size)
 		memset(reply, 0, reply_size);
 	return 0;
@@ -736,12 +740,15 @@ static int dcp_hdcp_notify_dpdev(struct apple_dcp *dcp)
 	return ret;
 }
 
-static int dcp_hdcp_call(struct apple_epic_service *service, u32 idx,
+static int dcp_hdcp_call(struct apple_epic_service *service, u16 group, u32 idx,
 			 const void *data, size_t data_size,
 			 void *reply, size_t reply_size)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 	__le64 ready = cpu_to_le64(1);
+
+	if (group)
+		return -ENOSYS;
 
 	if (reply && reply_size) {
 		memset(reply, 0, reply_size);
@@ -1017,10 +1024,21 @@ int dcp_start(struct platform_device *pdev)
 			return dev_err_probe(dcp->dev, ret,
 					     "Failed to start DPSAC endpoint\n");
 
-		ret = dcp_start_aux_ep(dcp, AV_ENDPOINT, &dcp->avauxep);
+		/*
+		 * The 26.6 AV endpoint is compact, but its audio service still uses
+		 * the established DCPAV command ABI.  Let the audio-aware endpoint
+		 * own 0x29 when requested; starting the generic endpoint here would
+		 * make the later avep_init() call a permanent no-op.
+		 */
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+		if (hdmi_audio)
+			ret = avep_init(dcp);
+		else
+#endif
+			ret = dcp_start_aux_ep(dcp, AV_ENDPOINT, &dcp->avauxep);
 		if (ret)
 			return dev_err_probe(dcp->dev, ret,
-					     "Failed to start AV auxiliary endpoint\n");
+					     "Failed to start AV endpoint\n");
 
 		ret = dcp_start_aux_ep(dcp, REMOTE_ALLOC_ENDPOINT,
 				       &dcp->remoteallocep);
@@ -1142,7 +1160,7 @@ int dcp_start(struct platform_device *pdev)
 	}
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	if (hdmi_audio && !dcp->avauxep) {
+	if (hdmi_audio && !dcp->avep && !dcp->avauxep) {
 		ret = avep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start AV endpoint: %d", ret);

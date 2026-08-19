@@ -748,7 +748,8 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *ep,
 			 ep->endpoint, channel, le16_to_cpu(call->group),
 			 le32_to_cpu(call->command));
 	} else {
-		ret = service->ops->call(service, le32_to_cpu(call->command),
+		ret = service->ops->call(service, le16_to_cpu(call->group),
+					le32_to_cpu(call->command),
 					call + 1, call_size, reply_call + 1,
 					call_size);
 	}
@@ -1008,7 +1009,7 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		if (!reply)
 			return;
 
-		ret = service->ops->call(service, le32_to_cpu(call->type),
+		ret = service->ops->call(service, 0, le32_to_cpu(call->type),
 					 payload + sizeof(*call), call_size,
 					 reply + sizeof(*call), call_size);
 		if (ret) {
@@ -1822,7 +1823,8 @@ static void afk_populate_service_debugfs(struct apple_epic_service *srv)
 	if (!srv->ep->debugfs_entry || !srv->ops)
 		return;
 
-	if (strcmp(srv->ops->name, "DCPAVAudioInterface") == 0) {
+	if (!strcmp(srv->ops->name, "DCPAVAudioInterface") ||
+	    !strcmp(srv->ops->name, "dcpav-audio-interface-")) {
 		srv->debugfs.entry = debugfs_create_dir(srv->ops->name,
 							srv->ep->debugfs_entry);
 		debugfs_create_file("call", 0600, srv->debugfs.entry, srv,
