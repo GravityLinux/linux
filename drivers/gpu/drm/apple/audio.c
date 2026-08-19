@@ -39,10 +39,13 @@ struct dcp_audio {
 	struct device *dma_dev;
 	struct device_link *dma_link;
 	struct dma_chan *chan;
+	bool dma_buffer_configured;
 	struct snd_card *card;
 	struct snd_jack *jack;
 	struct snd_pcm_substream *substream;
 	unsigned int open_cookie;
+	bool power_held;
+	bool link_started;
 
 	struct mutex data_lock;
 	bool dcp_connected; /// dcp status keep for delayed initialization
@@ -59,7 +62,7 @@ struct dcp_audio {
 
 static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.info	 = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-		   SNDRV_PCM_INFO_INTERLEAVED,
+		   SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BATCH,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_LE |
 		   SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rates			= SNDRV_PCM_RATE_CONTINUOUS,
@@ -117,6 +120,7 @@ static void dcpaud_fill_fmt_sieve(struct snd_pcm_hw_params *params,
 				SNDRV_PCM_HW_PARAM_FORMAT);
 	int i;
 
+	memset(sieve, 0, sizeof(*sieve));
 	sieve->nchans = GENMASK(c->max, c->min);
 	sieve->formats = f->bits[0] | ((u64) f->bits[1]) << 32; /* TODO: don't open-code */
 
@@ -213,9 +217,12 @@ static int dcpaud_rule_rate(struct snd_pcm_hw_params *params,
         return snd_interval_rate_bits(r, hits.rates);
 }
 
-static int dcpaud_init_dma(struct dcp_audio *dcpaud)
+extern bool hdmi_audio;
+
+static int dcpaud_request_dma(struct dcp_audio *dcpaud)
 {
 	struct dma_chan *chan;
+
 	if (dcpaud->chan)
 		return 0;
 
@@ -232,10 +239,24 @@ static int dcpaud_init_dma(struct dcp_audio *dcpaud)
 		return PTR_ERR(chan);
 	}
 	dcpaud->chan = chan;
+	return 0;
+}
 
-	snd_pcm_set_managed_buffer(dcpaud->substream, SNDRV_DMA_TYPE_DEV_IRAM,
-				   dcpaud->chan->device->dev, 1024 * 1024,
-				   SIZE_MAX);
+static int dcpaud_init_dma(struct dcp_audio *dcpaud)
+{
+	int ret;
+
+	ret = dcpaud_request_dma(dcpaud);
+	if (ret)
+		return ret;
+
+	if (!dcpaud->dma_buffer_configured) {
+		snd_pcm_set_managed_buffer(dcpaud->substream,
+					   SNDRV_DMA_TYPE_DEV_IRAM,
+					   dcpaud->chan->device->dev,
+					   1024 * 1024, SIZE_MAX);
+		dcpaud->dma_buffer_configured = true;
+	}
 
 	return 0;
 }
@@ -251,8 +272,10 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 
 	mutex_lock(&dcpaud->data_lock);
 	ret = dcpaud_init_dma(dcpaud);
-	if (ret < 0)
+	if (ret < 0) {
+		mutex_unlock(&dcpaud->data_lock);
 		return ret;
+	}
 
 	if (!dcpaud->connected) {
 		mutex_unlock(&dcpaud->data_lock);
@@ -277,7 +300,7 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 
 	hw = dcp_pcm_hw;
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-			  SNDRV_PCM_INFO_INTERLEAVED;
+			  SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BATCH;
 	hw.periods_min = 2;
 	hw.periods_max = UINT_MAX;
 	hw.period_bytes_min = 256;
@@ -290,7 +313,34 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		return ret;
 	substream->runtime->hw = hw;
 
-	return snd_dmaengine_pcm_open(substream, dcpaud->chan);
+	ret = snd_dmaengine_pcm_open(substream, dcpaud->chan);
+	if (ret)
+		return ret;
+
+	/* Native 26.6 keeps the physical audio link fixed at 48 kHz and
+	 * resamples CoreAudio clients into it.  We retain that link across ALSA
+	 * clients below, so accepting a different rate here would leave SIO and
+	 * the already-started DCP link running at different rates. */
+	if (of_device_is_compatible(dcpaud->dev->of_node,
+				    "apple,t8132-dpaudio")) {
+		ret = snd_pcm_hw_constraint_single(substream->runtime,
+					       SNDRV_PCM_HW_PARAM_RATE, 48000);
+		/* A positive return means the interval was successfully narrowed. */
+		if (ret < 0)
+			goto err_close;
+
+		ret = snd_pcm_hw_constraint_step(substream->runtime, 0,
+					 SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+					 SZ_4K);
+		if (ret)
+			goto err_close;
+	}
+
+	return 0;
+
+err_close:
+	snd_dmaengine_pcm_close(substream);
+	return ret;
 }
 
 static int dcp_pcm_close(struct snd_pcm_substream *substream)
@@ -317,6 +367,8 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	struct dma_slave_config slave_config;
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
+	bool acquired_power = false;
+	bool just_powered = false;
 	int ret;
 
 	if (!dcpaud_connection_up(dcpaud))
@@ -328,11 +380,37 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	if (!ret)
 		return -EINVAL;
 
+	/* T8132 needs the DPA power domain up while AVService prepares the
+	 * link, not merely when the final PCM trigger starts DMA. Native 26.6
+	 * keeps that hardware session resident across CoreAudio clients and
+	 * continuously feeds silence, so retain the DPA reference across ALSA
+	 * PCM closes rather than invalidating the AV binding after every sound. */
+	if (!dcpaud->power_held) {
+		ret = pm_runtime_get_if_active(dcpaud->dev);
+		if (ret < 0)
+			return ret;
+		if (!ret) {
+			/* Native closes the stale AV binding while DPA is inactive,
+			 * then powers DPA up, configures SIO, and opens it again. */
+			ret = dcp_audiosrv_close_for_power_transition(
+							 dcpaud->dcp_dev);
+			if (ret < 0)
+				return ret;
+
+			ret = pm_runtime_resume_and_get(dcpaud->dev);
+			if (ret < 0)
+				return ret;
+			just_powered = true;
+		}
+		acquired_power = true;
+		dcpaud->power_held = true;
+	}
+
 	memset(&slave_config, 0, sizeof(slave_config));
 	ret = snd_hwparams_to_dma_slave_config(substream, params, &slave_config);
 	dev_info(dcpaud->dev, "snd_hwparams_to_dma_slave_config: %d\n", ret);
 	if (ret < 0)
-		return ret;
+		goto rpm_put;
 
 	slave_config.direction = DMA_MEM_TO_DEV;
 	/*
@@ -343,44 +421,116 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 
 	ret = dmaengine_slave_config(chan, &slave_config);
 	dev_info(dcpaud->dev, "dmaengine_slave_config: %d\n", ret);
+	if (ret < 0)
+		goto rpm_put;
+
+	/* Native 26.6 configures SIO channel 0x64 before issuing another AV audio
+	 * open after a DPA power transition. */
+	if (just_powered) {
+		ret = dcp_audiosrv_open_after_power_transition(dcpaud->dcp_dev);
+		if (ret < 0)
+			goto rpm_put;
+	}
+	return ret;
+
+rpm_put:
+	if (acquired_power) {
+		pm_runtime_mark_last_busy(dcpaud->dev);
+		pm_runtime_put_autosuspend(dcpaud->dev);
+		dcpaud->power_held = false;
+	}
 	return ret;
 }
 
 static int dcp_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	int ret = 0;
 
-	if (!dcpaud_connection_up(dcpaud))
+	if (of_device_is_compatible(dcpaud->dev->of_node,
+				    "apple,t8132-dpaudio") &&
+	    dcpaud->link_started)
 		return 0;
 
-	return dcp_audiosrv_unprepare(dcpaud->dcp_dev);
+	if (dcpaud_connection_up(dcpaud)) {
+		ret = dcp_audiosrv_unprepare(dcpaud->dcp_dev);
+		dev_dbg(dcpaud->dev, "AVService unprepare returned %d\n", ret);
+	}
+
+	return ret;
 }
 
 static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	int ret;
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
 
-	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
-				    &dcpaud->selected_cookie);
+	/* T8132/26.6 submits SIO DMA before AVService prepare/start.  Defer
+	 * prepare to the START trigger so that ordering can be preserved. */
+	if (of_device_is_compatible(dcpaud->dev->of_node,
+				    "apple,t8132-dpaudio"))
+		return 0;
+
+	ret = dcp_audiosrv_prepare(dcpaud->dcp_dev,
+				   &dcpaud->selected_cookie);
+	dev_dbg(dcpaud->dev, "AVService prepare returned %d\n", ret);
+	return ret;
 }
 
 static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	bool t8132 = of_device_is_compatible(dcpaud->dev->of_node,
+					     "apple,t8132-dpaudio");
 	int ret;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		if (!dcpaud_connection_up(dcpaud))
+			return -ENXIO;
+
+		if (t8132) {
+			/* Native 26.6 has audio DMA pending before it prepares and
+			 * starts the DCP link.  Starting the link first leaves T8132
+			 * acknowledging SIO descriptors without consuming them. */
+			ret = snd_dmaengine_pcm_trigger(substream, cmd);
+			if (ret < 0)
+				return ret;
+			if (dcpaud->link_started)
+				return 0;
+
+			ret = dcp_audiosrv_prepare(dcpaud->dcp_dev,
+						   &dcpaud->selected_cookie);
+			dev_dbg(dcpaud->dev,
+				 "AVService deferred prepare returned %d\n", ret);
+			if (ret < 0)
+				goto stop_dma;
+		}
+
+		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
+					     &dcpaud->selected_cookie);
+		dev_dbg(dcpaud->dev, "AVService startLink returned %d\n", ret);
+		if (ret < 0) {
+			if (t8132)
+				goto stop_dma;
+			return ret;
+		}
+		if (t8132) {
+			dcpaud->link_started = true;
+			return 0;
+		}
+		break;
+
 	case SNDRV_PCM_TRIGGER_RESUME:
 		if (!dcpaud_connection_up(dcpaud))
 			return -ENXIO;
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
+		dev_dbg(dcpaud->dev, "AVService startLink returned %d\n", ret);
 		if (ret < 0)
 			return ret;
 		break;
@@ -404,15 +554,20 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		if (t8132 && dcpaud->link_started)
+			return 0;
 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
+		dev_dbg(dcpaud->dev, "AVService stopLink returned %d\n", ret);
 		if (ret < 0)
 			return ret;
 		break;
 	}
 
 	return 0;
+
+stop_dma:
+	snd_dmaengine_pcm_trigger(substream, SNDRV_PCM_TRIGGER_STOP);
+	return ret;
 }
 
 struct snd_pcm_ops dcp_playback_ops = {
@@ -422,6 +577,7 @@ struct snd_pcm_ops dcp_playback_ops = {
 	.hw_free = dcp_pcm_hw_free,
 	.prepare = dcp_pcm_prepare,
 	.trigger = dcp_pcm_trigger,
+	.sync_stop = snd_dmaengine_pcm_sync_stop,
 	.pointer = snd_dmaengine_pcm_pointer,
 };
 
@@ -489,6 +645,7 @@ static int dcpaud_create_pcm(struct dcp_audio *dcpaud)
 static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 {
 	struct snd_pcm_substream *substream = dcpaud->substream;
+	bool sync_stop = false;
 
 	if (!dcpaud->card || dcpaud->connected == connected) {
 		mutex_unlock(&dcpaud->data_lock);
@@ -496,17 +653,38 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 	}
 
 	dcpaud->connected = connected;
-	if (connected)
+	if (connected) {
 		dcpaud->connection_cookie++;
+		/*
+		 * The sound card is persistent across HPD, unlike macOS's audio
+		 * device.  Admit an already-open stream into the new connection
+		 * generation so its XRUN recovery can build a fresh DCP session.
+		 */
+		dcpaud->open_cookie = dcpaud->connection_cookie;
+	}
 	mutex_unlock(&dcpaud->data_lock);
 
 	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
 
 	if (!connected) {
 		snd_pcm_stream_lock(substream);
-		if (substream->runtime)
-			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
+		if (substream->runtime) {
+			snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+			sync_stop = true;
+		}
 		snd_pcm_stream_unlock(substream);
+
+		/*
+		 * STOP only schedules apple-sio's TERMINATE64 work.  Native waits
+		 * for its ACK and all final reports before DPA/AV teardown, so make
+		 * that boundary explicit before invalidating the DCP link state.
+		 */
+		if (sync_stop)
+			snd_dmaengine_pcm_sync_stop(substream);
+
+		mutex_lock(&dcpaud->data_lock);
+		dcpaud->link_started = false;
+		mutex_unlock(&dcpaud->data_lock);
 	}
 }
 
@@ -541,8 +719,6 @@ static void dcpaud_expose_debugfs_blob(struct dcp_audio *dcpaud, const char *nam
 #else
 static void dcpaud_expose_debugfs_blob(struct dcp_audio *dcpaud, const char *name, void *base, size_t size) {}
 #endif
-
-extern bool hdmi_audio;
 
 static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
 {
@@ -687,6 +863,17 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
 	/* snd_card_free_when_closed() checks for NULL */
 	snd_card_free_when_closed(dcpaud->card);
 
+	if (dcpaud->link_started) {
+		dcp_audiosrv_stoplink(dcpaud->dcp_dev);
+		dcp_audiosrv_unprepare(dcpaud->dcp_dev);
+		dcpaud->link_started = false;
+	}
+
+	if (dcpaud->power_held) {
+		pm_runtime_put_sync(dcpaud->dev);
+		dcpaud->power_held = false;
+	}
+
 	if (dcpaud->dma_link)
 		device_link_del(dcpaud->dma_link);
 }
@@ -699,6 +886,7 @@ static const struct component_ops dcpaud_comp_ops = {
 static int dcpaud_probe(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
+	int ret;
 
 	dcpaud = devm_kzalloc(&pdev->dev, sizeof(*dcpaud), GFP_KERNEL);
 	if (!dcpaud)
@@ -717,6 +905,20 @@ static int dcpaud_probe(struct platform_device *pdev)
 	dcpaud->dev = &pdev->dev;
 	mutex_init(&dcpaud->data_lock);
 	platform_set_drvdata(pdev, dcpaud);
+
+	/* DCP 26.6 constructs its AV audio interface against the live SIO
+	 * firmware state.  Unlike older systems it cannot recover if SIO probes
+	 * after AVService, so keep the display component graph deferred until
+	 * the DMA provider is actually ready. */
+	if (hdmi_audio && of_device_is_compatible(pdev->dev.of_node,
+						  "apple,t8132-dpaudio")) {
+		ret = dcpaud_request_dma(dcpaud);
+		if (ret == -ENXIO)
+			ret = -EPROBE_DEFER;
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "waiting for SIO DMA provider\n");
+	}
 
 	return component_add(&pdev->dev, &dcpaud_comp_ops);
 }
@@ -773,4 +975,3 @@ void __exit dcp_audio_unregister(void)
 {
         platform_driver_unregister(&dcpaud_driver);
 }
-

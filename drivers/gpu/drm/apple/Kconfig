@@ -21,6 +21,7 @@ config DRM_APPLE_AUDIO
 	default y
 	depends on DRM_APPLE
 	depends on SND
+	select APPLE_SIO
 	select SND_PCM
 	select SND_DMAENGINE_PCM
 

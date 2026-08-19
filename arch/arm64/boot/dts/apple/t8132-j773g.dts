@@ -18,6 +18,7 @@
 
 	aliases {
 		ethernet0 = &ethernet0;
+		sio = &sio;
 	};
 };
 
@@ -38,6 +39,22 @@
  */
 &framebuffer0 {
 	power-domains = <&ps_dispext0_cpu>, <&ps_dptx_phy>;
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
+
+&sio {
+	status = "okay";
+};
+
+&dpaudio0 {
+	status = "okay";
 };
 
 &disp0_dart {

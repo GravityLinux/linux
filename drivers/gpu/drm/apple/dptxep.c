@@ -533,11 +533,45 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call(struct apple_epic_service *service, u32 idx,
+/*
+ * Compact firmware adds a second DPTX callback group whose command numbers
+ * overlap the original link/PHY callbacks. Commands 3 and 4 carry an
+ * 80-byte record. Preserve the traced input prefix, clear the result word,
+ * and never echo the pointer-bearing tail back to firmware.
+ */
+static int dptxport_call_group1(u32 idx, const void *data, size_t data_size,
+				void *reply, size_t reply_size)
+{
+	size_t preserved = min_t(size_t, 32, min(data_size, reply_size));
+	size_t result_offset;
+
+	if (idx != 3 && idx != 4)
+		return -ENOSYS;
+
+	memcpy(reply, data, preserved);
+	if (reply_size > preserved)
+		memset(reply + preserved, 0, reply_size - preserved);
+
+	result_offset = idx == 3 ? 0 : 16;
+	if (reply_size < result_offset + sizeof(__le32))
+		return -EINVAL;
+	memset(reply + result_offset, 0, sizeof(__le32));
+
+	return 0;
+}
+
+static int dptxport_call(struct apple_epic_service *service, u16 group, u32 idx,
 			 const void *data, size_t data_size, void *reply,
 			 size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
+
+	if (group == 1)
+		return dptxport_call_group1(idx, data, data_size, reply,
+					    reply_size);
+	if (group)
+		return -ENOSYS;
+
 	trace_dptxport_apcall(dptx, idx, data_size);
 
 	switch (idx) {
