@@ -111,6 +111,7 @@ struct sio_data {
 	struct dma_device dma;
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	struct workqueue_struct *terminate_workqueue;
 	void *shmem;
 	struct sio_coproc_desc *shmem_desc_base;
 	unsigned long *desc_allocated;
@@ -411,7 +412,8 @@ static int sio_terminate_all(struct dma_chan *chan)
 	if (siochan->current_tx && !siochan->current_tx->terminated) {
 		dma_cookie_complete(&siochan->current_tx->vd.tx);
 		siochan->current_tx->terminated = true;
-		schedule_work(&siochan->terminate_wq);
+		queue_work(siochan->host->terminate_workqueue,
+			   &siochan->terminate_wq);
 	}
 	vchan_get_all_descriptors(&siochan->vc, &to_free);
 	spin_unlock_irqrestore(&siochan->vc.lock, flags);
@@ -741,10 +743,16 @@ static int sio_alloc_shmem(struct sio_data *sio)
 	return 0;
 }
 
-static int sio_send_dt_params(struct sio_data *sio)
+static bool sio_param_is_deferred(u32 key)
+{
+	return key == 0xb || key == 0xc;
+}
+
+static int sio_send_dt_params(struct sio_data *sio, bool deferred)
 {
 	struct device_node *np = sio->dev->of_node;
 	const char *propname = "apple,sio-firmware-params";
+	bool defer_aux = of_device_is_compatible(np, "apple,t8132-sio");
 	int nparams, err, i;
 
 	nparams = of_property_count_u32_elems(np, propname);
@@ -762,6 +770,13 @@ static int sio_send_dt_params(struct sio_data *sio)
 		err = of_property_read_u32_index(np, propname, 2 * i + 1, &val);
 		if (err)
 			goto badprop;
+
+		/* Native 26.6 publishes the 0xb/0xc auxiliary region only after
+		 * the main protocol shared memory (setup 1/2) is installed. */
+		if (defer_aux && deferred != sio_param_is_deferred(key))
+			continue;
+		if (!defer_aux && deferred)
+			continue;
 
 		err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_SETUP) |
 				    FIELD_PREP(SIOMSG_PARAM, key & 0xff) |
@@ -805,6 +820,12 @@ static int sio_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, sio);
 	sio->dev = &pdev->dev;
 	sio->nchannels = nchannels;
+	sio->terminate_workqueue = devm_alloc_ordered_workqueue(&pdev->dev,
+							  "%s-terminate",
+							  WQ_MEM_RECLAIM,
+							  dev_name(&pdev->dev));
+	if (!sio->terminate_workqueue)
+		return -ENOMEM;
 
 	sio->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sio->base))
@@ -873,7 +894,7 @@ static int sio_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, err, "starting SIO service\n");
 	}
 
-	err = sio_send_dt_params(sio);
+	err = sio_send_dt_params(sio, false);
 	if (err < 0)
 		return dev_err_probe(&pdev->dev, err, "failed to send boot-up parameters\n");
 
@@ -881,6 +902,12 @@ static int sio_probe(struct platform_device *pdev)
 	if (err < 0)
 		return err;
 
+	if (of_device_is_compatible(np, "apple,t8132-sio")) {
+		err = sio_send_dt_params(sio, true);
+		if (err < 0)
+			return dev_err_probe(&pdev->dev, err,
+					     "failed to send deferred boot-up parameters\n");
+	}
 	err = dma_async_device_register(&sio->dma);
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
