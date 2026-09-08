@@ -2492,6 +2492,10 @@ int vb2_mmap(struct vb2_queue *q, struct vm_area_struct *vma)
 	int ret;
 	unsigned long length;
 
+	/* Buffer offsets are page-aligned cookies, not byte offsets. */
+	if (vma_slice_off(vma))
+		return -EINVAL;
+
 	/*
 	 * Check memory area access mode.
 	 */
