@@ -111,10 +111,9 @@
 	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
 };
 
-/* This desktop experiment is entirely RAM/network backed. Do not expose the
- * internal SSD to userspace or desktop automounters. */
+/* The internal SSD is part of the M4 mini Linux bring-up environment. */
 &nvme {
-	status = "disabled";
+	status = "okay";
 };
 
 /*
