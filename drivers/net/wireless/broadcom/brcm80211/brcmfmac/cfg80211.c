@@ -6468,6 +6468,12 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		if (completed) {
 			brcmf_get_assoc_ies(cfg, ifp);
 			brcmf_update_bss_info(cfg, ifp);
+			if ((profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) ||
+			    (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK)) {
+				cfg80211_port_authorized(ndev, profile->bssid,
+							 NULL, 0, GFP_KERNEL);
+				brcmf_dbg(CONN, "Report port authorized\n");
+			}
 			set_bit(BRCMF_VIF_STATUS_CONNECTED,
 				&ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_SUCCESS;
