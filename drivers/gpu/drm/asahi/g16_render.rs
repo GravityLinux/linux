@@ -187,9 +187,9 @@ impl Parameters {
             (0x1c039, tilemap),
             (0x1c9c8, tilemap),
             (0x1c0a1, self.ta_offset(self.tpc)),
-            (0x1c031, heapmeta | 9223372036854775808),
-            (0x1c9c0, heapmeta | 9223372036854775808),
-            (0x1c051, 16325625965641731),
+            (0x1c031, heapmeta | 0x8000000000000000),
+            (0x1c9c0, heapmeta | 0x8000000000000000),
+            (0x1c051, 0x3a0012006b0003),
             (0x1c061, 1),
             (0x10149, self.utile_config),
             (0x10139, self.multisample_control),
@@ -198,7 +198,7 @@ impl Parameters {
             (0x10119, self.ta_offset(self.deflake_2)),
             (0x1c9b8, self.ta_offset(self.deflake_2)),
             (0x1c958, 1),
-            (0x1c950, self.ta_offset(self.deflake_3) | 1125899906842624),
+            (0x1c950, self.ta_offset(self.deflake_3) | 0x4000000000000),
             (0x1c930, 0),
             (0x1c880, self.ta_offset(self.encoder)),
             (0x1c079, layermeta),
@@ -209,7 +209,7 @@ impl Parameters {
             (0x1c1a9, 0),
             (0x1c1b1, 0),
             (0x1c1b9, 0),
-            (0x1c8f8, 34912),
+            (0x1c8f8, 0x8860),
             (0x1c0b1, g.size1),
             (0x1c850, g.size1),
             (0x10131, 0x88),
@@ -223,11 +223,11 @@ impl Parameters {
             (0x10171, 256),
             (0x10169, target_layers),
             (0x0a309, 0),
-            (0x1c8e0, 18446744073709551615),
-            (0x1c8e8, 18446744073709551615),
+            (0x1c8e0, 0xffffffffffffffff),
+            (0x1c8e8, 0xffffffffffffffff),
             (0x1c898, 0),
             (0x101e1, 28),
-            (0x1c9e8, target_layers & 20479),
+            (0x1c9e8, target_layers & 0x4fff),
             (0x1a099, 0),
             (0x1a0a1, 0),
             (0x1a069, 0),
@@ -237,13 +237,13 @@ impl Parameters {
             (0x101c9, 0),
             (0x0d471, 0),
             (0x1a0f1, 8),
-            (0x10799, 16711680),
+            (0x10799, 0xff0000),
             (0x1c830, self.tiling_admission),
             (0x1ca30, self.cycle),
             (0x16c39, self.cycle),
             (0x1c910, record_index),
             (0x0a5a1, self.tiling_gate),
-            (0x0d419, 8589934593),
+            (0x0d419, 0x200000001),
             (0x1ca10, self.tiling_lifecycle),
             (0x014a1, self.tiling_lifecycle),
             (0x0a349, self.tiling_lifecycle),
@@ -285,7 +285,7 @@ impl Parameters {
             (0x16030, g.macro_size),
             (0x100d9, g.screen),
             (0x0a301, 0),
-            (0x10791, 16712192),
+            (0x10791, 0xff0200),
             (0x16098, self.heapmeta),
             (0x15109, self.scissor_array),
             (0x15101, self.depth_bias_array),
@@ -295,10 +295,10 @@ impl Parameters {
             (0x10051, self.tib_encoding()),
             (0x15321, self.depth_dimensions),
             (0x15301, self.depth_clear_value_bits),
-            (0x15309, self.stencil_clear_value | 768),
+            (0x15309, self.stencil_clear_value | 0x300),
             (0x15311, self.occlusion_query_base),
             (0x15319, self.depth_flags),
-            (0x15349, 67372036),
+            (0x15349, 0x4040404),
             (0x15351, 0),
             (0x15329, self.depth_buffer),
             (0x15331, self.depth_buffer),
@@ -327,7 +327,7 @@ impl Parameters {
             (0x16020, 0),
             (0x16451, 0),
             (0x15359, 0),
-            (0x100b8, 34912),
+            (0x100b8, 0x8860),
             (0x16461, self.aux_fb),
             (0x16090, self.aux_fb),
             (0x101e9, 28),
@@ -343,7 +343,7 @@ impl Parameters {
             (0x0d469, 0),
             (0x1a0f9, 8),
             (0x0a5a9, self.fragment_gate),
-            (0x0d429, 8589934593),
+            (0x0d429, 0x200000001),
             (0x160e0, self.fragment_lifecycle),
             (0x01499, self.fragment_lifecycle),
             (0x0a341, self.fragment_lifecycle),
@@ -444,74 +444,74 @@ impl Addresses {
             } else {
                 0
             };
-        u32_at(&mut out, 0x0, (5) as u32);
+        u32_at(&mut out, 0x0, 5);
         for (offset, value) in [
-            (20, work + 64),
-            (28, self.buffer_manager),
-            (36, self.buffer_thing),
-            (44, self.tiling_stats),
-            (52, queue),
-            (60, work + 2140),
+            (0x14, work + 0x40),
+            (0x1c, self.buffer_manager),
+            (0x24, self.buffer_thing),
+            (0x2c, self.tiling_stats),
+            (0x34, queue),
+            (0x3c, work + 0x85c),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x44, (self.context_id) as u32);
-        u32_at(&mut out, 0x48, (self.tiling_counter) as u32);
-        u64_at(&mut out, 0x50, (self.buffer_manager_slot) as u64);
-        u64_at(&mut out, 0x64, (work + 1924) as u64);
-        u64_at(&mut out, 0x6c, (work + 2216) as u64);
-        u32_at(&mut out, 0x7c, (self.tiling_uuid) as u32);
-        u64_at(&mut out, 0x190, (self.support) as u64);
-        u64_at(&mut out, 0x1a8, (self.tiling_status_page) as u64);
-        u64_at(&mut out, 0x1b8, (1) as u64);
-        u32_at(&mut out, 0x1c0, (self.tiling_event) as u32);
-        u32_at(&mut out, 0x1cc, (2147483651) as u32);
+        u32_at(&mut out, 0x44, self.context_id as u32);
+        u32_at(&mut out, 0x48, self.tiling_counter as u32);
+        u64_at(&mut out, 0x50, self.buffer_manager_slot);
+        u64_at(&mut out, 0x64, work + 0x784);
+        u64_at(&mut out, 0x6c, work + 0x8a8);
+        u32_at(&mut out, 0x7c, self.tiling_uuid as u32);
+        u64_at(&mut out, 0x190, self.support);
+        u64_at(&mut out, 0x1a8, self.tiling_status_page);
+        u64_at(&mut out, 0x1b8, 1);
+        u32_at(&mut out, 0x1c0, self.tiling_event as u32);
+        u32_at(&mut out, 0x1cc, 0x80000003);
         for (offset, value) in [
-            (464, work + 2240),
-            (472, work + 2248),
-            (480, work + 2248),
-            (488, queue),
-            (496, user_timestamps),
-            (504, work + 2344),
-            (512, work + 2108),
+            (0x1d0, work + 0x8c0),
+            (0x1d8, work + 0x8c8),
+            (0x1e0, work + 0x8c8),
+            (0x1e8, queue),
+            (0x1f0, user_timestamps),
+            (0x1f8, work + 0x928),
+            (0x200, work + 0x83c),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x210, (self.tiling_uuid) as u32);
-        u32_at(&mut out, 0x218, (1) as u32);
-        u32_at(&mut out, 0x21c, (3) as u32);
+        u32_at(&mut out, 0x210, self.tiling_uuid as u32);
+        u32_at(&mut out, 0x218, 1);
+        u32_at(&mut out, 0x21c, 3);
         for (offset, value) in [
-            (544, work + 2240),
-            (552, work + 2248),
-            (560, work + 2256),
-            (568, queue),
-            (576, user_timestamps),
-            (584, work + 2344),
-            (592, work + 2108),
+            (0x220, work + 0x8c0),
+            (0x228, work + 0x8c8),
+            (0x230, work + 0x8d0),
+            (0x238, queue),
+            (0x240, user_timestamps),
+            (0x248, work + 0x928),
+            (0x250, work + 0x83c),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x260, (self.tiling_uuid) as u32);
-        u32_at(&mut out, 0x268, (6) as u32);
+        u32_at(&mut out, 0x260, self.tiling_uuid as u32);
+        u32_at(&mut out, 0x268, 6);
         for (offset, value) in [
-            (620, self.buffer_thing),
-            (628, self.buffer_manager),
-            (636, self.tiling_stats),
-            (644, queue),
-            (652, work + 2140),
+            (0x26c, self.buffer_thing),
+            (0x274, self.buffer_manager),
+            (0x27c, self.tiling_stats),
+            (0x284, queue),
+            (0x28c, work + 0x85c),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x294, (self.context_id) as u32);
-        u64_at(&mut out, 0x29c, (work + 1924) as u64);
-        u32_at(&mut out, 0x2a8, (self.tiling_uuid) as u32);
-        u64_at(&mut out, 0x2b0, (self.tiling_firmware_stamp) as u64);
-        u32_at(&mut out, 0x2b8, (self.tiling_stamp) as u32);
-        u64_at(&mut out, 0x2e0, (self.tiling_microsequence + 400) as u64);
+        u32_at(&mut out, 0x294, self.context_id as u32);
+        u64_at(&mut out, 0x29c, work + 0x784);
+        u32_at(&mut out, 0x2a8, self.tiling_uuid as u32);
+        u64_at(&mut out, 0x2b0, self.tiling_firmware_stamp);
+        u32_at(&mut out, 0x2b8, self.tiling_stamp as u32);
+        u64_at(&mut out, 0x2e0, self.tiling_microsequence + 0x190);
         u32_at(&mut out, 0x2e8, (-0x268i32) as u32);
-        u64_at(&mut out, 0x2ed, (work + 2328) as u64);
-        u64_at(&mut out, 0x2f5, (144115188075855873) as u64);
-        u32_at(&mut out, 0x2fc, (1073741826) as u32);
+        u64_at(&mut out, 0x2ed, work + 0x918);
+        u64_at(&mut out, 0x2f5, 0x200000000000001);
+        u32_at(&mut out, 0x2fc, 0x40000002);
         out
     }
     pub(crate) fn fragment_microsequence(&self) -> [u8; 0x380] {
@@ -524,81 +524,81 @@ impl Addresses {
             } else {
                 0
             };
-        u32_at(&mut out, 0x0, (7) as u32);
+        u32_at(&mut out, 0x0, 7);
         for (offset, value) in [
-            (20, work + 128),
-            (28, self.buffer_thing),
-            (36, self.fragment_stats),
-            (44, work + 2928),
-            (52, self.buffer_thing + 84),
-            (60, work + 2992),
-            (68, work + 2996),
-            (76, queue),
-            (84, work),
+            (0x14, work + 0x80),
+            (0x1c, self.buffer_thing),
+            (0x24, self.fragment_stats),
+            (0x2c, work + 0xb70),
+            (0x34, self.buffer_thing + 0x54),
+            (0x3c, work + 0xbb0),
+            (0x44, work + 0xbb4),
+            (0x4c, queue),
+            (0x54, work),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x5c, (self.context_id) as u32);
-        u32_at(&mut out, 0x60, (self.tiling_counter) as u32);
-        u64_at(&mut out, 0x68, (self.buffer_manager_slot) as u64);
-        u64_at(&mut out, 0x7c, (work + 2648) as u64);
-        u64_at(&mut out, 0x84, (work + 3056) as u64);
-        u32_at(&mut out, 0xa0, (self.fragment_uuid) as u32);
-        u64_at(&mut out, 0x1b0, (self.support) as u64);
-        u64_at(&mut out, 0x1c8, (self.fragment_status_page) as u64);
-        u32_at(&mut out, 0x1e0, (self.fragment_event) as u32);
-        u32_at(&mut out, 0x1e4, (1) as u32);
-        u32_at(&mut out, 0x1ec, (2147483651) as u32);
+        u32_at(&mut out, 0x5c, self.context_id as u32);
+        u32_at(&mut out, 0x60, self.tiling_counter as u32);
+        u64_at(&mut out, 0x68, self.buffer_manager_slot);
+        u64_at(&mut out, 0x7c, work + 0xa58);
+        u64_at(&mut out, 0x84, work + 0xbf0);
+        u32_at(&mut out, 0xa0, self.fragment_uuid as u32);
+        u64_at(&mut out, 0x1b0, self.support);
+        u64_at(&mut out, 0x1c8, self.fragment_status_page);
+        u32_at(&mut out, 0x1e0, self.fragment_event as u32);
+        u32_at(&mut out, 0x1e4, 1);
+        u32_at(&mut out, 0x1ec, 0x80000003);
         for (offset, value) in [
-            (496, work + 3080),
-            (504, work + 3088),
-            (512, work + 3088),
-            (520, queue),
-            (528, user_timestamps),
-            (536, work + 3184),
-            (544, work + 2948),
+            (0x1f0, work + 0xc08),
+            (0x1f8, work + 0xc10),
+            (0x200, work + 0xc10),
+            (0x208, queue),
+            (0x210, user_timestamps),
+            (0x218, work + 0xc70),
+            (0x220, work + 0xb84),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x230, (self.fragment_uuid) as u32);
-        u32_at(&mut out, 0x238, (1) as u32);
-        u32_at(&mut out, 0x23c, (3) as u32);
+        u32_at(&mut out, 0x230, self.fragment_uuid as u32);
+        u32_at(&mut out, 0x238, 1);
+        u32_at(&mut out, 0x23c, 3);
         for (offset, value) in [
-            (576, work + 3080),
-            (584, work + 3088),
-            (592, work + 3096),
-            (600, queue),
-            (608, user_timestamps),
-            (616, work + 3184),
-            (624, work + 2948),
+            (0x240, work + 0xc08),
+            (0x248, work + 0xc10),
+            (0x250, work + 0xc18),
+            (0x258, queue),
+            (0x260, user_timestamps),
+            (0x268, work + 0xc70),
+            (0x270, work + 0xb84),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x280, (self.fragment_uuid) as u32);
-        u32_at(&mut out, 0x288, (8) as u32);
-        u32_at(&mut out, 0x28c, (self.fragment_uuid) as u32);
-        u64_at(&mut out, 0x294, (self.fragment_firmware_stamp) as u64);
-        u32_at(&mut out, 0x29c, (self.fragment_stamp) as u32);
+        u32_at(&mut out, 0x280, self.fragment_uuid as u32);
+        u32_at(&mut out, 0x288, 8);
+        u32_at(&mut out, 0x28c, self.fragment_uuid as u32);
+        u64_at(&mut out, 0x294, self.fragment_firmware_stamp);
+        u32_at(&mut out, 0x29c, self.fragment_stamp as u32);
         for (offset, value) in [
-            (676, self.buffer_thing),
-            (684, self.buffer_manager),
-            (692, 1),
-            (696, self.fragment_stats),
-            (704, work + 2992),
-            (712, work + 2996),
-            (720, work + 2928),
-            (728, queue),
-            (736, work),
+            (0x2a4, self.buffer_thing),
+            (0x2ac, self.buffer_manager),
+            (0x2b4, 1),
+            (0x2b8, self.fragment_stats),
+            (0x2c0, work + 0xbb0),
+            (0x2c8, work + 0xbb4),
+            (0x2d0, work + 0xb70),
+            (0x2d8, queue),
+            (0x2e0, work),
         ] {
             u64_at(&mut out, offset, value);
         }
-        u32_at(&mut out, 0x2e8, (self.context_id) as u32);
-        u64_at(&mut out, 0x2ec, (work + 2648) as u64);
-        u64_at(&mut out, 0x320, (self.fragment_microsequence + 432) as u64);
+        u32_at(&mut out, 0x2e8, self.context_id as u32);
+        u64_at(&mut out, 0x2ec, work + 0xa58);
+        u64_at(&mut out, 0x320, self.fragment_microsequence + 0x1b0);
         u32_at(&mut out, 0x328, (-0x288i32) as u32);
-        u64_at(&mut out, 0x32d, (work + 3168) as u64);
-        u64_at(&mut out, 0x335, (18695992639489) as u64);
-        u32_at(&mut out, 0x344, (1073741826) as u32);
+        u64_at(&mut out, 0x32d, work + 0xc60);
+        u64_at(&mut out, 0x335, 0x110100000001);
+        u32_at(&mut out, 0x344, 0x40000002);
         out
     }
 }
@@ -628,52 +628,47 @@ impl Parameters {
         } else {
             sampler_count + 1
         };
-        u32_at(&mut out, 0x0, (0x0) as u32);
-        u64_at(&mut out, 0x4, (a.tiling_counter) as u64);
-        u32_at(&mut out, 0xc, (a.context_id) as u32);
-        u64_at(&mut out, 0x10, (a.event_control) as u64);
-        u64_at(&mut out, 0x18, (a.buffer_manager_slot) as u64);
-        u64_at(&mut out, 0x20, (a.buffer_manager) as u64);
-        u64_at(&mut out, 0x28, (a.buffer_thing) as u64);
-        u64_at(&mut out, 0x30, (a.empty_buffer) as u64);
+        u32_at(&mut out, 0x0, 0x0);
+        u64_at(&mut out, 0x4, a.tiling_counter);
+        u32_at(&mut out, 0xc, a.context_id as u32);
+        u64_at(&mut out, 0x10, a.event_control);
+        u64_at(&mut out, 0x18, a.buffer_manager_slot);
+        u64_at(&mut out, 0x20, a.buffer_manager);
+        u64_at(&mut out, 0x28, a.buffer_thing);
+        u64_at(&mut out, 0x30, a.empty_buffer);
         out[0x40..0x640].copy_from_slice(&registers);
-        u64_at(&mut out, 0x740, (a.tiling_register_alias) as u64);
+        u64_at(&mut out, 0x740, a.tiling_register_alias);
         out[0x748..0x74a].copy_from_slice(&(0x41u16).to_le_bytes());
         out[0x74a..0x74c].copy_from_slice(&((0x41 * 0xc) as u16).to_le_bytes());
-        u64_at(&mut out, 0x760, (self.tpc) as u64);
-        u64_at(&mut out, 0x768, ((g.size3 << 0x6) * self.layers) as u64);
-        u64_at(&mut out, 0x770, (a.tiling_microsequence) as u64);
-        u32_at(&mut out, 0x778, (0x300) as u32);
-        u32_at(&mut out, 0x77c, (0x11) as u32);
-        u32_at(&mut out, 0x780, (a.fragment_stamp) as u32);
-        u64_at(&mut out, 0x7a8, (self.ta_offset(self.deflake_1)) as u64);
+        u64_at(&mut out, 0x760, self.tpc);
+        u64_at(&mut out, 0x768, (g.size3 << 0x6) * self.layers);
+        u64_at(&mut out, 0x770, a.tiling_microsequence);
+        u32_at(&mut out, 0x778, 0x300);
+        u32_at(&mut out, 0x77c, 0x11);
+        u32_at(&mut out, 0x780, a.fragment_stamp as u32);
+        u64_at(&mut out, 0x7a8, self.ta_offset(self.deflake_1));
         out[0x864] = u8::from(self.request_tvb_growth);
-        u64_at(&mut out, 0x840, (self.tiling_lifecycle >> 0x20) as u64);
-        u32_at(&mut out, 0x848, (0xffffffff) as u32);
-        u64_at(&mut out, 0x84c, (sampler_array) as u64);
-        u32_at(&mut out, 0x84c + 0x8, (sampler_count) as u32);
-        u32_at(&mut out, 0x84c + 0xc, (sampler_max) as u32);
-        u64_at(&mut out, 0x878, (a.tiling_driver_stamp) as u64);
-        u64_at(&mut out, 0x880, (a.tiling_firmware_stamp) as u64);
-        u32_at(&mut out, 0x888, (a.tiling_stamp) as u32);
-        u32_at(&mut out, 0x88c, (a.tiling_event) as u32);
-        u32_at(&mut out, 0x898, (a.tiling_uuid) as u32);
-        u64_at(&mut out, 0x8a0, (self.layers - 0x1) as u64);
-        u64_at(&mut out, 0x8c8, (a.timestamp_start) as u64);
-        u64_at(&mut out, 0x8d8, (a.tiling_user_timestamp_start) as u64);
-        u64_at(&mut out, 0x8e0, (a.tiling_user_timestamp_end) as u64);
-        u64_at(&mut out, 0x8ff, (tagged_page(a.support)) as u64);
+        u64_at(&mut out, 0x840, self.tiling_lifecycle >> 0x20);
+        u32_at(&mut out, 0x848, 0xffffffff);
+        u64_at(&mut out, 0x84c, sampler_array);
+        u32_at(&mut out, 0x84c + 0x8, sampler_count as u32);
+        u32_at(&mut out, 0x84c + 0xc, sampler_max as u32);
+        u64_at(&mut out, 0x878, a.tiling_driver_stamp);
+        u64_at(&mut out, 0x880, a.tiling_firmware_stamp);
+        u32_at(&mut out, 0x888, a.tiling_stamp as u32);
+        u32_at(&mut out, 0x88c, a.tiling_event as u32);
+        u32_at(&mut out, 0x898, a.tiling_uuid as u32);
+        u64_at(&mut out, 0x8a0, self.layers - 0x1);
+        u64_at(&mut out, 0x8c8, a.timestamp_start);
+        u64_at(&mut out, 0x8d8, a.tiling_user_timestamp_start);
+        u64_at(&mut out, 0x8e0, a.tiling_user_timestamp_end);
+        u64_at(&mut out, 0x8ff, tagged_page(a.support));
         u64_at(
             &mut out,
             0x908,
-            (0xdaa0
-                | (if self.layers > 0x1 {
-                    0x4000000000000000u64
-                } else {
-                    0x0
-                })) as u64,
+            0xdaa0 | if self.layers > 1 { 1 << 62 } else { 0 },
         );
-        u64_at(&mut out, 0x910, (tagged_page(a.tiling_shared_tail)) as u64);
+        u64_at(&mut out, 0x910, tagged_page(a.tiling_shared_tail));
         Some(out)
     }
     pub(crate) fn fragment_work(&self, a: &Addresses) -> Option<[u8; 0xcc0]> {
@@ -706,109 +701,100 @@ impl Parameters {
         };
         let compact_store = (self.store_pipeline & 0xffffffff) << 32;
         let compact_partial_store = (self.partial_store_pipeline & 0xffffffff) << 32;
-        u32_at(&mut out, 0x0, (0x1) as u32);
-        u64_at(&mut out, 0x4, (a.fragment_counter) as u64);
-        u32_at(&mut out, 0xc, (a.context_id) as u32);
-        u32_at(&mut out, 0x10, (0x0) as u32);
-        u64_at(&mut out, 0x14, (a.fragment_microsequence) as u64);
-        u32_at(&mut out, 0x1c, (0x380) as u32);
-        u64_at(&mut out, 0x20, (a.event_control) as u64);
-        u64_at(&mut out, 0x28, (a.buffer_manager) as u64);
-        u64_at(&mut out, 0x30, (a.buffer_thing) as u64);
-        u64_at(&mut out, 0x38, (a.empty_buffer) as u64);
-        u64_at(&mut out, 0x40, (self.tilemap) as u64);
-        u64_at(&mut out, 0x48, (self.multisample_control) as u64);
-        u32_at(&mut out, 0x50, (self.samples) as u32);
-        u32_at(&mut out, 0x54, (g.macro_size) as u32);
-        u32_at(&mut out, 0x68, (merge_x) as u32);
-        u32_at(&mut out, 0x6c, (merge_y) as u32);
-        u64_at(&mut out, 0x78, (tiles_x * tiles_y) as u64);
+        u32_at(&mut out, 0x0, 0x1);
+        u64_at(&mut out, 0x4, a.fragment_counter);
+        u32_at(&mut out, 0xc, a.context_id as u32);
+        u32_at(&mut out, 0x10, 0x0);
+        u64_at(&mut out, 0x14, a.fragment_microsequence);
+        u32_at(&mut out, 0x1c, 0x380);
+        u64_at(&mut out, 0x20, a.event_control);
+        u64_at(&mut out, 0x28, a.buffer_manager);
+        u64_at(&mut out, 0x30, a.buffer_thing);
+        u64_at(&mut out, 0x38, a.empty_buffer);
+        u64_at(&mut out, 0x40, self.tilemap);
+        u64_at(&mut out, 0x48, self.multisample_control);
+        u32_at(&mut out, 0x50, self.samples as u32);
+        u32_at(&mut out, 0x54, g.macro_size as u32);
+        u32_at(&mut out, 0x68, merge_x as u32);
+        u32_at(&mut out, 0x6c, merge_y as u32);
+        u64_at(&mut out, 0x78, tiles_x * tiles_y);
         out[0x80..0x680].copy_from_slice(&registers);
         u64_at(&mut out, 0x680, 0x8c020001dddc00);
         u64_at(&mut out, 0x688, 0xa0001de1800);
         u64_at(&mut out, 0x690, 0x8c020200029800);
         u64_at(&mut out, 0x698, 0x220200039520);
-        u64_at(&mut out, 0x780, (a.fragment_register_alias) as u64);
+        u64_at(&mut out, 0x780, a.fragment_register_alias);
         out[0x788..0x78a].copy_from_slice(&(0x51u16).to_le_bytes());
         out[0x78a..0x78c].copy_from_slice(&((0x51 * 0xc) as u16).to_le_bytes());
-        u64_at(&mut out, 0x7a0, (self.depth_bias_array) as u64);
-        u64_at(&mut out, 0x7b0, (self.scissor_array) as u64);
-        u64_at(&mut out, 0x7c0, (self.occlusion_query_base) as u64);
-        u64_at(&mut out, 0x8f8, (self.load_pipeline_bind) as u64);
-        u64_at(&mut out, 0x900, (self.load_pipeline) as u64);
-        u64_at(&mut out, 0x928, (self.partial_load_pipeline_bind) as u64);
-        u64_at(&mut out, 0x930, (self.partial_load_pipeline) as u64);
-        u64_at(&mut out, 0x938, (self.depth_flags) as u64);
-        u32_at(&mut out, 0x940, (0x4040404) as u32);
-        u64_at(&mut out, 0x948, (self.depth_buffer) as u64);
+        u64_at(&mut out, 0x7a0, self.depth_bias_array);
+        u64_at(&mut out, 0x7b0, self.scissor_array);
+        u64_at(&mut out, 0x7c0, self.occlusion_query_base);
+        u64_at(&mut out, 0x8f8, self.load_pipeline_bind);
+        u64_at(&mut out, 0x900, self.load_pipeline);
+        u64_at(&mut out, 0x928, self.partial_load_pipeline_bind);
+        u64_at(&mut out, 0x930, self.partial_load_pipeline);
+        u64_at(&mut out, 0x938, self.depth_flags);
+        u32_at(&mut out, 0x940, 0x4040404);
+        u64_at(&mut out, 0x948, self.depth_buffer);
         u64_at(&mut out, 0x950, self.depth_stride);
         u64_at(&mut out, 0x958, self.depth_aux_stride);
-        u64_at(&mut out, 0x960, (self.depth_buffer) as u64);
-        u64_at(&mut out, 0x968, (self.depth_buffer) as u64);
-        u64_at(&mut out, 0x970, (self.depth_aux_buffer) as u64);
-        u64_at(&mut out, 0x978, (self.stencil_buffer) as u64);
+        u64_at(&mut out, 0x960, self.depth_buffer);
+        u64_at(&mut out, 0x968, self.depth_buffer);
+        u64_at(&mut out, 0x970, self.depth_aux_buffer);
+        u64_at(&mut out, 0x978, self.stencil_buffer);
         u64_at(&mut out, 0x980, self.stencil_stride);
         u64_at(&mut out, 0x988, self.stencil_aux_stride);
-        u64_at(&mut out, 0x990, (self.stencil_buffer) as u64);
-        u64_at(&mut out, 0x998, (self.stencil_buffer) as u64);
-        u64_at(&mut out, 0x9a0, (self.stencil_aux_buffer) as u64);
-        u32_at(&mut out, 0x9b8, (self.tib_encoding()) as u32);
-        u64_at(&mut out, 0x9c0, (self.aux_fb_flags) as u64);
-        u64_at(&mut out, 0x9c8, ((self.height << 0x20) | self.width) as u64);
-        u64_at(&mut out, 0x9d0, (self.aux_fb_page_count) as u64);
-        u64_at(&mut out, 0x9d8, (self.tile_config) as u64);
+        u64_at(&mut out, 0x990, self.stencil_buffer);
+        u64_at(&mut out, 0x998, self.stencil_buffer);
+        u64_at(&mut out, 0x9a0, self.stencil_aux_buffer);
+        u32_at(&mut out, 0x9b8, self.tib_encoding() as u32);
+        u64_at(&mut out, 0x9c0, self.aux_fb_flags);
+        u64_at(&mut out, 0x9c8, (self.height << 0x20) | self.width);
+        u64_at(&mut out, 0x9d0, self.aux_fb_page_count);
+        u64_at(&mut out, 0x9d8, self.tile_config);
         // The compact EOT records retain the common firmware layout:
         // rsrc_spec at +0x0c, USC address at +0x14 (fw/fragment.rs::EotProgram).
         u32_at(&mut out, 0x9f4, self.store_pipeline_bind as u32);
-        u64_at(&mut out, 0x9f8, (compact_store) as u64);
-        u64_at(&mut out, 0x9fc, (self.store_pipeline) as u64);
+        u64_at(&mut out, 0x9f8, compact_store);
+        u64_at(&mut out, 0x9fc, self.store_pipeline);
         u32_at(&mut out, 0xa14, self.partial_store_pipeline_bind as u32);
-        u64_at(&mut out, 0xa18, (compact_partial_store) as u64);
-        u64_at(&mut out, 0xa1c, (self.partial_store_pipeline) as u64);
-        u32_at(&mut out, 0xa28, (self.depth_clear_value_bits) as u32);
+        u64_at(&mut out, 0xa18, compact_partial_store);
+        u64_at(&mut out, 0xa1c, self.partial_store_pipeline);
+        u32_at(&mut out, 0xa28, self.depth_clear_value_bits as u32);
         u32_at(
             &mut out,
             0xa2c,
             ((self.stencil_clear_value & 0xff) | 0x300) as u32,
         );
-        u64_at(&mut out, 0xa30, (self.sample_size) as u64);
-        u64_at(&mut out, 0xa50, (self.depth_dimensions) as u64);
+        u64_at(&mut out, 0xa30, self.sample_size);
+        u64_at(&mut out, 0xa50, self.depth_dimensions);
         u32_at(&mut out, 0xb80, u32::from(self.fragment_sync_grow));
-        u64_at(&mut out, 0xb88, (self.fragment_lifecycle >> 0x20) as u64);
-        u32_at(&mut out, 0xb90, (0xffffffff) as u32);
-        u64_at(&mut out, 0xb94, (sampler_array) as u64);
-        u32_at(&mut out, 0xb94 + 0x8, (sampler_count) as u32);
-        u32_at(&mut out, 0xb94 + 0xc, (sampler_max) as u32);
+        u64_at(&mut out, 0xb88, self.fragment_lifecycle >> 0x20);
+        u32_at(&mut out, 0xb90, 0xffffffff);
+        u64_at(&mut out, 0xb94, sampler_array);
+        u32_at(&mut out, 0xb94 + 0x8, sampler_count as u32);
+        u32_at(&mut out, 0xb94 + 0xc, sampler_max as u32);
         u32_at(&mut out, 0xba4, u32::from(self.process_empty_tiles));
-        u32_at(&mut out, 0xba8, (0x1) as u32);
-        u32_at(&mut out, 0xbac, ((self.samples > 0x1) as u64) as u32);
-        u64_at(&mut out, 0xbc0, (a.fragment_driver_stamp) as u64);
-        u64_at(&mut out, 0xbc8, (a.fragment_firmware_stamp) as u64);
-        u32_at(&mut out, 0xbd0, (a.fragment_stamp) as u32);
-        u32_at(&mut out, 0xbd4, (a.fragment_event) as u32);
-        u32_at(&mut out, 0xbe0, (a.fragment_uuid) as u32);
-        u64_at(&mut out, 0xbe8, (self.layers - 0x1) as u64);
-        u64_at(&mut out, 0xc10, (a.timestamp_start) as u64);
-        u64_at(&mut out, 0xc18, (a.timestamp_end) as u64);
-        u64_at(&mut out, 0xc20, (a.fragment_user_timestamp_start) as u64);
-        u64_at(&mut out, 0xc28, (a.fragment_user_timestamp_end) as u64);
-        u64_at(&mut out, 0xc47, (tagged_page(a.support)) as u64);
+        u32_at(&mut out, 0xba8, 0x1);
+        u32_at(&mut out, 0xbac, u32::from(self.samples > 1));
+        u64_at(&mut out, 0xbc0, a.fragment_driver_stamp);
+        u64_at(&mut out, 0xbc8, a.fragment_firmware_stamp);
+        u32_at(&mut out, 0xbd0, a.fragment_stamp as u32);
+        u32_at(&mut out, 0xbd4, a.fragment_event as u32);
+        u32_at(&mut out, 0xbe0, a.fragment_uuid as u32);
+        u64_at(&mut out, 0xbe8, self.layers - 0x1);
+        u64_at(&mut out, 0xc10, a.timestamp_start);
+        u64_at(&mut out, 0xc18, a.timestamp_end);
+        u64_at(&mut out, 0xc20, a.fragment_user_timestamp_start);
+        u64_at(&mut out, 0xc28, a.fragment_user_timestamp_end);
+        u64_at(&mut out, 0xc47, tagged_page(a.support));
         u64_at(
             &mut out,
             0xc50,
-            (0x113a0
-                | (if self.layers > 0x1 {
-                    0x4000000000000000u64
-                } else {
-                    0x0
-                })) as u64,
+            0x113a0 | if self.layers > 1 { 1 << 62 } else { 0 },
         );
-        u64_at(
-            &mut out,
-            0xc58,
-            (tagged_page(a.fragment_shared_tail)) as u64,
-        );
-        u64_at(&mut out, 0xc80, (0x100000000) as u64);
+        u64_at(&mut out, 0xc58, tagged_page(a.fragment_shared_tail));
+        u64_at(&mut out, 0xc80, 0x100000000);
         Some(out)
     }
 }

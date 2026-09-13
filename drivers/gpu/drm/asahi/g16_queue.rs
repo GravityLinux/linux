@@ -125,5 +125,4 @@ pub(crate) const POINTERS: u64 = 0xffff_fc20_0001_2860;
 pub(crate) const RING: u64 = 0xffff_fc20_c001_2860;
 pub(crate) const JOBS: u64 = 0xffff_fc20_0000_0000;
 pub(crate) const CONTEXT: u64 = 0xffff_fc20_c050_8040;
-pub(crate) const BARRIER: u64 = 0xffff_fc20_c052_0000;
 pub(crate) const STAMP: u64 = 0xffff_fc20_0013_8000;

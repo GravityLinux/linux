@@ -150,7 +150,7 @@ impl Bootstrap {
         if self.render_root != next_root {
             self.render_queue_root = 0;
         }
-        self.render_root = space.map(|s| s.low).unwrap_or(0);
+        self.render_root = next_root;
         Ok(())
     }
 
@@ -297,7 +297,6 @@ impl Bootstrap {
         params: &render::Parameters,
         support: &Support,
         priority: u32,
-        timestamps: &[u64; 4],
     ) -> Result<[u64; 4]> {
         let root = client.roots().low;
         let index = match self.tvb_pools.iter().position(|p| p.root == root) {
@@ -318,8 +317,7 @@ impl Bootstrap {
             }
         };
         let mut pool = self.tvb_pools.swap_remove(index);
-        let result =
-            self.submit_render_pool(client, params, support, priority, &mut pool, timestamps);
+        let result = self.submit_render_pool(client, params, support, priority, &mut pool);
         self.tvb_pools.push(pool, GFP_KERNEL)?;
         result
     }
@@ -331,7 +329,6 @@ impl Bootstrap {
         support: &Support,
         priority: u32,
         pool: &mut crate::g16_tvb::Tvb,
-        timestamps: &[u64; 4],
     ) -> Result<[u64; 4]> {
         if self.render_failed {
             return Err(EIO);
@@ -349,7 +346,6 @@ impl Bootstrap {
         pool.work_addresses(&mut a, self.render_publication);
         // Timestamp microcommands write private per-Work counter slots. The
         // frontend copies the converted values to caller BOs before its fence.
-        let _ = timestamps;
         a.tiling_queue = 0xffff_fc20_c000_0000;
         a.fragment_queue = g16_fw::queue::QUEUE;
         a.support = support.address();
@@ -702,7 +698,6 @@ impl Bootstrap {
         params: &compute::Parameters,
         priority: u32,
         memory: &impl crate::g16_cdm::Memory,
-        _timestamps: &[u64; 4],
     ) -> Result<[u64; 4]> {
         let space = client.roots();
         use g16_fw::queue as q;
