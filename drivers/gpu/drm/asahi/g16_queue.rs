@@ -118,11 +118,5 @@ pub(crate) fn channel(
     out
 }
 
-// Initial device-lifetime transport allocation. Addresses are constructor
-// inputs to the serializers above, not part of their wire format.
-pub(crate) const QUEUE: u64 = 0xffff_fc20_c000_24c0;
-pub(crate) const POINTERS: u64 = 0xffff_fc20_0001_2860;
-pub(crate) const RING: u64 = 0xffff_fc20_c001_2860;
-pub(crate) const JOBS: u64 = 0xffff_fc20_0000_0000;
-pub(crate) const CONTEXT: u64 = 0xffff_fc20_c050_8040;
+// Bootstrap completion stamp; public workqueues allocate their own storage.
 pub(crate) const STAMP: u64 = 0xffff_fc20_0013_8000;

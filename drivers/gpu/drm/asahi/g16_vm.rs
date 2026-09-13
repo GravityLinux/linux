@@ -533,6 +533,7 @@ impl FirmwareSpace {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn zero_live(&mut self, va: u64, size: usize) -> Result {
         self.update_live(va, size, |ptr, _, size| {
             // SAFETY: update_live supplies a valid host-owned byte range.
