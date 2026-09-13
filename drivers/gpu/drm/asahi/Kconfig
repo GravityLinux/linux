@@ -1,5 +1,20 @@
 # SPDX-License-Identifier: GPL-2.0
 
+config DRM_ASAHI_M4
+	tristate "Apple M4 GPU driver"
+	depends on RUST && DRM=y
+	depends on ARM64 && ARCH_APPLE && PAGE_SIZE_16KB
+	depends on PM
+	select RUST_DRM_GEM_SHMEM_HELPER
+	select RUST_DRM_SCHED
+	select RUST_APPLE_RTKIT
+	select APPLE_MAILBOX
+	help
+	  Rust DRM driver for the T8132 (M4) GPU, following the Asahi UAPI
+	  and the M4 Python DRM-shim firmware implementation. Intended for
+	  development under m1n1. The probe_only parameter defaults to true
+	  until the firmware port is qualified.
+
 config RUST_DRM_SCHED
 	bool
 	select DRM_SCHED
