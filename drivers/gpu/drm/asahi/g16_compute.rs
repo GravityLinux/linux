@@ -26,6 +26,18 @@ pub(crate) const SUPPORT: u64 = 0xffff_fc20_c05e_8000;
 pub(crate) const SHARED_STATE: u64 = 0xffff_fc20_001b_0000;
 pub(crate) const CONTEXT: u64 = QUEUE + 0xb000;
 pub(crate) const JOBS: u64 = QUEUE + 0xb040;
+pub(crate) const ENTRY_OFFSET: u64 = 0x1a00;
+
+/// Drain/invalidate compute caches before entering the caller's CDM stream.
+/// Back-to-back M4 Works require the full barrier used by Mesa's CDM helper;
+/// 0x60000168 does not preserve dependent SSBO writes across context views.
+pub(crate) fn entry(stream: u64) -> [u8; 12] {
+    let mut out = [0; 12];
+    u32_at(&mut out, 0, 0x600fffff);
+    u32_at(&mut out, 4, 0x20000000 | (stream >> 32) as u32);
+    u32_at(&mut out, 8, stream as u32);
+    out
+}
 
 pub(crate) fn private_ranges() -> [(u64, usize); 19] {
     core::array::from_fn(|i| match i {
@@ -88,6 +100,7 @@ pub(crate) struct Addresses {
     pub(crate) stamp: u32,
     pub(crate) event: u32,
     pub(crate) ordinal: u32,
+    pub(crate) cdm_entry: Option<u64>,
 }
 
 impl Addresses {
@@ -117,6 +130,7 @@ impl Addresses {
             stamp: ((index + 1) * 0x100) as u32,
             event: 4,
             ordinal: ordinal as u32,
+            cdm_entry: None,
         })
     }
 
@@ -157,7 +171,7 @@ impl Parameters {
         u64_at(&mut out, 16, a.notifier);
         let registers = [
             (0x1a510, self.resource),
-            (0x1a420, self.cdm),
+            (0x1a420, a.cdm_entry.unwrap_or(self.cdm)),
             (0x1a4d0, self.resource + 0x1480),
             (0x1a4d8, self.resource + 0x1488),
             (0x1a4e0, self.resource + 0x1490),

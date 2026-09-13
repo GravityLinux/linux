@@ -2,16 +2,302 @@
 // Copyright The Gravity Linux Contributors
 // Adapted from Niklas Sheth's linux-m4-integration prototype.
 
-//! Synchronous G16 graphics publication and retirement.
+//! G16 ring publication and independent firmware retirement.
 
 use super::Bootstrap;
 use crate::{g16_compute as compute, g16_fw, g16_render as render, g16_vm};
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel::time::{delay::fsleep, Delta};
-use kernel::{c_str, io, prelude::*, sync::Arc};
+use kernel::time::{Instant, Monotonic};
+use kernel::{
+    c_str, io,
+    prelude::*,
+    sync::{Arc, Mutex},
+};
 
-/// A per-VM firmware support object. The submit mutex and file-state lock keep
-/// this lease live until all GPU accesses from the VM have completed.
+pub(crate) const MAX_FLIGHTS: usize = 16;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Stamp {
+    pub(crate) address: u64,
+    pub(crate) value: u32,
+    pub(crate) event: u32,
+}
+impl Stamp {
+    fn barrier(self, target: u32, uuid: u32) -> [u8; 0x40] {
+        // G16 barriers carry both firmware stamp addresses. This is the same
+        // ABI as the tiling -> fragment barrier, including the wider prefix.
+        let mut out = [0u8; 0x40];
+        out[..4].copy_from_slice(&4u32.to_le_bytes());
+        out[4..12].copy_from_slice(&self.address.to_le_bytes());
+        out[12..20].copy_from_slice(&self.address.to_le_bytes());
+        for (off, value) in [
+            (0x14, self.value),
+            (0x20, self.event),
+            (0x24, target),
+            (0x28, uuid),
+        ] {
+            out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) struct Receipt {
+    pub(crate) id: u64,
+    pub(crate) stamp: Stamp,
+}
+struct RenderFlight {
+    addresses: render::Addresses,
+    client: Arc<Mutex<g16_vm::AddressSpace>>,
+    root: u64,
+    events: RenderEvents,
+}
+pub(super) struct Flight {
+    id: u64,
+    context: u32,
+    started: Instant<Monotonic>,
+    stamps: [Option<Stamp>; 2],
+    queues: [(u64, u32); 2],
+    channels: [(usize, u32); 2],
+    timestamps: [u64; 4],
+    render: Option<RenderFlight>,
+}
+
+/// Ring distance is unambiguous because admission keeps less than half a ring
+/// outstanding. Equality alone would lose completions when firmware advances
+/// past several commands between polls, including over the wrap boundary.
+fn reached(cursor: u32, target: u32, capacity: u32) -> bool {
+    cursor < capacity && target < capacity && (cursor + capacity - target) % capacity < capacity / 2
+}
+
+impl Bootstrap {
+    fn reserve_flight(&mut self) -> Result {
+        if self.render_failed {
+            return Err(EIO);
+        }
+        if self.flights.len() >= MAX_FLIGHTS {
+            return Err(EBUSY);
+        }
+        self.flights.reserve(1, GFP_KERNEL)?;
+        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+        let guard = self._sgx.try_access().ok_or(ENODEV)?;
+        for route in &config.channels[..12] {
+            let read =
+                guard.try_read32(0xd64000 + (route.state[0] - 0xffff_fc20_0002_8000) as usize)?;
+            let done =
+                guard.try_read32(0xd64000 + (route.state[1] - 0xffff_fc20_0002_8000) as usize)?;
+            let tail =
+                guard.try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize)?;
+            if read >= 256 || done >= 256 || tail >= 256 {
+                return Err(EIO);
+            }
+            if (tail + 1) & 255 == read || (tail + 1) & 255 == done {
+                return Err(EBUSY);
+            }
+        }
+        // At most four TA entries, two fragment entries or two compute entries
+        // per flight: a 0x500-entry queue cannot fill at this admission limit.
+        Ok(())
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.render_failed = true;
+    }
+
+    fn stamps_done(&self, flight: &Flight) -> Result<bool> {
+        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        for stamp in flight.stamps.iter().flatten() {
+            if fw.read_u32(stamp.address)? != stamp.value {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn trace_publication(&self, kind: &str, id: u64) -> Result {
+        if *crate::module_parameters::fw_trace.value() != 0 {
+            let mut unretired = 0;
+            for flight in &self.flights {
+                if !self.stamps_done(flight).unwrap_or(false) {
+                    unretired += 1;
+                }
+            }
+            dev_info!(
+                self.dev.as_ref(),
+                "G16: publish {} {:#x} outstanding={} unfinished_stamps={}\n",
+                kind,
+                id,
+                self.flights.len(),
+                unretired
+            );
+        }
+        Ok(())
+    }
+
+    /// Dispatch events by the outstanding Work identity, never by the most
+    /// recently submitted job. Completion notifications are hints; stamps and
+    /// ring retirement remain authoritative even if event bits coalesce.
+    fn service_flights(&mut self) -> Result {
+        const STATE: u64 = 0xffff_fc20_0003_f1c0;
+        const RING: u64 = 0xffff_fc20_0003_f440;
+        for _ in 0..256 {
+            let fw = self._firmware_space.as_mut().ok_or(EIO)?;
+            let cursor = fw.read_u32(STATE)?;
+            let end = fw.read_u32(STATE + 0x20)?;
+            if cursor >= 256 || end >= 256 {
+                return Err(EIO);
+            }
+            if cursor == end {
+                break;
+            }
+            let base = RING + u64::from(cursor) * 0x48;
+            let kind = fw.read_u32(base)?;
+            if kind == 1
+                || (kind == 13
+                    && self.opening_notification_pending
+                    && fw.read_u32(base + 4)? == 1
+                    && fw.read_u32(base + 8)? == 0
+                    && fw.read_u64(base + 12)? == g16_fw::CONTROL_DATA
+                    && fw.read_u64(base + 20)? == g16_fw::OPERAND_TABLE
+                    && fw.read_u64(base + 28)? == g16_fw::OPERAND_TABLE
+                    && fw.read_u32(base + 36)? == 20 * 8)
+            {
+                if kind == 13 {
+                    self.opening_notification_pending = false;
+                }
+                fw.write_live(STATE, &((cursor + 1) & 255).to_le_bytes())?;
+                continue;
+            }
+            let mut selected = None;
+            for (index, flight) in self.flights.iter().enumerate() {
+                if let Some(render) = &flight.render {
+                    let a = &render.addresses;
+                    let matches = match kind {
+                        6 => {
+                            fw.read_u32(base + 4)? == a.context_id as u32
+                                && fw.read_u32(base + 8)? == a.buffer_manager_slot as u32
+                                && fw.read_u32(a.fragment_firmware_stamp)?
+                                    != a.fragment_stamp as u32
+                        }
+                        7 => {
+                            fw.read_u32(base + 12)? == a.fragment_event as u32
+                                && fw.read_u32(base + 16)? == a.fragment_stamp as u32
+                        }
+                        _ => false,
+                    };
+                    if matches {
+                        selected = Some(index);
+                        break;
+                    }
+                }
+            }
+            let index = selected.ok_or(EIO)?;
+            let mut render = self.flights[index].render.take().ok_or(EIO)?;
+            let pool_index = self
+                .tvb_pools
+                .iter()
+                .position(|p| p.root == render.root)
+                .ok_or(EIO)?;
+            let mut pool = self.tvb_pools.swap_remove(pool_index);
+            let result = self.service_render_events(
+                &mut render.client.lock(),
+                &mut pool,
+                &render.addresses,
+                &mut render.events,
+            );
+            self.tvb_pools.push(pool, GFP_KERNEL)?;
+            self.flights[index].render = Some(render);
+            result?;
+            if self._firmware_space.as_ref().ok_or(EIO)?.read_u32(STATE)? == cursor {
+                break;
+            }
+        }
+        self.drain_trace_rx()
+    }
+
+    pub(crate) fn retire(&mut self) -> Result<Option<(u64, Result<[u64; 4]>)>> {
+        if self.render_failed {
+            return Err(EIO);
+        }
+        self.service_flights()?;
+        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+        for index in 0..self.flights.len() {
+            let flight = &self.flights[index];
+            if !self.stamps_done(flight)? {
+                continue;
+            }
+            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+            let mut done = true;
+            for &(pointers, head) in &flight.queues {
+                if pointers != 0 {
+                    done &= reached(fw.read_u32(pointers)?, head, 0x500)
+                        && reached(fw.read_u32(pointers + 0x30)?, head, 0x500);
+                }
+            }
+            let guard = self._sgx.try_access().ok_or(ENODEV)?;
+            for &(channel, target) in &flight.channels {
+                if channel == usize::MAX {
+                    continue;
+                }
+                for address in &config.channels[channel].state[..2] {
+                    done &= reached(
+                        guard.try_read32(0xd64000 + (*address - 0xffff_fc20_0002_8000) as usize)?,
+                        target,
+                        256,
+                    );
+                }
+            }
+            // Growth replies can refer to a Work after its main stage stamp.
+            if flight.render.is_some() {
+                done &= guard.try_read32(0xd640c0)? == guard.try_read32(0xd60060)?
+                    && guard.try_read32(0xd640c8)? == guard.try_read32(0xd60060)?;
+            }
+            drop(guard);
+            if !done {
+                continue;
+            }
+            let mut values = [0; 4];
+            for (i, &address) in flight.timestamps.iter().enumerate() {
+                if address != 0 {
+                    values[i] = timestamp_ns(fw.read_u64(address)?)?;
+                }
+            }
+            let limited = flight
+                .render
+                .as_ref()
+                .is_some_and(|r| r.events.memory_limit);
+            let id = flight.id;
+            self.context_users[flight.context as usize] -= 1;
+            self.flights.remove(index).map_err(|_| EIO)?;
+            // Queued commands can legitimately wait longer than one Work's
+            // timeout. Watch for a lack of retirement progress, rather than
+            // charging every command for all its predecessors' execution.
+            let now = Instant::now();
+            for pending in &mut self.flights {
+                pending.started = now;
+            }
+            return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(values) })));
+        }
+        if let Some(flight) = self
+            .flights
+            .iter()
+            .find(|f| f.started.elapsed().as_millis() > 10000)
+        {
+            dev_err!(
+                self.dev.as_ref(),
+                "G16: async Work {:#x} context {} timeout without retirement progress\n",
+                flight.id,
+                flight.context
+            );
+            self.render_failed = true;
+            return Err(ETIMEDOUT);
+        }
+        Ok(None)
+    }
+}
+
+/// A per-VM firmware support object retained by every queued execution until
+/// its GPU accesses finish, including after public VM/queue handle destruction.
 pub(crate) struct Support {
     slots: Arc<AtomicU64>,
     index: u32,
@@ -113,93 +399,69 @@ impl Bootstrap {
         Ok(lease)
     }
 
-    fn render_context(&mut self, space: Option<g16_vm::Roots>) -> Result {
-        let dev = self.dev.as_ref();
-        let res = dev
+    fn set_context(&mut self, index: usize, roots: Option<g16_vm::Roots>) -> Result {
+        let res = self
+            .dev
+            .as_ref()
             .of_node()
             .ok_or(EINVAL)?
             .reserved_mem_region_to_resource_byname(c_str!("ttbs"))?;
-        // SAFETY: The validated loader-owned table has 64 two-root slots.
-        let table = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
-        let next_root = space.map(|s| s.low).unwrap_or(0);
-        // Preserve the previous ASID while removing its valid roots, matching
-        // the working SPTM UAT transition before the old backing is released.
-        unsafe {
-            let ptr = table.ptr().add(9 * 16);
-            if self.render_root != 0 && self.render_root != next_root {
-                ptr.cast::<u64>()
-                    .write_volatile(ptr.cast::<u64>().read_volatile() & !1);
-                ptr.add(8)
-                    .cast::<u64>()
-                    .write_volatile(ptr.add(8).cast::<u64>().read_volatile() & !1);
-                core::arch::asm!("dc cvac, {addr}", "dsb oshst", addr = in(reg) ptr);
-                crate::mem::tlbi_asid(9);
-                core::arch::asm!("dsb osh", "isb");
-            }
-            if let Some(space) = space {
-                ptr.cast::<u64>().write_volatile(space.low | (9 << 48) | 1);
-                ptr.add(8)
-                    .cast::<u64>()
-                    .write_volatile(space.high | (9 << 48) | 1);
-                core::arch::asm!("dc cvac, {addr}", addr = in(reg) ptr);
-            }
-        }
-        crate::mem::sync();
-        crate::mem::tlbi_all();
-        crate::mem::sync();
-        if self.render_root != next_root {
-            self.render_queue_root = 0;
-        }
-        self.render_root = next_root;
-        Ok(())
-    }
-
-    fn compute_context(&mut self, roots: Option<g16_vm::Roots>) -> Result {
-        let next = roots.map(|s| s.low).unwrap_or(0);
-        if self.compute_queue_root == next {
-            return Ok(());
-        }
-        let dev = self.dev.as_ref();
-        let res = dev
-            .of_node()
-            .ok_or(EINVAL)?
-            .reserved_mem_region_to_resource_byname(c_str!("ttbs"))?;
-        // SAFETY: Slot one is exclusively managed under the runtime mutex.
+        // SAFETY: The reserved table has 64 two-root slots. A slot is changed
+        // only with no outstanding Work using it, under the runtime mutex.
         let table = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
         unsafe {
-            let ptr = table.ptr().add(16);
+            let ptr = table.ptr().add(index * 16);
             ptr.cast::<u64>()
                 .write_volatile(ptr.cast::<u64>().read_volatile() & !1);
             ptr.add(8)
                 .cast::<u64>()
                 .write_volatile(ptr.add(8).cast::<u64>().read_volatile() & !1);
             core::arch::asm!("dc cvac, {addr}", "dsb oshst", addr=in(reg) ptr);
-            crate::mem::tlbi_asid(1);
+            crate::mem::tlbi_asid(index as u8);
             core::arch::asm!("dsb osh", "isb");
             if let Some(roots) = roots {
-                ptr.cast::<u64>().write_volatile(roots.low | (1 << 48) | 1);
+                ptr.cast::<u64>()
+                    .write_volatile(roots.low | ((index as u64) << 48) | 1);
                 ptr.add(8)
                     .cast::<u64>()
-                    .write_volatile(roots.high | (1 << 48) | 1);
+                    .write_volatile(roots.high | ((index as u64) << 48) | 1);
                 core::arch::asm!("dc cvac, {addr}", addr=in(reg) ptr);
             }
         }
         crate::mem::sync();
-        crate::mem::tlbi_all();
-        crate::mem::sync();
-        self.compute_queue_root = next;
+        self.context_roots[index] = roots;
         Ok(())
+    }
+
+    fn acquire_context(&mut self, roots: g16_vm::Roots, preferred: usize) -> Result<u32> {
+        let existing = (1..64).find(|&i| self.context_roots[i].is_some_and(|r| r.low == roots.low));
+        let slot = existing
+            .or_else(|| {
+                if self.context_users[preferred] == 0 {
+                    Some(preferred)
+                } else {
+                    (1..64).find(|&i| self.context_users[i] == 0)
+                }
+            })
+            .ok_or(EBUSY)?;
+        if existing.is_none() {
+            self.set_context(slot, Some(roots))?;
+        }
+        self.context_users[slot] += 1;
+        Ok(slot as u32)
     }
 
     pub(crate) fn release_render_vm(&mut self, space: g16_vm::Roots) -> Result {
         if self.render_failed {
             return Err(EIO);
         }
-        if self.compute_queue_root == space.low {
-            self.compute_context(None)?;
-        }
-        if self.render_root == space.low {
-            self.render_context(None)?;
+        for index in 1..64 {
+            if self.context_roots[index].is_some_and(|r| r.low == space.low) {
+                if self.context_users[index] != 0 {
+                    return Err(EBUSY);
+                }
+                self.set_context(index, None)?;
+            }
         }
         if let Some(index) = self.tvb_pools.iter().position(|p| p.root == space.low) {
             let a = self.tvb_pools[index].addresses;
@@ -211,14 +473,9 @@ impl Bootstrap {
         Ok(())
     }
 
-    fn drain_render_rx(&mut self) -> Result {
-        self.drain_render_rx_inner(true)
-    }
-
-    fn drain_render_rx_inner(&mut self, events: bool) -> Result {
+    fn drain_trace_rx(&mut self) -> Result {
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         for (state, capacity) in [
-            (0xffff_fc20_0003_f1c0, 256),
             (0xffff_fc20_0003_f3c0, 512),
             (0xffff_fc20_0003_f400, 256),
             (0xffff_fc20_0003_f200, 256),
@@ -228,44 +485,12 @@ impl Bootstrap {
             (0xffff_fc20_0003_f2c0, 256),
             (0xffff_fc20_0003_f2f0, 256),
         ] {
-            if !events && state == 0xfffffc200003f1c0 {
-                continue;
-            }
             let read = fw.read_u32(state)?;
             let write = fw.read_u32(state + 0x20)?;
             if read >= capacity || write >= capacity {
                 return Err(EIO);
             }
             if read != write {
-                if state == 0xffff_fc20_0003_f1c0 {
-                    let mut cursor = read;
-                    while cursor != write {
-                        let base = 0xffff_fc20_0003_f440 + u64::from(cursor) * 0x48;
-                        let kind = fw.read_u32(base)?;
-                        if kind == 13
-                            && self.opening_notification_pending
-                            && fw.read_u32(base + 4)? == 1
-                            && fw.read_u32(base + 8)? == 0
-                            && fw.read_u64(base + 12)? == g16_fw::CONTROL_DATA
-                            && fw.read_u64(base + 20)? == g16_fw::OPERAND_TABLE
-                            && fw.read_u64(base + 28)? == g16_fw::OPERAND_TABLE
-                            && fw.read_u32(base + 36)? == 20 * 8
-                        {
-                            // Completion of our boot-time opcode-0x20 admission.
-                            // Only the authored prefix is meaningful; the tail
-                            // is opaque firmware stack storage.
-                            self.opening_notification_pending = false;
-                        } else if kind != 1 {
-                            pr_err!(
-                                "G16: unexpected firmware event {} at render {}\n",
-                                kind,
-                                self.render_publication
-                            );
-                            return Err(EIO);
-                        }
-                        cursor = (cursor + 1) % capacity;
-                    }
-                }
                 if state == 0xffff_fc20_0003_f3c0 {
                     let mut cursor = read;
                     while cursor != write {
@@ -293,11 +518,15 @@ impl Bootstrap {
     /// after publication it must quarantine those mappings until reset.
     pub(crate) fn submit_render(
         &mut self,
-        client: &mut g16_vm::AddressSpace,
+        owner: Arc<Mutex<g16_vm::AddressSpace>>,
         params: &render::Parameters,
         support: &Support,
         priority: u32,
-    ) -> Result<[u64; 4]> {
+        dependency: Option<Stamp>,
+    ) -> Result<Receipt> {
+        self.reserve_flight()?;
+        let mut guard = owner.lock();
+        let client = &mut *guard;
         let root = client.roots().low;
         let index = match self.tvb_pools.iter().position(|p| p.root == root) {
             Some(index) => index,
@@ -317,7 +546,15 @@ impl Bootstrap {
             }
         };
         let mut pool = self.tvb_pools.swap_remove(index);
-        let result = self.submit_render_pool(client, params, support, priority, &mut pool);
+        let result = self.submit_render_pool(
+            client,
+            params,
+            support,
+            priority,
+            &mut pool,
+            owner.clone(),
+            dependency,
+        );
         self.tvb_pools.push(pool, GFP_KERNEL)?;
         result
     }
@@ -329,7 +566,9 @@ impl Bootstrap {
         support: &Support,
         priority: u32,
         pool: &mut crate::g16_tvb::Tvb,
-    ) -> Result<[u64; 4]> {
+        owner: Arc<Mutex<g16_vm::AddressSpace>>,
+        dependency: Option<Stamp>,
+    ) -> Result<Receipt> {
         if self.render_failed {
             return Err(EIO);
         }
@@ -357,6 +596,12 @@ impl Bootstrap {
         a.tiling_counter = queue_ordinal * 2 + 1;
         let va = self.next_work_va;
         self.next_work_va = va.checked_add(0x14000).ok_or(ENOSPC)?;
+        a.event_control = va + 0x200;
+        a.event_count_array = va + 0x300;
+        a.tiling_driver_stamp = va + 0x400;
+        a.fragment_driver_stamp = va + 0x440;
+        a.tiling_firmware_stamp = va + 0x480;
+        a.fragment_firmware_stamp = va + 0x4c0;
         let alias = 0x72_0000_0000 + self.render_publication * 0x8000;
         if alias + 0x8000 > 0x73_0000_0000 {
             return Err(ENOSPC);
@@ -391,7 +636,10 @@ impl Bootstrap {
         fw.sync();
         crate::mem::tlbi_all();
         crate::mem::sync();
-        // Encode everything before any client root or producer is published.
+        // A live context lease keeps these roots fixed through retirement.
+        a.context_id = u64::from(self.acquire_context(space, 9)?);
+        // From here any publication failure quarantines the roots.
+        self.render_failed = true;
         let mut ta = params.tiling_work(&a).ok_or(EINVAL)?;
         let mut frag = params.fragment_work(&a).ok_or(EINVAL)?;
         let raw_timestamps = [va + 0x100, va + 0x108, va + 0x110, va + 0x118];
@@ -403,7 +651,7 @@ impl Bootstrap {
         // root requires a fresh bind even though the firmware queues persist.
         let rebind = self.render_publication == 0;
         let initbm = !pool.initialized;
-        self.render_context(Some(space))?;
+
         // The shared count covers individual Work items, not render pairs.
         // Firmware retires one tiling and one fragment item per submission.
         let submitted = support.submissions.load(Ordering::Relaxed);
@@ -415,25 +663,63 @@ impl Bootstrap {
             .as_mut()
             .ok_or(EIO)?
             .write_live(a.render_shared_state, &use_count.to_le_bytes())?;
-        let result = self.publish_render(&a, &ta, &frag, priority, rebind, initbm, client, pool);
-        if result.is_ok() {
-            pool.initialized = true;
-            support.submissions.store(next_submitted, Ordering::Relaxed);
-            self.render_queue_root = space.low;
-            self.render_publication += 1;
-            self.render_queue_publication = queue_ordinal + 1;
-            self.render_channel_publications[priority as usize] += 1;
-            self.render_failed = false;
-        }
-        if result? {
-            return Err(ENOMEM);
-        }
-        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-        let mut out = [0; 4];
-        for (i, address) in raw_timestamps.iter().enumerate() {
-            out[i] = timestamp_ns(fw.read_u64(*address)?)?;
-        }
-        Ok(out)
+        let (heads, epoch) = self.publish_render(
+            &a,
+            &ta,
+            &frag,
+            priority,
+            rebind,
+            initbm,
+            pool.blocks,
+            dependency,
+        )?;
+        pool.initialized = true;
+        support.submissions.store(next_submitted, Ordering::Relaxed);
+        self.render_publication += 1;
+        self.render_queue_publication = queue_ordinal + 1;
+        self.render_channel_publications[priority as usize] += 1;
+        self.render_queue_heads = heads;
+        let stamp = Stamp {
+            address: a.fragment_firmware_stamp,
+            value: a.fragment_stamp as u32,
+            event: a.fragment_event as u32,
+        };
+        let receipt = Receipt { id: va, stamp };
+        self.last_render = Some(stamp);
+        self.flights.push(
+            Flight {
+                id: va,
+                context: a.context_id as u32,
+                started: Instant::now(),
+                stamps: [
+                    Some(Stamp {
+                        address: a.tiling_firmware_stamp,
+                        value: a.tiling_stamp as u32,
+                        event: a.tiling_event as u32,
+                    }),
+                    Some(stamp),
+                ],
+                queues: [
+                    (0xffff_fc20_0001_0000, heads[0]),
+                    (g16_fw::queue::POINTERS, heads[1]),
+                ],
+                channels: [
+                    (priority as usize * 3, epoch),
+                    (priority as usize * 3 + 1, epoch),
+                ],
+                timestamps: raw_timestamps,
+                render: Some(RenderFlight {
+                    addresses: a,
+                    client: owner,
+                    root: space.low,
+                    events: RenderEvents::default(),
+                }),
+            },
+            GFP_KERNEL,
+        )?;
+        self.render_failed = false;
+        self.trace_publication("render", va)?;
+        Ok(receipt)
     }
 
     fn publish_render(
@@ -444,9 +730,9 @@ impl Bootstrap {
         priority: u32,
         rebind: bool,
         initbm: bool,
-        client: &mut g16_vm::AddressSpace,
-        pool: &mut crate::g16_tvb::Tvb,
-    ) -> Result<bool> {
+        blocks: u32,
+        dependency: Option<Stamp>,
+    ) -> Result<([u32; 2], u32)> {
         use g16_fw::queue as q;
         let publication = self.render_publication;
         let epoch = (self.render_channel_publications[priority as usize] & 255) as u32;
@@ -455,7 +741,6 @@ impl Bootstrap {
             &config.channels[priority as usize * 3],
             &config.channels[priority as usize * 3 + 1],
         ];
-        let state_offset = |address: u64| 0xd64000 + (address - 0xffff_fc20_0002_8000) as usize;
         let producer_offset = |address: u64| 0xd60000 + (address - 0xffff_fc20_0002_0000) as usize;
         let next = (epoch + 1) & 255;
         let firsts = if rebind {
@@ -463,16 +748,20 @@ impl Bootstrap {
         } else {
             self.render_queue_heads
         };
+        let mut waits = KVec::new();
+        for stamp in [self.last_render, dependency].into_iter().flatten() {
+            if !waits.iter().any(|s: &Stamp| s.address == stamp.address) {
+                waits.push(stamp, GFP_KERNEL)?;
+            }
+        }
         let heads = [
-            (firsts[0] + 1 + u32::from(initbm)) % 0x500,
+            (firsts[0] + 1 + u32::from(initbm) + waits.len() as u32) % 0x500,
             (firsts[1] + 2) % 0x500,
         ];
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        if publication == 0 {
-            // The event control covers both stages of the initial render.
-            // Seed its submitted count before firmware observes either Work.
-            fw.write_live(a.event_count_array + 4, &2u32.to_le_bytes())?;
-        }
+        fw.write_live(a.event_control, &a.event_count_array.to_le_bytes())?;
+        fw.write_live(a.event_control + 0x10, &0x50u32.to_le_bytes())?;
+        fw.write_live(a.event_count_array, &2u32.to_le_bytes())?;
         // The queue lanes persist independently of the physical work channel.
         for stage in 0..2 {
             let queue = if stage == 0 {
@@ -506,24 +795,6 @@ impl Bootstrap {
                 fw.write_live(pointers, &q::pointers(0x500, 0))?;
                 fw.write_live(jobs, &q::jobs(jobs))?;
                 fw.write_live(context, &q::context())?;
-            } else {
-                for off in [0, 0x30, 0x40] {
-                    if fw.read_u32(pointers + off)? != firsts[stage] {
-                        return Err(EBUSY);
-                    }
-                }
-                // Only priority fields are host-owned after queue admission.
-                let bytes = q::Queue {
-                    pointers,
-                    ring,
-                    jobs: 0,
-                    private: 0,
-                    context: 0,
-                    uuid: 0,
-                }
-                .encode_priority(priority)
-                .ok_or(EINVAL)?;
-                fw.write_live(queue + 0x30, &bytes[0x30..0x4c])?;
             }
             let prelude = if stage == 0 {
                 a.tiling_prelude
@@ -543,7 +814,7 @@ impl Bootstrap {
             fw.write_live(
                 prelude,
                 &if stage == 0 {
-                    a.tiling_prelude(pool.blocks)
+                    a.tiling_prelude(blocks)
                 } else {
                     a.fragment_prelude()
                 },
@@ -555,6 +826,17 @@ impl Bootstrap {
                 fw.write_live(micro, &a.fragment_microsequence())?;
             }
             let mut pos = firsts[stage];
+            if stage == 0 {
+                for (index, stamp) in waits.iter().enumerate() {
+                    let address = a.tiling_prelude + 0x100 + index as u64 * 0x40;
+                    fw.write_live(
+                        address,
+                        &stamp.barrier(a.tiling_stamp as u32, a.tiling_uuid as u32),
+                    )?;
+                    fw.write_live(ring + u64::from(pos) * 8, &address.to_le_bytes())?;
+                    pos = (pos + 1) % 0x500;
+                }
+            }
             if stage == 1 || initbm {
                 fw.write_live(ring + u64::from(pos) * 8, &prelude.to_le_bytes())?;
                 pos = (pos + 1) % 0x500;
@@ -562,32 +844,17 @@ impl Bootstrap {
             fw.write_live(ring + u64::from(pos) * 8, &work.to_le_bytes())?;
             fw.write_live(pointers + 0x40, &heads[stage].to_le_bytes())?;
         }
-        if publication != 0 {
-            let event_count = fw.read_u32(a.event_count_array + 4)?;
-            fw.write_live(
-                a.event_count_array + 4,
-                &event_count.wrapping_add(2).to_le_bytes(),
-            )?;
-        }
         crate::mem::sync();
-        self.drain_render_rx()?;
-        let dev = self.dev.clone();
         let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
         let sgx = &*sgx_guard;
         // The selected fragment channel is published before tiling; its barrier
         // waits for the matching TA completion stamp.
         for stage in [1usize, 0] {
             let route = routes[stage];
-            let state = state_offset(route.state[0]);
-            let done = state_offset(route.state[1]);
+
             let producer = producer_offset(route.state[2]);
-            if (
-                sgx.try_read32(state)?,
-                sgx.try_read32(done)?,
-                sgx.try_read32(producer)?,
-            ) != (epoch, epoch, epoch)
-            {
-                return Err(EBUSY);
+            if sgx.try_read32(producer)? != epoch {
+                return Err(EIO);
             }
             let ring = route.ring;
             let (queue, event) = if stage == 0 {
@@ -613,57 +880,7 @@ impl Bootstrap {
         self._rtkit
             .as_mut()
             .send_message(0x21, 0x0083_0000_0000_0000 | (u64::from(priority) << 2))?;
-        let mut service = RenderEvents::default();
-        for _ in 0..10000 {
-            self.service_render_events(client, pool, a, &mut service)?;
-            self.drain_render_rx_inner(false)?;
-            let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
-            let sgx = &*sgx_guard;
-            let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-            let mut channels = true;
-            for route in routes {
-                channels &= sgx.try_read32(state_offset(route.state[0]))? == next
-                    && sgx.try_read32(state_offset(route.state[1]))? == next;
-            }
-            let queues = fw.read_u32(0xffff_fc20_0001_0000)? == heads[0]
-                && fw.read_u32(q::POINTERS)? == heads[1]
-                && fw.read_u32(0xffff_fc20_0001_0030)? == heads[0]
-                && fw.read_u32(q::POINTERS + 0x30)? == heads[1];
-            let stamps = fw.read_u32(a.tiling_firmware_stamp)? == a.tiling_stamp as u32
-                && fw.read_u32(a.fragment_firmware_stamp)? == a.fragment_stamp as u32;
-            let control_idle = sgx.try_read32(0xd640c0)? == sgx.try_read32(0xd60060)?
-                && sgx.try_read32(0xd640c8)? == sgx.try_read32(0xd60060)?;
-            if channels && queues && stamps && control_idle {
-                if fw.read_u32(pool.addresses.buffer_manager + 0x3c)? != pool.blocks {
-                    return Err(EIO);
-                }
-                self.render_queue_heads = heads;
-                return Ok(service.memory_limit);
-            }
-            drop(sgx_guard);
-            fsleep(Delta::from_millis(1));
-        }
-        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        dev_err!(
-            dev.as_ref(),
-            "G16: render {} timeout; TA read/done {}/{} 3D {}/{} stamps {:#x}/{:#x}\n",
-            publication,
-            fw.read_u32(0xffff_fc20_0001_0030)?,
-            fw.read_u32(0xffff_fc20_0001_0000)?,
-            fw.read_u32(q::POINTERS + 0x30)?,
-            fw.read_u32(q::POINTERS)?,
-            fw.read_u32(a.tiling_firmware_stamp)?,
-            fw.read_u32(a.fragment_firmware_stamp)?
-        );
-        let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
-        let sgx = &*sgx_guard;
-        dev_err!(
-            dev.as_ref(),
-            "G16: fault {:#x} address {:#x}\n",
-            sgx.read64(0xd8c0),
-            sgx.read64(0xd8c8)
-        );
-        Err(ETIMEDOUT)
+        Ok((heads, next))
     }
 }
 
@@ -690,11 +907,16 @@ impl Bootstrap {
 
     pub(crate) fn submit_compute(
         &mut self,
-        client: &mut g16_vm::AddressSpace,
+        parent: &mut g16_vm::AddressSpace,
         params: &compute::Parameters,
         priority: u32,
         memory: &impl crate::g16_cdm::Memory,
-    ) -> Result<[u64; 4]> {
+        dependency: Option<Stamp>,
+    ) -> Result<Receipt> {
+        self.reserve_flight()?;
+        parent.views.reserve(1, GFP_KERNEL)?;
+        let mut view = parent.fork()?;
+        let client = &mut view;
         let space = client.roots();
         use g16_fw::queue as q;
         if self.render_failed {
@@ -734,20 +956,26 @@ impl Bootstrap {
             crate::pgtable::prot::PROT_GPU_SHARED_RW,
             false,
         )?;
-        let a = compute::Addresses::publication(self.compute_publication, ordinal, work, alias)
+        let mut a = compute::Addresses::publication(self.compute_publication, ordinal, work, alias)
             .ok_or(ENOSPC)?;
         self._address_space.as_ref().ok_or(EIO)?.sync();
         fw.sync();
         client.sync();
         crate::mem::tlbi_all();
         crate::mem::sync();
+        a.context = self.acquire_context(space, 1)?;
+        a.identity = (u64::from(a.context) << 32) | (a.identity & 0xffff_ffff);
+        a.register_identity = (u64::from(a.context) << 32) | 1;
+        // Retain the new tables and snapshot before publishing any Work.
+        parent.views.push(view, GFP_KERNEL)?;
+        self.render_failed = true;
+        a.cdm_entry = Some(alias + compute::ENTRY_OFFSET);
         let work = params.work(&a).ok_or(EINVAL)?;
         let count = self.compute_publication.checked_add(1).ok_or(ENOSPC)?;
         let count32 = u32::try_from(count).map_err(|_| ENOSPC)?;
-        self.compute_context(Some(space))?;
-        self.render_failed = true;
+
         let first = if rebind { 0 } else { self.compute_queue_head };
-        let head = (first + 1) % 0x500;
+        let head = (first + 1 + u32::from(dependency.is_some())) % 0x500;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         let queue = q::Queue {
             pointers: compute::POINTERS,
@@ -765,16 +993,10 @@ impl Bootstrap {
             fw.write_live(compute::POINTERS, &q::pointers(0x500, 0))?;
             fw.write_live(compute::JOBS, &q::jobs(compute::JOBS))?;
             fw.write_live(compute::CONTEXT, &q::context())?;
-        } else {
-            for off in [0, 0x30, 0x40] {
-                if fw.read_u32(compute::POINTERS + off)? != first {
-                    return Err(EBUSY);
-                }
-            }
-            fw.write_live(compute::QUEUE + 0x30, &queue[0x30..0x4c])?;
         }
         fw.write_live(compute::SHARED_STATE, &count32.to_le_bytes())?;
         fw.write_live(a.work, &work)?;
+        fw.write_live(a.work + compute::ENTRY_OFFSET, &compute::entry(params.cdm))?;
         fw.write_live(a.microsequence, &params.microsequence(&a))?;
         let notifier = a.notifier(count32);
         // Retained notifier list links are firmware-owned even after completion.
@@ -785,26 +1007,25 @@ impl Bootstrap {
         fw.write_live(a.driver_stamp, &previous.to_le_bytes())?;
         fw.write_live(a.firmware_stamp, &previous.to_le_bytes())?;
         // Optional resume state is null, matching ordinary shim compute.
-        fw.write_live(compute::RING + u64::from(first) * 8, &a.work.to_le_bytes())?;
+        let mut pos = first;
+        if let Some(stamp) = dependency {
+            let barrier = a.work + 0x1900;
+            fw.write_live(barrier, &stamp.barrier(a.stamp, a.identity as u32))?;
+            fw.write_live(compute::RING + u64::from(pos) * 8, &barrier.to_le_bytes())?;
+            pos = (pos + 1) % 0x500;
+        }
+        fw.write_live(compute::RING + u64::from(pos) * 8, &a.work.to_le_bytes())?;
         fw.write_live(compute::POINTERS + 0x40, &head.to_le_bytes())?;
         crate::mem::sync();
-        self.drain_render_rx()?;
         let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
         let route = &config.channels[2];
-        let state = 0xd64000 + (route.state[0] - 0xffff_fc20_0002_8000) as usize;
-        let done = 0xd64000 + (route.state[1] - 0xffff_fc20_0002_8000) as usize;
         let producer = 0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize;
         let epoch = (self.compute_channel_publications[0] & 255) as u32;
         let next = (epoch + 1) & 255;
         let guard = self._sgx.try_access().ok_or(ENODEV)?;
         let sgx = &*guard;
-        if (
-            sgx.try_read32(state)?,
-            sgx.try_read32(done)?,
-            sgx.try_read32(producer)?,
-        ) != (epoch, epoch, epoch)
-        {
-            return Err(EBUSY);
+        if sgx.try_read32(producer)? != epoch {
+            return Err(EIO);
         }
         self._firmware_space.as_mut().ok_or(EIO)?.write_live(
             route.ring + u64::from(epoch) * 0x18,
@@ -824,48 +1045,36 @@ impl Bootstrap {
         self._rtkit
             .as_mut()
             .send_message(0x21, 0x0083_0000_0000_0002)?;
-        for _ in 0..10000 {
-            self.drain_render_rx()?;
-            let guard = self._sgx.try_access().ok_or(ENODEV)?;
-            let sgx = &*guard;
-            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-            if sgx.try_read32(state)? == next
-                && sgx.try_read32(done)? == next
-                && fw.read_u32(compute::POINTERS)? == head
-                && fw.read_u32(compute::POINTERS + 0x30)? == head
-                && fw.read_u32(a.firmware_stamp)? == a.stamp
-            {
-                self.compute_publication += 1;
-                self.compute_queue_publication = ordinal + 1;
-                self.compute_channel_publications[0] += 1;
-                self.compute_queue_head = head;
-                self.compute_queue_root = space.low;
-                self.render_failed = false;
-                return Ok([
-                    timestamp_ns(fw.read_u64(a.timestamp_start)?)?,
-                    timestamp_ns(fw.read_u64(a.timestamp_end)?)?,
-                    0,
-                    0,
-                ]);
-            }
-            drop(guard);
-            fsleep(Delta::from_millis(1));
-        }
-        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-        let guard = self._sgx.try_access().ok_or(ENODEV)?;
-        let sgx = &*guard;
-        dev_err!(self.dev.as_ref(), "G16: compute {} timeout; channel {}/{}/{} queue {}/{} stamp {:#x}; fault {:#x} at {:#x}\n",
-            self.compute_publication, sgx.try_read32(state)?, sgx.try_read32(done)?, sgx.try_read32(producer)?,
-            fw.read_u32(compute::POINTERS)?, fw.read_u32(compute::POINTERS + 0x30)?,
-            fw.read_u32(a.firmware_stamp)?, sgx.read64(0xd8c0), sgx.read64(0xd8c8));
-        Err(ETIMEDOUT)
+        self.compute_publication += 1;
+        self.compute_queue_publication = ordinal + 1;
+        self.compute_channel_publications[0] += 1;
+        self.compute_queue_head = head;
+        let stamp = Stamp {
+            address: a.firmware_stamp,
+            value: a.stamp,
+            event: a.event,
+        };
+        self.flights.push(
+            Flight {
+                id: a.work,
+                context: a.context,
+                started: Instant::now(),
+                stamps: [Some(stamp), None],
+                queues: [(compute::POINTERS, head), (0, 0)],
+                channels: [(2, next), (usize::MAX, 0)],
+                timestamps: [a.timestamp_start, a.timestamp_end, 0, 0],
+                render: None,
+            },
+            GFP_KERNEL,
+        )?;
+        self.render_failed = false;
+        self.trace_publication("compute", a.work)?;
+        Ok(Receipt { id: a.work, stamp })
     }
 }
 
 #[derive(Default)]
 struct RenderEvents {
-    replies: u32,
-    refused: bool,
     memory_limit: bool,
 }
 
@@ -914,23 +1123,23 @@ impl Bootstrap {
             }
             let mut reply = [0u8; 64];
             if kind == 6 {
-                if service.memory_limit
-                    || service.replies >= 256
-                    || fw.read_u32(base + 4)? != a.context_id as u32
+                let subpipe = fw.read_u32(base + 16)?;
+                let halt_count = fw.read_u64(base + 20)?;
+                if fw.read_u32(base + 4)? != a.context_id as u32
                     || fw.read_u32(base + 8)? != pool.addresses.buffer_manager_slot as u32
                     || fw.read_u32(base + 12)? != pool.counter
-                    || fw.read_u32(base + 16)? != 0
-                    || fw.read_u64(base + 20)? != 0
+                    || subpipe >= 64
                 {
                     return Err(EIO);
                 }
                 let grown = pool.grow(fw, client)?;
                 dev_info!(
                     self.dev.as_ref(),
-                    "G16: TVB slot {} blocks {} growth {}\n",
+                    "G16: TVB slot {} blocks {} growth {} subpipe {}\n",
                     pool.addresses.buffer_manager_slot,
                     pool.blocks,
-                    grown
+                    grown,
+                    subpipe
                 );
                 for (i, word) in [
                     8,
@@ -944,11 +1153,16 @@ impl Bootstrap {
                 {
                     reply[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
                 }
-                service.refused |= !grown;
-                service.replies += 1;
+                // Native allocateMemoryEvent echoes the request's subpipe
+                // and halt counter. Queued work can request growth on another
+                // subpipe before its main stage starts, so this state belongs
+                // to the pool, not whichever Work is currently executing.
+                reply[20..24].copy_from_slice(&subpipe.to_le_bytes());
+                reply[24..32].copy_from_slice(&halt_count.to_le_bytes());
+                pool.refused |= !grown;
                 pool.counter = pool.counter.checked_add(1).ok_or(EIO)?;
             } else {
-                if !service.refused
+                if !pool.refused
                     || service.memory_limit
                     || fw.read_u32(base + 4)? != 0
                     || fw.read_u32(base + 8)? != 1
@@ -973,7 +1187,7 @@ impl Bootstrap {
             self._rtkit
                 .as_mut()
                 .send_message(0x21, 0x0084_0000_0000_0011)?;
-            cursor = next;
+            return Ok(());
         }
         Ok(())
     }

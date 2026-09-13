@@ -24,10 +24,12 @@ pub(crate) struct Roots {
 pub(crate) struct AddressSpace {
     pub(crate) low: UatPageTable,
     pub(crate) high: UatPageTable,
+    // Per-Work compute views retain their own table snapshots until this VM
+    // is destroyed. Their leaves share this VM's pinned GEM/private backing.
+    pub(crate) views: KVec<AddressSpace>,
     // Drop the owned tables before releasing their mapped pages.
     pages: KVec<(u64, Owned<Page>)>,
     snapshots: KVec<Owned<Page>>,
-    overlay: Option<(u64, u64)>,
 }
 
 impl AddressSpace {
@@ -44,7 +46,17 @@ impl AddressSpace {
             high: UatPageTable::new_with_ias(OAS, IAS)?,
             pages: KVec::new(),
             snapshots: KVec::new(),
-            overlay: None,
+            views: KVec::new(),
+        })
+    }
+
+    pub(crate) fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            low: self.low.fork()?,
+            high: self.high.fork()?,
+            pages: KVec::new(),
+            snapshots: KVec::new(),
+            views: KVec::new(),
         })
     }
 
@@ -181,17 +193,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    pub(crate) fn restore_snapshot(&mut self) -> Result {
-        if let Some((address, leaf)) = self.overlay {
-            self.low.restore_leaf(address, leaf)?;
-            self.sync();
-            crate::mem::tlbi_all();
-            crate::mem::sync();
-            self.overlay = None;
-        }
-        Ok(())
-    }
-
     /// Preserve the caller DVA (its table can contain self-pointers), while
     /// firmware preemption writes go to a fresh context-owned physical page.
     pub(crate) fn snapshot(
@@ -199,8 +200,9 @@ impl AddressSpace {
         memory: &impl crate::g16_cdm::Memory,
         address: u64,
     ) -> Result {
-        self.restore_snapshot()?;
-        let leaf = self.low.leaf(address)?;
+        if !self.snapshots.is_empty() {
+            return Err(EEXIST);
+        }
         let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
         page.with_pointer_into_page(0, UAT_PGSZ, |ptr| {
             // SAFETY: The fresh unpublished page is exclusively owned here.
@@ -212,7 +214,6 @@ impl AddressSpace {
         let phys = page.phys();
         self.snapshots.push(page, GFP_KERNEL)?;
         // Retain backing before the first possible translation change.
-        self.overlay = Some((address, leaf));
         self.low.unmap_pages(address..address + UAT_PGSZ as u64)?;
         self.low.map_pages(
             address..address + UAT_PGSZ as u64,
