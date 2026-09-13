@@ -391,6 +391,27 @@ impl Mem {
     pub fn size(&self) -> usize {
         self.size
     }
+
+    /// Borrows a bounded byte range as ordinary RAM for IO-agnostic APIs.
+    pub fn as_iosys_map(
+        &mut self,
+        offset: usize,
+        size: usize,
+    ) -> Result<crate::iosys_map::IoSysMapRef<'_, u8>> {
+        use crate::iosys_map::{IoSysMapRef, RawIoSysMap};
+        if offset.checked_add(size).ok_or(EINVAL)? > self.size {
+            return Err(EINVAL);
+        }
+        let raw = bindings::iosys_map {
+            __bindgen_anon_1: bindings::iosys_map__bindgen_ty_1 {
+                // SAFETY: The checked range lies inside this owned mapping.
+                vaddr: unsafe { self.ptr().add(offset) }.cast(),
+            },
+            is_iomem: false,
+        };
+        // SAFETY: The map is valid for the duration of this mutable borrow.
+        Ok(unsafe { IoSysMapRef::new(RawIoSysMap::from_raw(raw), size) })
+    }
 }
 
 impl Drop for Mem {

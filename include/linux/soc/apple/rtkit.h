@@ -105,6 +105,9 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
  */
 void apple_rtkit_free(struct apple_rtkit *rtk);
 
+/* G16 requires its preallocated crash-buffer reply during endpoint discovery. */
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
+
 /*
  * Reinitialize internal structures. Must only be called with the co-processor
  * is held in reset.

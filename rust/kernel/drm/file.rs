@@ -20,6 +20,9 @@ pub trait DriverFile {
     /// Open a new file (called when a client opens the DRM device).
     fn open(device: &drm::Device<Self::Driver>) -> Result<Pin<KBox<Self>>>;
 
+    /// Called after associating driver data with an open DRM file.
+    fn post_open(&self, _file: &File<Self>) where Self: Sized {}
+
     /// Get raw drm_file pointer
     fn as_raw(&self) -> *mut bindings::drm_file;
 }
@@ -44,7 +47,8 @@ impl<T: DriverFile> File<T> {
         unsafe { &*ptr.cast() }
     }
 
-    pub(super) fn as_raw(&self) -> *mut bindings::drm_file {
+    /// Return the DRM core pointer for the lifetime of this open file.
+    pub fn as_raw(&self) -> *mut bindings::drm_file {
         self.0.get()
     }
 
@@ -86,6 +90,8 @@ impl<T: DriverFile> File<T> {
 
         // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid.
         unsafe { (*file.as_raw()).driver_priv = driver_priv.cast() };
+
+        file.inner().post_open(file);
 
         0
     }

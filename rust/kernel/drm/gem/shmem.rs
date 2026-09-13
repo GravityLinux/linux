@@ -448,6 +448,13 @@ pub struct SGTable<T: DriverObject> {
     _owner: ARef<Object<T>>,
 }
 
+impl<T: DriverObject> SGTable<T> {
+    /// Returns the GEM object kept alive by this pinned scatter-gather table.
+    pub fn object(&self) -> &Object<T> {
+        &self._owner
+    }
+}
+
 // SAFETY: This object is thread-safe via our type invariants.
 unsafe impl<T: DriverObject> Send for SGTable<T> {}
 // SAFETY: This object is thread-safe via our type invariants.

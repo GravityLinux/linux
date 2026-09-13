@@ -186,6 +186,19 @@ impl<'a, T: AsBytes + FromBytes> IoSysMapRef<'a, T> {
         Ok(())
     }
 
+    /// Copies a checked range from this mapping into `dst`.
+    /// The offset and count are in units of `T`.
+    pub fn read(&self, dst: &mut [T], offset: usize) -> Result {
+        let range = self.compute_range(offset, dst.len())?;
+        // SAFETY: Both regions are valid for the checked byte count. The
+        // C helper selects ordinary memory or MMIO access for this mapping.
+        unsafe {
+            bindings::iosys_map_memcpy_from(dst.as_mut_ptr().cast(), self.as_raw(),
+                range.start, range.len());
+        }
+        Ok(())
+    }
+
     /// Memset the region starting from `offset`.
     ///
     /// `offset` and `len` are in units of `T`, not the number of bytes.
