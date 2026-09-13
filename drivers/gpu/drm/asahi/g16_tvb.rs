@@ -114,14 +114,17 @@ impl Tvb {
         client.sync();
         crate::mem::tlbi_all();
         crate::mem::sync();
+        let mut entries = [0u8; GROW_BLOCKS as usize * 8];
         for index in 0..new - old {
             let dva = self.next + u64::from(index) * 0x28000;
             let id = (dva - render::CONTEXT_BASE) / 0x8000;
-            fw.write_live(
-                a.buffer_manager_block_list + u64::from(old + index) * 8,
-                &id.to_le_bytes(),
-            )?;
+            let offset = index as usize * 8;
+            entries[offset..offset + 8].copy_from_slice(&id.to_le_bytes());
         }
+        fw.write_live(
+            a.buffer_manager_block_list + u64::from(old) * 8,
+            &entries[..(new - old) as usize * 8],
+        )?;
         crate::mem::sync();
         let counts = (u64::from(new) | (u64::from(new) << 32)).to_le_bytes();
         fw.write_live(a.buffer_manager_block_control, &counts)?;

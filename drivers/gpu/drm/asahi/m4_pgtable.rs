@@ -8,6 +8,7 @@
 //! format. This module manages the actual page tables by allocating raw memory pages from
 //! the kernel page allocator.
 
+use core::cell::Cell;
 use core::fmt::Debug;
 use core::mem::size_of;
 use core::ops::Range;
@@ -219,6 +220,12 @@ pub(crate) struct DumpedPage {
     pub(crate) data: Option<Owned<Page>>,
 }
 
+enum Walk {
+    Read,
+    Write,
+    Allocate,
+}
+
 struct OwnedTable {
     phys: PhysicalAddr,
     parent: PhysicalAddr,
@@ -232,7 +239,7 @@ pub(crate) struct UatPageTable {
     oas_mask: u64,
     ias_mask: u64,
     owned_tables: KVec<OwnedTable>,
-    walked_tables: KVec<PhysicalAddr>,
+    dirty_tables: KVec<(PhysicalAddr, Cell<bool>)>,
 }
 
 impl UatPageTable {
@@ -247,6 +254,8 @@ impl UatPageTable {
         }
         pr_debug!("UATPageTable::new: oas={} ias={}\n", oas, ias);
         let ttb_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+        let mut dirty_tables = KVec::new();
+        dirty_tables.push((ttb_page.phys(), Cell::new(true)), GFP_KERNEL)?;
         let ttb = Page::into_phys(ttb_page);
         Ok(UatPageTable {
             ttb,
@@ -255,7 +264,7 @@ impl UatPageTable {
             oas_mask: (1u64 << oas) - 1,
             ias_mask: (1u64 << ias) - 1,
             owned_tables: KVec::new(),
-            walked_tables: KVec::new(),
+            dirty_tables,
         })
     }
 
@@ -301,14 +310,17 @@ impl UatPageTable {
             oas_mask: (1u64 << oas) - 1,
             ias_mask: (1u64 << ias) - 1,
             owned_tables: KVec::new(),
-            walked_tables: KVec::new(),
+            dirty_tables: KVec::new(),
         })
     }
 
-    /// Publish table edits to the noncoherent firmware walker. Includes
-    /// inherited tables modified while extending a firmware-owned root.
-    pub(crate) fn sync(&self) {
-        for phys in Iterator::chain(core::iter::once(&self.ttb), self.walked_tables.iter()) {
+    /// Queue cache cleaning for edited tables, including borrowed ancestors.
+    /// The enclosing publication batch supplies the completion barrier.
+    pub(crate) fn clean(&self) {
+        for (phys, dirty) in &self.dirty_tables {
+            if !dirty.replace(false) {
+                continue;
+            }
             // SAFETY: Every recorded table is live until this owner is dropped.
             let page = unsafe { Page::borrow_phys_unchecked(phys) };
             page.with_page_mapped(|p| {
@@ -320,17 +332,35 @@ impl UatPageTable {
                 }
             });
         }
+    }
+
+    pub(crate) fn sync(&self) {
+        self.clean();
         crate::mem::sync();
+    }
+
+    // Record dirtiness before writing a PTE so allocation failure cannot leave
+    // an untracked edit. Read-only walks neither allocate nor dirty metadata.
+    fn mark_dirty(&mut self, phys: PhysicalAddr) -> Result {
+        if let Some((_, dirty)) = self.dirty_tables.iter().find(|(p, _)| *p == phys) {
+            dirty.set(true);
+            return Ok(());
+        }
+        self.dirty_tables
+            .push((phys, Cell::new(true)), GFP_KERNEL)?;
+        Ok(())
     }
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
         self.ttb
     }
 
-    fn with_pages<F>(&mut self, iova_range: Range<u64>, alloc: bool, mut cb: F) -> Result
+    fn with_pages<F>(&mut self, iova_range: Range<u64>, walk: Walk, mut cb: F) -> Result
     where
         F: FnMut(u64, &[Pte]) -> Result,
     {
+        let alloc = matches!(walk, Walk::Allocate);
+        let write = !matches!(walk, Walk::Read);
         pr_debug!(
             "UATPageTable::with_pages: {:#x?} alloc={}\n",
             iova_range,
@@ -381,9 +411,6 @@ impl UatPageTable {
                         as usize;
                     // SAFETY: Page table addresses are either allocated by us, or
                     // firmware-managed and safe to borrow a struct page from.
-                    if !self.walked_tables.contains(&phys) {
-                        self.walked_tables.push(phys, GFP_KERNEL)?;
-                    }
                     let upt = unsafe { Page::borrow_phys_unchecked(&phys) };
                     pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
                     pt_addr[level] =
@@ -395,6 +422,7 @@ impl UatPageTable {
                             let mut upte_val = upte.load(Ordering::Relaxed);
                             // Allocate if requested
                             if upte_val == 0 && alloc {
+                                self.mark_dirty(phys)?;
                                 let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
                                 pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
                                 let pt_paddr = pt_page.phys();
@@ -404,6 +432,9 @@ impl UatPageTable {
                                     index: upidx,
                                 }, GFP_KERNEL)?;
                                 let _ = Page::into_phys(pt_page);
+                                // The new table's zero entries also need publication.
+                                // Ownership has transferred before this fallible step.
+                                self.mark_dirty(pt_paddr)?;
                                 upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
                                 upte.store(upte_val, Ordering::Relaxed);
                             }
@@ -452,8 +483,8 @@ impl UatPageTable {
             );
             // SAFETY: Page table addresses are either allocated by us, or
             // firmware-managed and safe to borrow a struct page from.
-            if !self.walked_tables.contains(&phys) {
-                self.walked_tables.push(phys, GFP_KERNEL)?;
+            if write {
+                self.mark_dirty(phys)?;
             }
             let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
             pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
@@ -502,7 +533,7 @@ impl UatPageTable {
 
         let pte_bits = self.pte_bits();
 
-        self.with_pages(iova_range, true, |iova, ptes| {
+        self.with_pages(iova_range, Walk::Allocate, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
                 if ptev != 0 {
@@ -530,7 +561,7 @@ impl UatPageTable {
         }
         let mut result = None;
         let mask = self.oas_mask & !(UAT_PGMSK as u64);
-        self.with_pages(page..end, false, |_, ptes| {
+        self.with_pages(page..end, Walk::Read, |_, ptes| {
             let pte = ptes[0].load(Ordering::Relaxed);
             if pte & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
                 result = Some((pte & mask) | (iova & UAT_PGMSK as u64));
@@ -546,7 +577,7 @@ impl UatPageTable {
             return Err(EINVAL);
         }
         let mut value = 0;
-        self.with_pages(address..address + UAT_PGSZ as u64, false, |_, ptes| {
+        self.with_pages(address..address + UAT_PGSZ as u64, Walk::Read, |_, ptes| {
             value = ptes[0].load(Ordering::Relaxed);
             Ok(())
         })?;
@@ -561,15 +592,19 @@ impl UatPageTable {
         if address & UAT_PGMSK as u64 != 0 || value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
             return Err(EINVAL);
         }
-        self.with_pages(address..address + UAT_PGSZ as u64, false, |_, ptes| {
-            ptes[0].store(value, Ordering::Relaxed);
-            Ok(())
-        })
+        self.with_pages(
+            address..address + UAT_PGSZ as u64,
+            Walk::Write,
+            |_, ptes| {
+                ptes[0].store(value, Ordering::Relaxed);
+                Ok(())
+            },
+        )
     }
 
     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
         pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
-        self.with_pages(iova_range, false, |iova, ptes| {
+        self.with_pages(iova_range, Walk::Write, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 if pte.load(Ordering::Relaxed) & PTE_TYPE_LEAF_TABLE == 0 {
                     pr_err!(
@@ -588,7 +623,7 @@ impl UatPageTable {
         let mut pages = KVVec::new();
         let oas_mask = self.oas_mask;
         let iova_base = self.va_range.start & !self.ias_mask;
-        self.with_pages(iova_range, false, |iova, ptes| {
+        self.with_pages(iova_range, Walk::Read, |iova, ptes| {
             let iova = iova | iova_base;
             for (idx, ppte) in ptes.iter().enumerate() {
                 let pte = ppte.load(Ordering::Relaxed);

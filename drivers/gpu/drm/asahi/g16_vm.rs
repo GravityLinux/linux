@@ -6,6 +6,7 @@
 //! roots, even when the hardware context table is using slot zero.
 
 use crate::pgtable::{prot, UatPageTable, UAT_PGSZ};
+use core::cell::Cell;
 use kernel::{device, page::Page, prelude::*};
 
 const IAS: usize = 42;
@@ -66,7 +67,7 @@ impl AddressSpace {
             let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
             // These raw pages do not receive the GEM/DMA mapping's initial
             // publication. Clean CPU initialization before exposing them.
-            sync_page(&page);
+            clean_page(&page);
             let phys = page.phys();
             self.pages.push((v, page), GFP_KERNEL)?;
             self.low
@@ -93,7 +94,7 @@ impl AddressSpace {
                 let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, UAT_PGSZ) };
                 render::private_page(&pool, offset, bytes).ok_or(EINVAL)
             })?;
-            sync_page(page);
+            clean_page(page);
         }
         for (alias, offset, size) in render::private_aliases(&pool) {
             for page in (0..size).step_by(UAT_PGSZ) {
@@ -140,7 +141,7 @@ impl AddressSpace {
                     Ok(page) => page,
                     Err(_) => return Ok(false),
                 };
-                sync_page(&page);
+                clean_page(&page);
                 pages.push((va, page), GFP_KERNEL)?;
             }
         }
@@ -173,7 +174,7 @@ impl AddressSpace {
                 }
                 Ok(())
             })?;
-            sync_page(page);
+            clean_page(page);
             va = va.checked_add(size as u64).ok_or(EINVAL)?;
             bytes = &bytes[size..];
         }
@@ -207,7 +208,7 @@ impl AddressSpace {
                 core::slice::from_raw_parts_mut(ptr, UAT_PGSZ)
             })
         })?;
-        sync_page(&page);
+        clean_page(&page);
         let phys = page.phys();
         self.snapshots.push(page, GFP_KERNEL)?;
         // Retain backing before the first possible translation change.
@@ -229,8 +230,8 @@ impl AddressSpace {
     /// mapping changes do not need to sweep all existing client allocations.
     /// Firmware-private storage is managed separately by FirmwareSpace.
     pub(crate) fn sync(&self) {
-        self.low.sync();
-        self.high.sync();
+        self.low.clean();
+        self.high.clean();
         crate::mem::sync();
     }
 
@@ -330,6 +331,10 @@ use kernel::types::Owned;
 struct FirmwareRegion {
     va: u64,
     pages: KVec<Owned<Page>>,
+    // One flag per owned page. Live writes publish themselves; only allocation
+    // and unpublished initialization need work at the next space-wide sync.
+    dirty_pages: KVec<Cell<bool>>,
+    pending: Cell<bool>,
 }
 
 /// The firmware uses this bootloader root independently of all client slots.
@@ -408,8 +413,17 @@ impl FirmwareSpace {
         for _ in 0..size / UAT_PGSZ {
             pages.push(Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?, GFP_KERNEL)?;
         }
-        self.regions
-            .push(FirmwareRegion { va, pages }, GFP_KERNEL)?;
+        let mut dirty_pages = KVec::new();
+        dirty_pages.extend_with(pages.len(), Cell::new(true), GFP_KERNEL)?;
+        self.regions.push(
+            FirmwareRegion {
+                va,
+                pages,
+                dirty_pages,
+                pending: Cell::new(true),
+            },
+            GFP_KERNEL,
+        )?;
         let region = self.regions.last().ok_or(EIO)?;
         for (i, page) in region.pages.iter().enumerate() {
             let v = va + (i * UAT_PGSZ) as u64;
@@ -439,6 +453,8 @@ impl FirmwareSpace {
         while !remaining.is_empty() {
             let within = offset & (UAT_PGSZ - 1);
             let size = remaining.len().min(UAT_PGSZ - within);
+            region.pending.set(true);
+            region.dirty_pages[offset / UAT_PGSZ].set(true);
             region.pages[offset / UAT_PGSZ].with_pointer_into_page(within, size, |p| {
                 // SAFETY: These owned bytes are not yet published to firmware.
                 unsafe {
@@ -466,6 +482,8 @@ impl FirmwareSpace {
             .iter()
             .find(|r| va >= r.va && va < r.va + (r.pages.len() * UAT_PGSZ) as u64)
             .ok_or(EINVAL)?;
+        region.pending.set(true);
+        region.dirty_pages[((va - region.va) as usize) / UAT_PGSZ].set(true);
         region.pages[((va - region.va) as usize) / UAT_PGSZ].with_pointer_into_page(
             0,
             UAT_PGSZ,
@@ -504,38 +522,82 @@ impl FirmwareSpace {
         Ok(())
     }
 
-    /// Update host-owned fields after publication, preserving adjacent firmware
-    /// data in the CPU cache line. The caller must own the requested bytes.
+    /// Update host-owned bytes, preserving adjacent firmware-owned cache lines.
+    /// Cache maintenance completes once per range, not once per page.
     pub(crate) fn write_live(&mut self, va: u64, bytes: &[u8]) -> Result {
-        let end = va.checked_add(bytes.len() as u64).ok_or(EINVAL)?;
+        self.update_live(va, bytes.len(), |ptr, offset, size| {
+            // SAFETY: update_live supplies an exclusively host-owned destination
+            // and a range within the source slice, with no alias between them.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), ptr, size) };
+        })
+    }
+
+    pub(crate) fn zero_live(&mut self, va: u64, size: usize) -> Result {
+        self.update_live(va, size, |ptr, _, size| {
+            // SAFETY: update_live supplies a valid host-owned byte range.
+            unsafe { core::ptr::write_bytes(ptr, 0, size) };
+        })
+    }
+
+    fn update_live(
+        &mut self,
+        va: u64,
+        size: usize,
+        mut update: impl FnMut(*mut u8, usize, usize),
+    ) -> Result {
+        let end = va.checked_add(size as u64).ok_or(EINVAL)?;
         let region = self
             .regions
             .iter()
             .find(|r| va >= r.va && end <= r.va + (r.pages.len() * UAT_PGSZ) as u64)
             .ok_or(EINVAL)?;
-        let mut offset = (va - region.va) as usize;
-        let mut remaining = bytes;
-        while !remaining.is_empty() {
-            let within = offset & (UAT_PGSZ - 1);
-            let size = remaining.len().min(UAT_PGSZ - within);
-            region.pages[offset / UAT_PGSZ].with_page_mapped(|p| {
-                // SAFETY: Bounds above place all lines and bytes in this page.
-                // Previously published CPU writes have already reached PoC.
-                unsafe {
-                    for off in (within & !63..within + size).step_by(64) {
-                        core::arch::asm!("dc ivac, {addr}", addr = in(reg) p.add(off));
-                    }
-                    core::arch::asm!("dsb sy");
-                    core::ptr::copy_nonoverlapping(remaining.as_ptr(), p.add(within), size);
-                    for off in (within & !63..within + size).step_by(64) {
-                        core::arch::asm!("dc cvac, {addr}", addr = in(reg) p.add(off));
-                    }
-                    core::arch::asm!("dsb sy");
+        if size == 0 {
+            return Ok(());
+        }
+        let start = (va - region.va) as usize;
+        let end = start + size;
+        let first = start / UAT_PGSZ;
+        let last = (end - 1) / UAT_PGSZ;
+        for index in first..=last {
+            // Unpublished initialization is still authoritative in CPU cache.
+            if region.dirty_pages[index].get() {
+                continue;
+            }
+            let base = index * UAT_PGSZ;
+            let within = start.saturating_sub(base);
+            let limit = (end - base).min(UAT_PGSZ);
+            region.pages[index].with_page_mapped(|p| {
+                for off in (within & !63..limit).step_by(64) {
+                    // SAFETY: These cache lines lie within the mapped page.
+                    unsafe { core::arch::asm!("dc ivac, {addr}", addr = in(reg) p.add(off)) };
                 }
             });
-            remaining = &remaining[size..];
-            offset += size;
         }
+        crate::mem::sync();
+        for index in first..=last {
+            let base = index * UAT_PGSZ;
+            let within = start.saturating_sub(base);
+            let limit = (end - base).min(UAT_PGSZ);
+            let dirty = region.dirty_pages[index].replace(false);
+            region.pages[index].with_page_mapped(|p| {
+                // SAFETY: The checked range lies in this mapped page. The
+                // caller owns these bytes; neighboring firmware bytes were
+                // invalidated before the batch's completion barrier above.
+                unsafe { update(p.add(within), base + within - start, limit - within) };
+                // Publish all initialization on a dirty page, including zeros
+                // outside this write. Published pages need only touched lines.
+                let lines = if dirty {
+                    0..UAT_PGSZ
+                } else {
+                    (within & !63)..limit
+                };
+                for off in lines.step_by(64) {
+                    // SAFETY: The cache line lies in this mapped page.
+                    unsafe { core::arch::asm!("dc cvac, {addr}", addr = in(reg) p.add(off)) };
+                }
+            });
+        }
+        crate::mem::sync();
         Ok(())
     }
 
@@ -580,8 +642,13 @@ impl FirmwareSpace {
 
     pub(crate) fn sync(&self) {
         for region in &self.regions {
-            for page in &region.pages {
-                sync_page(page);
+            if !region.pending.replace(false) {
+                continue;
+            }
+            for (page, dirty) in region.pages.iter().zip(&region.dirty_pages) {
+                if dirty.replace(false) {
+                    clean_page(page);
+                }
             }
         }
         self.table.sync();
@@ -608,7 +675,7 @@ impl Drop for FirmwareSpace {
     }
 }
 
-fn sync_page(page: &Page) {
+fn clean_page(page: &Page) {
     page.with_page_mapped(|p| {
         for off in (0..UAT_PGSZ).step_by(64) {
             // SAFETY: The cache line lies inside this owned page.

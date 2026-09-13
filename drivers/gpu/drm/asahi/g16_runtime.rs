@@ -487,11 +487,7 @@ impl Bootstrap {
                 q::RING
             };
             if rebind {
-                let zeros = [0u8; 0x100];
-                for offset in (0..0x2410usize).step_by(zeros.len()) {
-                    let size = zeros.len().min(0x2410 - offset);
-                    fw.write_live(queue + 0xb0 + offset as u64, &zeros[..size])?;
-                }
+                fw.zero_live(queue + 0xb0, 0x2410)?;
                 let jobs = q::JOBS;
                 let context = q::CONTEXT;
                 fw.write_live(
@@ -764,13 +760,7 @@ impl Bootstrap {
         .encode_priority(priority)
         .ok_or(EINVAL)?;
         if rebind {
-            let zeros = [0u8; 0x100];
-            for offset in (0..0x2410usize).step_by(zeros.len()) {
-                fw.write_live(
-                    compute::QUEUE + 0xb0 + offset as u64,
-                    &zeros[..zeros.len().min(0x2410 - offset)],
-                )?;
-            }
+            fw.zero_live(compute::QUEUE + 0xb0, 0x2410)?;
             fw.write_live(compute::QUEUE, &queue)?;
             fw.write_live(compute::POINTERS, &q::pointers(0x500, 0))?;
             fw.write_live(compute::JOBS, &q::jobs(compute::JOBS))?;
