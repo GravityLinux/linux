@@ -18,6 +18,7 @@ pub(crate) struct Tvb {
     pub(crate) initialized: bool,
     pub(crate) blocks: u32,
     pub(crate) counter: u32,
+    pub(crate) refused: bool,
     next: u64,
 }
 impl Tvb {
@@ -65,6 +66,7 @@ impl Tvb {
             initialized: false,
             blocks: 11,
             counter: 0,
+            refused: false,
             next: growth_base,
         })
     }

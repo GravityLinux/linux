@@ -243,6 +243,87 @@ pub(crate) struct UatPageTable {
 }
 
 impl UatPageTable {
+    /// Copy an owned tree, preserving leaf attributes and sharing only backing
+    /// pages. The caller must retain the source's mapped storage for the copy.
+    /// No published PTE in the source is changed.
+    pub(crate) fn fork(&self) -> Result<Self> {
+        if !self.ttb_owned {
+            return Err(EINVAL);
+        }
+        let mut copy = Self::new_with_ias(
+            self.oas_mask.count_ones(),
+            self.ias_mask.count_ones() as usize,
+        )?;
+        copy.owned_tables
+            .reserve(self.owned_tables.len(), GFP_KERNEL)?;
+        copy.dirty_tables
+            .reserve(self.owned_tables.len(), GFP_KERNEL)?;
+        let copy_page = |source: u64, destination: u64| -> Result {
+            // SAFETY: Both pages belong to these live trees. Source access is
+            // serialized by the VM lock; the destination is unpublished.
+            let src = unsafe { Page::borrow_phys_unchecked(&source) };
+            let dst = unsafe { Page::borrow_phys_unchecked(&destination) };
+            src.with_pointer_into_page(0, UAT_PGSZ, |s| {
+                dst.with_pointer_into_page(0, UAT_PGSZ, |d| {
+                    for i in 0..UAT_NPTE {
+                        // SAFETY: Aligned PTEs inside two distinct table pages.
+                        unsafe {
+                            d.cast::<Pte>().add(i).as_ref().unwrap().store(
+                                s.cast::<Pte>()
+                                    .add(i)
+                                    .as_ref()
+                                    .unwrap()
+                                    .load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+            })
+        };
+        copy_page(self.ttb, copy.ttb)?;
+        // Parents precede children in owned_tables, including after a failed
+        // mapping allocation. Drop can therefore unwind an incomplete copy.
+        for old in &self.owned_tables {
+            let parent = if old.parent == self.ttb {
+                copy.ttb
+            } else {
+                let index = self
+                    .owned_tables
+                    .iter()
+                    .position(|p| p.phys == old.parent)
+                    .ok_or(EIO)?;
+                copy.owned_tables.get(index).ok_or(EIO)?.phys
+            };
+            let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+            let phys = page.phys();
+            copy_page(old.phys, phys)?;
+            copy.owned_tables.push(
+                OwnedTable {
+                    phys,
+                    parent,
+                    index: old.index,
+                },
+                GFP_KERNEL,
+            )?;
+            let _ = Page::into_phys(page);
+            copy.mark_dirty(phys)?;
+            // SAFETY: The copied parent is owned and still unpublished.
+            unsafe { Page::borrow_phys_unchecked(&parent) }.with_pointer_into_page(
+                old.index * PTE_SIZE,
+                PTE_SIZE,
+                |p| {
+                    // SAFETY: The checked slot is an aligned PTE.
+                    unsafe { &*p.cast::<Pte>() }
+                        .store(phys | PTE_TYPE_LEAF_TABLE, Ordering::Relaxed);
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(copy)
+    }
+
     /// Allocate a root with the address width of this GPU generation.
     /// G16 has 64 top-level entries (42 address bits per TTBR), while
     /// G13/G14 use 8 entries (39 bits per TTBR).
@@ -572,6 +653,7 @@ impl UatPageTable {
     }
 
     /// Save one existing leaf while a Work temporarily substitutes owned RAM.
+    #[cfg(test)]
     pub(crate) fn leaf(&mut self, address: u64) -> Result<u64> {
         if address & UAT_PGMSK as u64 != 0 {
             return Err(EINVAL);
@@ -588,6 +670,7 @@ impl UatPageTable {
     }
 
     /// Restore a leaf obtained from this VM by `leaf`, before its backing dies.
+    #[cfg(test)]
     pub(crate) fn restore_leaf(&mut self, address: u64, value: u64) -> Result {
         if address & UAT_PGMSK as u64 != 0 || value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
             return Err(EINVAL);

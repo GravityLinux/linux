@@ -166,7 +166,7 @@ impl rtkit::Operations for BootOps {
 /// No render node is published until the submission backend is available.
 #[path = "g16_runtime.rs"]
 mod render_runtime;
-pub(crate) use render_runtime::Support;
+pub(crate) use render_runtime::{Stamp, Support};
 
 // Keep the opening barrier transport separate from render queues. Firmware
 // retains queue and item references after consuming this bootstrap prefix.
@@ -195,15 +195,16 @@ pub(crate) struct Bootstrap {
     render_queue_publication: u64,
     render_channel_publications: [u64; 4],
     render_queue_heads: [u32; 2],
-    render_root: u64,
-    render_queue_root: u64,
-    compute_queue_root: u64,
     next_work_va: u64,
     compute_publication: u64,
     compute_queue_publication: u64,
     compute_channel_publications: [u64; 4],
     compute_queue_head: u32,
     render_failed: bool,
+    flights: KVec<render_runtime::Flight>,
+    context_roots: [Option<crate::g16_vm::Roots>; 64],
+    context_users: [u32; 64],
+    last_render: Option<render_runtime::Stamp>,
     render_support: kernel::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 
@@ -638,15 +639,16 @@ impl Bootstrap {
             render_queue_publication: 0,
             render_channel_publications: [0; 4],
             render_queue_heads: [0; 2],
-            render_root: 0,
-            render_queue_root: 0,
-            compute_queue_root: 0,
             next_work_va: 0xffff_fc22_0000_0000,
             compute_publication: 0,
             compute_queue_publication: 0,
             compute_channel_publications: [0; 4],
             compute_queue_head: 0,
             render_failed: false,
+            flights: KVec::new(),
+            context_roots: [None; 64],
+            context_users: [0; 64],
+            last_render: None,
             render_support: kernel::sync::Arc::new(
                 core::sync::atomic::AtomicU64::new(0),
                 GFP_KERNEL,

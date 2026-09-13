@@ -39,6 +39,7 @@ type DrmFile = drm::File<File>;
 type Object = shmem::Object<Buffer>;
 const VM_END: u64 = (1 << 42) - 0x8000;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+static NEXT_EXECUTION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct Mapping {
@@ -173,6 +174,7 @@ struct Queue {
     vm: u32,
     priority: u32,
     entity: sched::Entity<SubmissionJob>,
+    order: Arc<Mutex<Option<crate::g16::Stamp>>>,
     fences: dma_fence::FenceContexts,
 }
 #[derive(Clone)]
@@ -196,6 +198,8 @@ pub(crate) struct Data {
     failed: AtomicBool,
     #[pin]
     runtime: Mutex<crate::g16::Bootstrap>,
+    #[pin]
+    engine: Mutex<Engine>,
 }
 
 #[vtable]
@@ -239,10 +243,11 @@ pub(crate) fn register(pdev: &platform::Device<Core>) -> Result<DeviceRef> {
     let runtime = crate::g16::Bootstrap::new(pdev)?;
     let data = try_pin_init!(Data {
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
-        scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 1, 0, 30000, c_str!("asahi_m4"))?,
+        scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 16, 0, 30000, c_str!("asahi_m4"))?,
         admission <- kernel::new_mutex!(KVec::new()),
         failed: AtomicBool::new(false),
-        runtime <- kernel::new_mutex!(runtime), });
+        runtime <- kernel::new_mutex!(runtime),
+        engine <- kernel::new_mutex!(Engine { running: false, jobs: KVec::new(), issued: KVec::new() }), });
     let device = Device::new(pdev.as_ref(), data)?;
     drm::driver::Registration::new_foreign_owned(&device, pdev.as_ref(), 0)?;
     Ok(device)
@@ -529,6 +534,7 @@ impl File {
         let fences = dma_fence::FenceContexts::new(1, c_str!("asahi_m4"), FENCE_KEY)?;
         state.queues.push(
             Queue {
+                order: Arc::pin_init(kernel::new_mutex!(None), GFP_KERNEL)?,
                 id,
                 vm: data.vm_id,
                 priority: data.priority,
@@ -701,7 +707,6 @@ impl File {
             .iter_mut()
             .find(|vm| vm.id == data.vm_id && vm.visible)
             .ok_or(ENOENT)?;
-        vm.compute_space.lock().restore_snapshot()?;
         for _ in 0..data.num_binds {
             let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(data.stride as usize)?;
             let (flags, handle, offset, size, address) =
@@ -832,7 +837,12 @@ impl File {
 impl Vm {
     fn detach(&self, runtime: &mut crate::g16::Bootstrap) -> Result {
         runtime.release_render_vm(self.space.lock().roots())?;
-        runtime.release_render_vm(self.compute_space.lock().roots())
+        let compute = self.compute_space.lock();
+        runtime.release_render_vm(compute.roots())?;
+        for view in &compute.views {
+            runtime.release_render_vm(view.roots())?;
+        }
+        Ok(())
     }
 
     fn map(
@@ -999,6 +1009,11 @@ fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
 /// can publish pending fences while the current job executes.
 #[pin_data(PinnedDrop)]
 struct Execution {
+    id: u64,
+    order: Arc<Mutex<Option<crate::g16::Stamp>>>,
+    // Compute metadata may itself have been produced by an earlier command.
+    // Such CPU preparation waits for the explicitly declared batch barriers.
+    prepare_after: KVec<bool>,
     device: DeviceRef,
     _owner: Arc<Mutex<FileState>>,
     render_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
@@ -1016,46 +1031,173 @@ struct Execution {
 
 impl_has_work! { impl HasWork<Self> for Execution { self.work } }
 
+struct Running {
+    execution: Arc<Execution>,
+    next: usize,
+    pending: usize,
+    error: Option<Error>,
+}
+struct Issued {
+    id: u64,
+    owner: u64,
+    command: usize,
+}
+struct Engine {
+    running: bool,
+    jobs: KVec<Running>,
+    issued: KVec<Issued>,
+}
+
 impl WorkItem for Execution {
     type Pointer = Arc<Self>;
 
     fn run(this: Arc<Self>) {
-        let result = (|| {
-            if this.device.failed.load(Ordering::Acquire) {
-                return Err(EIO);
-            }
+        // Exactly one pump owns publication order. It holds these locks only
+        // while preparing/publishing or inspecting retirement, never asleep.
+        // Scheduler callbacks append ready jobs even while hardware is busy.
+        loop {
+            let mut engine = this.device.engine.lock();
             let mut runtime = this.device.runtime.lock();
-            if runtime.render_failed() {
-                return Err(EIO);
-            }
-            for (index, parameters) in this.parameters.iter().enumerate() {
-                let timestamps = &this.timestamps[index];
-                crate::mem::sync();
-                let values = match parameters {
-                    Parameters::Render(p) => runtime.submit_render(
-                        &mut this.render_space.lock(),
-                        p,
-                        this.support.as_deref().ok_or(EIO)?,
-                        this.priority,
-                    )?,
-                    Parameters::Compute(p) => runtime.submit_compute(
-                        &mut this.space.lock(),
-                        p,
-                        this.priority,
-                        &this.memory,
-                    )?,
-                };
-                this.memory.store_timestamps(timestamps, &values)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            if this.device.runtime.lock().render_failed() {
+            let result = (|| -> Result<bool> {
+                if this.device.failed.load(Ordering::Acquire) {
+                    return Err(EIO);
+                }
+                let mut progress = false;
+                while let Some((id, result)) = runtime.retire()? {
+                    let index = engine.issued.iter().position(|r| r.id == id).ok_or(EIO)?;
+                    let issued = engine.issued.remove(index).map_err(|_| EIO)?;
+                    let job = engine
+                        .jobs
+                        .iter_mut()
+                        .find(|r| r.execution.id == issued.owner)
+                        .ok_or(EIO)?;
+                    job.pending -= 1;
+                    let result = result.and_then(|values| {
+                        job.execution
+                            .memory
+                            .store_timestamps(&job.execution.timestamps[issued.command], &values)
+                    });
+                    if let Err(error) = result {
+                        job.error = Some(error);
+                    }
+                    progress = true;
+                }
+                for index in 0..engine.jobs.len() {
+                    // A batch awaiting GPU-produced compute metadata must not
+                    // stall independent public queues. Later submissions on
+                    // its own queue still wait for all its commands to publish.
+                    if engine.jobs[..index].iter().any(|earlier| {
+                        earlier.error.is_none()
+                            && earlier.next < earlier.execution.parameters.len()
+                            && Arc::ptr_eq(
+                                &earlier.execution.order,
+                                &engine.jobs[index].execution.order,
+                            )
+                    }) {
+                        continue;
+                    }
+                    loop {
+                        let job = &engine.jobs[index];
+                        if job.error.is_some() || job.next == job.execution.parameters.len() {
+                            break;
+                        }
+                        // A CPU CDM/resource read cannot be moved ahead of a
+                        // batch dependency that might generate those bytes.
+                        if job.execution.prepare_after[job.next] && job.pending != 0 {
+                            break;
+                        }
+                        engine.issued.reserve(1, GFP_KERNEL)?;
+                        let job = &mut engine.jobs[index];
+                        let execution = &job.execution;
+                        let mut order = execution.order.lock();
+                        crate::mem::sync();
+                        let receipt = match &execution.parameters[job.next] {
+                            Parameters::Render(p) => runtime.submit_render(
+                                execution.render_space.clone(),
+                                p,
+                                execution.support.as_deref().ok_or(EIO)?,
+                                execution.priority,
+                                *order,
+                            ),
+                            Parameters::Compute(p) => runtime.submit_compute(
+                                &mut execution.space.lock(),
+                                p,
+                                execution.priority,
+                                &execution.memory,
+                                *order,
+                            ),
+                        };
+                        let receipt = match receipt {
+                            Ok(receipt) => receipt,
+                            Err(EBUSY) if !runtime.render_failed() => return Ok(progress),
+                            Err(error) if !runtime.render_failed() => {
+                                job.error = Some(error);
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        *order = Some(receipt.stamp);
+                        let issued = Issued {
+                            id: receipt.id,
+                            owner: execution.id,
+                            command: job.next,
+                        };
+                        job.next += 1;
+                        job.pending += 1;
+                        drop(order);
+                        engine.issued.push(issued, GFP_KERNEL)?;
+                        progress = true;
+                    }
+                }
+                Ok(progress)
+            })();
+            if let Err(error) = result {
+                pr_err!(
+                    "G16: submission pipeline failed: {:?}, {} jobs, {} issued\n",
+                    error,
+                    engine.jobs.len(),
+                    engine.issued.len()
+                );
+                runtime.poison();
                 this.device.failed.store(true, Ordering::Release);
+                let jobs = core::mem::take(&mut engine.jobs);
+                engine.issued.clear();
+                engine.running = false;
+                drop(runtime);
+                drop(engine);
+                // Quarantined context roots remain installed and retained;
+                // a failed fence never authorizes reuse of their backing.
+                for job in jobs {
+                    job.execution.completion.set_error(error);
+                    let _ = job.execution.completion.signal();
+                }
+                return;
             }
-            this.completion.set_error(error);
+            if let Some(index) = engine.jobs.iter().position(|j| {
+                j.pending == 0 && (j.error.is_some() || j.next == j.execution.parameters.len())
+            }) {
+                let job = engine
+                    .jobs
+                    .remove(index)
+                    .expect("index found under engine lock");
+                drop(runtime);
+                drop(engine);
+                if let Some(error) = job.error {
+                    job.execution.completion.set_error(error);
+                }
+                let _ = job.execution.completion.signal();
+                continue;
+            }
+            if engine.jobs.is_empty() {
+                engine.running = false;
+                return;
+            }
+            drop(runtime);
+            drop(engine);
+            if !result.unwrap_or(false) {
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+            }
         }
-        let _ = this.completion.signal();
     }
 }
 
@@ -1083,9 +1225,24 @@ impl sched::JobImpl for SubmissionJob {
             return Err(EIO);
         }
         let fence = execution.completion.clone();
-        // The started guard permits exactly one enqueue of this fresh Work.
-        // If already queued, that worker still owns and signals the same fence.
-        let _ = workqueue::system_unbound().enqueue(execution.clone());
+        let mut engine = execution.device.engine.lock();
+        if let Err(error) = engine.jobs.push(
+            Running {
+                execution: execution.clone(),
+                next: 0,
+                pending: 0,
+                error: None,
+            },
+            GFP_KERNEL,
+        ) {
+            execution.completion.set_error(error.into());
+            let _ = execution.completion.signal();
+            return Err(error.into());
+        }
+        if !engine.running {
+            engine.running = true;
+            let _ = workqueue::system_unbound().enqueue(execution.clone());
+        }
         Ok(Some(fence))
     }
 
@@ -1139,6 +1296,7 @@ impl File {
         .reader()
         .read_all(&mut bytes, GFP_KERNEL)?;
         let mut commands = KVec::new();
+        let mut prepare_after = KVec::new();
         let mut attachments = KVec::new();
         let mut offset = 0usize;
         let mut renders = 0u16;
@@ -1161,6 +1319,7 @@ impl File {
                     let command = crate::util::Reader::new(payload)
                         .read_up_to::<uapi::drm_asahi_cmd_render>(payload.len())?;
                     commands.push(Command::Render(command), GFP_KERNEL)?;
+                    prepare_after.push(false, GFP_KERNEL)?;
                     renders += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
@@ -1173,6 +1332,11 @@ impl File {
                     let command = crate::util::Reader::new(payload)
                         .read_up_to::<uapi::drm_asahi_cmd_compute>(payload.len())?;
                     commands.push(Command::Compute(command), GFP_KERNEL)?;
+                    prepare_after.push(
+                        (header.vdm_barrier != 0xffff && header.vdm_barrier != 0)
+                            || (header.cdm_barrier != 0xffff && header.cdm_barrier != 0),
+                        GFP_KERNEL,
+                    )?;
                     computes += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS
@@ -1267,6 +1431,7 @@ impl File {
         // queue needs its own DMA-fence timeline/context.
         let unique = queue.fences.new_fence(0, Completion)?;
         let (vm_id, priority) = (queue.vm, queue.priority + 1);
+        let order = queue.order.clone();
         let mut timestamps = KVec::new();
         let resolve = |stamp: &uapi::drm_asahi_timestamp| -> Result<u64> {
             if stamp.handle == 0 {
@@ -1379,6 +1544,7 @@ impl File {
         let worker_completion = completion.clone();
         let execution = Arc::pin_init(
             try_pin_init!(Execution {
+                id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), order, prepare_after,
                 device: device.into(), _owner: inner.state.clone(),
                 render_space: vm.space.clone(), space: vm.compute_space.clone(), memory,
                 support: vm.render_support.clone(),
@@ -1397,9 +1563,13 @@ impl File {
             job.add_dependency(fence)?;
         }
         // No fallible operation follows output-fence publication.
+        // Publish the hardware lifetime fence directly. Scheduler finished
+        // fences can be downgraded to scheduled dependencies by DRM; our
+        // external inputs must wait for actual completion (including CPU CDM
+        // preparation that may read data produced by the dependency).
+        let fence = completion.clone();
         admission.push(completion, GFP_KERNEL)?;
-        let mut job = job.arm();
-        let fence = job.fences().finished();
+        let job = job.arm();
         for output in outputs {
             if let Some(chain) = output.chain {
                 output.object.add_point(chain, &fence, output.point);
