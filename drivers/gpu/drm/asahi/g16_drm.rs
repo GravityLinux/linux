@@ -49,6 +49,24 @@ struct Mapping {
     sg: Arc<shmem::SGTable<Buffer>>,
 }
 
+impl Mapping {
+    fn cover(mappings: &[Self], start: u64, size: u64, permissions: u32) -> Result {
+        let end = start.checked_add(size).ok_or(EINVAL)?;
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let mapping = mappings
+                .iter()
+                .find(|m| m.range.contains(&cursor) && m.permissions & permissions == permissions)
+                .ok_or(EINVAL)?;
+            cursor = end.min(mapping.range.end);
+        }
+        Ok(())
+    }
+}
+
 struct Vm {
     id: u32,
     visible: bool,
@@ -105,20 +123,7 @@ impl MemoryView {
 
 impl crate::g16_cdm::Memory for MemoryView {
     fn cover(&self, start: u64, size: u64, permissions: u32) -> Result {
-        let end = start.checked_add(size).ok_or(EINVAL)?;
-        if size == 0 {
-            return Err(EINVAL);
-        }
-        let mut cursor = start;
-        while cursor < end {
-            let mapping = self
-                .mappings
-                .iter()
-                .find(|m| m.range.contains(&cursor) && m.permissions & permissions == permissions)
-                .ok_or(EINVAL)?;
-            cursor = end.min(mapping.range.end);
-        }
-        Ok(())
+        Mapping::cover(&self.mappings, start, size, permissions)
     }
 
     fn read(&self, mut address: u64, mut out: &mut [u8]) -> Result {
@@ -322,10 +327,10 @@ impl PinnedDrop for File {
             self.device.failed.store(true, Ordering::Release);
             return;
         }
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let mut runtime = self.device.runtime.lock();
-        for index in (0..state.vms.len()).rev() {
-            if state.vms[index].detach(&mut runtime).is_err() {
+        for vm in state.vms.iter().rev() {
+            if vm.detach(&mut runtime).is_err() {
                 // Retain GPU-visible mappings if the installed root cannot
                 // be detached safely; device reset releases the hardware.
                 drop(runtime);
@@ -1032,14 +1037,12 @@ impl WorkItem for Execution {
                         p,
                         this.support.as_deref().ok_or(EIO)?,
                         this.priority,
-                        timestamps,
                     )?,
                     Parameters::Compute(p) => runtime.submit_compute(
                         &mut this.space.lock(),
                         p,
                         this.priority,
                         &this.memory,
-                        timestamps,
                     )?,
                 };
                 this.memory.store_timestamps(timestamps, &values)?;
@@ -1411,24 +1414,7 @@ impl File {
 
 impl Vm {
     fn cover(&self, start: u64, size: u64, permissions: u32) -> Result {
-        let end = start.checked_add(size).ok_or(EINVAL)?;
-        if size == 0 {
-            return Err(EINVAL);
-        }
-        let mut next = start;
-        while next < end {
-            let m = self
-                .mappings
-                .iter()
-                .find(|m| {
-                    m.range.start <= next
-                        && next < m.range.end
-                        && m.permissions & permissions == permissions
-                })
-                .ok_or(EINVAL)?;
-            next = m.range.end.min(end);
-        }
-        Ok(())
+        Mapping::cover(&self.mappings, start, size, permissions)
     }
 
     fn compute_parameters(&self, c: &uapi::drm_asahi_cmd_compute) -> Result<compute::Parameters> {
@@ -1463,7 +1449,12 @@ impl Vm {
     }
 
     fn render_parameters(&self, c: &uapi::drm_asahi_cmd_render) -> Result<render::Parameters> {
-        if c.flags & !((1 << 1) | (1 << 18)) != 0
+        use uapi::{
+            drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT as DBIAS_IS_INT,
+            drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as PROCESS_EMPTY_TILES,
+        };
+
+        if c.flags & !(PROCESS_EMPTY_TILES | DBIAS_IS_INT) != 0
             || c.vertex_helper.binary != 0
             || c.vertex_helper.cfg != 0
             || c.vertex_helper.data != 0
@@ -1497,14 +1488,14 @@ impl Vm {
                 4 => 2,
                 _ => return Err(EINVAL),
             };
+        p.process_empty_tiles = c.flags & PROCESS_EMPTY_TILES != 0;
         p.tile_config =
-            0x280 | if p.layers > 1 { 1 } else { 0 } | if c.flags & 2 != 0 { 0x10000 } else { 0 };
-        p.process_empty_tiles = c.flags & 2 != 0;
+            0x280 | u64::from(p.layers > 1) | if p.process_empty_tiles { 0x10000 } else { 0 };
         p.multisample_control = c.ppp_multisamplectl;
         p.ppp_control = u64::from(c.ppp_ctrl);
         p.merge_upper_x_bits = u64::from(c.isp_merge_upper_x);
         p.merge_upper_y_bits = u64::from(c.isp_merge_upper_y);
-        p.aux_fb_flags = 0xc000 | u64::from(c.flags & (1 << 18));
+        p.aux_fb_flags = 0xc000 | u64::from(c.flags & DBIAS_IS_INT);
         p.aux_fb_page_count = 0x100000;
         p.scissor_array = c.isp_scissor_base;
         p.depth_bias_array = c.isp_dbias_base;

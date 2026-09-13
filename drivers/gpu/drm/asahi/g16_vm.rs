@@ -504,14 +504,6 @@ impl FirmwareSpace {
         Ok(())
     }
 
-    /// Apply a sparse declarative profile to an already zeroed allocation.
-    pub(crate) fn write_fields(&mut self, va: u64, fields: &[(usize, &[u8])]) -> Result {
-        for (offset, bytes) in fields {
-            self.write(va.checked_add(*offset as u64).ok_or(EINVAL)?, bytes)?;
-        }
-        Ok(())
-    }
-
     /// Update host-owned fields after publication, preserving adjacent firmware
     /// data in the CPU cache line. The caller must own the requested bytes.
     pub(crate) fn write_live(&mut self, va: u64, bytes: &[u8]) -> Result {

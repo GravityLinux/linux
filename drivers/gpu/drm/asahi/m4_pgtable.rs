@@ -11,25 +11,13 @@
 use core::fmt::Debug;
 use core::mem::size_of;
 use core::ops::Range;
-use core::sync::atomic::{
-    AtomicU64,
-    Ordering, //
-};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use kernel::{
-    addr::PhysicalAddr,
-    error::Result,
-    page::Page,
-    prelude::*, //
-};
+use kernel::{addr::PhysicalAddr, error::Result, page::Page, prelude::*};
 #[cfg(CONFIG_DEV_COREDUMP)]
 use kernel::{
     types::Owned,
-    uapi::{
-        PF_R,
-        PF_W,
-        PF_X, //
-    },
+    uapi::{PF_R, PF_W, PF_X},
 };
 
 use crate::util::align;
@@ -58,21 +46,19 @@ const UAT_LVMSK: u64 = (UAT_LVSZ - 1) as u64;
 
 const UAT_LEVELS: usize = 3;
 
-/// UAT input address space
-pub(crate) const UAT_IAS: usize = 39;
-
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
 const UAT_NON_GLOBAL: u64 = 1 << 11;
 const UAT_AP_SHIFT: u32 = 6;
+#[cfg(CONFIG_DEV_COREDUMP)]
 const UAT_AP_BITS: u64 = 3 << UAT_AP_SHIFT;
 const UAT_HIGH_BITS_SHIFT: u32 = 52;
+#[cfg(CONFIG_DEV_COREDUMP)]
 const UAT_HIGH_BITS: u64 = 0xfff << UAT_HIGH_BITS_SHIFT;
 const UAT_MEMATTR_SHIFT: u32 = 2;
+#[cfg(CONFIG_DEV_COREDUMP)]
 const UAT_MEMATTR_BITS: u64 = 7 << UAT_MEMATTR_SHIFT;
-
-const UAT_PROT_BITS: u64 = UAT_AP_BITS | UAT_MEMATTR_BITS | UAT_HIGH_BITS;
 
 const UAT_AF: u64 = 1 << 10;
 
@@ -102,13 +88,11 @@ pub(crate) struct Prot {
 const PROT_FW_GPU_NA: Prot = Prot::from_bits(AP_FW_GPU, 0, 0);
 const _PROT_FW_GPU_RO: Prot = Prot::from_bits(AP_FW_GPU, 0, 1);
 const _PROT_FW_GPU_WO: Prot = Prot::from_bits(AP_FW_GPU, 1, 0);
-const PROT_FW_GPU_RW: Prot = Prot::from_bits(AP_FW_GPU, 1, 1);
 
 // Firmware only access
 const PROT_FW_RO: Prot = Prot::from_bits(AP_FW, 0, 0);
 const _PROT_FW_NA: Prot = Prot::from_bits(AP_FW, 0, 1);
 const PROT_FW_RW: Prot = Prot::from_bits(AP_FW, 1, 0);
-const PROT_FW_RW_GPU_RO: Prot = Prot::from_bits(AP_FW, 1, 1);
 
 // GPU only access
 const PROT_GPU_RO: Prot = Prot::from_bits(AP_GPU, 0, 0);
@@ -151,12 +135,6 @@ pub(crate) mod prot {
     pub(crate) const PROT_FW_SHARED_RO: Prot = PROT_FW_RO.memattr(MEMATTR_UNCACHED);
     /// Firmware private (cached) RW
     pub(crate) const PROT_FW_PRIV_RW: Prot = PROT_FW_RW.memattr(MEMATTR_CACHED);
-    /// Firmware/GPU shared (uncached) RW
-    pub(crate) const PROT_GPU_FW_SHARED_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_UNCACHED);
-    /// Firmware/GPU shared (private) RW
-    pub(crate) const PROT_GPU_FW_PRIV_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_CACHED);
-    /// Firmware-RW/GPU-RO shared (private) RW
-    pub(crate) const PROT_GPU_RO_FW_PRIV_RW: Prot = PROT_FW_RW_GPU_RO.memattr(MEMATTR_CACHED);
     /// GPU shared/coherent RW
     pub(crate) const PROT_GPU_SHARED_RW: Prot = PROT_GPU_RW.memattr(MEMATTR_UNCACHED);
     /// GPU shared/coherent RO
@@ -226,14 +204,6 @@ impl Prot {
             | (self.memattr as u64) << UAT_MEMATTR_SHIFT
             | UAT_AF
     }
-
-    pub(crate) const fn is_cached_noncoherent(&self) -> bool {
-        self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
-    }
-
-    pub(crate) const fn as_uncached(&self) -> Self {
-        self.memattr(MEMATTR_UNCACHED)
-    }
 }
 
 impl Default for Prot {
@@ -266,10 +236,6 @@ pub(crate) struct UatPageTable {
 }
 
 impl UatPageTable {
-    pub(crate) fn new(oas: u32) -> Result<Self> {
-        Self::new_with_ias(oas, UAT_IAS)
-    }
-
     /// Allocate a root with the address width of this GPU generation.
     /// G16 has 64 top-level entries (42 address bits per TTBR), while
     /// G13/G14 use 8 entries (39 bits per TTBR).
@@ -291,10 +257,6 @@ impl UatPageTable {
             owned_tables: KVec::new(),
             walked_tables: KVec::new(),
         })
-    }
-
-    pub(crate) fn new_with_ttb(ttb: PhysicalAddr, va_range: Range<u64>, oas: u32) -> Result<Self> {
-        Self::new_with_ttb_and_ias(ttb, va_range, oas, UAT_IAS)
     }
 
     /// Borrow a firmware root without owning its existing child tables.
@@ -510,11 +472,6 @@ impl UatPageTable {
         Ok(())
     }
 
-    pub(crate) fn alloc_pages(&mut self, iova_range: Range<u64>) -> Result {
-        pr_debug!("UATPageTable::alloc_pages: {:#x?}\n", iova_range);
-        self.with_pages(iova_range, true, |_, _| Ok(()))
-    }
-
     fn pte_bits(&self) -> u64 {
         if self.ttb_owned {
             // Owned page tables are userspace, so non-global
@@ -606,29 +563,6 @@ impl UatPageTable {
         }
         self.with_pages(address..address + UAT_PGSZ as u64, false, |_, ptes| {
             ptes[0].store(value, Ordering::Relaxed);
-            Ok(())
-        })
-    }
-
-    pub(crate) fn reprot_pages(&mut self, iova_range: Range<u64>, prot: Prot) -> Result {
-        pr_debug!(
-            "UATPageTable::reprot_pages: {:#x?} {:?}\n",
-            iova_range,
-            prot
-        );
-        self.with_pages(iova_range, true, |iova, ptes| {
-            for (idx, pte) in ptes.iter().enumerate() {
-                let ptev = pte.load(Ordering::Relaxed);
-                if ptev & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
-                    pr_err!(
-                        "UATPageTable::reprot_pages: Page at IOVA {:#x} is unmapped (PTE: {:#x})\n",
-                        iova + (idx * UAT_PGSZ) as u64,
-                        ptev
-                    );
-                    continue;
-                }
-                pte.store((ptev & !UAT_PROT_BITS) | prot.as_pte(), Ordering::Relaxed);
-            }
             Ok(())
         })
     }

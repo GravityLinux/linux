@@ -11,7 +11,6 @@ use kernel::prelude::*;
 
 pub(crate) const GROW_BLOCKS: u32 = 10;
 pub(crate) const MAX_BLOCKS: u32 = 11 + 32 * GROW_BLOCKS;
-pub(crate) const GROWTH_EXTENT: u64 = 32 * GROW_BLOCKS as u64 * 0x28000;
 
 pub(crate) struct Tvb {
     pub(crate) root: u64,
