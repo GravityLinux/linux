@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright The Gravity Linux Contributors
 
-//! GPU page-table publication, matching the Python shim's native UAT sync.
+//! GPU memory publication and translation invalidation.
+//! Cache-clean loops queue maintenance; publication boundaries complete it.
 
 #[inline(always)]
 pub(crate) fn sync() {
