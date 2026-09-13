@@ -644,7 +644,9 @@ impl Parameters {
         u64_at(&mut out, 0x768, (g.size3 << 0x6) * self.layers);
         u64_at(&mut out, 0x770, a.tiling_microsequence);
         u32_at(&mut out, 0x778, 0x300);
-        u32_at(&mut out, 0x77c, 0x11);
+        // Partial rendering finds its matching fragment Work through this
+        // event/stamp pair, independently of the tiling completion event.
+        u32_at(&mut out, 0x77c, a.fragment_event as u32);
         u32_at(&mut out, 0x780, a.fragment_stamp as u32);
         u64_at(&mut out, 0x7a8, self.ta_offset(self.deflake_1));
         out[0x864] = u8::from(self.request_tvb_growth);

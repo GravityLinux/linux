@@ -172,9 +172,8 @@ struct FileState {
 struct Queue {
     id: u32,
     vm: u32,
-    priority: u32,
     entity: sched::Entity<SubmissionJob>,
-    order: Arc<Mutex<Option<crate::g16::Stamp>>>,
+    firmware: Arc<Mutex<crate::g16::FirmwareQueues>>,
     fences: dma_fence::FenceContexts,
 }
 #[derive(Clone)]
@@ -534,10 +533,12 @@ impl File {
         let fences = dma_fence::FenceContexts::new(1, c_str!("asahi_m4"), FENCE_KEY)?;
         state.queues.push(
             Queue {
-                order: Arc::pin_init(kernel::new_mutex!(None), GFP_KERNEL)?,
+                firmware: Arc::pin_init(
+                    kernel::new_mutex!(crate::g16::FirmwareQueues::new(data.priority + 1)),
+                    GFP_KERNEL,
+                )?,
                 id,
                 vm: data.vm_id,
-                priority: data.priority,
                 entity,
                 fences,
             },
@@ -1010,7 +1011,7 @@ fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
 #[pin_data(PinnedDrop)]
 struct Execution {
     id: u64,
-    order: Arc<Mutex<Option<crate::g16::Stamp>>>,
+    firmware: Arc<Mutex<crate::g16::FirmwareQueues>>,
     // Compute metadata may itself have been produced by an earlier command.
     // Such CPU preparation waits for the explicitly declared batch barriers.
     prepare_after: KVec<bool>,
@@ -1022,7 +1023,6 @@ struct Execution {
     support: Option<Arc<crate::g16::Support>>,
     parameters: KVec<Parameters>,
     timestamps: KVec<[u64; 4]>,
-    priority: u32,
     completion: dma_fence::Fence,
     started: AtomicBool,
     #[pin]
@@ -1090,8 +1090,8 @@ impl WorkItem for Execution {
                         earlier.error.is_none()
                             && earlier.next < earlier.execution.parameters.len()
                             && Arc::ptr_eq(
-                                &earlier.execution.order,
-                                &engine.jobs[index].execution.order,
+                                &earlier.execution.firmware,
+                                &engine.jobs[index].execution.firmware,
                             )
                     }) {
                         continue;
@@ -1109,22 +1109,19 @@ impl WorkItem for Execution {
                         engine.issued.reserve(1, GFP_KERNEL)?;
                         let job = &mut engine.jobs[index];
                         let execution = &job.execution;
-                        let mut order = execution.order.lock();
                         crate::mem::sync();
                         let receipt = match &execution.parameters[job.next] {
                             Parameters::Render(p) => runtime.submit_render(
+                                execution.firmware.clone(),
                                 execution.render_space.clone(),
                                 p,
                                 execution.support.as_deref().ok_or(EIO)?,
-                                execution.priority,
-                                *order,
                             ),
                             Parameters::Compute(p) => runtime.submit_compute(
+                                execution.firmware.clone(),
                                 &mut execution.space.lock(),
                                 p,
-                                execution.priority,
                                 &execution.memory,
-                                *order,
                             ),
                         };
                         let receipt = match receipt {
@@ -1136,7 +1133,6 @@ impl WorkItem for Execution {
                             }
                             Err(error) => return Err(error),
                         };
-                        *order = Some(receipt.stamp);
                         let issued = Issued {
                             id: receipt.id,
                             owner: execution.id,
@@ -1144,7 +1140,6 @@ impl WorkItem for Execution {
                         };
                         job.next += 1;
                         job.pending += 1;
-                        drop(order);
                         engine.issued.push(issued, GFP_KERNEL)?;
                         progress = true;
                     }
@@ -1430,8 +1425,8 @@ impl File {
         // Different queues may execute out of submission order, so each
         // queue needs its own DMA-fence timeline/context.
         let unique = queue.fences.new_fence(0, Completion)?;
-        let (vm_id, priority) = (queue.vm, queue.priority + 1);
-        let order = queue.order.clone();
+        let vm_id = queue.vm;
+        let firmware = queue.firmware.clone();
         let mut timestamps = KVec::new();
         let resolve = |stamp: &uapi::drm_asahi_timestamp| -> Result<u64> {
             if stamp.handle == 0 {
@@ -1544,11 +1539,11 @@ impl File {
         let worker_completion = completion.clone();
         let execution = Arc::pin_init(
             try_pin_init!(Execution {
-                id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), order, prepare_after,
+                id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), firmware, prepare_after,
                 device: device.into(), _owner: inner.state.clone(),
                 render_space: vm.space.clone(), space: vm.compute_space.clone(), memory,
                 support: vm.render_support.clone(),
-                parameters, timestamps, priority, completion: worker_completion,
+                parameters, timestamps, completion: worker_completion,
                 started: AtomicBool::new(false), work <- new_work!("m4-execution"),
             }),
             GFP_KERNEL,

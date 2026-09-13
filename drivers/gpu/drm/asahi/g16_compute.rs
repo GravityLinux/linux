@@ -6,10 +6,8 @@
 //! the owner of the work allocation, independently of Rust structure layout.
 
 pub(crate) const QUEUE: u64 = 0xffff_fc20_c500_0000;
-pub(crate) const RING: u64 = QUEUE + 0x4000;
 pub(crate) const STATS: u64 = QUEUE + 0x8000;
 pub(crate) const SHARED: u64 = 0xffff_fc20_0200_0000;
-pub(crate) const POINTERS: u64 = SHARED;
 pub(crate) const PRIVATE_SIZE: usize = 0x24000;
 
 // Fixed opening compute namespace used by the working shim. These pages
@@ -24,8 +22,6 @@ pub(crate) const SCRATCH: u64 = 0x70_030e_0000;
 pub(crate) const MARKER: u64 = 0x10_00c6_0000;
 pub(crate) const SUPPORT: u64 = 0xffff_fc20_c05e_8000;
 pub(crate) const SHARED_STATE: u64 = 0xffff_fc20_001b_0000;
-pub(crate) const CONTEXT: u64 = QUEUE + 0xb000;
-pub(crate) const JOBS: u64 = QUEUE + 0xb040;
 pub(crate) const ENTRY_OFFSET: u64 = 0x1a00;
 
 /// Drain/invalidate compute caches before entering the caller's CDM stream.
