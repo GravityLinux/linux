@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright The Gravity Linux Contributors
 
-//! The shim's bounded Apple9 CDM walker and resource-table selection.
+//! Bounded Apple9 CDM walker and resource-table selection.
 //! Reads happen after scheduler dependencies complete, because earlier GPU
 //! commands can produce a later command stream or its resource table.
 
@@ -36,7 +36,7 @@ pub(crate) fn resource(memory: &impl Memory, base: u64, end: u64) -> Result<u64>
             0 => match mode {
                 0 => 0x28,
                 1 => 0x24,
-                2 => return Err(ENOTSUPP),
+                2 => 0x18,
                 _ => return Err(EINVAL),
             },
             1 => 8,
@@ -66,9 +66,13 @@ pub(crate) fn resource(memory: &impl Memory, base: u64, end: u64) -> Result<u64>
                     return Err(ENOTSUPP);
                 }
                 selected = Some(resource);
-                if mode == 1 {
+                if mode != 0 {
                     let indirect = (u64::from(word(0x10)) << 32) | u64::from(word(0x14));
-                    memory.cover(indirect, 12, 2)?;
+                    // Local-indirect adds three local dimensions to the three
+                    // global thread dimensions. Validate the complete readable
+                    // object, but leave GPU-produced values to the hardware.
+                    let geometry_size = if mode == 2 { 24 } else { 12 };
+                    memory.cover(indirect, geometry_size, 2)?;
                 }
                 cursor = next;
             }
