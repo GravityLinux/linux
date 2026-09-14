@@ -5,7 +5,6 @@
 
 #![recursion_limit = "2048"]
 
-#[path = "m4_float.rs"]
 mod float;
 mod g16;
 mod g16_compute;
