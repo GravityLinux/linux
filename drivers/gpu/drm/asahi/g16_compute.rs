@@ -102,12 +102,11 @@ pub(crate) struct Addresses {
 }
 
 impl Addresses {
-    /// All Work storage is freshly allocated and retained by its owner.
-    pub(crate) fn publication(index: u64, ordinal: u64, work: u64, alias: u64) -> Option<Self> {
-        if index > 0x00ff_fff0 || ordinal > u32::MAX as u64 {
-            return None;
-        }
-        Some(Self {
+    /// Work storage is retained by its owner. Firmware-width fields wrap
+    /// independently of the full software publication and queue counters.
+    pub(crate) fn publication(index: u64, ordinal: u64, work: u64, alias: u64) -> Self {
+        let count = index.wrapping_add(1);
+        Self {
             work,
             microsequence: work + 0x1000,
             register_table: alias + 0x20,
@@ -121,15 +120,15 @@ impl Addresses {
             timestamp_start: work + 0x1700,
             timestamp_end: work + 0x1708,
             context: 1,
-            identity: (1u64 << 32) + 1 + index,
+            identity: (1u64 << 32) | u64::from(count as u32),
             register_identity: (1u64 << 32) + 1,
-            counter: index + 1,
-            event_generation: (index + 1) as u32,
-            stamp: ((index + 1) * 0x100) as u32,
+            counter: count,
+            event_generation: count as u32,
+            stamp: crate::g16_stamp::value(ordinal, 0x100),
             event: 4,
             ordinal: ordinal as u32,
             cdm_entry: None,
-        })
+        }
     }
 
     pub(crate) fn notifier(&self, count: u32) -> [u8; 0x100] {

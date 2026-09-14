@@ -1108,17 +1108,14 @@ impl Addresses {
 pub(crate) const SUPPORT_BASE: u64 = 0xffff_fc20_c300_0000;
 
 impl Addresses {
-    pub(crate) fn publication(&self, ordinal: u64) -> Option<Self> {
-        if ordinal > 0x00ff_fff0 {
-            return None;
-        }
+    pub(crate) fn publication(&self, ordinal: u64) -> Self {
         let mut a = *self;
-        a.tiling_counter += ordinal * 2;
-        a.fragment_counter += ordinal * 2;
-        a.tiling_stamp += ordinal * 0x100;
-        a.fragment_stamp += ordinal * 0x100;
-        a.buffer_thing = (self.buffer_thing & !0x3fff) + ((ordinal + 1) % 80) * 0x80;
-        Some(a)
+        a.tiling_counter = a.tiling_counter.wrapping_add(ordinal.wrapping_mul(2));
+        a.fragment_counter = a.fragment_counter.wrapping_add(ordinal.wrapping_mul(2));
+        a.tiling_stamp = u64::from(crate::g16_stamp::value(ordinal, self.tiling_stamp as u32));
+        a.fragment_stamp = u64::from(crate::g16_stamp::value(ordinal, self.fragment_stamp as u32));
+        a.buffer_thing = (self.buffer_thing & !0x3fff) + ((ordinal % 80 + 1) % 80) * 0x80;
+        a
     }
 }
 

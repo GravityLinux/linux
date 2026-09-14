@@ -13,6 +13,7 @@ mod g16_fw;
 mod g16_platform;
 mod g16_power;
 mod g16_render;
+mod g16_stamp;
 mod g16_tvb;
 mod g16_vm;
 #[path = "m4_mem.rs"]
@@ -108,6 +109,10 @@ kernel::module_platform_driver! {
     description: "Apple M4 GPU driver",
     license: "GPL v2",
     params: {
+        fw_counter_start: u64 {
+            default: 0,
+            description: "Initial submission counters for firmware rollover qualification (normally 0)",
+        },
         fw_trace: u32 {
             default: 0,
             description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies",
