@@ -658,6 +658,7 @@ impl Parameters {
         u64_at(&mut out, 0x878, a.tiling_driver_stamp);
         u64_at(&mut out, 0x880, a.tiling_firmware_stamp);
         u32_at(&mut out, 0x888, a.tiling_stamp as u32);
+        u32_at(&mut out, 0x894, 1); // Flush notifier stamps before storage reuse.
         u32_at(&mut out, 0x88c, a.tiling_event as u32);
         u32_at(&mut out, 0x898, a.tiling_uuid as u32);
         u64_at(&mut out, 0x8a0, self.layers - 0x1);
@@ -782,6 +783,7 @@ impl Parameters {
         u64_at(&mut out, 0xbc0, a.fragment_driver_stamp);
         u64_at(&mut out, 0xbc8, a.fragment_firmware_stamp);
         u32_at(&mut out, 0xbd0, a.fragment_stamp as u32);
+        u32_at(&mut out, 0xbdc, 1);
         u32_at(&mut out, 0xbd4, a.fragment_event as u32);
         u32_at(&mut out, 0xbe0, a.fragment_uuid as u32);
         u64_at(&mut out, 0xbe8, self.layers - 0x1);
