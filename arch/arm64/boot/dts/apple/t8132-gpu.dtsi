@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 GPU resources. Firmware memory addresses are supplied by m1n1. */
+
+/ {
+	aliases {
+		gpu = &gpu;
+	};
+
+	reserved-memory {
+		uat_ttbs: uat-ttbs {
+			status = "disabled";
+		};
+		uat_pagetables: uat-pagetables {
+			status = "disabled";
+		};
+		uat_l2: uat-l2 {
+			status = "disabled";
+		};
+		uat_handoff: uat-handoff {
+			status = "disabled";
+		};
+		gpu_firmware: gpu-firmware {
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	gpu: gpu@302600000 {
+		compatible = "apple,agx-t8132";
+		reg = <0x3 0x02600000 0 0x88000>,
+		      <0x3 0x00000000 0 0x4000000>;
+		reg-names = "asc", "sgx";
+		mboxes = <&agx_mbox>;
+		power-domains = <&ps_gfx>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_l2>,
+				<&uat_handoff>, <&gpu_firmware>;
+		memory-region-names = "ttbs", "pagetables", "l2",
+				      "handoff", "firmware";
+		/* Enabled only after the loader has reserved the firmware state. */
+		status = "disabled";
+	};
+
+	agx_mbox: mailbox@302608000 {
+		compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x02608000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		/* ADT pairs are not-empty, empty; Linux names are reversed. */
+		interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 995 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_gfx>;
+	};
+};
