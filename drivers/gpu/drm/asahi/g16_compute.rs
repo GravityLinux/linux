@@ -8,7 +8,6 @@
 pub(crate) const QUEUE: u64 = 0xffff_fc20_c500_0000;
 pub(crate) const STATS: u64 = QUEUE + 0x8000;
 pub(crate) const SHARED: u64 = 0xffff_fc20_0200_0000;
-pub(crate) const PRIVATE_SIZE: usize = 0x24000;
 
 // Fixed opening compute namespace used by the working shim. These pages
 // belong to the device and are aliased into whichever client root is active.
@@ -48,6 +47,9 @@ pub(crate) fn support() -> [u8; 0x100] {
     let mut out = [0; 0x100];
     let pages = (BUFFER_COUNT * BUFFER_SIZE / 0x1000) as u32;
     u64_at(&mut out, 0, 2);
+    // +8 selects the hardware FList slot; +0 is a separate pool identity.
+    // Sharing slot zero with render corrupts concurrently active pool state.
+    u32_at(&mut out, 8, 2);
     u64_at(&mut out, 0x14, DIRECTORY);
     u32_at(&mut out, 0x1c, (DIRECTORY_SIZE / 8) as u32);
     u32_at(&mut out, 0x24, pages % (DIRECTORY_SIZE / 8) as u32);

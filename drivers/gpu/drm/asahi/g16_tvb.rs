@@ -19,6 +19,7 @@ pub(crate) struct Tvb {
     pub(crate) blocks: u32,
     pub(crate) counter: u32,
     pub(crate) refused: bool,
+    scenes: u64,
     next: u64,
 }
 impl Tvb {
@@ -67,11 +68,27 @@ impl Tvb {
             blocks: 11,
             counter: 0,
             refused: false,
+            scenes: 0,
             next: growth_base,
         })
     }
 
-    pub(crate) fn work_addresses(&self, a: &mut render::Addresses, publication: u64) {
+    pub(crate) fn reserve_scene(&mut self) -> Result<u32> {
+        // The firmware's accelerator scene records have 36 slots. Lease one
+        // until both stages and their event replies have retired.
+        let index = (!self.scenes).trailing_zeros();
+        if index >= 36 {
+            return Err(EBUSY);
+        }
+        self.scenes |= 1 << index;
+        Ok(index)
+    }
+
+    pub(crate) fn release_scene(&mut self, index: u32) {
+        self.scenes &= !(1 << index);
+    }
+
+    pub(crate) fn work_addresses(&self, a: &mut render::Addresses, scene: u32) {
         let p = &self.addresses;
         a.buffer_manager_slot = p.buffer_manager_slot;
         a.buffer_manager = p.buffer_manager;
@@ -80,7 +97,7 @@ impl Tvb {
         a.buffer_manager_counter = p.buffer_manager_counter;
         a.buffer_manager_block_list = p.buffer_manager_block_list;
         a.buffer_manager_page_list = p.buffer_manager_page_list;
-        a.buffer_thing = (p.buffer_thing & !0x3fff) + ((publication + 1) % 80) * 0x80;
+        a.buffer_thing = (p.buffer_thing & !0x3fff) + u64::from(scene) * 0x80;
     }
 
     pub(crate) fn grow(
@@ -91,7 +108,9 @@ impl Tvb {
         let a = &self.addresses;
         let old = self.blocks;
         if client.roots().low != self.root
-            || fw.read_u32(a.buffer_manager + 0x3c)? != old
+            // Another queued request can arrive before firmware consumes the
+            // previous growth reply. Its mirror may lag our published lists.
+            || fw.read_u32(a.buffer_manager + 0x3c)? > old
             || fw.read_u32(a.buffer_manager_block_control)? != old
             || fw.read_u32(a.buffer_manager_block_control + 4)? != old
             || fw.read_u64(a.buffer_manager + 0x44)? != a.buffer_manager_block_list

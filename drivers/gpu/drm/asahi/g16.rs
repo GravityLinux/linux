@@ -169,7 +169,7 @@ impl rtkit::Operations for BootOps {
 /// No render node is published until the submission backend is available.
 #[path = "g16_runtime.rs"]
 mod render_runtime;
-pub(crate) use render_runtime::{FirmwareQueues, Support};
+pub(crate) use render_runtime::{FirmwareQueues, Stamp, Support};
 
 #[path = "g16_notify.rs"]
 mod notify;
@@ -209,7 +209,7 @@ pub(crate) struct Bootstrap {
     flights: KVec<render_runtime::Flight>,
     context_roots: [Option<crate::g16_vm::Roots>; 64],
     context_users: [u32; 64],
-    last_render: Option<render_runtime::Stamp>,
+    pressure_reported: core::sync::atomic::AtomicU64,
     render_support: kernel::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 
@@ -661,13 +661,13 @@ impl Bootstrap {
             flights: KVec::new(),
             context_roots: [None; 64],
             context_users: [0; 64],
-            last_render: None,
+            pressure_reported: core::sync::atomic::AtomicU64::new(0),
             render_support: kernel::sync::Arc::new(
                 core::sync::atomic::AtomicU64::new(0),
                 GFP_KERNEL,
             )?,
         };
-        if *crate::module_parameters::fw_trace.value() != 0 {
+        if *crate::module_parameters::fw_trace.value() & 1 != 0 {
             // Region C starts with the firmware KTrace mask, as in the shim.
             session
                 ._firmware_space
