@@ -8,7 +8,7 @@
 //! format. This module manages the actual page tables by allocating raw memory pages from
 //! the kernel page allocator.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::fmt::Debug;
 use core::mem::size_of;
 use core::ops::Range;
@@ -240,88 +240,49 @@ pub(crate) struct UatPageTable {
     ias_mask: u64,
     owned_tables: KVec<OwnedTable>,
     dirty_tables: KVec<(PhysicalAddr, Cell<bool>)>,
+    invalidations: RefCell<KVec<Range<u64>>>,
+    copy_on_write: bool,
 }
 
 impl UatPageTable {
-    /// Copy an owned tree, preserving leaf attributes and sharing only backing
-    /// pages. The caller must retain the source's mapped storage for the copy.
-    /// No published PTE in the source is changed.
-    pub(crate) fn fork(&self) -> Result<Self> {
-        if !self.ttb_owned {
+    /// Copy the root and share unchanged child tables. Writes to the fork
+    /// copy only the affected branch before modifying any inherited PTE.
+    ///
+    /// # Safety
+    /// The source tables must outlive the fork. The caller serializes CPU
+    /// access to shared tables and keeps their mapped backing alive.
+    pub(crate) unsafe fn fork(&self) -> Result<Self> {
+        if !self.ttb_owned || self.copy_on_write {
             return Err(EINVAL);
         }
         let mut copy = Self::new_with_ias(
             self.oas_mask.count_ones(),
             self.ias_mask.count_ones() as usize,
         )?;
-        copy.owned_tables
-            .reserve(self.owned_tables.len(), GFP_KERNEL)?;
-        copy.dirty_tables
-            .reserve(self.owned_tables.len(), GFP_KERNEL)?;
-        let copy_page = |source: u64, destination: u64| -> Result {
-            // SAFETY: Both pages belong to these live trees. Source access is
-            // serialized by the VM lock; the destination is unpublished.
-            let src = unsafe { Page::borrow_phys_unchecked(&source) };
-            let dst = unsafe { Page::borrow_phys_unchecked(&destination) };
-            src.with_pointer_into_page(0, UAT_PGSZ, |s| {
-                dst.with_pointer_into_page(0, UAT_PGSZ, |d| {
-                    for i in 0..UAT_NPTE {
-                        // SAFETY: Aligned PTEs inside two distinct table pages.
-                        unsafe {
-                            d.cast::<Pte>().add(i).as_ref().unwrap().store(
-                                s.cast::<Pte>()
-                                    .add(i)
-                                    .as_ref()
-                                    .unwrap()
-                                    .load(Ordering::Relaxed),
-                                Ordering::Relaxed,
-                            );
-                        }
-                    }
-                    Ok(())
-                })
-            })
-        };
-        copy_page(self.ttb, copy.ttb)?;
-        // Parents precede children in owned_tables, including after a failed
-        // mapping allocation. Drop can therefore unwind an incomplete copy.
-        for old in &self.owned_tables {
-            let parent = if old.parent == self.ttb {
-                copy.ttb
-            } else {
-                let index = self
-                    .owned_tables
-                    .iter()
-                    .position(|p| p.phys == old.parent)
-                    .ok_or(EIO)?;
-                copy.owned_tables.get(index).ok_or(EIO)?.phys
-            };
-            let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
-            let phys = page.phys();
-            copy_page(old.phys, phys)?;
-            copy.owned_tables.push(
-                OwnedTable {
-                    phys,
-                    parent,
-                    index: old.index,
-                },
-                GFP_KERNEL,
-            )?;
-            let _ = Page::into_phys(page);
-            copy.mark_dirty(phys)?;
-            // SAFETY: The copied parent is owned and still unpublished.
-            unsafe { Page::borrow_phys_unchecked(&parent) }.with_pointer_into_page(
-                old.index * PTE_SIZE,
-                PTE_SIZE,
-                |p| {
-                    // SAFETY: The checked slot is an aligned PTE.
-                    unsafe { &*p.cast::<Pte>() }
-                        .store(phys | PTE_TYPE_LEAF_TABLE, Ordering::Relaxed);
-                    Ok(())
-                },
-            )?;
-        }
+        Self::copy_table(self.ttb, copy.ttb)?;
+        copy.copy_on_write = true;
         Ok(copy)
+    }
+
+    fn copy_table(source: PhysicalAddr, destination: PhysicalAddr) -> Result {
+        // SAFETY: The source is owned or borrowed under fork's lifetime
+        // contract; the destination is an exclusively owned unpublished page.
+        let src = unsafe { Page::borrow_phys_unchecked(&source) };
+        let dst = unsafe { Page::borrow_phys_unchecked(&destination) };
+        src.with_pointer_into_page(0, UAT_PGSZ, |s| {
+            dst.with_pointer_into_page(0, UAT_PGSZ, |d| {
+                for i in 0..UAT_NPTE {
+                    // SAFETY: Aligned PTEs within two distinct live pages.
+                    unsafe {
+                        (*d.cast::<Pte>().add(i)).store(
+                            (*s.cast::<Pte>().add(i)).load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+                Ok(())
+            })
+        })
     }
 
     /// Allocate a root with the address width of this GPU generation.
@@ -346,6 +307,8 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             owned_tables: KVec::new(),
             dirty_tables,
+            invalidations: RefCell::new(KVec::new()),
+            copy_on_write: false,
         })
     }
 
@@ -392,6 +355,8 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             owned_tables: KVec::new(),
             dirty_tables: KVec::new(),
+            invalidations: RefCell::new(KVec::new()),
+            copy_on_write: false,
         })
     }
 
@@ -418,6 +383,45 @@ impl UatPageTable {
     pub(crate) fn sync(&self) {
         self.clean();
         crate::mem::sync();
+    }
+
+    /// Record before editing so an allocation failure cannot hide a changed
+    /// mapping. Adjacent edits share one invalidation interval.
+    fn changed(&mut self, range: Range<u64>) -> Result {
+        if range.is_empty()
+            || range.start < self.va_range.start
+            || range.end > self.va_range.end
+            || (range.start | range.end) & UAT_PGMSK as u64 != 0
+        {
+            return Err(EINVAL);
+        }
+        let ranges = self.invalidations.get_mut();
+        if let Some(last) = ranges.last_mut() {
+            if last.start <= range.end && range.start <= last.end {
+                last.start = last.start.min(range.start);
+                last.end = last.end.max(range.end);
+                return Ok(());
+            }
+        }
+        ranges.push(range, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// PTE cleaning must have completed before invalidation. None targets
+    /// global firmware mappings by VA across all ASIDs, never the whole TLB.
+    pub(crate) fn invalidate(&self, asid: Option<u8>) {
+        for range in self.invalidations.borrow().iter() {
+            crate::mem::tlbi_range(asid, range.start, range.end);
+        }
+    }
+
+    pub(crate) fn reserve_invalidation(&mut self) -> Result {
+        self.invalidations.get_mut().reserve(1, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_invalidations(&self) {
+        self.invalidations.borrow_mut().clear();
     }
 
     // Record dirtiness before writing a PTE so allocation failure cannot leave
@@ -520,7 +524,24 @@ impl UatPageTable {
                                 upte.store(upte_val, Ordering::Relaxed);
                             }
                             if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                                Ok(Some(upte_val & self.oas_mask & (!UAT_PGMSK as u64)))
+                                let inherited = upte_val & self.oas_mask & (!UAT_PGMSK as u64);
+                                if write && self.copy_on_write
+                                    && !self.owned_tables.iter().any(|t| t.phys == inherited)
+                                {
+                                    self.mark_dirty(phys)?;
+                                    let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+                                    let private = page.phys();
+                                    Self::copy_table(inherited, private)?;
+                                    self.owned_tables.push(OwnedTable {
+                                        phys: private, parent: phys, index: upidx,
+                                    }, GFP_KERNEL)?;
+                                    let _ = Page::into_phys(page);
+                                    self.mark_dirty(private)?;
+                                    upte.store(private | PTE_TYPE_LEAF_TABLE, Ordering::Relaxed);
+                                    Ok(Some(private))
+                                } else {
+                                    Ok(Some(inherited))
+                                }
                             } else if upte_val == 0 || !alloc {
                                 pr_debug!("UATPageTable::with_pages: no level {}\n", level);
                                 Ok(None)
@@ -612,6 +633,7 @@ impl UatPageTable {
             return Err(EINVAL);
         }
 
+        self.changed(iova_range.clone())?;
         let pte_bits = self.pte_bits();
 
         self.with_pages(iova_range, Walk::Allocate, |iova, ptes| {
@@ -686,6 +708,7 @@ impl UatPageTable {
     }
 
     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
+        self.changed(iova_range.clone())?;
         pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
         self.with_pages(iova_range, Walk::Write, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {

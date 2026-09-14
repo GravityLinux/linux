@@ -59,8 +59,6 @@ impl Tvb {
         )?;
         fw.sync();
         client.sync();
-        crate::mem::tlbi_all();
-        crate::mem::sync();
         Ok(Self {
             root: client.roots().low,
             addresses: a,
@@ -104,6 +102,7 @@ impl Tvb {
         &mut self,
         fw: &mut FirmwareSpace,
         client: &mut AddressSpace,
+        asid: u8,
     ) -> Result<bool> {
         let a = &self.addresses;
         let old = self.blocks;
@@ -133,8 +132,11 @@ impl Tvb {
             return Ok(false);
         }
         client.sync();
-        crate::mem::tlbi_all();
+        client.low.invalidate(Some(asid));
+        client.high.invalidate(Some(asid));
         crate::mem::sync();
+        client.low.clear_invalidations();
+        client.high.clear_invalidations();
         let mut entries = [0u8; GROW_BLOCKS as usize * 8];
         for index in 0..new - old {
             let dva = self.next + u64::from(index) * 0x28000;
