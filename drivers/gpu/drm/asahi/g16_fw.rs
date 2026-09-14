@@ -17,6 +17,8 @@ pub(crate) const MAIN_SIZE: usize = 0x500;
 pub(crate) const CONTROL_DATA: u64 = 0xffff_fc20_c052_8000;
 pub(crate) const CONTROL_AUX: u64 = 0xffff_fc20_0014_8000;
 pub(crate) const OPERAND_TABLE: u64 = 0x70_0040_8000;
+pub(crate) const TIMESTAMP_BASE: u64 = 0xffff_fc21_8140_0000;
+pub(crate) const TIMESTAMP_SIZE: u64 = 0x400_0000;
 
 /// The two publications following firmware's already-consumed slot zero.
 pub(crate) fn opening_control() -> [u8; 0x80] {
