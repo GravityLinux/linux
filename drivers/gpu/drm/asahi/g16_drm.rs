@@ -462,7 +462,9 @@ impl File {
         state.queues.push(
             Queue {
                 firmware: Arc::pin_init(
-                    kernel::new_mutex!(crate::g16::FirmwareQueues::new(data.priority + 1)),
+                    // Firmware priority runs in the opposite direction:
+                    // public low/medium select native classes 3/2.
+                    kernel::new_mutex!(crate::g16::FirmwareQueues::new(3 - data.priority)),
                     GFP_KERNEL,
                 )?,
                 id,

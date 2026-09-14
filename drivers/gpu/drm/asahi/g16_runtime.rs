@@ -165,7 +165,7 @@ impl Bootstrap {
         // Retirement must not allocate. Space for every outstanding lease
         // also covers all of them completing before another acquisition.
         self.free_work[index].reserve(self.flights.len() + 1, GFP_KERNEL)?;
-        let stride = if render { 0x18000 } else { 0x8000 };
+        let stride = if render { 0x1c000 } else { 0x8000 };
         if self.work_arenas[index].is_empty() {
             let base = self.next_work_va;
             let end = base.checked_add(16 * stride).ok_or(ENOSPC)?;
@@ -176,7 +176,9 @@ impl Bootstrap {
             for va in (base..end).step_by(stride as usize) {
                 fw.alloc(va, if render { 0x10000 } else { 0x4000 }, PROT_FW_PRIV_RW)?;
                 if render {
-                    fw.alloc(va + 0x10000, 0x8000, PROT_FW_SHARED_RW)?;
+                    fw.alloc(va + 0x10000, 0xc000, PROT_FW_SHARED_RW)?;
+                } else {
+                    fw.alloc(va + 0x4000, 0x4000, PROT_FW_SHARED_RW)?;
                 }
             }
             fw.sync();
@@ -209,7 +211,7 @@ impl Bootstrap {
             // shared only by its own vertex, fragment and compute lanes.
             let jobs = base + 0x4100;
             let context = base + 0x4140;
-            for lane in &lanes {
+            for (stage, lane) in lanes.iter().enumerate() {
                 fw.alloc(lane.queue, 0x4000, PROT_FW_PRIV_RW)?;
                 fw.alloc(lane.pointers, 0x8000, PROT_FW_SHARED_RW)?;
                 let mut descriptor = q::Queue {
@@ -222,12 +224,14 @@ impl Bootstrap {
                 }
                 .encode_priority(owner.priority)
                 .ok_or(EINVAL)?;
-                // Run an active Work to completion on each engine. The
-                // preempting profile lost compute updates and, with mixed
-                // engines, a rendered image. Engines still overlap, and TA
-                // pipelines ahead of fragment; priorities select channels.
-                descriptor[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
-                descriptor[0x48..0x4c].copy_from_slice(&1u32.to_le_bytes());
+                // Native TA/3D profiles allow firmware to suspend and restart
+                // renders. Their Work/scratch leases survive until the final
+                // notifier/driver stamp, including intervening partial runs.
+                // Compute remains non-preemptible, matching the M1/M2 driver.
+                if stage == 2 {
+                    descriptor[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+                    descriptor[0x48..0x4c].copy_from_slice(&1u32.to_le_bytes());
+                }
                 fw.write(lane.queue, &descriptor)?;
                 fw.write(lane.pointers, &q::pointers(0x500, 0))?;
             }
@@ -1102,7 +1106,7 @@ impl Bootstrap {
         if self.render_failed {
             return Err(EIO);
         }
-        if !params.valid() || !(1..=2).contains(&queue.priority) {
+        if !params.valid() || !(2..=3).contains(&queue.priority) {
             return Err(EINVAL);
         }
         let space = client.roots();
@@ -1141,8 +1145,11 @@ impl Bootstrap {
         a.fragment_shared_tail = va + 0x14000;
         a.event_control = va + 0x200;
         a.event_count_array = va + 0x300;
-        a.tiling_driver_stamp = va + 0x400;
-        a.fragment_driver_stamp = va + 0x440;
+        // The notifier pass stores driver stamps, then sends the IRQ after
+        // a DSB. These destinations must be firmware-uncached: a DSB does
+        // not clean a cached stamp, leaving Linux asleep on stale memory.
+        a.tiling_driver_stamp = va + 0x18000;
+        a.fragment_driver_stamp = va + 0x18040;
         a.tiling_firmware_stamp = lanes[0].firmware_stamp();
         a.fragment_firmware_stamp = lanes[1].firmware_stamp();
         let alias = 0x72_0000_0000 + (va - 0xffff_fc22_0000_0000);
@@ -1462,7 +1469,7 @@ impl Bootstrap {
         if self.render_failed {
             return Err(EIO);
         }
-        if !(1..=2).contains(&priority) {
+        if !(2..=3).contains(&priority) {
             return Err(EINVAL);
         }
         let ordinal = queue.compute_count;
@@ -1485,6 +1492,7 @@ impl Bootstrap {
         let mut a = compute::Addresses::publication(self.compute_publication, ordinal, work, alias)
             .ok_or(ENOSPC)?;
         a.queue = lane.queue;
+        a.driver_stamp = work + 0x4000;
         a.firmware_stamp = lane.firmware_stamp();
         a.event = queue.event(2)?;
         a.stamp = u32::try_from((ordinal + 1) * 0x100).map_err(|_| ENOSPC)?;
