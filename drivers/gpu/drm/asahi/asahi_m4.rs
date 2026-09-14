@@ -23,6 +23,7 @@ mod pgtable;
 #[path = "m4_util.rs"]
 mod util;
 
+use kernel::io::Io;
 use kernel::{c_str, device::Core, devres::Devres, io::mem::IoMem, of, platform, prelude::*};
 
 const SGX_SIZE: usize = 0x4000000;
@@ -66,7 +67,7 @@ impl platform::Driver for M4Gpu {
         let sgx = KBox::pin_init(request.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
         {
             let regs = sgx.try_access().ok_or(ENODEV)?;
-            let version = regs.read32_relaxed(ID_VERSION);
+            let version = regs.relaxed().read32(ID_VERSION);
             if version == 0 || version == u32::MAX {
                 dev_err!(dev, "Invalid GPU ID {:#010x}\n", version);
                 return Err(ENODEV);
@@ -75,9 +76,9 @@ impl platform::Driver for M4Gpu {
                 dev,
                 "Apple M4 GPU recognized: ID={:#010x} counts={:#010x}/{:#010x} clusters={:#010x}\n",
                 version,
-                regs.read32_relaxed(ID_COUNTS_1),
-                regs.read32_relaxed(ID_COUNTS_2),
-                regs.read32_relaxed(ID_CLUSTERS),
+                regs.relaxed().read32(ID_COUNTS_1),
+                regs.relaxed().read32(ID_COUNTS_2),
+                regs.relaxed().read32(ID_CLUSTERS),
             );
             dev_info!(
                 dev,

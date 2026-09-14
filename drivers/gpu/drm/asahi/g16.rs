@@ -5,6 +5,7 @@
 //! G16 firmware bootstrap. Its 43-bit address space and initialization graph
 //! must not be passed to a G13/G14 firmware manager.
 
+use kernel::io::Io;
 use kernel::{c_str, device::Core, platform, prelude::*};
 
 const PAGE_SIZE: u64 = 0x4000;
@@ -83,7 +84,7 @@ use kernel::{
     iosys_map::IoSysMapRef,
     soc::apple::rtkit,
     sync::Arc,
-    types::ARef,
+    sync::aref::ARef,
     types::ForeignOwnable,
 };
 
@@ -272,8 +273,9 @@ impl Bootstrap {
         let handoff = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
         let asc_guard = asc.try_access().ok_or(ENODEV)?;
         let asc_io = &*asc_guard;
-        let control = asc_io.read32_relaxed(0x44);
-        let status = asc_io.read32_relaxed(0x48);
+        let control = asc_io.relaxed().read32(0x44);
+        let status = asc_io.relaxed().read32(0x48);
+        drop(asc_guard);
         dev_info!(
             dev,
             "G16: cold ASC control={:#x} status={:#x}\n",
@@ -286,9 +288,10 @@ impl Bootstrap {
         let sgx_guard = sgx.try_access().ok_or(ENODEV)?;
         let sgx_io = &*sgx_guard;
         for offset in [0x1000104, 0x1000108] {
-            sgx_io.write32_relaxed(sgx_io.read32_relaxed(offset) | 1, offset);
+            sgx_io.relaxed().write32(sgx_io.relaxed().read32(offset) | 1, offset);
         }
-        sgx_io.write32_relaxed(6, 0xd06030);
+        sgx_io.relaxed().write32(6, 0xd06030);
+        drop(sgx_guard);
         // SAFETY: The region validation guarantees a full aligned page. The
         // coprocessor is stopped, so these host-owned bootstrap fields are
         // not concurrently accessed by firmware.
@@ -322,7 +325,9 @@ impl Bootstrap {
             GFP_KERNEL,
         )?;
         rtkit.as_mut().set_early_crashlog();
-        asc_io.write32_relaxed(control | 0x10, 0x44);
+        let asc_guard = asc.try_access().ok_or(ENODEV)?;
+        asc_guard.relaxed().write32(control | 0x10, 0x44);
+        drop(asc_guard);
         crate::mem::sync();
         rtkit.as_mut().boot()?;
         for ep in [0x20, 0x21] {
@@ -695,9 +700,9 @@ impl Bootstrap {
             firmware.write_live(addr, &0u32.to_le_bytes())?;
         }
         let before = (
-            sgx.read32_relaxed(0xd64040),
-            sgx.read32_relaxed(0xd64048),
-            sgx.read32_relaxed(0xd60020),
+            sgx.relaxed().read32(0xd64040),
+            sgx.relaxed().read32(0xd64048),
+            sgx.relaxed().read32(0xd60020),
         );
         if before != (0, 0, 0) {
             return Err(EBUSY);
@@ -707,8 +712,9 @@ impl Bootstrap {
             crate::g16_fw::BUNDLE_ADDRESS + 0x16240,
             &q::channel(BOOT_QUEUE, 2, 1, 1, true, 1),
         )?;
-        sgx.write32_relaxed(1, 0xd60020);
+        sgx.relaxed().write32(1, 0xd60020);
         crate::mem::sync();
+        drop(sgx_guard);
         let mut committed = false;
         for _ in 0..3000 {
             let cursor = firmware.read_u32(crate::g16_fw::CONTROL_DATA + 0x48)?;
@@ -732,8 +738,10 @@ impl Bootstrap {
             .as_mut()
             .send_message(0x21, 0x0083_0000_0000_0001)?;
         for _ in 0..3000 {
-            if sgx.read32_relaxed(0xd64040) == 1
-                && sgx.read32_relaxed(0xd64048) == 1
+            let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
+            let sgx = &*sgx_guard;
+            if sgx.relaxed().read32(0xd64040) == 1
+                && sgx.relaxed().read32(0xd64048) == 1
                 && firmware.read_u32(BOOT_POINTERS + 0x30)? == 2
             {
                 // Barriers consume the inner ring without advancing its
@@ -741,14 +749,17 @@ impl Bootstrap {
                 dev_info!(dev, "G16: barrier channel retired; two items consumed\n");
                 return Ok(());
             }
+            drop(sgx_guard);
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
         }
+        let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
+        let sgx = &*sgx_guard;
         dev_err!(
             dev,
             "G16: barrier timeout; channel {}/{}/{} item done/read {}/{}\n",
-            sgx.read32_relaxed(0xd64040),
-            sgx.read32_relaxed(0xd64048),
-            sgx.read32_relaxed(0xd60020),
+            sgx.relaxed().read32(0xd64040),
+            sgx.relaxed().read32(0xd64048),
+            sgx.relaxed().read32(0xd60020),
             firmware.read_u32(BOOT_POINTERS)?,
             firmware.read_u32(BOOT_POINTERS + 0x30)?
         );
@@ -808,15 +819,16 @@ impl Bootstrap {
         let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
         let sgx = &*sgx_guard;
         let before = (
-            sgx.read32_relaxed(0xd640c0),
-            sgx.read32_relaxed(0xd640c8),
-            sgx.read32_relaxed(0xd60060),
+            sgx.relaxed().read32(0xd640c0),
+            sgx.relaxed().read32(0xd640c8),
+            sgx.relaxed().read32(0xd60060),
         );
         if before != (1, 1, 1) {
             dev_err!(dev, "G16: unexpected opening cursors {:?}\n", before);
             return Err(EIO);
         }
-        sgx.write32_relaxed(3, 0xd60060);
+        sgx.relaxed().write32(3, 0xd60060);
+        drop(sgx_guard);
         for (address, value) in [
             (0xffff_fc20_0003_4f88, 0xffff_fc21_8100_0000u64),
             (0xffff_fc20_0003_4f90, 0xffff_fc21_8100_8000u64),
@@ -831,10 +843,12 @@ impl Bootstrap {
             .as_mut()
             .send_message(0x21, 0x0084_0000_0000_0011)?;
         for _ in 0..3000 {
+            let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
+            let sgx = &*sgx_guard;
             let cursors = (
-                sgx.read32_relaxed(0xd640c0),
-                sgx.read32_relaxed(0xd640c8),
-                sgx.read32_relaxed(0xd60060),
+                sgx.relaxed().read32(0xd640c0),
+                sgx.relaxed().read32(0xd640c8),
+                sgx.relaxed().read32(0xd60060),
             );
             if cursors == (3, 3, 3) && firmware.read_u32(0xffff_fc20_0003_f19c)? == 1 {
                 dev_info!(
@@ -844,14 +858,17 @@ impl Bootstrap {
                 );
                 return Ok(());
             }
+            drop(sgx_guard);
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
         }
+        let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
+        let sgx = &*sgx_guard;
         dev_err!(
             dev,
             "G16: control timeout; cursors {}/{}/{} completion {}\n",
-            sgx.read32_relaxed(0xd640c0),
-            sgx.read32_relaxed(0xd640c8),
-            sgx.read32_relaxed(0xd60060),
+            sgx.relaxed().read32(0xd640c0),
+            sgx.relaxed().read32(0xd640c8),
+            sgx.relaxed().read32(0xd60060),
             firmware.read_u32(0xffff_fc20_0003_f19c)?
         );
         Err(ETIMEDOUT)
@@ -890,6 +907,7 @@ impl Bootstrap {
                 return Err(EIO);
             }
         }
+        drop(sgx_guard);
         // Slot zero's high root is empty. Firmware keeps using its separate
         // bootstrap root from the loader reservation, not this context entry.
         unsafe {

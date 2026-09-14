@@ -833,6 +833,13 @@ void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_boot_ap_power);
 
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
+{
+	rtk->early_crashlog = true;
+	reinit_completion(&rtk->crashlog_completion);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
+
 int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
 			      size_t n_endpoints)
 {
@@ -928,16 +935,6 @@ int apple_rtkit_reuse_crashlog_buffer(struct apple_rtkit *rtk,
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reuse_crashlog_buffer);
 
-void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
-{
-	rtk->early_crashlog = true;
-	reinit_completion(&rtk->crashlog_completion);
-}
-EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
-
-
-
-
 static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 					   unsigned int state)
 {
@@ -987,11 +984,6 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			rtk->iop_power_state, ret);
 		return ret;
 	}
-	if (!rtk->boot_ap_power) {
-		dev_dbg(rtk->dev, "RTKit: reusing boot AP power ownership\n");
-		rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
-		return 0;
-	}
 	if (rtk->early_crashlog) {
 		ret = apple_rtkit_wait_for_completion(&rtk->crashlog_completion);
 		if (ret) {
@@ -999,7 +991,11 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			return ret;
 		}
 	}
-
+	if (!rtk->boot_ap_power) {
+		dev_dbg(rtk->dev, "RTKit: reusing boot AP power ownership\n");
+		rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+		return 0;
+	}
 
 	ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 	if (ret)
