@@ -14,6 +14,7 @@ use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use kernel::rbtree::RBTree;
 use kernel::{addr::PhysicalAddr, error::Result, page::Page, prelude::*};
 #[cfg(CONFIG_DEV_COREDUMP)]
 use kernel::{
@@ -239,7 +240,9 @@ pub(crate) struct UatPageTable {
     oas_mask: u64,
     ias_mask: u64,
     owned_tables: KVec<OwnedTable>,
-    dirty_tables: KVec<(PhysicalAddr, Cell<bool>)>,
+    // Membership survives publication; the queue contains only pending cleans.
+    dirty_tables: RBTree<PhysicalAddr, Cell<bool>>,
+    pending_tables: RefCell<KVec<PhysicalAddr>>,
     invalidations: RefCell<KVec<Range<u64>>>,
 }
 
@@ -255,8 +258,10 @@ impl UatPageTable {
         }
         pr_debug!("UATPageTable::new: oas={} ias={}\n", oas, ias);
         let ttb_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
-        let mut dirty_tables = KVec::new();
-        dirty_tables.push((ttb_page.phys(), Cell::new(true)), GFP_KERNEL)?;
+        let mut dirty_tables = RBTree::new();
+        dirty_tables.try_create_and_insert(ttb_page.phys(), Cell::new(true), GFP_KERNEL)?;
+        let mut pending_tables = KVec::new();
+        pending_tables.push(ttb_page.phys(), GFP_KERNEL)?;
         let ttb = Page::into_phys(ttb_page);
         Ok(UatPageTable {
             ttb,
@@ -266,6 +271,7 @@ impl UatPageTable {
             ias_mask: (1u64 << ias) - 1,
             owned_tables: KVec::new(),
             dirty_tables,
+            pending_tables: RefCell::new(pending_tables),
             invalidations: RefCell::new(KVec::new()),
         })
     }
@@ -312,7 +318,8 @@ impl UatPageTable {
             oas_mask: (1u64 << oas) - 1,
             ias_mask: (1u64 << ias) - 1,
             owned_tables: KVec::new(),
-            dirty_tables: KVec::new(),
+            dirty_tables: RBTree::new(),
+            pending_tables: RefCell::new(KVec::new()),
             invalidations: RefCell::new(KVec::new()),
         })
     }
@@ -320,12 +327,10 @@ impl UatPageTable {
     /// Queue cache cleaning for edited tables, including borrowed ancestors.
     /// The enclosing publication batch supplies the completion barrier.
     pub(crate) fn clean(&self) {
-        for (phys, dirty) in &self.dirty_tables {
-            if !dirty.replace(false) {
-                continue;
-            }
+        for phys in self.pending_tables.borrow_mut().drain(..) {
+            self.dirty_tables.get(&phys).unwrap().set(false);
             // SAFETY: Every recorded table is live until this owner is dropped.
-            let page = unsafe { Page::borrow_phys_unchecked(phys) };
+            let page = unsafe { Page::borrow_phys_unchecked(&phys) };
             page.with_page_mapped(|p| {
                 for off in (0..UAT_PGSZ).step_by(64) {
                     // SAFETY: This cache line lies within the mapped table page.
@@ -384,12 +389,18 @@ impl UatPageTable {
     // Record dirtiness before writing a PTE so allocation failure cannot leave
     // an untracked edit. Read-only walks neither allocate nor dirty metadata.
     fn mark_dirty(&mut self, phys: PhysicalAddr) -> Result {
-        if let Some((_, dirty)) = self.dirty_tables.iter().find(|(p, _)| *p == phys) {
-            dirty.set(true);
-            return Ok(());
+        match self.dirty_tables.get(&phys) {
+            Some(dirty) if dirty.get() => return Ok(()),
+            Some(_) => {}
+            None => {
+                self.dirty_tables
+                    .try_create_and_insert(phys, Cell::new(false), GFP_KERNEL)?;
+            }
         }
-        self.dirty_tables
-            .push((phys, Cell::new(true)), GFP_KERNEL)?;
+        // Queue before setting membership or editing a PTE. A failed reserve
+        // leaves the table clean and permits a later attempt to enqueue it.
+        self.pending_tables.get_mut().push(phys, GFP_KERNEL)?;
+        self.dirty_tables.get(&phys).unwrap().set(true);
         Ok(())
     }
 
