@@ -29,9 +29,32 @@ pub(crate) struct AddressSpace {
     pages: RBTree<u64, Owned<Page>>,
     compute_scratch: core::ops::Range<u64>,
     render_scratch: core::ops::Range<u64>,
+    scratch_free: [KVec<core::ops::Range<u64>>; 2],
+    scratch_users: [usize; 2],
+}
+
+/// An exclusive suballocation; its backing remains owned by the VM.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Scratch {
+    range: core::ops::Range<u64>,
+    render: bool,
 }
 
 impl AddressSpace {
+    /// Reused Work retains the same alias and backing. Existing aliases need
+    /// no PTE edit or invalidation; conflicting client mappings are rejected.
+    pub(crate) fn map_work_alias(&mut self, va: u64, pa: u64) -> Result {
+        match self.low.translate(va)? {
+            Some(existing) if existing == pa => Ok(()),
+            Some(_) => Err(EEXIST),
+            None => self.low.map_pages(
+                va..va + UAT_PGSZ as u64,
+                pa,
+                prot::PROT_GPU_SHARED_RW,
+                false,
+            ),
+        }
+    }
     pub(crate) fn roots(&self) -> Roots {
         Roots {
             low: self.low.ttb(),
@@ -46,6 +69,8 @@ impl AddressSpace {
             pages: RBTree::new(),
             compute_scratch: 0..0,
             render_scratch: 0..0,
+            scratch_free: [KVec::new(), KVec::new()],
+            scratch_users: [0; 2],
         })
     }
 
@@ -124,23 +149,18 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Each render owns its tile metadata, deflake/status and auxiliary pages.
-    /// Only fresh DVAs are installed, so earlier renders keep stable mappings.
-    /// Pages remain owned by the VM until destruction, including failed setup.
-    pub(crate) fn prepare_render(&mut self, p: &mut crate::g16_render::Parameters) -> Result {
+    /// Each active render exclusively leases tile metadata and save storage.
+    pub(crate) fn prepare_render(
+        &mut self,
+        p: &mut crate::g16_render::Parameters,
+    ) -> Result<Scratch> {
         let (tilemap, tpc) = p.scratch_sizes().ok_or(EINVAL)?;
-        let base = self.render_scratch.start;
         let size = tilemap
             .checked_add(tpc)
             .and_then(|n| n.checked_add(5 * UAT_PGSZ))
             .ok_or(ENOMEM)?;
-        let end = base.checked_add(size as u64).ok_or(ENOMEM)?;
-        if end > self.render_scratch.end {
-            return Err(ENOMEM);
-        }
-        // Reserve before a fallible allocation so no partial range is reused.
-        self.render_scratch.start = end;
-        self.alloc_low(base, size, prot::PROT_GPU_SHARED_RW)?;
+        let scratch = self.lease_scratch(true, size)?;
+        let base = scratch.range.start;
         p.tilemap = base;
         p.tpc = base + tilemap as u64;
         let meta = p.tpc + tpc as u64;
@@ -154,7 +174,7 @@ impl AddressSpace {
         p.aux_fb = meta + 0x10000;
         self.write_low(p.aux_fb + 0x600, &0x0000035b60000000u64.to_le_bytes())?;
         self.sync();
-        Ok(())
+        Ok(scratch)
     }
 
     /// Compute commands use distinct private scratch addresses in the caller's
@@ -164,17 +184,84 @@ impl AddressSpace {
         self.compute_scratch = range;
     }
 
-    pub(crate) fn prepare_compute(&mut self, p: &mut crate::g16_compute::Parameters) -> Result {
-        let base = self.compute_scratch.start;
-        let end = base.checked_add(0x24000).ok_or(ENOMEM)?;
-        if end > self.compute_scratch.end {
-            return Err(ENOMEM);
-        }
-        // Failed allocations retain their pages and cannot reuse this range.
-        self.compute_scratch.start = end;
-        self.alloc_low(base, 0x24000, prot::PROT_GPU_SHARED_RW)?;
+    pub(crate) fn prepare_compute(
+        &mut self,
+        p: &mut crate::g16_compute::Parameters,
+    ) -> Result<Scratch> {
+        let scratch = self.lease_scratch(false, 0x24000)?;
+        let base = scratch.range.start;
         p.scratch = base;
         p.marker = base + 0x20000;
+        Ok(scratch)
+    }
+
+    fn lease_scratch(&mut self, render: bool, size: usize) -> Result<Scratch> {
+        if size == 0 || size & (UAT_PGSZ - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let index = usize::from(render);
+        // Splitting a free range adds at most one future free-list entry.
+        // Reserve now; completion and coalescing cannot allocate.
+        self.scratch_free[index].reserve(self.scratch_users[index] + 1, GFP_KERNEL)?;
+        let free = self.scratch_free[index]
+            .iter()
+            .position(|r| r.end - r.start >= size as u64);
+        let range = if let Some(slot) = free {
+            let start = self.scratch_free[index][slot].start;
+            let end = start + size as u64;
+            if end == self.scratch_free[index][slot].end {
+                self.scratch_free[index].remove(slot).map_err(|_| EIO)?;
+            } else {
+                self.scratch_free[index][slot].start = end;
+            }
+            // All previous GPU writes have retired. Reinitialize the entire
+            // leased range without touching PTEs or neighbouring active jobs.
+            for va in (start..end).step_by(UAT_PGSZ) {
+                let page = self.pages.get(&va).ok_or(EIO)?;
+                page.with_page_mapped(|ptr| {
+                    // SAFETY: The lease owns this full page exclusively.
+                    unsafe { core::ptr::write_bytes(ptr, 0, UAT_PGSZ) };
+                });
+                clean_page(page);
+            }
+            start..end
+        } else {
+            let arena = if render {
+                &mut self.render_scratch
+            } else {
+                &mut self.compute_scratch
+            };
+            let start = arena.start;
+            let end = start.checked_add(size as u64).ok_or(ENOMEM)?;
+            if end > arena.end {
+                return Err(ENOMEM);
+            }
+            // Partially allocated failures stay quarantined until VM teardown.
+            arena.start = end;
+            self.alloc_low(start, size, prot::PROT_GPU_SHARED_RW)?;
+            start..end
+        };
+        self.scratch_users[index] += 1;
+        Ok(Scratch { range, render })
+    }
+
+    pub(crate) fn release_scratch(&mut self, scratch: Scratch) -> Result {
+        let index = usize::from(scratch.render);
+        let mut range = scratch.range;
+        let free = &mut self.scratch_free[index];
+        let mut slot = 0;
+        while slot < free.len() {
+            if free[slot].end == range.start || range.end == free[slot].start {
+                let old = free.remove(slot).map_err(|_| EIO)?;
+                range.start = range.start.min(old.start);
+                range.end = range.end.max(old.end);
+                slot = 0;
+            } else {
+                slot += 1;
+            }
+        }
+        free.push(range, GFP_KERNEL)?;
+        self.scratch_users[index] -= 1;
         Ok(())
     }
 
@@ -573,7 +660,6 @@ impl FirmwareSpace {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn zero_live(&mut self, va: u64, size: usize) -> Result {
         self.update_live(va, size, |ptr, _, size| {
             // SAFETY: update_live supplies a valid host-owned byte range.

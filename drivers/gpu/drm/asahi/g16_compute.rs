@@ -235,6 +235,7 @@ impl Parameters {
                 },
             ),
             (0x810, a.stamp),
+            (0x81c, 1), // Flush notifier stamps before storage reuse.
             (0x814, a.event),
             (0x820, a.identity as u32),
             (0x828, a.ordinal),

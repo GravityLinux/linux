@@ -36,6 +36,12 @@ struct Lane {
     new: bool,
 }
 
+impl Lane {
+    fn firmware_stamp(&self) -> u64 {
+        self.pointers + 0x1040
+    }
+}
+
 /// Reserve three distinct event IDs while this queue has unfinished work.
 /// Idle queues release their lease, so creating idle queues does not consume
 /// firmware event slots. Slots 0..31 are left to the bootstrap protocol.
@@ -92,6 +98,9 @@ pub(super) struct Flight {
     context: u32,
     started: Instant<Monotonic>,
     stamps: [Option<Stamp>; 2],
+    driver_stamps: [Option<Stamp>; 2],
+    scratch: g16_vm::Scratch,
+    client: Arc<Mutex<g16_vm::AddressSpace>>,
     queues: [(u64, u32); 2],
     channels: [(usize, u32); 2],
     render: Option<RenderFlight>,
@@ -144,12 +153,18 @@ impl Bootstrap {
         }
     }
 
-    /// Amortize firmware page allocation and mapping over sixteen Works.
-    /// Every slot is distinct and retained; firmware notifier links and saved
-    /// completion stamps are never recycled. Render tails keep shared access.
+    /// Lease Work storage until notifier/driver stamps and transport retire.
+    /// Backing stays mapped. Queue-owned monotonic stamps outlive reused Work,
+    /// so a pending dependency never follows a recycled completion address.
     fn allocate_work(&mut self, render: bool) -> Result<u64> {
         use crate::pgtable::prot::{PROT_FW_PRIV_RW, PROT_FW_SHARED_RW};
         let index = usize::from(render);
+        if let Some(va) = self.free_work[index].pop() {
+            return Ok(va);
+        }
+        // Retirement must not allocate. Space for every outstanding lease
+        // also covers all of them completing before another acquisition.
+        self.free_work[index].reserve(self.flights.len() + 1, GFP_KERNEL)?;
         let stride = if render { 0x18000 } else { 0x8000 };
         if self.work_arenas[index].is_empty() {
             let base = self.next_work_va;
@@ -455,7 +470,7 @@ impl Bootstrap {
     fn stamps_done(&self, flight: &Flight) -> Result<bool> {
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
         for stamp in flight.stamps.iter().flatten() {
-            if fw.read_u32(stamp.address)? != stamp.value {
+            if (fw.read_u32(stamp.address)?.wrapping_sub(stamp.value) as i32) < 0 {
                 return Ok(false);
             }
         }
@@ -623,6 +638,20 @@ impl Bootstrap {
             }
             let fw = self._firmware_space.as_ref().ok_or(EIO)?;
             let mut done = true;
+            // The notifier pass drops embedded JobMeta references and cleans
+            // their cache lines before publishing these later driver stamps.
+            for stamp in flight.driver_stamps.iter().flatten() {
+                done &= (fw.read_u32(stamp.address)?.wrapping_sub(stamp.value) as i32) >= 0;
+            }
+            // A reusable Work has its own notifier and exact submitted count.
+            // Removal must be visible before that storage can change queues.
+            let notifier = flight.id
+                + if flight.render.is_some() {
+                    0x200
+                } else {
+                    0x1400
+                };
+            done &= fw.read_u32(notifier + 0x94)? == 0;
             for &(pointers, head) in &flight.queues {
                 if pointers != 0 {
                     done &= reached(fw.read_u32(pointers)?, head, 0x500)
@@ -656,6 +685,7 @@ impl Bootstrap {
                 .as_ref()
                 .is_some_and(|r| r.events.memory_limit);
             let id = flight.id;
+            let render_work = flight.render.is_some();
             if let Some(render) = &flight.render {
                 let pool = self
                     .tvb_pools
@@ -671,7 +701,9 @@ impl Bootstrap {
             }
             drop(owner);
             self.context_users[flight.context as usize] -= 1;
-            self.flights.remove(index).map_err(|_| EIO)?;
+            let flight = self.flights.remove(index).map_err(|_| EIO)?;
+            flight.client.lock().release_scratch(flight.scratch)?;
+            self.free_work[usize::from(render_work)].push(id, GFP_KERNEL)?;
             // Queued commands can legitimately wait longer than one Work's
             // timeout. Watch for a lack of retirement progress, rather than
             // charging every command for all its predecessors' execution.
@@ -1081,7 +1113,7 @@ impl Bootstrap {
         // BufferThing. Reusing scene 1 here corrupts other in-flight renders.
         params.scene_slot = u64::from(scene);
         params.cycle = 0x240000 + u64::from(scene) * 0x30;
-        client.prepare_render(&mut params)?;
+        let scratch = client.prepare_render(&mut params)?;
         let mut a = render::Addresses::bootstrap()
             .publication(self.render_publication)
             .ok_or(ENOSPC)?;
@@ -1111,9 +1143,9 @@ impl Bootstrap {
         a.event_count_array = va + 0x300;
         a.tiling_driver_stamp = va + 0x400;
         a.fragment_driver_stamp = va + 0x440;
-        a.tiling_firmware_stamp = va + 0x480;
-        a.fragment_firmware_stamp = va + 0x4c0;
-        let alias = 0x72_0000_0000 + self.render_publication * 0x8000;
+        a.tiling_firmware_stamp = lanes[0].firmware_stamp();
+        a.fragment_firmware_stamp = lanes[1].firmware_stamp();
+        let alias = 0x72_0000_0000 + (va - 0xffff_fc22_0000_0000);
         if alias + 0x8000 > 0x73_0000_0000 {
             return Err(ENOSPC);
         }
@@ -1123,12 +1155,7 @@ impl Bootstrap {
             let register_page = alias + stage * 0x4000;
             let pa = fw.physical(work_page)?;
             for view in [self._address_space.as_mut().ok_or(EIO)?, &mut *client] {
-                view.low.map_pages(
-                    register_page..register_page + 0x4000,
-                    pa,
-                    crate::pgtable::prot::PROT_GPU_SHARED_RW,
-                    false,
-                )?;
+                view.map_work_alias(register_page, pa)?;
                 view.sync();
             }
             if stage == 0 {
@@ -1210,6 +1237,19 @@ impl Bootstrap {
                     }),
                     Some(stamp),
                 ],
+                driver_stamps: [
+                    Some(Stamp {
+                        address: a.tiling_driver_stamp,
+                        value: a.tiling_stamp as u32,
+                        event: a.tiling_event as u32,
+                    }),
+                    Some(Stamp {
+                        address: a.fragment_driver_stamp,
+                        ..stamp
+                    }),
+                ],
+                scratch,
+                client: owner.clone(),
                 queues: [(lanes[0].pointers, heads[0]), (lanes[1].pointers, heads[1])],
                 channels: [
                     (queue.priority as usize * 3, (epochs[0] + 1) & 255),
@@ -1253,8 +1293,16 @@ impl Bootstrap {
         ];
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         fw.write_live(a.event_control, &a.event_count_array.to_le_bytes())?;
+        fw.write_live(
+            a.event_control + 8,
+            &(a.fragment_stamp as u32).to_le_bytes(),
+        )?;
+        fw.write_live(a.event_control + 12, &0u32.to_le_bytes())?;
         fw.write_live(a.event_control + 0x10, &0x50u32.to_le_bytes())?;
+        fw.write_live(a.event_control + 0x24, &(a.context_id as u32).to_le_bytes())?;
         fw.write_live(a.event_count_array, &2u32.to_le_bytes())?;
+        fw.write_live(a.tiling_driver_stamp, &0u32.to_le_bytes())?;
+        fw.write_live(a.fragment_driver_stamp, &0u32.to_le_bytes())?;
         // The queue lanes persist independently of the physical work channel.
         for stage in 0..2 {
             let Lane { ring, .. } = lanes[stage];
@@ -1366,12 +1414,13 @@ impl Bootstrap {
     pub(crate) fn submit_compute(
         &mut self,
         queues: Arc<Mutex<FirmwareQueues>>,
-        client: &mut g16_vm::AddressSpace,
+        owner: Arc<Mutex<g16_vm::AddressSpace>>,
         params: &compute::Parameters,
         timestamps: [u64; 4],
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
+        let mut client = owner.lock();
         self.reserve_flight(
             &queue,
             false,
@@ -1382,7 +1431,8 @@ impl Bootstrap {
         let result = self.submit_compute_queue(
             &mut queue,
             queues.clone(),
-            client,
+            &mut client,
+            owner.clone(),
             params,
             timestamps,
             dependencies,
@@ -1398,6 +1448,7 @@ impl Bootstrap {
         queue: &mut FirmwareQueues,
         queues: Arc<Mutex<FirmwareQueues>>,
         client: &mut g16_vm::AddressSpace,
+        owner: Arc<Mutex<g16_vm::AddressSpace>>,
         params: &compute::Parameters,
         timestamps: [u64; 4],
         dependencies: &[Option<Stamp>; 2],
@@ -1406,7 +1457,7 @@ impl Bootstrap {
         let priority = queue.priority;
 
         let mut params = *params;
-        client.prepare_compute(&mut params)?;
+        let scratch = client.prepare_compute(&mut params)?;
         let space = client.roots();
         if self.render_failed {
             return Err(EIO);
@@ -1416,7 +1467,7 @@ impl Bootstrap {
         }
         let ordinal = queue.compute_count;
         let work = self.allocate_work(false)?;
-        let alias = 0x71_0000_0000 + self.compute_publication * 0x4000;
+        let alias = 0x71_0000_0000 + (work - 0xffff_fc22_0000_0000);
         if alias + 0x4000 > 0x72_0000_0000 {
             return Err(ENOSPC);
         }
@@ -1425,21 +1476,16 @@ impl Bootstrap {
         params.save_area = alias + 0x2000;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         let pa = fw.physical(work)?;
-        self._address_space.as_mut().ok_or(EIO)?.low.map_pages(
-            alias..alias + 0x4000,
-            pa,
-            crate::pgtable::prot::PROT_GPU_SHARED_RW,
-            false,
-        )?;
-        client.low.map_pages(
-            alias..alias + 0x4000,
-            pa,
-            crate::pgtable::prot::PROT_GPU_SHARED_RW,
-            false,
-        )?;
+        self._address_space
+            .as_mut()
+            .ok_or(EIO)?
+            .map_work_alias(alias, pa)?;
+        client.map_work_alias(alias, pa)?;
+        fw.zero_live(work + 0x2000, 0x2000)?;
         let mut a = compute::Addresses::publication(self.compute_publication, ordinal, work, alias)
             .ok_or(ENOSPC)?;
         a.queue = lane.queue;
+        a.firmware_stamp = lane.firmware_stamp();
         a.event = queue.event(2)?;
         a.stamp = u32::try_from((ordinal + 1) * 0x100).map_err(|_| ENOSPC)?;
         self._address_space.as_ref().ok_or(EIO)?.sync();
@@ -1473,14 +1519,12 @@ impl Bootstrap {
         fw.write_live(user_timestamps, &timestamps[0].to_le_bytes())?;
         fw.write_live(user_timestamps + 8, &timestamps[1].to_le_bytes())?;
         fw.write_live(a.microsequence, &microsequence)?;
-        let notifier = a.notifier(count32);
+        let notifier = a.notifier(0);
         // Retained notifier list links are firmware-owned even after completion.
         fw.write_live(a.notifier, &notifier[..0x14])?;
         fw.write_live(a.notifier + 0x24, &notifier[0x24..0x28])?;
-        fw.write_live(a.threshold, &count32.to_le_bytes())?;
-        let previous = a.stamp.checked_sub(0x100).ok_or(EINVAL)?;
-        fw.write_live(a.driver_stamp, &previous.to_le_bytes())?;
-        fw.write_live(a.firmware_stamp, &previous.to_le_bytes())?;
+        fw.write_live(a.threshold, &1u32.to_le_bytes())?;
+        fw.write_live(a.driver_stamp, &0u32.to_le_bytes())?;
         let mut pos = first;
         for (index, dep) in dependencies.iter().flatten().enumerate() {
             // Between the threshold/timestamps and the CDM entry trampoline.
@@ -1524,6 +1568,15 @@ impl Bootstrap {
                 context: a.context,
                 started: Instant::now(),
                 stamps: [Some(stamp), None],
+                driver_stamps: [
+                    Some(Stamp {
+                        address: a.driver_stamp,
+                        ..stamp
+                    }),
+                    None,
+                ],
+                scratch,
+                client: owner,
                 queues: [(pointers, head), (0, 0)],
                 channels: [(channel, (epoch + 1) & 255), (usize::MAX, 0)],
                 render: None,

@@ -1076,7 +1076,7 @@ impl WorkItem for Execution {
                             ),
                             Parameters::Compute(p) => runtime.submit_compute(
                                 execution.firmware.clone(),
-                                &mut execution.space.lock(),
+                                execution.space.clone(),
                                 p,
                                 execution.timestamps[job.next],
                                 &dependencies,
