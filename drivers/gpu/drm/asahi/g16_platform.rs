@@ -2,7 +2,7 @@
 // Copyright The Gravity Linux Contributors
 
 //! Live platform inputs and initialization builders from g16g_platform.py and
-//! g16g_initdata.py. No archived performance or register-window profile.
+//! g16g_initdata.py. Firmware data is built from explicit bootloader properties.
 
 use kernel::{c_str, device, of, prelude::*};
 
@@ -75,13 +75,23 @@ pub(crate) struct Platform {
 impl Platform {
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
         let node = dev.of_node().ok_or(ENODEV)?;
-        let power = ladder(&node, c_str!("apple,m4-power-mw"))?;
+        // Only the maximum is consumed by the firmware builders. A loader
+        // with an observed board maximum need not invent an entire power
+        // ladder. Continue accepting the original loader's modeled ladder.
+        let maximum_power = match node.get_opt_property::<u32>(c_str!("apple,m4-max-power-mw"))? {
+            Some(value) => value,
+            None => {
+                let power = ladder(&node, c_str!("apple,m4-power-mw"))?;
+                if power[0] != 0 || power.windows(2).any(|w| w[0] > w[1]) {
+                    return Err(EINVAL);
+                }
+                power[10]
+            }
+        };
         let freq_a = ladder(&node, c_str!("apple,m4-freq-a"))?;
         let freq_b = ladder(&node, c_str!("apple,m4-freq-b"))?;
-        if power[0] != 0
-            || power[10] == 0
-            || power[10] > i32::MAX as u32
-            || power.windows(2).any(|w| w[0] > w[1])
+        if maximum_power == 0
+            || maximum_power > i32::MAX as u32
             || freq_a[0] != 0
             || freq_a.windows(2).any(|w| w[0] >= w[1])
             || freq_b[0] != 0
@@ -120,7 +130,7 @@ impl Platform {
             node,
             freq_a,
             freq_b,
-            maximum_power: power[10],
+            maximum_power,
             core_mask,
             period_ms,
             period_clocks,

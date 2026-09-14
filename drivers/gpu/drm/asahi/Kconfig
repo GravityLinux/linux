@@ -12,8 +12,8 @@ config DRM_ASAHI_M4
 	help
 	  Rust DRM driver for the T8132 (M4) GPU, following the Asahi UAPI
 	  and the M4 Python DRM-shim firmware implementation. Intended for
-	  development under m1n1. The probe_only parameter defaults to true
-	  until the firmware port is qualified.
+	  development under m1n1. Normal initialization is the default;
+	  probe_only selects identification without firmware startup.
 
 config RUST_DRM_SCHED
 	bool

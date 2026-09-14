@@ -11,6 +11,7 @@
 
 #include "t8132.dtsi"
 #include "t8132-jxxx.dtsi"
+#include "t8132-gpu.dtsi"
 
 / {
 	compatible = "apple,j773g", "apple,t8132", "apple,arm-platform";
