@@ -92,36 +92,8 @@ struct Vm {
 /// input dependencies; no file-state lock is needed in the worker.
 struct MemoryView {
     mappings: KVec<Mapping>,
-    timestamps: KVec<TimestampBuffer>,
+    _timestamps: KVec<TimestampBuffer>,
 }
-impl MemoryView {
-    fn store_timestamps(&self, addresses: &[u64; 4], values: &[u64; 4]) -> Result {
-        for (address, value) in addresses.iter().zip(values) {
-            if *address == 0 {
-                continue;
-            }
-            let binding = self
-                .timestamps
-                .iter()
-                .find(|t| {
-                    *address >= t.address
-                        && address
-                            .checked_add(8)
-                            .is_some_and(|end| end <= t.address + t.size)
-                })
-                .ok_or(EIO)?;
-            let offset = binding.offset + address - binding.address;
-            binding
-                .sg
-                .object()
-                .vmap::<u8>()?
-                .write(&value.to_le_bytes(), offset.try_into()?)?;
-        }
-        crate::mem::sync();
-        Ok(())
-    }
-}
-
 impl crate::g16_cdm::Memory for MemoryView {
     fn cover(&self, start: u64, size: u64, permissions: u32) -> Result {
         Mapping::cover(&self.mappings, start, size, permissions)
@@ -184,7 +156,6 @@ struct TimestampBuffer {
     extent: u64,
     address: u64,
     size: u64,
-    offset: u64,
 }
 
 #[pin_data]
@@ -195,6 +166,7 @@ pub(crate) struct Data {
     #[pin]
     admission: Mutex<KVec<dma_fence::Fence>>,
     failed: AtomicBool,
+    notifications: Arc<crate::g16::Notifications>,
     #[pin]
     runtime: Mutex<crate::g16::Bootstrap>,
     #[pin]
@@ -245,6 +217,7 @@ pub(crate) fn register(pdev: &platform::Device<Core>) -> Result<DeviceRef> {
         scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 16, 0, 30000, c_str!("asahi_m4"))?,
         admission <- kernel::new_mutex!(KVec::new()),
         failed: AtomicBool::new(false),
+        notifications: runtime.notifications.clone(),
         runtime <- kernel::new_mutex!(runtime),
         engine <- kernel::new_mutex!(Engine { running: false, jobs: KVec::new(), issued: KVec::new() }), });
     let device = Device::new(pdev.as_ref(), data)?;
@@ -624,7 +597,6 @@ impl File {
                     extent,
                     address: base + (data.offset - first),
                     size: data.range,
-                    offset: data.offset,
                 };
                 // Keep backing even if mapping installation or rollback fails.
                 state
@@ -1040,7 +1012,6 @@ struct Running {
 struct Issued {
     id: u64,
     owner: u64,
-    command: usize,
 }
 struct Engine {
     running: bool,
@@ -1055,15 +1026,21 @@ impl WorkItem for Execution {
         // Exactly one pump owns publication order. It holds these locks only
         // while preparing/publishing or inspecting retirement, never asleep.
         // Scheduler callbacks append ready jobs even while hardware is busy.
+        let mut wake_result = Ok(());
         loop {
+            let generation = this.device.notifications.snapshot();
             let mut engine = this.device.engine.lock();
             let mut runtime = this.device.runtime.lock();
             let result = (|| -> Result<bool> {
+                wake_result?;
+                generation?;
                 if this.device.failed.load(Ordering::Acquire) {
                     return Err(EIO);
                 }
                 let mut progress = false;
-                while let Some((id, result)) = runtime.retire()? {
+                while let Some((id, result)) = runtime.retire().inspect_err(|error| {
+                    pr_err!("G16: firmware retirement failed: {:?}\n", error);
+                })? {
                     let index = engine.issued.iter().position(|r| r.id == id).ok_or(EIO)?;
                     let issued = engine.issued.remove(index).map_err(|_| EIO)?;
                     let job = engine
@@ -1072,11 +1049,6 @@ impl WorkItem for Execution {
                         .find(|r| r.execution.id == issued.owner)
                         .ok_or(EIO)?;
                     job.pending -= 1;
-                    let result = result.and_then(|values| {
-                        job.execution
-                            .memory
-                            .store_timestamps(&job.execution.timestamps[issued.command], &values)
-                    });
                     if let Err(error) = result {
                         job.error = Some(error);
                     }
@@ -1116,27 +1088,40 @@ impl WorkItem for Execution {
                                 execution.render_space.clone(),
                                 p,
                                 execution.support.as_deref().ok_or(EIO)?,
+                                execution.timestamps[job.next],
                             ),
                             Parameters::Compute(p) => runtime.submit_compute(
                                 execution.firmware.clone(),
                                 &mut execution.space.lock(),
                                 p,
                                 &execution.memory,
+                                execution.timestamps[job.next],
                             ),
                         };
                         let receipt = match receipt {
                             Ok(receipt) => receipt,
                             Err(EBUSY) if !runtime.render_failed() => return Ok(progress),
                             Err(error) if !runtime.render_failed() => {
+                                pr_err!(
+                                    "G16: command {} preparation failed: {:?}\n",
+                                    job.next,
+                                    error
+                                );
                                 job.error = Some(error);
                                 break;
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                pr_err!(
+                                    "G16: command {} publication failed: {:?}\n",
+                                    job.next,
+                                    error
+                                );
+                                return Err(error);
+                            }
                         };
                         let issued = Issued {
                             id: receipt.id,
                             owner: execution.id,
-                            command: job.next,
                         };
                         job.next += 1;
                         job.pending += 1;
@@ -1187,10 +1172,14 @@ impl WorkItem for Execution {
                 engine.running = false;
                 return;
             }
+            let timeout_ms = runtime.watchdog_remaining_ms();
             drop(runtime);
             drop(engine);
             if !result.unwrap_or(false) {
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                wake_result = this.device.notifications.wait(
+                    generation.expect("checked before servicing jobs"),
+                    timeout_ms,
+                );
             }
         }
     }
@@ -1238,13 +1227,17 @@ impl sched::JobImpl for SubmissionJob {
             engine.running = true;
             let _ = workqueue::system_unbound().enqueue(execution.clone());
         }
+        // A running worker may be asleep waiting for firmware on another
+        // queue. New ready work must wake it even if no GPU event arrives.
+        execution.device.notifications.notify(false);
         Ok(Some(fence))
     }
 
     fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
         job.execution.device.failed.store(true, Ordering::Release);
-        // The worker retains the mappings until its bounded firmware wait
-        // ends. Do not signal its lifetime fence early here.
+        job.execution.device.notifications.notify(false);
+        // Wake the worker to quarantine firmware mappings and fail the jobs.
+        // Do not signal its lifetime fence before that cleanup here.
         sched::Status::NoDevice
     }
 
@@ -1533,7 +1526,7 @@ impl File {
         }
         let memory = MemoryView {
             mappings,
-            timestamps: timestamp_bindings,
+            _timestamps: timestamp_bindings,
         };
         let completion = dma_fence::Fence::from_fence(&unique);
         let worker_completion = completion.clone();

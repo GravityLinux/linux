@@ -89,6 +89,11 @@ impl Stamp {
             (0x20, self.event),
             (0x24, target),
             (0x28, uuid),
+            // General queue dependency, as in M1/M2's explicit barriers.
+            // Zero is reserved for the fixed TA -> fragment dependency.
+            // G16's DAG barrier checker skips the dynamic stamp checks when
+            // this field is zero, which can strand a compute -> TA wait.
+            (0x30, 1),
         ] {
             out[off..off + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -113,13 +118,12 @@ pub(super) struct Flight {
     stamps: [Option<Stamp>; 2],
     queues: [(u64, u32); 2],
     channels: [(usize, u32); 2],
-    timestamps: [u64; 4],
     render: Option<RenderFlight>,
 }
 
 /// Ring distance is unambiguous because admission keeps less than half a ring
 /// outstanding. Equality alone would lose completions when firmware advances
-/// past several commands between polls, including over the wrap boundary.
+/// past several commands between notifications, including over the wrap boundary.
 fn reached(cursor: u32, target: u32, capacity: u32) -> bool {
     cursor < capacity && target < capacity && (cursor + capacity - target) % capacity < capacity / 2
 }
@@ -327,7 +331,15 @@ impl Bootstrap {
                     }
                 }
             }
-            let index = selected.ok_or(EIO)?;
+            let index = selected.ok_or_else(|| {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G16: unowned Event kind {} cursor {}\n",
+                    kind,
+                    cursor
+                );
+                EIO
+            })?;
             let mut render = self.flights[index].render.take().ok_or(EIO)?;
             let pool_index = self
                 .tvb_pools
@@ -351,11 +363,17 @@ impl Bootstrap {
         self.drain_trace_rx()
     }
 
-    pub(crate) fn retire(&mut self) -> Result<Option<(u64, Result<[u64; 4]>)>> {
+    pub(crate) fn retire(&mut self) -> Result<Option<(u64, Result)>> {
         if self.render_failed {
             return Err(EIO);
         }
-        self.service_flights()?;
+        self.service_flights().inspect_err(|error| {
+            dev_err!(
+                self.dev.as_ref(),
+                "G16: firmware event service failed: {:?}\n",
+                error
+            );
+        })?;
         let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
         for index in 0..self.flights.len() {
             let flight = &self.flights[index];
@@ -392,12 +410,6 @@ impl Bootstrap {
             if !done {
                 continue;
             }
-            let mut values = [0; 4];
-            for (i, &address) in flight.timestamps.iter().enumerate() {
-                if address != 0 {
-                    values[i] = timestamp_ns(fw.read_u64(address)?)?;
-                }
-            }
             let limited = flight
                 .render
                 .as_ref()
@@ -418,12 +430,12 @@ impl Bootstrap {
             for pending in &mut self.flights {
                 pending.started = now;
             }
-            return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(values) })));
+            return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(()) })));
         }
         if let Some(flight) = self
             .flights
             .iter()
-            .find(|f| f.started.elapsed().as_millis() > 10000)
+            .find(|f| f.started.elapsed().as_millis() >= 10000)
         {
             dev_err!(
                 self.dev.as_ref(),
@@ -435,6 +447,16 @@ impl Bootstrap {
             return Err(ETIMEDOUT);
         }
         Ok(None)
+    }
+
+    /// Notifications do not extend the watchdog. Only retirement progress
+    /// resets it, so trace traffic cannot keep a stuck command alive.
+    pub(crate) fn watchdog_remaining_ms(&self) -> u32 {
+        self.flights
+            .iter()
+            .map(|flight| (10000 - flight.started.elapsed().as_millis()).clamp(1, 10000) as u32)
+            .min()
+            .unwrap_or(10000)
     }
 }
 
@@ -463,7 +485,7 @@ impl Bootstrap {
             return Err(EINVAL);
         }
         // Match the shim's firmware-shared special-object aperture.
-        let mut base = 0xfffffc2181400000u64;
+        let mut base = g16_fw::TIMESTAMP_BASE;
         for range in &self.timestamp_ranges {
             if base.checked_add(size).ok_or(ENOSPC)? <= range.start {
                 break;
@@ -471,7 +493,7 @@ impl Bootstrap {
             base = base.max(range.end);
         }
         let end = base.checked_add(size).ok_or(ENOSPC)?;
-        if end > 0xfffffc2185400000 {
+        if end > g16_fw::TIMESTAMP_BASE + g16_fw::TIMESTAMP_SIZE {
             return Err(ENOSPC);
         }
         self.timestamp_ranges.push(base..end, GFP_KERNEL)?;
@@ -630,6 +652,14 @@ impl Bootstrap {
             let read = fw.read_u32(state)?;
             let write = fw.read_u32(state + 0x20)?;
             if read >= capacity || write >= capacity {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G16: invalid RX cursors at {:#x}: {}/{} capacity {}\n",
+                    state,
+                    read,
+                    write,
+                    capacity
+                );
                 return Err(EIO);
             }
             if read != write {
@@ -664,11 +694,19 @@ impl Bootstrap {
         owner: Arc<Mutex<g16_vm::AddressSpace>>,
         params: &render::Parameters,
         support: &Support,
+        timestamps: [u64; 4],
     ) -> Result<Receipt> {
         self.reserve_flight()?;
         let mut queue = queues.lock();
         self.prepare_queues(&mut queue)?;
-        let result = self.submit_render_queue(&mut queue, queues.clone(), owner, params, support);
+        let result = self.submit_render_queue(
+            &mut queue,
+            queues.clone(),
+            owner,
+            params,
+            support,
+            timestamps,
+        );
         if queue.pending == 0 {
             queue.events = None;
         }
@@ -682,6 +720,7 @@ impl Bootstrap {
         owner: Arc<Mutex<g16_vm::AddressSpace>>,
         params: &render::Parameters,
         support: &Support,
+        timestamps: [u64; 4],
     ) -> Result<Receipt> {
         let mut guard = owner.lock();
         let client = &mut *guard;
@@ -712,6 +751,7 @@ impl Bootstrap {
             queues,
             &mut pool,
             owner.clone(),
+            timestamps,
         );
         self.tvb_pools.push(pool, GFP_KERNEL)?;
         result
@@ -726,6 +766,7 @@ impl Bootstrap {
         queues: Arc<Mutex<FirmwareQueues>>,
         pool: &mut crate::g16_tvb::Tvb,
         owner: Arc<Mutex<g16_vm::AddressSpace>>,
+        timestamps: [u64; 4],
     ) -> Result<Receipt> {
         if self.render_failed {
             return Err(EIO);
@@ -741,8 +782,8 @@ impl Bootstrap {
             .publication(self.render_publication)
             .ok_or(ENOSPC)?;
         pool.work_addresses(&mut a, self.render_publication);
-        // Timestamp microcommands write private per-Work counter slots. The
-        // frontend copies the converted values to caller BOs before its fence.
+        // Keep profiling storage private to the Work. Public timestamp BOs
+        // are written by the firmware through its separate user destinations.
         let lanes = queue.lanes.as_ref().ok_or(EIO)?;
         a.tiling_queue = lanes[0].queue;
         a.fragment_queue = lanes[1].queue;
@@ -803,15 +844,20 @@ impl Bootstrap {
         crate::mem::sync();
         // A live context lease keeps these roots fixed through retirement.
         a.context_id = u64::from(self.acquire_context(space, 9)?);
+        a.tiling_user_timestamp_start = timestamps[0];
+        a.tiling_user_timestamp_end = timestamps[1];
+        a.fragment_user_timestamp_start = timestamps[2];
+        a.fragment_user_timestamp_end = timestamps[3];
         // From here any publication failure quarantines the roots.
         self.render_failed = true;
         let mut ta = params.tiling_work(&a).ok_or(EINVAL)?;
         let mut frag = params.fragment_work(&a).ok_or(EINVAL)?;
-        let raw_timestamps = [va + 0x100, va + 0x108, va + 0x110, va + 0x118];
-        ta[0x8c8..0x8d0].copy_from_slice(&raw_timestamps[0].to_le_bytes());
-        ta[0x8d0..0x8d8].copy_from_slice(&raw_timestamps[1].to_le_bytes());
-        frag[0xc10..0xc18].copy_from_slice(&raw_timestamps[2].to_le_bytes());
-        frag[0xc18..0xc20].copy_from_slice(&raw_timestamps[3].to_le_bytes());
+        // Keep firmware's internal profiling destinations distinct from the
+        // explicit user timestamp slots used for UAPI completion above.
+        ta[0x8c8..0x8d0].copy_from_slice(&(va + 0x100).to_le_bytes());
+        ta[0x8d0..0x8d8].copy_from_slice(&(va + 0x108).to_le_bytes());
+        frag[0xc10..0xc18].copy_from_slice(&(va + 0x110).to_le_bytes());
+        frag[0xc18..0xc20].copy_from_slice(&(va + 0x118).to_le_bytes());
         // TVB initialization and first publication of a firmware queue are
         // independent: several public queues can share one VM's TVB pool.
         let initbm = !pool.initialized;
@@ -866,7 +912,6 @@ impl Bootstrap {
                     (queue.priority as usize * 3, epoch),
                     (queue.priority as usize * 3 + 1, epoch),
                 ],
-                timestamps: raw_timestamps,
                 render: Some(RenderFlight {
                     addresses: a,
                     client: owner,
@@ -1035,11 +1080,19 @@ impl Bootstrap {
         parent: &mut g16_vm::AddressSpace,
         params: &compute::Parameters,
         memory: &impl crate::g16_cdm::Memory,
+        timestamps: [u64; 4],
     ) -> Result<Receipt> {
         self.reserve_flight()?;
         let mut queue = queues.lock();
         self.prepare_queues(&mut queue)?;
-        let result = self.submit_compute_queue(&mut queue, queues.clone(), parent, params, memory);
+        let result = self.submit_compute_queue(
+            &mut queue,
+            queues.clone(),
+            parent,
+            params,
+            memory,
+            timestamps,
+        );
         if queue.pending == 0 {
             queue.events = None;
         }
@@ -1053,6 +1106,7 @@ impl Bootstrap {
         parent: &mut g16_vm::AddressSpace,
         params: &compute::Parameters,
         memory: &impl crate::g16_cdm::Memory,
+        timestamps: [u64; 4],
     ) -> Result<Receipt> {
         let lane = queue.lanes.as_ref().ok_or(EIO)?[2];
         let priority = queue.priority;
@@ -1119,6 +1173,10 @@ impl Bootstrap {
         self.render_failed = true;
         a.cdm_entry = Some(alias + compute::ENTRY_OFFSET);
         let work = params.work(&a).ok_or(EINVAL)?;
+        // Timestamp's user destinations must lie in the validated special-
+        // object aperture. Firmware writes nanoseconds directly, as on M1/M2.
+        // The pointer pair is private to this Work and may be consumed/reset.
+        let user_timestamps = a.work + 0x17c0;
         let count = self.compute_publication.checked_add(1).ok_or(ENOSPC)?;
         let count32 = u32::try_from(count).map_err(|_| ENOSPC)?;
 
@@ -1128,7 +1186,13 @@ impl Bootstrap {
         fw.write_live(compute::SHARED_STATE, &count32.to_le_bytes())?;
         fw.write_live(a.work, &work)?;
         fw.write_live(a.work + compute::ENTRY_OFFSET, &compute::entry(params.cdm))?;
-        fw.write_live(a.microsequence, &params.microsequence(&a))?;
+        let mut microsequence = params.microsequence(&a);
+        for base in [0x1bc, 0x20c] {
+            microsequence[base + 0x24..base + 0x2c].copy_from_slice(&user_timestamps.to_le_bytes());
+        }
+        fw.write_live(user_timestamps, &timestamps[0].to_le_bytes())?;
+        fw.write_live(user_timestamps + 8, &timestamps[1].to_le_bytes())?;
+        fw.write_live(a.microsequence, &microsequence)?;
         let notifier = a.notifier(count32);
         // Retained notifier list links are firmware-owned even after completion.
         fw.write_live(a.notifier, &notifier[..0x14])?;
@@ -1200,7 +1264,6 @@ impl Bootstrap {
                 stamps: [Some(stamp), None],
                 queues: [(pointers, head), (0, 0)],
                 channels: [(channel, next), (usize::MAX, 0)],
-                timestamps: [a.timestamp_start, a.timestamp_end, 0, 0],
                 render: None,
             },
             GFP_KERNEL,
@@ -1329,14 +1392,4 @@ impl Bootstrap {
         }
         Ok(())
     }
-}
-
-fn timestamp_ns(raw: u64) -> Result<u64> {
-    // Firmware profiling timestamps use the 24 MHz always-on clock. M4's
-    // architectural CNTFRQ can instead describe the extended 1 GHz counter.
-    const FREQUENCY: u64 = 24_000_000;
-    (raw / FREQUENCY)
-        .checked_mul(1_000_000_000)
-        .and_then(|n| n.checked_add((raw % FREQUENCY) * 1_000_000_000 / FREQUENCY))
-        .ok_or(EOVERFLOW)
 }

@@ -89,6 +89,7 @@ use kernel::{
 
 struct BootData {
     dev: ARef<platform::Device>,
+    notifications: Arc<Notifications>,
 }
 
 struct CrashBuffer {
@@ -144,9 +145,10 @@ impl rtkit::Operations for BootOps {
     }
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
-        // Ordinary ring notifications are serviced by the submitter. Logging
-        // each notification can flood the console when a job times out.
         if ep == 0x20 && msg == 0x0042_0000_0000_0000 {
+            // RTKit delivers this callback in process context after the
+            // mailbox receive barrier. The worker drains the firmware rings.
+            data.notifications.notify(false);
             return;
         }
         dev_info!(
@@ -158,6 +160,7 @@ impl rtkit::Operations for BootOps {
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _log: Option<&[u8]>) {
+        data.notifications.notify(true);
         dev_err!(data.dev.as_ref(), "G16: firmware crashed\n");
     }
 }
@@ -167,6 +170,10 @@ impl rtkit::Operations for BootOps {
 #[path = "g16_runtime.rs"]
 mod render_runtime;
 pub(crate) use render_runtime::{FirmwareQueues, Support};
+
+#[path = "g16_notify.rs"]
+mod notify;
+pub(crate) use notify::Notifications;
 
 // Keep the opening barrier transport separate from render queues. Firmware
 // retains queue and item references after consuming this bootstrap prefix.
@@ -179,6 +186,7 @@ const BOOT_BARRIER: u64 = 0xffff_fc20_c052_0080;
 
 pub(crate) struct Bootstrap {
     dev: ARef<platform::Device>,
+    pub(crate) notifications: Arc<Notifications>,
     _rtkit: Pin<KBox<rtkit::RtKit<BootOps>>>,
     _asc: Pin<KBox<Devres<IoMem<0x4000>>>>,
     _sgx: Pin<KBox<Devres<IoMem<0x4000000>>>>,
@@ -232,7 +240,10 @@ impl Bootstrap {
         validate_boot_resources(pdev)?;
         let platform = crate::g16_platform::Platform::new(pdev.as_ref())?;
         // All board inputs are checked before any firmware is started.
-        let bundle = platform.bundle(unsafe { kernel::bindings::get_random_u32() })?;
+        let mut bundle = platform.bundle(unsafe { kernel::bindings::get_random_u32() })?;
+        // The firmware Timestamp handler accepts user destinations only in
+        // this 64 MiB aperture, based at header+0x28.
+        bundle[0x28..0x30].copy_from_slice(&crate::g16_fw::TIMESTAMP_BASE.to_le_bytes());
         let region_c = platform.region_c()?;
         let dev = pdev.as_ref();
         let mut address_space = crate::g16_vm::AddressSpace::new()?;
@@ -296,7 +307,14 @@ impl Bootstrap {
         }
         crate::mem::sync();
 
-        let data = Arc::new(BootData { dev: pdev.into() }, GFP_KERNEL)?;
+        let notifications = Arc::pin_init(Notifications::new(), GFP_KERNEL)?;
+        let data = Arc::new(
+            BootData {
+                dev: pdev.into(),
+                notifications: notifications.clone(),
+            },
+            GFP_KERNEL,
+        )?;
         let mut rtkit = KBox::pin(
             rtkit::RtKit::<BootOps>::new(dev, None, 0, data)?,
             GFP_KERNEL,
@@ -620,6 +638,7 @@ impl Bootstrap {
         );
         let mut session = Self {
             dev: pdev.into(),
+            notifications,
             _rtkit: rtkit,
             _asc: asc,
             _sgx: sgx,
