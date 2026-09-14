@@ -17,7 +17,7 @@ use kernel::drm::{
     ioctl,
 };
 use kernel::sync::{Arc, Mutex};
-use kernel::types::ARef;
+use kernel::sync::aref::ARef;
 use kernel::uaccess::{UserPtr, UserSlice};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
 use kernel::{bindings, c_str, device::Core, drm, platform, prelude::*, uapi};

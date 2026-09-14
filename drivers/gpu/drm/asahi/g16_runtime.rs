@@ -4,6 +4,7 @@
 
 //! G16 ring publication and independent firmware retirement.
 
+use kernel::io::Io;
 use super::Bootstrap;
 use crate::{g16_compute as compute, g16_fw, g16_render as render, g16_vm};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -347,6 +348,7 @@ impl Bootstrap {
                 }
             }
         }
+        drop(guard);
         self.flights.reserve(1, GFP_KERNEL)?;
         self.publications.reserve(stages.len(), GFP_KERNEL)?;
         Ok(())
@@ -377,6 +379,7 @@ impl Bootstrap {
         if tail >= 256 {
             return Err(EIO);
         }
+        drop(guard);
         let reserved = self
             .publications
             .iter()
@@ -1640,6 +1643,7 @@ impl Bootstrap {
             let head = sgx.try_read32(0xd640c0)?;
             let ack = sgx.try_read32(0xd640c8)?;
             let tail = sgx.try_read32(0xd60060)?;
+            drop(guard);
             if head >= 256 || ack >= 256 || tail >= 256 {
                 return Err(EIO);
             }
@@ -1708,7 +1712,9 @@ impl Bootstrap {
             fw.write_live(control + u64::from(tail) * 64, &reply)?;
             crate::mem::sync();
             fw.write_live(STATE, &next.to_le_bytes())?;
-            sgx.try_write32(successor, 0xd60060)?;
+            let guard = self._sgx.try_access().ok_or(ENODEV)?;
+            guard.try_write32(successor, 0xd60060)?;
+            drop(guard);
             crate::mem::sync();
             self._rtkit
                 .as_mut()
