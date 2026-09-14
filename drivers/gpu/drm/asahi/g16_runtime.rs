@@ -254,16 +254,16 @@ impl Bootstrap {
         &mut self,
         queue: &FirmwareQueues,
         render: bool,
-        root: Option<u64>,
+        root: u64,
+        entries: [u32; 3],
     ) -> Result {
         if self.render_failed {
             return Err(EIO);
         }
         // Check scarce resources before allocating any per-Work storage.
-        // A live render VM can share its ASID; compute uses a private root.
+        // Commands in either persistent VM root can share its live ASID.
         if !(1..64).any(|i| {
-            self.context_users[i] == 0
-                || root.is_some_and(|r| self.context_roots[i].is_some_and(|s| s.low == r))
+            self.context_users[i] == 0 || self.context_roots[i].is_some_and(|s| s.low == root)
         }) {
             self.report_pressure(1, "ASIDs");
             return Err(EBUSY);
@@ -317,13 +317,12 @@ impl Bootstrap {
             if let Some(lanes) = &queue.lanes {
                 let lane = lanes[stage];
                 let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-                let entries = if render { 2 } else { 1 };
                 let read = fw.read_u32(lane.pointers)?;
                 let done = fw.read_u32(lane.pointers + 0x30)?;
                 if read >= 0x500 || done >= 0x500 || lane.head >= 0x500 {
                     return Err(EIO);
                 }
-                if !ring_room(lane.head, read, done, entries, 0x500) {
+                if !ring_room(lane.head, read, done, entries[stage], 0x500) {
                     self.report_pressure(16, "workqueue");
                     return Err(EBUSY);
                 }
@@ -449,16 +448,6 @@ impl Bootstrap {
         Ok(())
     }
 
-    pub(crate) fn dependencies_done(&self, dependencies: &[Option<Stamp>; 2]) -> Result<bool> {
-        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-        for stamp in dependencies.iter().flatten() {
-            if fw.read_u32(stamp.address)? != stamp.value {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     pub(crate) fn poison(&mut self) {
         self.render_failed = true;
     }
@@ -493,6 +482,34 @@ impl Bootstrap {
                 flight.queues[1].0.saturating_sub(0x4000),
                 flight.stamps[0].map_or(u32::MAX, |s| s.event),
                 flight.stamps[1].map_or(u32::MAX, |s| s.event)
+            );
+        }
+        Ok(())
+    }
+
+    /// Optional qualification trace. Readiness is observed only for diagnostics;
+    /// it does not decide whether a dependent Work can enter the firmware ring.
+    fn trace_dependencies(
+        &self,
+        kind: &str,
+        id: u64,
+        context: u32,
+        dependencies: &[Option<Stamp>; 2],
+    ) -> Result {
+        if *crate::module_parameters::fw_trace.value() & 8 != 0 {
+            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+            let mut unfinished = 0;
+            for dep in dependencies.iter().flatten() {
+                unfinished += usize::from(fw.read_u32(dep.address)? != dep.value);
+            }
+            dev_info!(
+                self.dev.as_ref(),
+                "G16: staged {} {:#x} context={} dependencies={} unfinished={}\n",
+                kind,
+                id,
+                context,
+                dependencies.iter().flatten().count(),
+                unfinished
             );
         }
         Ok(())
@@ -950,9 +967,24 @@ impl Bootstrap {
         params: &render::Parameters,
         support: &Support,
         timestamps: [u64; 4],
+        dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
-        self.reserve_flight(&queue, true, Some(owner.lock().roots().low))?;
+        let root = owner.lock().roots().low;
+        let initbm = !self
+            .tvb_pools
+            .iter()
+            .any(|p| p.root == root && p.initialized);
+        self.reserve_flight(
+            &queue,
+            true,
+            root,
+            [
+                1 + u32::from(initbm) + dependencies.iter().flatten().count() as u32,
+                2,
+                0,
+            ],
+        )?;
         self.prepare_queues(&mut queue)?;
         let result = self.submit_render_queue(
             &mut queue,
@@ -961,6 +993,7 @@ impl Bootstrap {
             params,
             support,
             timestamps,
+            dependencies,
         );
         if queue.pending == 0 {
             queue.events = None;
@@ -976,6 +1009,7 @@ impl Bootstrap {
         params: &render::Parameters,
         support: &Support,
         timestamps: [u64; 4],
+        dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let mut guard = owner.lock();
         let client = &mut *guard;
@@ -1011,6 +1045,7 @@ impl Bootstrap {
             owner.clone(),
             scene,
             timestamps,
+            dependencies,
         );
         if result.is_err() && !self.render_failed {
             pool.release_scene(scene);
@@ -1030,6 +1065,7 @@ impl Bootstrap {
         owner: Arc<Mutex<g16_vm::AddressSpace>>,
         scene: u32,
         timestamps: [u64; 4],
+        dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         if self.render_failed {
             return Err(EIO);
@@ -1141,7 +1177,8 @@ impl Bootstrap {
             .as_mut()
             .ok_or(EIO)?
             .write_live(a.render_shared_state, &use_count.to_le_bytes())?;
-        let (heads, epochs) = self.publish_render(&a, &ta, &frag, queue, initbm, pool.blocks)?;
+        let (heads, epochs) =
+            self.publish_render(&a, &ta, &frag, queue, initbm, pool.blocks, dependencies)?;
         pool.initialized = true;
         support.submissions.store(next_submitted, Ordering::Relaxed);
         self.render_publication += 1;
@@ -1191,6 +1228,7 @@ impl Bootstrap {
         self.render_failed = false;
         self.batch_works += 1;
         self.trace_publication("render", va)?;
+        self.trace_dependencies("render", va, a.context_id as u32, dependencies)?;
         Ok(receipt)
     }
 
@@ -1202,13 +1240,15 @@ impl Bootstrap {
         queue: &FirmwareQueues,
         initbm: bool,
         blocks: u32,
+        dependencies: &[Option<Stamp>; 2],
     ) -> Result<([u32; 2], [u32; 2])> {
         let priority = queue.priority;
         let lanes = queue.lanes.as_ref().ok_or(EIO)?;
         let publication = self.render_publication;
         let firsts = [lanes[0].head, lanes[1].head];
         let heads = [
-            (firsts[0] + 1 + u32::from(initbm)) % 0x500,
+            (firsts[0] + 1 + u32::from(initbm) + dependencies.iter().flatten().count() as u32)
+                % 0x500,
             (firsts[1] + 2) % 0x500,
         ];
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
@@ -1248,6 +1288,25 @@ impl Bootstrap {
                 fw.write_live(micro, &a.fragment_microsequence())?;
             }
             let mut pos = firsts[stage];
+            if stage == 0 {
+                // The prelude page leaves +0x40..+0xc0 free before its
+                // microsequence. All barrier bytes share the Work's lifetime.
+                for (index, dep) in dependencies.iter().flatten().enumerate() {
+                    let address = prelude + 0x40 + index as u64 * 0x40;
+                    fw.write_live(
+                        address,
+                        &g16_fw::queue::dependency(
+                            dep.address,
+                            dep.value,
+                            dep.event,
+                            a.tiling_stamp as u32,
+                            a.tiling_uuid as u32,
+                        ),
+                    )?;
+                    fw.write_live(ring + u64::from(pos) * 8, &address.to_le_bytes())?;
+                    pos = (pos + 1) % 0x500;
+                }
+            }
             if stage == 1 || initbm {
                 fw.write_live(ring + u64::from(pos) * 8, &prelude.to_le_bytes())?;
                 pos = (pos + 1) % 0x500;
@@ -1274,9 +1333,18 @@ impl Bootstrap {
 }
 
 impl Bootstrap {
-    pub(crate) fn map_compute_work(&mut self, space: &mut g16_vm::AddressSpace) -> Result {
+    pub(crate) fn map_compute_work(
+        &mut self,
+        space: &mut g16_vm::AddressSpace,
+        private: core::ops::Range<u64>,
+    ) -> Result {
         let opening = self._opening_client.as_mut().ok_or(EIO)?;
         for (base, size) in compute::private_ranges() {
+            // Scratch and marker are private to each command at fresh VAs.
+            // Only the device-owned FList directory and spill pool are shared.
+            if base == compute::SCRATCH || base == compute::MARKER {
+                continue;
+            }
             for va in (base..base + size as u64).step_by(0x4000) {
                 if space.low.translate(va)?.is_some() {
                     return Err(EEXIST);
@@ -1290,6 +1358,7 @@ impl Bootstrap {
                 )?;
             }
         }
+        space.init_compute_private(private);
         space.sync();
         Ok(())
     }
@@ -1297,21 +1366,26 @@ impl Bootstrap {
     pub(crate) fn submit_compute(
         &mut self,
         queues: Arc<Mutex<FirmwareQueues>>,
-        parent: &mut g16_vm::AddressSpace,
+        client: &mut g16_vm::AddressSpace,
         params: &compute::Parameters,
-        memory: &impl crate::g16_cdm::Memory,
         timestamps: [u64; 4],
+        dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
-        self.reserve_flight(&queue, false, None)?;
+        self.reserve_flight(
+            &queue,
+            false,
+            client.roots().low,
+            [0, 0, 1 + dependencies.iter().flatten().count() as u32],
+        )?;
         self.prepare_queues(&mut queue)?;
         let result = self.submit_compute_queue(
             &mut queue,
             queues.clone(),
-            parent,
+            client,
             params,
-            memory,
             timestamps,
+            dependencies,
         );
         if queue.pending == 0 {
             queue.events = None;
@@ -1323,26 +1397,16 @@ impl Bootstrap {
         &mut self,
         queue: &mut FirmwareQueues,
         queues: Arc<Mutex<FirmwareQueues>>,
-        parent: &mut g16_vm::AddressSpace,
+        client: &mut g16_vm::AddressSpace,
         params: &compute::Parameters,
-        memory: &impl crate::g16_cdm::Memory,
         timestamps: [u64; 4],
+        dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let lane = queue.lanes.as_ref().ok_or(EIO)?[2];
         let priority = queue.priority;
 
-        parent.views.reserve(1, GFP_KERNEL)?;
-        // SAFETY: The parent lock serializes table access. The view is retained
-        // in parent.views before publication, and those views drop first.
-        let mut view = unsafe { parent.fork()? };
-        let client = &mut view;
-        // Different firmware compute queues can suspend/resume independently.
-        // Their scratch and resume marker must not alias the device's opening
-        // context (or another Work), even when they use the same virtual VA.
-        for (base, size) in [(params.scratch, 0x20000), (params.marker, 0x4000)] {
-            client.low.unmap_pages(base..base + size as u64)?;
-            client.alloc_low(base, size, crate::pgtable::prot::PROT_GPU_SHARED_RW)?;
-        }
+        let mut params = *params;
+        client.prepare_compute(&mut params)?;
         let space = client.roots();
         if self.render_failed {
             return Err(EIO);
@@ -1351,15 +1415,14 @@ impl Bootstrap {
             return Err(EINVAL);
         }
         let ordinal = queue.compute_count;
-        let resource = crate::g16_cdm::resource(memory, params.cdm, params.cdm_end)?;
-        client.snapshot(memory, resource)?;
-        let mut params = *params;
-        params.resource = resource;
         let work = self.allocate_work(false)?;
         let alias = 0x71_0000_0000 + self.compute_publication * 0x4000;
         if alias + 0x4000 > 0x72_0000_0000 {
             return Err(ENOSPC);
         }
+        // Firmware save state is independent of shader resource tables.
+        // The upper half of the zeroed Work page is GPU-addressable storage.
+        params.save_area = alias + 0x2000;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         let pa = fw.physical(work)?;
         self._address_space.as_mut().ok_or(EIO)?.low.map_pages(
@@ -1387,8 +1450,6 @@ impl Bootstrap {
         a.context = self.acquire_context(space, 1)?;
         a.identity = (u64::from(a.context) << 32) | (a.identity & 0xffff_ffff);
         a.register_identity = (u64::from(a.context) << 32) | 1;
-        // Retain the new tables and snapshot before publishing any Work.
-        parent.views.push(view, GFP_KERNEL)?;
         self.render_failed = true;
         a.cdm_entry = Some(alias + compute::ENTRY_OFFSET);
         let work = params.work(&a).ok_or(EINVAL)?;
@@ -1400,7 +1461,7 @@ impl Bootstrap {
         let count32 = u32::try_from(count).map_err(|_| ENOSPC)?;
 
         let first = lane.head;
-        let head = (first + 1) % 0x500;
+        let head = (first + 1 + dependencies.iter().flatten().count() as u32) % 0x500;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         fw.write_live(compute::SHARED_STATE, &count32.to_le_bytes())?;
         fw.write_live(a.work, &work)?;
@@ -1420,7 +1481,24 @@ impl Bootstrap {
         let previous = a.stamp.checked_sub(0x100).ok_or(EINVAL)?;
         fw.write_live(a.driver_stamp, &previous.to_le_bytes())?;
         fw.write_live(a.firmware_stamp, &previous.to_le_bytes())?;
-        fw.write_live(lane.ring + u64::from(first) * 8, &a.work.to_le_bytes())?;
+        let mut pos = first;
+        for (index, dep) in dependencies.iter().flatten().enumerate() {
+            // Between the threshold/timestamps and the CDM entry trampoline.
+            let address = a.work + 0x1900 + index as u64 * 0x40;
+            fw.write_live(
+                address,
+                &g16_fw::queue::dependency(
+                    dep.address,
+                    dep.value,
+                    dep.event,
+                    a.stamp,
+                    a.identity as u32,
+                ),
+            )?;
+            fw.write_live(lane.ring + u64::from(pos) * 8, &address.to_le_bytes())?;
+            pos = (pos + 1) % 0x500;
+        }
+        fw.write_live(lane.ring + u64::from(pos) * 8, &a.work.to_le_bytes())?;
         let channel = priority as usize * 3 + 2;
         let mut pending_lane = lane;
         pending_lane.head = head;
@@ -1455,6 +1533,7 @@ impl Bootstrap {
         self.render_failed = false;
         self.batch_works += 1;
         self.trace_publication("compute", a.work)?;
+        self.trace_dependencies("compute", a.work, a.context, dependencies)?;
         Ok(Receipt { id: a.work, stamp })
     }
 }

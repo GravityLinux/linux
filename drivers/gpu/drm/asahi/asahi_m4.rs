@@ -8,7 +8,6 @@
 #[path = "m4_float.rs"]
 mod float;
 mod g16;
-mod g16_cdm;
 mod g16_compute;
 mod g16_drm;
 mod g16_fw;
@@ -111,7 +110,7 @@ kernel::module_platform_driver! {
     params: {
         fw_trace: u32 {
             default: 0,
-            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches",
+            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies",
         },
         tvb_max_blocks: u32 {
             default: 331,

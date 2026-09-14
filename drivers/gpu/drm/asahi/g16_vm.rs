@@ -22,14 +22,11 @@ pub(crate) struct Roots {
 }
 
 pub(crate) struct AddressSpace {
-    // Forks borrow unchanged parent tables, so destroy them before those
-    // tables and their pinned GEM/private backing.
-    pub(crate) views: KVec<AddressSpace>,
     pub(crate) low: UatPageTable,
     pub(crate) high: UatPageTable,
     // Drop the owned tables before releasing their mapped pages.
     pages: KVec<(u64, Owned<Page>)>,
-    snapshots: KVec<Owned<Page>>,
+    compute_scratch: core::ops::Range<u64>,
     render_scratch: core::ops::Range<u64>,
 }
 
@@ -46,23 +43,7 @@ impl AddressSpace {
             low: UatPageTable::new_with_ias(OAS, IAS)?,
             high: UatPageTable::new_with_ias(OAS, IAS)?,
             pages: KVec::new(),
-            snapshots: KVec::new(),
-            views: KVec::new(),
-            render_scratch: 0..0,
-        })
-    }
-
-    /// # Safety
-    /// Retain the fork in this parent's views before publishing it. The parent
-    /// lock serializes shared-table edits and views are destroyed first.
-    pub(crate) unsafe fn fork(&self) -> Result<Self> {
-        Ok(Self {
-            // SAFETY: The caller supplies the parent lifetime and serialization.
-            low: unsafe { self.low.fork()? },
-            high: unsafe { self.high.fork()? },
-            pages: KVec::new(),
-            snapshots: KVec::new(),
-            views: KVec::new(),
+            compute_scratch: 0..0,
             render_scratch: 0..0,
         })
     }
@@ -175,6 +156,27 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Compute commands use distinct private scratch addresses in the caller's
+    /// reserved kernel aperture. The persistent root and all backing remain
+    /// owned by the VM; allocating a later command never replaces a live PTE.
+    pub(crate) fn init_compute_private(&mut self, range: core::ops::Range<u64>) {
+        self.compute_scratch = range;
+    }
+
+    pub(crate) fn prepare_compute(&mut self, p: &mut crate::g16_compute::Parameters) -> Result {
+        let base = self.compute_scratch.start;
+        let end = base.checked_add(0x24000).ok_or(ENOMEM)?;
+        if end > self.compute_scratch.end {
+            return Err(ENOMEM);
+        }
+        // Failed allocations retain their pages and cannot reuse this range.
+        self.compute_scratch.start = end;
+        self.alloc_low(base, 0x24000, prot::PROT_GPU_SHARED_RW)?;
+        p.scratch = base;
+        p.marker = base + 0x20000;
+        Ok(())
+    }
+
     /// Allocate all ten-block growth pages before changing visible mappings.
     pub(crate) fn alloc_tvb_blocks(&mut self, base: u64, count: usize) -> Result<bool> {
         if count == 0 || count > 10 || base & 0x7fff != 0 {
@@ -235,38 +237,6 @@ impl AddressSpace {
             va = va.checked_add(size as u64).ok_or(EINVAL)?;
             bytes = &bytes[size..];
         }
-        Ok(())
-    }
-
-    /// Preserve the caller DVA (its table can contain self-pointers), while
-    /// firmware preemption writes go to a fresh context-owned physical page.
-    pub(crate) fn snapshot(
-        &mut self,
-        memory: &impl crate::g16_cdm::Memory,
-        address: u64,
-    ) -> Result {
-        if !self.snapshots.is_empty() {
-            return Err(EEXIST);
-        }
-        let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
-        page.with_pointer_into_page(0, UAT_PGSZ, |ptr| {
-            // SAFETY: The fresh unpublished page is exclusively owned here.
-            memory.read(address, unsafe {
-                core::slice::from_raw_parts_mut(ptr, UAT_PGSZ)
-            })
-        })?;
-        clean_page(&page);
-        let phys = page.phys();
-        self.snapshots.push(page, GFP_KERNEL)?;
-        // Retain backing before the first possible translation change.
-        self.low.unmap_pages(address..address + UAT_PGSZ as u64)?;
-        self.low.map_pages(
-            address..address + UAT_PGSZ as u64,
-            phys,
-            prot::PROT_GPU_SHARED_RW,
-            false,
-        )?;
-        self.sync();
         Ok(())
     }
 

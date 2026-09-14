@@ -9,8 +9,8 @@ pub(crate) const QUEUE: u64 = 0xffff_fc20_c500_0000;
 pub(crate) const STATS: u64 = QUEUE + 0x8000;
 pub(crate) const SHARED: u64 = 0xffff_fc20_0200_0000;
 
-// Fixed opening compute namespace used by the working shim. These pages
-// belong to the device and are aliased into whichever client root is active.
+// Device-owned opening namespace. Client roots share only the FList directory
+// and spill pool; each command receives distinct scratch/marker VAs instead.
 pub(crate) const DIRECTORY: u64 = 0x70_02cc_0000;
 pub(crate) const DIRECTORY_SIZE: usize = 0x18000;
 pub(crate) const BUFFER_BASE: u64 = 0x70_0310_8000;
@@ -25,7 +25,7 @@ pub(crate) const ENTRY_OFFSET: u64 = 0x1a00;
 
 /// Drain/invalidate compute caches before entering the caller's CDM stream.
 /// Back-to-back M4 Works require the full barrier used by Mesa's CDM helper;
-/// 0x60000168 does not preserve dependent SSBO writes across context views.
+/// 0x60000168 does not preserve dependent SSBO writes between Works.
 pub(crate) fn entry(stream: u64) -> [u8; 12] {
     let mut out = [0; 12];
     u32_at(&mut out, 0, 0x600fffff);
@@ -73,7 +73,7 @@ pub(crate) struct Parameters {
     pub(crate) sampler_count: u32,
     pub(crate) scratch: u64,
     pub(crate) marker: u64,
-    pub(crate) resource: u64,
+    pub(crate) save_area: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -168,12 +168,12 @@ impl Parameters {
         u32_at(&mut out, 12, a.context);
         u64_at(&mut out, 16, a.notifier);
         let registers = [
-            (0x1a510, self.resource),
+            (0x1a510, self.save_area),
             (0x1a420, a.cdm_entry.unwrap_or(self.cdm)),
-            (0x1a4d0, self.resource + 0x1480),
-            (0x1a4d8, self.resource + 0x1488),
-            (0x1a4e0, self.resource + 0x1490),
-            (0x1a4e8, self.resource + 0x1498),
+            (0x1a4d0, self.save_area + 0x1480),
+            (0x1a4d8, self.save_area + 0x1488),
+            (0x1a4e0, self.save_area + 0x1490),
+            (0x1a4e8, self.save_area + 0x1498),
             (0x1a440, 0x154024201),
             (0x1a458, 0x10c08ae0),
             (0x101d9, 0x1c),
@@ -200,7 +200,7 @@ impl Parameters {
         for (off, value) in [
             (0x720, a.register_table),
             (0x760, a.microsequence),
-            (0x798, self.resource),
+            (0x798, self.save_area),
             (0x7a0, self.cdm_end - 4),
             (
                 0x7e8,
