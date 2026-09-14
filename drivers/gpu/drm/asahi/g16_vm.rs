@@ -6,7 +6,8 @@
 //! roots, even when the hardware context table is using slot zero.
 
 use crate::pgtable::{prot, UatPageTable, UAT_PGSZ};
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
+use kernel::rbtree::{RBTree, RBTreeNode};
 use kernel::{device, page::Page, prelude::*};
 
 const IAS: usize = 42;
@@ -25,7 +26,7 @@ pub(crate) struct AddressSpace {
     pub(crate) low: UatPageTable,
     pub(crate) high: UatPageTable,
     // Drop the owned tables before releasing their mapped pages.
-    pages: KVec<(u64, Owned<Page>)>,
+    pages: RBTree<u64, Owned<Page>>,
     compute_scratch: core::ops::Range<u64>,
     render_scratch: core::ops::Range<u64>,
 }
@@ -42,7 +43,7 @@ impl AddressSpace {
         Ok(Self {
             low: UatPageTable::new_with_ias(OAS, IAS)?,
             high: UatPageTable::new_with_ias(OAS, IAS)?,
-            pages: KVec::new(),
+            pages: RBTree::new(),
             compute_scratch: 0..0,
             render_scratch: 0..0,
         })
@@ -59,7 +60,7 @@ impl AddressSpace {
         }
         let end = va.checked_add(size as u64).ok_or(EINVAL)?;
         for v in (va..end).step_by(UAT_PGSZ) {
-            if self.low.translate(v)?.is_some() {
+            if self.pages.get(&v).is_some() || self.low.translate(v)?.is_some() {
                 return Err(EEXIST);
             }
         }
@@ -69,7 +70,7 @@ impl AddressSpace {
             // publication. Clean CPU initialization before exposing them.
             clean_page(&page);
             let phys = page.phys();
-            self.pages.push((v, page), GFP_KERNEL)?;
+            self.pages.try_create_and_insert(v, page, GFP_KERNEL)?;
             self.low
                 .map_pages(v..v + UAT_PGSZ as u64, phys, access, false)?;
         }
@@ -92,7 +93,7 @@ impl AddressSpace {
         self.alloc_low(start, render::PRIVATE_SIZE, prot::PROT_GPU_SHARED_RW)?;
         for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
             let va = start + offset as u64;
-            let page = &self.pages.iter().find(|(v, _)| *v == va).ok_or(EIO)?.1;
+            let page = self.pages.get(&va).ok_or(EIO)?;
             page.with_pointer_into_page(0, UAT_PGSZ, |ptr| {
                 // SAFETY: The closure has exclusive access to the full page
                 // owned by this unpublished VM; no GPU root references it.
@@ -183,15 +184,13 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         let mut pages = KVec::new();
-        if pages.reserve(count * 8, GFP_KERNEL).is_err()
-            || self.pages.reserve(count * 8, GFP_KERNEL).is_err()
-        {
+        if pages.reserve(count * 8, GFP_KERNEL).is_err() {
             return Ok(false);
         }
         for block in 0..count {
             let start = base + block as u64 * 0x28000;
             for va in (start..start + 0x28000).step_by(UAT_PGSZ) {
-                if self.low.translate(va)?.is_some() {
+                if self.pages.get(&va).is_some() || self.low.translate(va)?.is_some() {
                     return Err(EEXIST);
                 }
             }
@@ -201,21 +200,27 @@ impl AddressSpace {
                     Err(_) => return Ok(false),
                 };
                 clean_page(&page);
-                pages.push((va, page), GFP_KERNEL)?;
+                let node = match RBTreeNode::new(va, page, GFP_KERNEL) {
+                    Ok(node) => node,
+                    Err(_) => return Ok(false),
+                };
+                pages.push(node, GFP_KERNEL)?;
             }
         }
-        self.pages.reserve(pages.len(), GFP_KERNEL)?;
-        let first = self.pages.len();
-        for page in pages {
-            self.pages.push(page, GFP_KERNEL)?;
+        // Transfer every preallocated node before the first fallible PTE edit.
+        for node in pages {
+            self.pages.insert(node);
         }
-        for (va, page) in &self.pages[first..] {
-            self.low.map_pages(
-                *va..*va + UAT_PGSZ as u64,
-                page.phys(),
-                prot::PROT_GPU_SHARED_RW,
-                false,
-            )?;
+        for block in 0..count {
+            let start = base + block as u64 * 0x28000;
+            for va in (start..start + 0x20000).step_by(UAT_PGSZ) {
+                self.low.map_pages(
+                    va..va + UAT_PGSZ as u64,
+                    self.pages.get(&va).ok_or(EIO)?.phys(),
+                    prot::PROT_GPU_SHARED_RW,
+                    false,
+                )?;
+            }
         }
         Ok(true)
     }
@@ -223,7 +228,7 @@ impl AddressSpace {
     pub(crate) fn write_low(&mut self, mut va: u64, mut bytes: &[u8]) -> Result {
         while !bytes.is_empty() {
             let base = va & !(UAT_PGSZ as u64 - 1);
-            let page = &self.pages.iter().find(|(v, _)| *v == base).ok_or(EINVAL)?.1;
+            let page = self.pages.get(&base).ok_or(EINVAL)?;
             let offset = (va - base) as usize;
             let size = bytes.len().min(UAT_PGSZ - offset);
             page.with_pointer_into_page(offset, size, |p| {
@@ -355,7 +360,8 @@ struct FirmwareRegion {
 /// Its existing tables remain owned by the firmware reservation.
 pub(crate) struct FirmwareSpace {
     table: UatPageTable,
-    regions: KVec<FirmwareRegion>,
+    regions: RBTree<u64, FirmwareRegion>,
+    dirty_regions: RefCell<KVec<u64>>,
     external: KVec<core::ops::Range<u64>>,
 }
 
@@ -372,7 +378,8 @@ impl FirmwareSpace {
         dev_info!(dev, "G16: attached firmware root {:#x}\n", table.ttb());
         Ok(Self {
             table,
-            regions: KVec::new(),
+            regions: RBTree::new(),
+            dirty_regions: RefCell::new(KVec::new()),
             external: KVec::new(),
         })
     }
@@ -419,6 +426,23 @@ impl FirmwareSpace {
             return Err(EINVAL);
         }
         let end = va.checked_add(size as u64).ok_or(EINVAL)?;
+        // Failed mapping cleanup may retain an owned but partly unmapped
+        // region. Its address range must not be replaced or overlapped.
+        let previous = match self.regions.cursor_lower_bound(&va) {
+            Some(cursor) => {
+                if *cursor.current().0 < end {
+                    return Err(EEXIST);
+                }
+                cursor.peek_prev().map(|(base, _)| *base)
+            }
+            None => self.regions.cursor_back().map(|cursor| *cursor.current().0),
+        };
+        if previous.is_some_and(|base| {
+            let region = self.regions.get(&base).unwrap();
+            base + (region.pages.len() * UAT_PGSZ) as u64 > va
+        }) {
+            return Err(EEXIST);
+        }
         for v in (va..end).step_by(UAT_PGSZ) {
             if self.table.translate(v)?.is_some() {
                 return Err(EEXIST);
@@ -430,7 +454,8 @@ impl FirmwareSpace {
         }
         let mut dirty_pages = KVec::new();
         dirty_pages.extend_with(pages.len(), Cell::new(true), GFP_KERNEL)?;
-        self.regions.push(
+        let node = RBTreeNode::new(
+            va,
             FirmwareRegion {
                 va,
                 pages,
@@ -439,7 +464,10 @@ impl FirmwareSpace {
             },
             GFP_KERNEL,
         )?;
-        let region = self.regions.last().ok_or(EIO)?;
+        // Reserve dirty tracking before the allocation is owned or mapped.
+        self.dirty_regions.get_mut().push(va, GFP_KERNEL)?;
+        self.regions.insert(node);
+        let region = self.regions.get(&va).ok_or(EIO)?;
         for (i, page) in region.pages.iter().enumerate() {
             let v = va + (i * UAT_PGSZ) as u64;
             if let Err(e) = self
@@ -449,7 +477,12 @@ impl FirmwareSpace {
                 if v != va {
                     self.table.unmap_pages(va..v)?;
                 }
-                self.regions.pop();
+                self.table.sync();
+                self.table.invalidate(None);
+                crate::mem::sync();
+                self.table.clear_invalidations();
+                self.dirty_regions.get_mut().pop();
+                self.regions.remove(&va);
                 return Err(e);
             }
         }
@@ -457,18 +490,15 @@ impl FirmwareSpace {
     }
 
     pub(crate) fn write(&mut self, va: u64, bytes: &[u8]) -> Result {
-        let end = va.checked_add(bytes.len() as u64).ok_or(EINVAL)?;
-        let region = self
-            .regions
-            .iter()
-            .find(|r| va >= r.va && end <= r.va + (r.pages.len() * UAT_PGSZ) as u64)
-            .ok_or(EINVAL)?;
+        let region = self.region(va, bytes.len())?;
+        if !bytes.is_empty() {
+            self.queue_region(region)?;
+        }
         let mut offset = (va - region.va) as usize;
         let mut remaining = bytes;
         while !remaining.is_empty() {
             let within = offset & (UAT_PGSZ - 1);
             let size = remaining.len().min(UAT_PGSZ - within);
-            region.pending.set(true);
             region.dirty_pages[offset / UAT_PGSZ].set(true);
             region.pages[offset / UAT_PGSZ].with_pointer_into_page(within, size, |p| {
                 // SAFETY: These owned bytes are not yet published to firmware.
@@ -492,12 +522,8 @@ impl FirmwareSpace {
         if va & (UAT_PGSZ as u64 - 1) != 0 {
             return Err(EINVAL);
         }
-        let region = self
-            .regions
-            .iter()
-            .find(|r| va >= r.va && va < r.va + (r.pages.len() * UAT_PGSZ) as u64)
-            .ok_or(EINVAL)?;
-        region.pending.set(true);
+        let region = self.region(va, UAT_PGSZ)?;
+        self.queue_region(region)?;
         region.dirty_pages[((va - region.va) as usize) / UAT_PGSZ].set(true);
         region.pages[((va - region.va) as usize) / UAT_PGSZ].with_pointer_into_page(
             0,
@@ -561,12 +587,7 @@ impl FirmwareSpace {
         size: usize,
         mut update: impl FnMut(*mut u8, usize, usize),
     ) -> Result {
-        let end = va.checked_add(size as u64).ok_or(EINVAL)?;
-        let region = self
-            .regions
-            .iter()
-            .find(|r| va >= r.va && end <= r.va + (r.pages.len() * UAT_PGSZ) as u64)
-            .ok_or(EINVAL)?;
+        let region = self.region(va, size)?;
         if size == 0 {
             return Ok(());
         }
@@ -625,14 +646,16 @@ impl FirmwareSpace {
 
     /// Called only after the context is drained and its hardware roots detached.
     pub(crate) fn release_region(&mut self, va: u64) -> Result {
-        let index = self.regions.iter().position(|r| r.va == va).ok_or(EINVAL)?;
-        let size = self.regions[index].pages.len() * UAT_PGSZ;
+        let size = self.regions.get(&va).ok_or(EINVAL)?.pages.len() * UAT_PGSZ;
         self.table.unmap_pages(va..va + size as u64)?;
         self.table.sync();
         self.table.invalidate(None);
         crate::mem::sync();
         self.table.clear_invalidations();
-        self.regions.swap_remove(index);
+        self.dirty_regions
+            .get_mut()
+            .retain(|pending| *pending != va);
+        self.regions.remove(&va);
         Ok(())
     }
 
@@ -640,12 +663,7 @@ impl FirmwareSpace {
         if va & 3 != 0 {
             return Err(EINVAL);
         }
-        let end = va.checked_add(4).ok_or(EINVAL)?;
-        let region = self
-            .regions
-            .iter()
-            .find(|r| va >= r.va && end <= r.va + (r.pages.len() * UAT_PGSZ) as u64)
-            .ok_or(EINVAL)?;
+        let region = self.region(va, 4)?;
         let offset = (va - region.va) as usize;
         region.pages[offset / UAT_PGSZ].with_pointer_into_page(offset & (UAT_PGSZ - 1), 4, |p| {
             // SAFETY: The aligned word lies in this owned mapped page.
@@ -658,10 +676,9 @@ impl FirmwareSpace {
     }
 
     pub(crate) fn sync(&self) {
-        for region in &self.regions {
-            if !region.pending.replace(false) {
-                continue;
-            }
+        for va in self.dirty_regions.borrow_mut().drain(..) {
+            let region = self.regions.get(&va).unwrap();
+            region.pending.set(false);
             for (page, dirty) in region.pages.iter().zip(&region.dirty_pages) {
                 if dirty.replace(false) {
                     clean_page(page);
@@ -673,13 +690,40 @@ impl FirmwareSpace {
         crate::mem::sync();
         self.table.clear_invalidations();
     }
+
+    /// Find the preceding allocation in logarithmic time, then validate the
+    /// entire access. Adjacent regions must not hide an out-of-bounds request.
+    fn region(&self, va: u64, size: usize) -> Result<&FirmwareRegion> {
+        let end = va.checked_add(size as u64).ok_or(EINVAL)?;
+        let base = match self.regions.cursor_lower_bound(&va) {
+            Some(cursor) if *cursor.current().0 == va => va,
+            Some(cursor) => *cursor.peek_prev().ok_or(EINVAL)?.0,
+            None => *self.regions.cursor_back().ok_or(EINVAL)?.current().0,
+        };
+        let region = self.regions.get(&base).ok_or(EINVAL)?;
+        if end > base + (region.pages.len() * UAT_PGSZ) as u64 {
+            return Err(EINVAL);
+        }
+        Ok(region)
+    }
+
+    fn queue_region(&self, region: &FirmwareRegion) -> Result {
+        if !region.pending.get() {
+            // Failure leaves both the bytes and queue membership unchanged.
+            self.dirty_regions
+                .borrow_mut()
+                .push(region.va, GFP_KERNEL)?;
+            region.pending.set(true);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for FirmwareSpace {
     fn drop(&mut self) {
         // Only valid before publishing the graph or after firmware is stopped.
         // Remove leaf mappings before their backing pages are released.
-        for region in &self.regions {
+        for region in self.regions.values() {
             let _ = self
                 .table
                 .unmap_pages(region.va..region.va + (region.pages.len() * UAT_PGSZ) as u64);
