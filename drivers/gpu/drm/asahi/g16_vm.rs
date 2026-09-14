@@ -30,6 +30,7 @@ pub(crate) struct AddressSpace {
     // Drop the owned tables before releasing their mapped pages.
     pages: KVec<(u64, Owned<Page>)>,
     snapshots: KVec<Owned<Page>>,
+    render_scratch: core::ops::Range<u64>,
 }
 
 impl AddressSpace {
@@ -47,6 +48,7 @@ impl AddressSpace {
             pages: KVec::new(),
             snapshots: KVec::new(),
             views: KVec::new(),
+            render_scratch: 0..0,
         })
     }
 
@@ -57,6 +59,7 @@ impl AddressSpace {
             pages: KVec::new(),
             snapshots: KVec::new(),
             views: KVec::new(),
+            render_scratch: 0..0,
         })
     }
 
@@ -96,6 +99,11 @@ impl AddressSpace {
         let mut params = render::Parameters::default();
         params.set_private(start, end).ok_or(EINVAL)?;
         let pool = render::OperandPool::new(start, end).ok_or(EINVAL)?;
+        self.render_scratch =
+            pool.growth_end().ok_or(EINVAL)?..end.min(render::CONTEXT_BASE + (1 << 32));
+        if self.render_scratch.start > self.render_scratch.end {
+            return Err(ENOMEM);
+        }
         self.alloc_low(start, render::PRIVATE_SIZE, prot::PROT_GPU_SHARED_RW)?;
         for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
             let va = start + offset as u64;
@@ -126,6 +134,39 @@ impl AddressSpace {
                 )?;
             }
         }
+        self.sync();
+        Ok(())
+    }
+
+    /// Each render owns its tile metadata, deflake/status and auxiliary pages.
+    /// Only fresh DVAs are installed, so earlier renders keep stable mappings.
+    /// Pages remain owned by the VM until destruction, including failed setup.
+    pub(crate) fn prepare_render(&mut self, p: &mut crate::g16_render::Parameters) -> Result {
+        let (tilemap, tpc) = p.scratch_sizes().ok_or(EINVAL)?;
+        let base = self.render_scratch.start;
+        let size = tilemap
+            .checked_add(tpc)
+            .and_then(|n| n.checked_add(5 * UAT_PGSZ))
+            .ok_or(ENOMEM)?;
+        let end = base.checked_add(size as u64).ok_or(ENOMEM)?;
+        if end > self.render_scratch.end {
+            return Err(ENOMEM);
+        }
+        // Reserve before a fallible allocation so no partial range is reused.
+        self.render_scratch.start = end;
+        self.alloc_low(base, size, prot::PROT_GPU_SHARED_RW)?;
+        p.tilemap = base;
+        p.tpc = base + tilemap as u64;
+        let meta = p.tpc + tpc as u64;
+        p.layermeta = meta;
+        p.heapmeta = meta + if p.layers > 1 { 0x100 } else { 0 };
+        p.deflake_3 = meta + 0x4000;
+        p.deflake_2 = p.deflake_3 + 0x20;
+        p.deflake_1 = p.deflake_3 + 0x2a0;
+        p.ta_status = meta + 0x8000 + 0x240;
+        p.fragment_status = meta + 0xc000 + 0x2c0;
+        p.aux_fb = meta + 0x10000;
+        self.write_low(p.aux_fb + 0x600, &0x0000035b60000000u64.to_le_bytes())?;
         self.sync();
         Ok(())
     }

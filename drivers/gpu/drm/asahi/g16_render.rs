@@ -53,7 +53,7 @@ pub(crate) struct Parameters {
     pub(crate) multisample_control: u64,
     pub(crate) occlusion_query_base: u64,
     pub(crate) ppp_control: u64,
-    pub(crate) queue_item_index: u64,
+    pub(crate) scene_slot: u64,
     pub(crate) samples: u64,
     pub(crate) scissor_array: u64,
     pub(crate) stencil_aux_buffer: u64,
@@ -102,7 +102,7 @@ impl Parameters {
             )
             && matches!(self.samples, 1 | 2 | 4)
             && self.tib_blocks <= 64
-            && self.queue_item_index <= 0xffff
+            && self.scene_slot < 36
             && (self.sampler_array == 0) == (self.sampler_count == 0)
             && self.sampler_array & 7 == 0
             && self.sampler_count < u32::MAX as u64
@@ -180,7 +180,7 @@ impl Parameters {
             0x8000
         };
         let deflake_1 = self.ta_offset(self.deflake_1);
-        let record_index = 0x80005 + self.queue_item_index * 4;
+        let record_index = 0x80001 + self.scene_slot * 4;
         Some([
             (0x01748, 1),
             (0x10141, 512),
@@ -840,6 +840,10 @@ impl OperandPool {
     pub(crate) fn support(&self, id: u64, shared: u64) -> [u8; 0x100] {
         let mut out = [0; 0x100];
         u64_at(&mut out, 0, id);
+        // Render leases use slots 3..59, distinct from opening and compute.
+        // The native driver assigns +8 before publication; firmware programs
+        // this slot into the accelerator's private-memory pool selector.
+        u32_at(&mut out, 8, id as u32);
         u64_at(&mut out, 0x14, self.directory);
         u32_at(&mut out, 0x1c, 0x400000 / 8);
         u32_at(&mut out, 0x24, 24 * 512);

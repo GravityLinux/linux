@@ -82,9 +82,6 @@ struct Vm {
     render_ready: bool,
     compute_ready: bool,
     render_broken: bool,
-    scratch_next: u64,
-    tilemap: (u64, usize),
-    tpc: (u64, usize),
 }
 
 /// A submit-time view of bindings, pinned through actual hardware completion.
@@ -146,7 +143,6 @@ struct Queue {
     vm: u32,
     entity: sched::Entity<SubmissionJob>,
     firmware: Arc<Mutex<crate::g16::FirmwareQueues>>,
-    fences: dma_fence::FenceContexts,
 }
 #[derive(Clone)]
 struct TimestampBuffer {
@@ -214,12 +210,12 @@ pub(crate) fn register(pdev: &platform::Device<Core>) -> Result<DeviceRef> {
     let runtime = crate::g16::Bootstrap::new(pdev)?;
     let data = try_pin_init!(Data {
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
-        scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 16, 0, 30000, c_str!("asahi_m4"))?,
+        scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 128, 0, 30000, c_str!("asahi_m4"))?,
         admission <- kernel::new_mutex!(KVec::new()),
         failed: AtomicBool::new(false),
         notifications: runtime.notifications.clone(),
         runtime <- kernel::new_mutex!(runtime),
-        engine <- kernel::new_mutex!(Engine { running: false, jobs: KVec::new(), issued: KVec::new() }), });
+        engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }), });
     let device = Device::new(pdev.as_ref(), data)?;
     drm::driver::Registration::new_foreign_owned(&device, pdev.as_ref(), 0)?;
     Ok(device)
@@ -401,11 +397,6 @@ impl File {
                 render_ready: false,
                 compute_ready: false,
                 render_broken: false,
-                scratch_next: data.kernel_start
-                    + render::PRIVATE_SIZE as u64
-                    + compute::PRIVATE_SIZE as u64,
-                tilemap: (0, 0),
-                tpc: (0, 0),
             },
             GFP_KERNEL,
         )?;
@@ -503,7 +494,6 @@ impl File {
             sched::Priority::Normal
         };
         let entity = sched::Entity::new(&device.scheduler, priority)?;
-        let fences = dma_fence::FenceContexts::new(1, c_str!("asahi_m4"), FENCE_KEY)?;
         state.queues.push(
             Queue {
                 firmware: Arc::pin_init(
@@ -513,7 +503,6 @@ impl File {
                 id,
                 vm: data.vm_id,
                 entity,
-                fences,
             },
             GFP_KERNEL,
         )?;
@@ -984,9 +973,8 @@ fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
 struct Execution {
     id: u64,
     firmware: Arc<Mutex<crate::g16::FirmwareQueues>>,
-    // Compute metadata may itself have been produced by an earlier command.
-    // Such CPU preparation waits for the explicitly declared batch barriers.
-    prepare_after: KVec<bool>,
+    // UAPI subqueue indices, resolved against previous submissions and this batch.
+    barriers: KVec<[u16; 2]>,
     device: DeviceRef,
     _owner: Arc<Mutex<FileState>>,
     render_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
@@ -1008,6 +996,20 @@ struct Running {
     next: usize,
     pending: usize,
     error: Option<Error>,
+    history: [KVec<Option<crate::g16::Stamp>>; 2],
+}
+
+fn resolve_barriers(
+    history: &[KVec<Option<crate::g16::Stamp>>; 2],
+    barriers: [u16; 2],
+) -> Result<[Option<crate::g16::Stamp>; 2]> {
+    let mut dependencies = [None; 2];
+    for (stage, barrier) in barriers.into_iter().enumerate() {
+        if barrier != 0xffff {
+            dependencies[stage] = *history[stage].get(barrier as usize).ok_or(EIO)?;
+        }
+    }
+    Ok(dependencies)
 }
 struct Issued {
     id: u64,
@@ -1015,6 +1017,7 @@ struct Issued {
 }
 struct Engine {
     running: bool,
+    cursor: usize,
     jobs: KVec<Running>,
     issued: KVec<Issued>,
 }
@@ -1054,10 +1057,11 @@ impl WorkItem for Execution {
                     }
                     progress = true;
                 }
-                for index in 0..engine.jobs.len() {
-                    // A batch awaiting GPU-produced compute metadata must not
-                    // stall independent public queues. Later submissions on
-                    // its own queue still wait for all its commands to publish.
+                let start = engine.cursor;
+                for offset in 0..engine.jobs.len() {
+                    let index = (start + offset) % engine.jobs.len();
+                    // Preserve submit-relative barrier index zero: all earlier
+                    // submissions on this public queue must have published.
                     if engine.jobs[..index].iter().any(|earlier| {
                         earlier.error.is_none()
                             && earlier.next < earlier.execution.parameters.len()
@@ -1068,66 +1072,72 @@ impl WorkItem for Execution {
                     }) {
                         continue;
                     }
-                    loop {
-                        let job = &engine.jobs[index];
-                        if job.error.is_some() || job.next == job.execution.parameters.len() {
-                            break;
-                        }
-                        // A CPU CDM/resource read cannot be moved ahead of a
-                        // batch dependency that might generate those bytes.
-                        if job.execution.prepare_after[job.next] && job.pending != 0 {
-                            break;
-                        }
-                        engine.issued.reserve(1, GFP_KERNEL)?;
-                        let job = &mut engine.jobs[index];
-                        let execution = &job.execution;
-                        crate::mem::sync();
-                        let receipt = match &execution.parameters[job.next] {
-                            Parameters::Render(p) => runtime.submit_render(
-                                execution.firmware.clone(),
-                                execution.render_space.clone(),
-                                p,
-                                execution.support.as_deref().ok_or(EIO)?,
-                                execution.timestamps[job.next],
-                            ),
-                            Parameters::Compute(p) => runtime.submit_compute(
-                                execution.firmware.clone(),
-                                &mut execution.space.lock(),
-                                p,
-                                &execution.memory,
-                                execution.timestamps[job.next],
-                            ),
-                        };
-                        let receipt = match receipt {
-                            Ok(receipt) => receipt,
-                            Err(EBUSY) if !runtime.render_failed() => return Ok(progress),
-                            Err(error) if !runtime.render_failed() => {
-                                pr_err!(
-                                    "G16: command {} preparation failed: {:?}\n",
-                                    job.next,
-                                    error
-                                );
-                                job.error = Some(error);
-                                break;
-                            }
-                            Err(error) => {
-                                pr_err!(
-                                    "G16: command {} publication failed: {:?}\n",
-                                    job.next,
-                                    error
-                                );
-                                return Err(error);
-                            }
-                        };
-                        let issued = Issued {
-                            id: receipt.id,
-                            owner: execution.id,
-                        };
-                        job.next += 1;
-                        job.pending += 1;
-                        engine.issued.push(issued, GFP_KERNEL)?;
-                        progress = true;
+                    let job = &mut engine.jobs[index];
+                    if job.error.is_some() || job.next == job.execution.parameters.len() {
+                        continue;
                     }
+                    if job.history[0].is_empty() {
+                        let previous = job.execution.firmware.lock().last;
+                        for (history, stamp) in job.history.iter_mut().zip(previous) {
+                            history.push(stamp, GFP_KERNEL)?;
+                        }
+                    }
+                    let dependencies =
+                        resolve_barriers(&job.history, job.execution.barriers[job.next])?;
+                    let execution = job.execution.clone();
+                    let compute = matches!(execution.parameters[job.next], Parameters::Compute(_));
+                    // Wake on completion of explicitly declared dependencies.
+                    // NONE dependencies admit immediately; independent engines
+                    // and successive render stages can execute concurrently.
+                    if !runtime.dependencies_done(&dependencies)? {
+                        continue;
+                    }
+                    engine.issued.reserve(1, GFP_KERNEL)?;
+                    let job = &mut engine.jobs[index];
+                    crate::mem::sync();
+                    let receipt = match &execution.parameters[job.next] {
+                        Parameters::Render(p) => runtime.submit_render(
+                            execution.firmware.clone(),
+                            execution.render_space.clone(),
+                            p,
+                            execution.support.as_deref().ok_or(EIO)?,
+                            execution.timestamps[job.next],
+                        ),
+                        Parameters::Compute(p) => runtime.submit_compute(
+                            execution.firmware.clone(),
+                            &mut execution.space.lock(),
+                            p,
+                            &execution.memory,
+                            execution.timestamps[job.next],
+                        ),
+                    };
+                    let receipt = match receipt {
+                        Ok(receipt) => receipt,
+                        Err(EBUSY) if !runtime.render_failed() => continue,
+                        Err(error) if !runtime.render_failed() => {
+                            pr_err!(
+                                "G16: command {} preparation failed: {:?}\n",
+                                job.next,
+                                error
+                            );
+                            job.error = Some(error);
+                            progress = true;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    job.history[usize::from(compute)].push(Some(receipt.stamp), GFP_KERNEL)?;
+                    let issued = Issued {
+                        id: receipt.id,
+                        owner: execution.id,
+                    };
+                    job.next += 1;
+                    job.pending += 1;
+                    engine.issued.push(issued, GFP_KERNEL)?;
+                    // Resume after the last admitted job when a scarce slot
+                    // becomes free, rather than repeatedly favoring index zero.
+                    engine.cursor = index + 1;
+                    progress = true;
                 }
                 Ok(progress)
             })();
@@ -1210,18 +1220,27 @@ impl sched::JobImpl for SubmissionJob {
         }
         let fence = execution.completion.clone();
         let mut engine = execution.device.engine.lock();
-        if let Err(error) = engine.jobs.push(
-            Running {
-                execution: execution.clone(),
-                next: 0,
-                pending: 0,
-                error: None,
-            },
-            GFP_KERNEL,
-        ) {
-            execution.completion.set_error(error.into());
+        let result = (|| -> Result {
+            let mut history = [KVec::new(), KVec::new()];
+            for events in &mut history {
+                events.reserve(65, GFP_KERNEL)?;
+            }
+            engine.jobs.push(
+                Running {
+                    execution: execution.clone(),
+                    next: 0,
+                    pending: 0,
+                    error: None,
+                    history,
+                },
+                GFP_KERNEL,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            execution.completion.set_error(error);
             let _ = execution.completion.signal();
-            return Err(error.into());
+            return Err(error);
         }
         if !engine.running {
             engine.running = true;
@@ -1284,7 +1303,7 @@ impl File {
         .reader()
         .read_all(&mut bytes, GFP_KERNEL)?;
         let mut commands = KVec::new();
-        let mut prepare_after = KVec::new();
+        let mut barriers = KVec::new();
         let mut attachments = KVec::new();
         let mut offset = 0usize;
         let mut renders = 0u16;
@@ -1307,7 +1326,7 @@ impl File {
                     let command = crate::util::Reader::new(payload)
                         .read_up_to::<uapi::drm_asahi_cmd_render>(payload.len())?;
                     commands.push(Command::Render(command), GFP_KERNEL)?;
-                    prepare_after.push(false, GFP_KERNEL)?;
+                    barriers.push([header.vdm_barrier, header.cdm_barrier], GFP_KERNEL)?;
                     renders += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
@@ -1320,11 +1339,7 @@ impl File {
                     let command = crate::util::Reader::new(payload)
                         .read_up_to::<uapi::drm_asahi_cmd_compute>(payload.len())?;
                     commands.push(Command::Compute(command), GFP_KERNEL)?;
-                    prepare_after.push(
-                        (header.vdm_barrier != 0xffff && header.vdm_barrier != 0)
-                            || (header.cdm_barrier != 0xffff && header.cdm_barrier != 0),
-                        GFP_KERNEL,
-                    )?;
+                    barriers.push([header.vdm_barrier, header.cdm_barrier], GFP_KERNEL)?;
                     computes += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS
@@ -1415,9 +1430,11 @@ impl File {
             .iter()
             .find(|q| q.id == data.queue_id)
             .ok_or(ENOENT)?;
-        // Different queues may execute out of submission order, so each
-        // queue needs its own DMA-fence timeline/context.
-        let unique = queue.fences.new_fence(0, Completion)?;
+        // Render and compute on even one public queue may complete out of
+        // order. Give each submission its own timeline: a later independent
+        // completion must never subsume an earlier dependency in DRM.
+        let unique = dma_fence::FenceContexts::new(1, c_str!("asahi_m4"), FENCE_KEY)?
+            .new_fence(0, Completion)?;
         let vm_id = queue.vm;
         let firmware = queue.firmware.clone();
         let mut timestamps = KVec::new();
@@ -1474,14 +1491,8 @@ impl File {
                 GFP_KERNEL,
             )?;
         }
-        let mut needs_mapping =
+        let needs_mapping =
             (renders != 0 && !vm.render_ready) || (computes != 0 && !vm.compute_ready);
-        for p in &parameters {
-            if let Parameters::Render(p) = p {
-                let (tilemap, tpc) = p.scratch_sizes().ok_or(EINVAL)?;
-                needs_mapping |= tilemap > vm.tilemap.1 || tpc > vm.tpc.1;
-            }
-        }
         if needs_mapping {
             // Match the shim: drain before modifying GPU-visible mappings.
             // Already-initialized submissions do not wait for prior work.
@@ -1497,10 +1508,6 @@ impl File {
                     .alloc_render_private(vm.kernel.start, vm.kernel.end)?;
                 let pool =
                     render::OperandPool::new(vm.kernel.start, vm.kernel.end).ok_or(EINVAL)?;
-                vm.scratch_next = pool.growth_end().ok_or(EINVAL)?;
-                if vm.scratch_next > vm.kernel.end.min(render::CONTEXT_BASE + (1 << 32)) {
-                    return Err(ENOMEM);
-                }
                 vm.render_support = Some(Arc::new(
                     runtime.acquire_render_support(&pool)?,
                     GFP_KERNEL,
@@ -1515,11 +1522,6 @@ impl File {
                 vm.render_broken = false;
             }
         }
-        for p in &mut parameters {
-            if let Parameters::Render(p) = p {
-                vm.prepare_scratch(p)?;
-            }
-        }
         let mut mappings = KVec::new();
         for mapping in &vm.mappings {
             mappings.push(mapping.clone(), GFP_KERNEL)?;
@@ -1532,7 +1534,7 @@ impl File {
         let worker_completion = completion.clone();
         let execution = Arc::pin_init(
             try_pin_init!(Execution {
-                id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), firmware, prepare_after,
+                id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), firmware, barriers,
                 device: device.into(), _owner: inner.state.clone(),
                 render_space: vm.space.clone(), space: vm.compute_space.clone(), memory,
                 support: vm.render_support.clone(),
@@ -1764,33 +1766,6 @@ impl Vm {
             p.heapmeta += 0x100;
         }
         Ok(p)
-    }
-
-    fn prepare_scratch(&mut self, p: &mut render::Parameters) -> Result {
-        let (tilemap, tpc) = p.scratch_sizes().ok_or(EINVAL)?;
-        let mut changed = false;
-        for (current, needed) in [(&mut self.tilemap, tilemap), (&mut self.tpc, tpc)] {
-            if current.1 < needed {
-                let end = self.scratch_next.checked_add(needed as u64).ok_or(ENOMEM)?;
-                if end > self.kernel.end {
-                    return Err(ENOMEM);
-                }
-                self.space.lock().alloc_low(
-                    self.scratch_next,
-                    needed,
-                    crate::pgtable::prot::PROT_GPU_SHARED_RW,
-                )?;
-                *current = (self.scratch_next, needed);
-                self.scratch_next = end;
-                changed = true;
-            }
-        }
-        if changed {
-            self.publish_mappings();
-        }
-        p.tilemap = self.tilemap.0;
-        p.tpc = self.tpc.0;
-        Ok(())
     }
 }
 

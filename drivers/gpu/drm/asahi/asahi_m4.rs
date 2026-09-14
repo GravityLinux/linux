@@ -111,7 +111,7 @@ kernel::module_platform_driver! {
     params: {
         fw_trace: u32 {
             default: 0,
-            description: "Enable firmware KTrace records for command diagnostics",
+            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation",
         },
         tvb_max_blocks: u32 {
             default: 331,
