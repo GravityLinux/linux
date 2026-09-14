@@ -199,6 +199,7 @@ impl DriverObject for Buffer {
             vm: args.1,
         })
     }
+
     fn export(obj: &Object, flags: u32) -> Result<drm::gem::DmaBuf<Object>> {
         if obj.vm != 0 {
             return Err(EINVAL);
@@ -206,8 +207,38 @@ impl DriverObject for Buffer {
         obj.prime_export(flags)
     }
 
-    // Mappings pin GEM storage until VM destruction, including after closing
-    // a userspace handle. This matches the prototype's context-owned memory.
+    fn close(obj: &Object, file: &DrmFile) {
+        // Mesa may reuse this virtual address after GEM_CLOSE. Hold the file
+        // state against new submissions, and retire only VMs using this BO.
+        // Workers never acquire file state while completing their fences.
+        let inner = file.inner();
+        if inner.device.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let result: Result = (|| {
+            let mut state = inner.state.lock();
+            for vm in &mut state.vms {
+                if !vm.mappings.iter().any(|m| core::ptr::eq(m.sg.object(), obj)) {
+                    continue;
+                }
+                drain(&mut vm.pending)?;
+                let runtime = inner.device.runtime.lock();
+                while let Some(range) = vm.mappings.iter()
+                    .find(|m| core::ptr::eq(m.sg.object(), obj))
+                    .map(|m| m.range.clone())
+                {
+                    vm.unmap(range, &runtime)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // close cannot report failure. Preserve backing for late DMA and
+            // reject further submissions if completion was not established.
+            inner.device.failed.store(true, Ordering::Release);
+            pr_err!("G16: failed to unbind closed GEM object: {:?}\n", error);
+        }
+    }
 }
 
 #[pin_data(PinnedDrop)]
@@ -916,7 +947,8 @@ impl Vm {
 static FENCE_KEY: Pin<&kernel::sync::LockClassKey> = kernel::static_lock_class!();
 
 /// Wait only for actual worker completion, including on scheduler timeout.
-/// Callers hold admission, preventing new publications while mappings change.
+/// Callers hold admission or the affected file state, preventing new uses
+/// of the mappings protected by these fences.
 fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
     for fence in pending.iter() {
         // SAFETY: Each entry owns its fence reference throughout the wait.

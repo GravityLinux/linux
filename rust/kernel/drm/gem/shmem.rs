@@ -336,8 +336,10 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
         prime_handle_to_fd: None,
         prime_fd_to_handle: None,
         gem_prime_import: None,
-        gem_prime_import_sg_table: Some(bindings::drm_gem_shmem_prime_import_sg_table),
-        dumb_create: Some(bindings::drm_gem_shmem_dumb_create),
+        // The generic C allocators do not initialize the Rust object payload.
+        // Support native GEM allocation and export only.
+        gem_prime_import_sg_table: None,
+        dumb_create: None,
         dumb_map_offset: None,
     };
 }
@@ -448,13 +450,6 @@ pub struct SGTable<T: DriverObject> {
     _owner: ARef<Object<T>>,
 }
 
-impl<T: DriverObject> SGTable<T> {
-    /// Returns the GEM object kept alive by this pinned scatter-gather table.
-    pub fn object(&self) -> &Object<T> {
-        &self._owner
-    }
-}
-
 // SAFETY: This object is thread-safe via our type invariants.
 unsafe impl<T: DriverObject> Send for SGTable<T> {}
 // SAFETY: This object is thread-safe via our type invariants.
@@ -467,4 +462,9 @@ impl<T: DriverObject> Deref for SGTable<T> {
         // SAFETY: Creating an immutable reference to this is safe via our type invariants.
         unsafe { self.sgt.as_ref() }
     }
+}
+
+impl<T: DriverObject> SGTable<T> {
+    /// Return the GEM object that owns and pins this scatter-gather table.
+    pub fn object(&self) -> &Object<T> { &self._owner }
 }
