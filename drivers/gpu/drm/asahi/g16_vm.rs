@@ -22,11 +22,11 @@ pub(crate) struct Roots {
 }
 
 pub(crate) struct AddressSpace {
+    // Forks borrow unchanged parent tables, so destroy them before those
+    // tables and their pinned GEM/private backing.
+    pub(crate) views: KVec<AddressSpace>,
     pub(crate) low: UatPageTable,
     pub(crate) high: UatPageTable,
-    // Per-Work compute views retain their own table snapshots until this VM
-    // is destroyed. Their leaves share this VM's pinned GEM/private backing.
-    pub(crate) views: KVec<AddressSpace>,
     // Drop the owned tables before releasing their mapped pages.
     pages: KVec<(u64, Owned<Page>)>,
     snapshots: KVec<Owned<Page>>,
@@ -52,10 +52,14 @@ impl AddressSpace {
         })
     }
 
-    pub(crate) fn fork(&self) -> Result<Self> {
+    /// # Safety
+    /// Retain the fork in this parent's views before publishing it. The parent
+    /// lock serializes shared-table edits and views are destroyed first.
+    pub(crate) unsafe fn fork(&self) -> Result<Self> {
         Ok(Self {
-            low: self.low.fork()?,
-            high: self.high.fork()?,
+            // SAFETY: The caller supplies the parent lifetime and serialization.
+            low: unsafe { self.low.fork()? },
+            high: unsafe { self.high.fork()? },
             pages: KVec::new(),
             snapshots: KVec::new(),
             views: KVec::new(),
@@ -263,8 +267,6 @@ impl AddressSpace {
             false,
         )?;
         self.sync();
-        crate::mem::tlbi_all();
-        crate::mem::sync();
         Ok(())
     }
 
@@ -430,8 +432,9 @@ impl FirmwareSpace {
     pub(crate) fn unmap_external(&mut self, range: core::ops::Range<u64>) -> Result {
         self.table.unmap_pages(range.clone())?;
         self.table.sync();
-        crate::mem::tlbi_all();
+        self.table.invalidate(None);
         crate::mem::sync();
+        self.table.clear_invalidations();
         self.external
             .retain(|r| r.start < range.start || r.end > range.end);
         Ok(())
@@ -656,8 +659,9 @@ impl FirmwareSpace {
         let size = self.regions[index].pages.len() * UAT_PGSZ;
         self.table.unmap_pages(va..va + size as u64)?;
         self.table.sync();
-        crate::mem::tlbi_all();
+        self.table.invalidate(None);
         crate::mem::sync();
+        self.table.clear_invalidations();
         self.regions.swap_remove(index);
         Ok(())
     }
@@ -695,8 +699,9 @@ impl FirmwareSpace {
             }
         }
         self.table.sync();
-        crate::mem::tlbi_all();
+        self.table.invalidate(None);
         crate::mem::sync();
+        self.table.clear_invalidations();
     }
 }
 
@@ -713,8 +718,9 @@ impl Drop for FirmwareSpace {
             let _ = self.table.unmap_pages(range.clone());
         }
         self.table.sync();
-        crate::mem::tlbi_all();
+        self.table.invalidate(None);
         crate::mem::sync();
+        self.table.clear_invalidations();
     }
 }
 

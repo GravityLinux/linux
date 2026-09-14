@@ -200,13 +200,14 @@ pub(crate) struct Bootstrap {
     pub(crate) maximum_frequency_khz: u32,
     tvb_pools: KVec<crate::g16_tvb::Tvb>,
     render_publication: u64,
-    render_channel_publications: [u64; 4],
     next_work_va: u64,
+    work_arenas: [core::ops::Range<u64>; 2],
     compute_publication: u64,
-    compute_channel_publications: [u64; 4],
     queue_events: Arc<core::sync::atomic::AtomicU64>,
     render_failed: bool,
     flights: KVec<render_runtime::Flight>,
+    publications: KVec<render_runtime::Publication>,
+    batch_works: usize,
     context_roots: [Option<crate::g16_vm::Roots>; 64],
     context_users: [u32; 64],
     pressure_reported: core::sync::atomic::AtomicU64,
@@ -652,13 +653,14 @@ impl Bootstrap {
             maximum_frequency_khz: platform.freq_a[10] * 1000,
             tvb_pools: KVec::new(),
             render_publication: 0,
-            render_channel_publications: [0; 4],
             next_work_va: 0xffff_fc22_0000_0000,
+            work_arenas: [0..0, 0..0],
             compute_publication: 0,
-            compute_channel_publications: [0; 4],
             queue_events: Arc::new(core::sync::atomic::AtomicU64::new(0), GFP_KERNEL)?,
             render_failed: false,
             flights: KVec::new(),
+            publications: KVec::new(),
+            batch_works: 0,
             context_roots: [None; 64],
             context_users: [0; 64],
             pressure_reported: core::sync::atomic::AtomicU64::new(0),
@@ -820,7 +822,7 @@ impl Bootstrap {
             firmware.write_live(address, &value.to_le_bytes())?;
         }
         firmware.write_live(0xffff_fc20_0003_4fd4, &1u32.to_le_bytes())?;
-        crate::mem::tlbi_all();
+        crate::mem::tlbi_asid(1);
         crate::mem::sync();
         kernel::time::delay::fsleep(kernel::time::Delta::from_millis(100));
         self._rtkit
@@ -899,7 +901,7 @@ impl Bootstrap {
             core::arch::asm!("dc cvac, {addr}", addr = in(reg) ttbs.ptr());
         }
         crate::mem::sync();
-        crate::mem::tlbi_all();
+        crate::mem::tlbi_asid(0);
         crate::mem::sync();
         self._rtkit
             .as_mut()

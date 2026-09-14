@@ -97,6 +97,18 @@ pub(super) struct Flight {
     render: Option<RenderFlight>,
 }
 
+/// One channel message for all staged commands on this firmware queue.
+/// Its epoch remains stable while head advances, so every flight can retain
+/// the correct transport-retirement target before the batch is published.
+#[derive(Clone, Copy)]
+pub(super) struct Publication {
+    channel: usize,
+    epoch: u32,
+    lane: Lane,
+    event: u32,
+    sequence: u64,
+}
+
 /// Ring distance is unambiguous because admission keeps less than half a ring
 /// outstanding. Equality alone would lose completions when firmware advances
 /// past several commands between notifications, including over the wrap boundary.
@@ -130,6 +142,34 @@ impl Bootstrap {
                 self.flights.len()
             );
         }
+    }
+
+    /// Amortize firmware page allocation and mapping over sixteen Works.
+    /// Every slot is distinct and retained; firmware notifier links and saved
+    /// completion stamps are never recycled. Render tails keep shared access.
+    fn allocate_work(&mut self, render: bool) -> Result<u64> {
+        use crate::pgtable::prot::{PROT_FW_PRIV_RW, PROT_FW_SHARED_RW};
+        let index = usize::from(render);
+        let stride = if render { 0x18000 } else { 0x8000 };
+        if self.work_arenas[index].is_empty() {
+            let base = self.next_work_va;
+            let end = base.checked_add(16 * stride).ok_or(ENOSPC)?;
+            // Failed refills retain their partial allocations, but no part of
+            // that range becomes available for a later Work or another arena.
+            self.next_work_va = end;
+            let fw = self._firmware_space.as_mut().ok_or(EIO)?;
+            for va in (base..end).step_by(stride as usize) {
+                fw.alloc(va, if render { 0x10000 } else { 0x4000 }, PROT_FW_PRIV_RW)?;
+                if render {
+                    fw.alloc(va + 0x10000, 0x8000, PROT_FW_SHARED_RW)?;
+                }
+            }
+            fw.sync();
+            self.work_arenas[index] = base..end;
+        }
+        let va = self.work_arenas[index].start;
+        self.work_arenas[index].start += stride;
+        Ok(va)
     }
 
     fn prepare_queues(&mut self, owner: &mut FirmwareQueues) -> Result {
@@ -179,8 +219,6 @@ impl Bootstrap {
             fw.write(jobs, &q::jobs(jobs))?;
             fw.write(context, &q::context())?;
             fw.sync();
-            crate::mem::tlbi_all();
-            crate::mem::sync();
             owner.lanes = Some(lanes);
             if *crate::module_parameters::fw_trace.value() & 1 != 0 {
                 dev_info!(
@@ -245,19 +283,34 @@ impl Bootstrap {
             if read >= 256 || done >= 256 || tail >= 256 {
                 return Err(EIO);
             }
-            if !ring_room(tail, read, done, 1, 256) {
+            let staged = self
+                .publications
+                .iter()
+                .filter(|p| p.channel == channel)
+                .count() as u32;
+            let coalesced = queue.lanes.as_ref().is_some_and(|lanes| {
+                self.publications
+                    .iter()
+                    .any(|p| p.lane.queue == lanes[stage].queue)
+            });
+            if !ring_room(
+                (tail + staged) & 255,
+                read,
+                done,
+                u32::from(!coalesced),
+                256,
+            ) {
                 self.report_pressure(2, "channel");
                 return Err(EBUSY);
             }
-            // Keep even already-consumed, unretired targets within the
-            // half-ring window used by reached(). Notification can coalesce.
-            if self
-                .flights
-                .iter()
-                .filter(|f| f.channels.iter().any(|&(c, _)| c == channel))
-                .count()
-                >= 127
-            {
+            // Bound transport epochs, not the number of Works sharing each
+            // epoch. A coalesced batch consumes only one channel-ring slot.
+            let next = (tail + staged + u32::from(!coalesced)) & 255;
+            if self.flights.iter().any(|f| {
+                f.channels
+                    .iter()
+                    .any(|&(c, target)| c == channel && !reached(next, target, 256))
+            }) {
                 self.report_pressure(2, "channel");
                 return Err(EBUSY);
             }
@@ -277,6 +330,122 @@ impl Bootstrap {
             }
         }
         self.flights.reserve(1, GFP_KERNEL)?;
+        self.publications.reserve(stages.len(), GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// Stage a queue head; multiple Works share one transport message.
+    fn stage_queue(
+        &mut self,
+        channel: usize,
+        lane: Lane,
+        event: u32,
+        sequence: u64,
+    ) -> Result<u32> {
+        if let Some(p) = self
+            .publications
+            .iter_mut()
+            .find(|p| p.lane.queue == lane.queue)
+        {
+            p.lane.head = lane.head;
+            p.sequence = sequence;
+            return Ok(p.epoch);
+        }
+        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+        let route = &config.channels[channel];
+        let guard = self._sgx.try_access().ok_or(ENODEV)?;
+        let tail =
+            guard.try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize)?;
+        if tail >= 256 {
+            return Err(EIO);
+        }
+        let reserved = self
+            .publications
+            .iter()
+            .filter(|p| p.channel == channel)
+            .count() as u32;
+        let epoch = (tail + reserved) & 255;
+        self.publications.push(
+            Publication {
+                channel,
+                epoch,
+                lane,
+                event,
+                sequence,
+            },
+            GFP_KERNEL,
+        )?;
+        Ok(epoch)
+    }
+
+    /// Publish fully prepared rings together, then kick each used engine once
+    /// per priority. No staged Work may remain when the worker sleeps.
+    pub(crate) fn flush(&mut self) -> Result {
+        if self.publications.is_empty() {
+            return Ok(());
+        }
+        self.render_failed = true;
+        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
+        let mut tails = [None; 12];
+        let mut kicks = 0u32;
+        // Fragment transports must precede tiling, matching normal publication.
+        for stage in [1usize, 0, 2] {
+            for p in self.publications.iter().filter(|p| p.channel % 3 == stage) {
+                let route = &config.channels[p.channel];
+                fw.write_live(p.lane.pointers + 0x40, &p.lane.head.to_le_bytes())?;
+                fw.write_live(
+                    route.ring + u64::from(p.epoch) * 0x18,
+                    &g16_fw::queue::channel(
+                        p.lane.queue,
+                        p.lane.head as u16,
+                        p.event as u8,
+                        stage as u32,
+                        p.lane.new,
+                        p.sequence,
+                    ),
+                )?;
+                tails[p.channel] = Some((p.epoch + 1) & 255);
+                kicks |= 1 << ((p.channel / 3) * 2 + usize::from(stage == 2));
+            }
+        }
+        crate::mem::sync();
+        let guard = self._sgx.try_access().ok_or(ENODEV)?;
+        for stage in [1usize, 0, 2] {
+            for channel in (stage..12).step_by(3) {
+                if let Some(tail) = tails[channel] {
+                    let route = &config.channels[channel];
+                    guard.try_write32(
+                        tail,
+                        0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize,
+                    )?;
+                }
+            }
+        }
+        crate::mem::sync();
+        drop(guard);
+        for bit in 0..8 {
+            if kicks & (1 << bit) != 0 {
+                let priority = bit / 2;
+                let engine = (bit % 2) * 2;
+                self._rtkit.as_mut().send_message(
+                    0x21,
+                    0x0083_0000_0000_0000 | ((priority as u64) << 2) | engine as u64,
+                )?;
+            }
+        }
+        if *crate::module_parameters::fw_trace.value() & 4 != 0 {
+            dev_info!(
+                self.dev.as_ref(),
+                "G16: batch works={} messages={} kicks={}\n",
+                self.batch_works,
+                self.publications.len(),
+                kicks.count_ones()
+            );
+        }
+        self.publications.clear();
+        self.batch_works = 0;
+        self.render_failed = false;
         Ok(())
     }
 
@@ -660,6 +829,29 @@ impl Bootstrap {
         Ok(())
     }
 
+    /// Invalidate only slots actually bound to this root. New roots need no
+    /// shootdown: set_context invalidates the ASID before installing them.
+    pub(crate) fn invalidate_client(&self, client: &g16_vm::AddressSpace) {
+        let root = client.roots().low;
+        if self
+            ._address_space
+            .as_ref()
+            .is_some_and(|s| s.roots().low == root)
+        {
+            client.low.invalidate(Some(0));
+            client.high.invalidate(Some(0));
+        }
+        for (index, roots) in self.context_roots.iter().enumerate().skip(1) {
+            if roots.is_some_and(|r| r.low == root) {
+                client.low.invalidate(Some(index as u8));
+                client.high.invalidate(Some(index as u8));
+            }
+        }
+        crate::mem::sync();
+        client.low.clear_invalidations();
+        client.high.clear_invalidations();
+    }
+
     fn acquire_context(&mut self, roots: g16_vm::Roots, preferred: usize) -> Result<u32> {
         let existing = (1..64).find(|&i| self.context_roots[i].is_some_and(|r| r.low == roots.low));
         let slot = existing
@@ -876,8 +1068,7 @@ impl Bootstrap {
         // within each lane, even when other queues publish between them.
         a.fragment_stamp = 0x100 + queue_ordinal * 0x100;
         a.tiling_stamp = 0xc00 + queue_ordinal * 0x100;
-        let va = self.next_work_va;
-        self.next_work_va = va.checked_add(0x18000).ok_or(ENOSPC)?;
+        let va = self.allocate_work(true)?;
         a.tiling_shared_tail = va + 0x10000;
         a.fragment_shared_tail = va + 0x14000;
         a.event_control = va + 0x200;
@@ -891,12 +1082,6 @@ impl Bootstrap {
             return Err(ENOSPC);
         }
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        fw.alloc(va, 0x10000, crate::pgtable::prot::PROT_FW_PRIV_RW)?;
-        fw.alloc(
-            va + 0x10000,
-            0x8000,
-            crate::pgtable::prot::PROT_FW_SHARED_RW,
-        )?;
         for stage in 0..2u64 {
             let work_page = va + stage * 0x8000;
             let register_page = alias + stage * 0x4000;
@@ -923,8 +1108,8 @@ impl Bootstrap {
             }
         }
         fw.sync();
-        crate::mem::tlbi_all();
-        crate::mem::sync();
+        self.invalidate_client(self._address_space.as_ref().ok_or(EIO)?);
+        self.invalidate_client(client);
         // A live context lease keeps these roots fixed through retirement.
         a.context_id = u64::from(self.acquire_context(space, 9)?);
         a.tiling_user_timestamp_start = timestamps[0];
@@ -956,12 +1141,11 @@ impl Bootstrap {
             .as_mut()
             .ok_or(EIO)?
             .write_live(a.render_shared_state, &use_count.to_le_bytes())?;
-        let (heads, epoch) = self.publish_render(&a, &ta, &frag, queue, initbm, pool.blocks)?;
+        let (heads, epochs) = self.publish_render(&a, &ta, &frag, queue, initbm, pool.blocks)?;
         pool.initialized = true;
         support.submissions.store(next_submitted, Ordering::Relaxed);
         self.render_publication += 1;
         queue.render_count = queue_ordinal + 1;
-        self.render_channel_publications[queue.priority as usize] += 1;
         let lanes = queue.lanes.as_mut().ok_or(EIO)?;
         for stage in 0..2 {
             lanes[stage].head = heads[stage];
@@ -991,8 +1175,8 @@ impl Bootstrap {
                 ],
                 queues: [(lanes[0].pointers, heads[0]), (lanes[1].pointers, heads[1])],
                 channels: [
-                    (queue.priority as usize * 3, epoch),
-                    (queue.priority as usize * 3 + 1, epoch),
+                    (queue.priority as usize * 3, (epochs[0] + 1) & 255),
+                    (queue.priority as usize * 3 + 1, (epochs[1] + 1) & 255),
                 ],
                 render: Some(RenderFlight {
                     addresses: a,
@@ -1005,6 +1189,7 @@ impl Bootstrap {
             GFP_KERNEL,
         )?;
         self.render_failed = false;
+        self.batch_works += 1;
         self.trace_publication("render", va)?;
         Ok(receipt)
     }
@@ -1017,19 +1202,10 @@ impl Bootstrap {
         queue: &FirmwareQueues,
         initbm: bool,
         blocks: u32,
-    ) -> Result<([u32; 2], u32)> {
-        use g16_fw::queue as q;
+    ) -> Result<([u32; 2], [u32; 2])> {
         let priority = queue.priority;
         let lanes = queue.lanes.as_ref().ok_or(EIO)?;
         let publication = self.render_publication;
-        let epoch = (self.render_channel_publications[priority as usize] & 255) as u32;
-        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
-        let routes = [
-            &config.channels[priority as usize * 3],
-            &config.channels[priority as usize * 3 + 1],
-        ];
-        let producer_offset = |address: u64| 0xd60000 + (address - 0xffff_fc20_0002_0000) as usize;
-        let next = (epoch + 1) & 255;
         let firsts = [lanes[0].head, lanes[1].head];
         let heads = [
             (firsts[0] + 1 + u32::from(initbm)) % 0x500,
@@ -1041,7 +1217,7 @@ impl Bootstrap {
         fw.write_live(a.event_count_array, &2u32.to_le_bytes())?;
         // The queue lanes persist independently of the physical work channel.
         for stage in 0..2 {
-            let Lane { pointers, ring, .. } = lanes[stage];
+            let Lane { ring, .. } = lanes[stage];
             let prelude = if stage == 0 {
                 a.tiling_prelude
             } else {
@@ -1077,45 +1253,23 @@ impl Bootstrap {
                 pos = (pos + 1) % 0x500;
             }
             fw.write_live(ring + u64::from(pos) * 8, &work.to_le_bytes())?;
-            fw.write_live(pointers + 0x40, &heads[stage].to_le_bytes())?;
         }
-        crate::mem::sync();
-        let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
-        let sgx = &*sgx_guard;
-        // The selected fragment channel is published before tiling; its barrier
-        // waits for the matching TA completion stamp.
+        let mut epochs = [0; 2];
         for stage in [1usize, 0] {
-            let route = routes[stage];
-
-            let producer = producer_offset(route.state[2]);
-            if sgx.try_read32(producer)? != epoch {
-                return Err(EIO);
-            }
-            let ring = route.ring;
-            let (queue, event) = if stage == 0 {
-                (a.tiling_queue, a.tiling_event)
-            } else {
-                (a.fragment_queue, a.fragment_event)
-            };
-            self._firmware_space.as_mut().ok_or(EIO)?.write_live(
-                ring + u64::from(epoch) * 0x18,
-                &q::channel(
-                    queue,
-                    heads[stage] as u16,
-                    event as u8,
-                    stage as u32,
-                    lanes[stage].new,
-                    publication + 1,
-                ),
+            let mut lane = lanes[stage];
+            lane.head = heads[stage];
+            epochs[stage] = self.stage_queue(
+                priority as usize * 3 + stage,
+                lane,
+                if stage == 0 {
+                    a.tiling_event
+                } else {
+                    a.fragment_event
+                } as u32,
+                publication + 1,
             )?;
-            sgx.try_write32(next, producer)?;
         }
-        crate::mem::sync();
-        drop(sgx_guard);
-        self._rtkit
-            .as_mut()
-            .send_message(0x21, 0x0083_0000_0000_0000 | (u64::from(priority) << 2))?;
-        Ok((heads, next))
+        Ok((heads, epochs))
     }
 }
 
@@ -1178,7 +1332,9 @@ impl Bootstrap {
         let priority = queue.priority;
 
         parent.views.reserve(1, GFP_KERNEL)?;
-        let mut view = parent.fork()?;
+        // SAFETY: The parent lock serializes table access. The view is retained
+        // in parent.views before publication, and those views drop first.
+        let mut view = unsafe { parent.fork()? };
         let client = &mut view;
         // Different firmware compute queues can suspend/resume independently.
         // Their scratch and resume marker must not alias the device's opening
@@ -1188,7 +1344,6 @@ impl Bootstrap {
             client.alloc_low(base, size, crate::pgtable::prot::PROT_GPU_SHARED_RW)?;
         }
         let space = client.roots();
-        use g16_fw::queue as q;
         if self.render_failed {
             return Err(EIO);
         }
@@ -1200,14 +1355,12 @@ impl Bootstrap {
         client.snapshot(memory, resource)?;
         let mut params = *params;
         params.resource = resource;
-        let work = self.next_work_va;
+        let work = self.allocate_work(false)?;
         let alias = 0x71_0000_0000 + self.compute_publication * 0x4000;
         if alias + 0x4000 > 0x72_0000_0000 {
             return Err(ENOSPC);
         }
-        self.next_work_va = work.checked_add(0x8000).ok_or(ENOSPC)?;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        fw.alloc(work, 0x4000, crate::pgtable::prot::PROT_FW_PRIV_RW)?;
         let pa = fw.physical(work)?;
         self._address_space.as_mut().ok_or(EIO)?.low.map_pages(
             alias..alias + 0x4000,
@@ -1229,8 +1382,8 @@ impl Bootstrap {
         self._address_space.as_ref().ok_or(EIO)?.sync();
         fw.sync();
         client.sync();
-        crate::mem::tlbi_all();
-        crate::mem::sync();
+        self.invalidate_client(self._address_space.as_ref().ok_or(EIO)?);
+        self.invalidate_client(client);
         a.context = self.acquire_context(space, 1)?;
         a.identity = (u64::from(a.context) << 32) | (a.identity & 0xffff_ffff);
         a.register_identity = (u64::from(a.context) << 32) | 1;
@@ -1268,40 +1421,13 @@ impl Bootstrap {
         fw.write_live(a.driver_stamp, &previous.to_le_bytes())?;
         fw.write_live(a.firmware_stamp, &previous.to_le_bytes())?;
         fw.write_live(lane.ring + u64::from(first) * 8, &a.work.to_le_bytes())?;
-        fw.write_live(lane.pointers + 0x40, &head.to_le_bytes())?;
-        crate::mem::sync();
-        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
         let channel = priority as usize * 3 + 2;
-        let route = &config.channels[channel];
-        let producer = 0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize;
-        let epoch = (self.compute_channel_publications[priority as usize] & 255) as u32;
-        let next = (epoch + 1) & 255;
-        let guard = self._sgx.try_access().ok_or(ENODEV)?;
-        let sgx = &*guard;
-        if sgx.try_read32(producer)? != epoch {
-            return Err(EIO);
-        }
-        self._firmware_space.as_mut().ok_or(EIO)?.write_live(
-            route.ring + u64::from(epoch) * 0x18,
-            &q::channel(
-                a.queue,
-                head as u16,
-                a.event as u8,
-                2,
-                lane.new,
-                self.compute_publication + 1,
-            ),
-        )?;
-        crate::mem::sync();
-        sgx.try_write32(next, producer)?;
-        crate::mem::sync();
-        drop(guard);
-        self._rtkit
-            .as_mut()
-            .send_message(0x21, 0x0083_0000_0000_0002 | (u64::from(priority) << 2))?;
+        let mut pending_lane = lane;
+        pending_lane.head = head;
+        let epoch =
+            self.stage_queue(channel, pending_lane, a.event, self.compute_publication + 1)?;
         self.compute_publication += 1;
         queue.compute_count = ordinal + 1;
-        self.compute_channel_publications[priority as usize] += 1;
         let lane = &mut queue.lanes.as_mut().ok_or(EIO)?[2];
         lane.head = head;
         lane.new = false;
@@ -1321,12 +1447,13 @@ impl Bootstrap {
                 started: Instant::now(),
                 stamps: [Some(stamp), None],
                 queues: [(pointers, head), (0, 0)],
-                channels: [(channel, next), (usize::MAX, 0)],
+                channels: [(channel, (epoch + 1) & 255), (usize::MAX, 0)],
                 render: None,
             },
             GFP_KERNEL,
         )?;
         self.render_failed = false;
+        self.batch_works += 1;
         self.trace_publication("compute", a.work)?;
         Ok(Receipt { id: a.work, stamp })
     }
@@ -1391,7 +1518,7 @@ impl Bootstrap {
                 {
                     return Err(EIO);
                 }
-                let grown = pool.grow(fw, client)?;
+                let grown = pool.grow(fw, client, a.context_id as u8)?;
                 dev_info!(
                     self.dev.as_ref(),
                     "G16: TVB slot {} blocks {} growth {} subpipe {}\n",
