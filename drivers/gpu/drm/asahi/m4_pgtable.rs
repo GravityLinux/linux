@@ -241,50 +241,9 @@ pub(crate) struct UatPageTable {
     owned_tables: KVec<OwnedTable>,
     dirty_tables: KVec<(PhysicalAddr, Cell<bool>)>,
     invalidations: RefCell<KVec<Range<u64>>>,
-    copy_on_write: bool,
 }
 
 impl UatPageTable {
-    /// Copy the root and share unchanged child tables. Writes to the fork
-    /// copy only the affected branch before modifying any inherited PTE.
-    ///
-    /// # Safety
-    /// The source tables must outlive the fork. The caller serializes CPU
-    /// access to shared tables and keeps their mapped backing alive.
-    pub(crate) unsafe fn fork(&self) -> Result<Self> {
-        if !self.ttb_owned || self.copy_on_write {
-            return Err(EINVAL);
-        }
-        let mut copy = Self::new_with_ias(
-            self.oas_mask.count_ones(),
-            self.ias_mask.count_ones() as usize,
-        )?;
-        Self::copy_table(self.ttb, copy.ttb)?;
-        copy.copy_on_write = true;
-        Ok(copy)
-    }
-
-    fn copy_table(source: PhysicalAddr, destination: PhysicalAddr) -> Result {
-        // SAFETY: The source is owned or borrowed under fork's lifetime
-        // contract; the destination is an exclusively owned unpublished page.
-        let src = unsafe { Page::borrow_phys_unchecked(&source) };
-        let dst = unsafe { Page::borrow_phys_unchecked(&destination) };
-        src.with_pointer_into_page(0, UAT_PGSZ, |s| {
-            dst.with_pointer_into_page(0, UAT_PGSZ, |d| {
-                for i in 0..UAT_NPTE {
-                    // SAFETY: Aligned PTEs within two distinct live pages.
-                    unsafe {
-                        (*d.cast::<Pte>().add(i)).store(
-                            (*s.cast::<Pte>().add(i)).load(Ordering::Relaxed),
-                            Ordering::Relaxed,
-                        );
-                    }
-                }
-                Ok(())
-            })
-        })
-    }
-
     /// Allocate a root with the address width of this GPU generation.
     /// G16 has 64 top-level entries (42 address bits per TTBR), while
     /// G13/G14 use 8 entries (39 bits per TTBR).
@@ -308,7 +267,6 @@ impl UatPageTable {
             owned_tables: KVec::new(),
             dirty_tables,
             invalidations: RefCell::new(KVec::new()),
-            copy_on_write: false,
         })
     }
 
@@ -356,7 +314,6 @@ impl UatPageTable {
             owned_tables: KVec::new(),
             dirty_tables: KVec::new(),
             invalidations: RefCell::new(KVec::new()),
-            copy_on_write: false,
         })
     }
 
@@ -524,24 +481,7 @@ impl UatPageTable {
                                 upte.store(upte_val, Ordering::Relaxed);
                             }
                             if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                                let inherited = upte_val & self.oas_mask & (!UAT_PGMSK as u64);
-                                if write && self.copy_on_write
-                                    && !self.owned_tables.iter().any(|t| t.phys == inherited)
-                                {
-                                    self.mark_dirty(phys)?;
-                                    let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
-                                    let private = page.phys();
-                                    Self::copy_table(inherited, private)?;
-                                    self.owned_tables.push(OwnedTable {
-                                        phys: private, parent: phys, index: upidx,
-                                    }, GFP_KERNEL)?;
-                                    let _ = Page::into_phys(page);
-                                    self.mark_dirty(private)?;
-                                    upte.store(private | PTE_TYPE_LEAF_TABLE, Ordering::Relaxed);
-                                    Ok(Some(private))
-                                } else {
-                                    Ok(Some(inherited))
-                                }
+                                Ok(Some(upte_val & self.oas_mask & (!UAT_PGMSK as u64)))
                             } else if upte_val == 0 || !alloc {
                                 pr_debug!("UATPageTable::with_pages: no level {}\n", level);
                                 Ok(None)

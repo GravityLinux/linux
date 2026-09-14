@@ -85,48 +85,11 @@ struct Vm {
     render_broken: bool,
 }
 
-/// A submit-time view of bindings, pinned through actual hardware completion.
-/// GPU writes to the backing remain visible when the worker reads after its
-/// input dependencies; no file-state lock is needed in the worker.
-struct MemoryView {
-    mappings: KVec<Mapping>,
+/// Retain submit-time GEM and timestamp bindings until actual completion.
+/// Command preparation never reads caller CDM or shader resource data.
+struct Bindings {
+    _mappings: KVec<Mapping>,
     _timestamps: KVec<TimestampBuffer>,
-}
-impl crate::g16_cdm::Memory for MemoryView {
-    fn cover(&self, start: u64, size: u64, permissions: u32) -> Result {
-        Mapping::cover(&self.mappings, start, size, permissions)
-    }
-
-    fn read(&self, mut address: u64, mut out: &mut [u8]) -> Result {
-        if out.is_empty() {
-            return Ok(());
-        }
-        self.cover(address, out.len() as u64, 2)?;
-        while !out.is_empty() {
-            let mapping = self
-                .mappings
-                .iter()
-                .find(|m| m.range.contains(&address))
-                .ok_or(EINVAL)?;
-            let delta = address - mapping.range.start;
-            let mut size = out.len().min((mapping.range.end - address) as usize);
-            let offset = mapping.offset
-                + if mapping.single {
-                    size = size.min(0x4000 - (delta as usize & 0x3fff));
-                    delta & 0x3fff
-                } else {
-                    delta
-                };
-            mapping
-                .sg
-                .object()
-                .vmap::<u8>()?
-                .read(&mut out[..size], offset.try_into()?)?;
-            address += size as u64;
-            out = &mut out[size..];
-        }
-        Ok(())
-    }
 }
 
 struct FileState {
@@ -807,9 +770,6 @@ impl Vm {
         runtime.release_render_vm(self.space.lock().roots())?;
         let compute = self.compute_space.lock();
         runtime.release_render_vm(compute.roots())?;
-        for view in &compute.views {
-            runtime.release_render_vm(view.roots())?;
-        }
         Ok(())
     }
 
@@ -989,7 +949,7 @@ struct Execution {
     _owner: Arc<Mutex<FileState>>,
     render_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
-    memory: MemoryView,
+    _bindings: Bindings,
     support: Option<Arc<crate::g16::Support>>,
     parameters: KVec<Parameters>,
     timestamps: KVec<[u64; 4]>,
@@ -1100,12 +1060,8 @@ impl WorkItem for Execution {
                         let execution = job.execution.clone();
                         let compute =
                             matches!(execution.parameters[job.next], Parameters::Compute(_));
-                        // Wake on completion of explicitly declared dependencies.
-                        // NONE dependencies admit immediately; independent engines
-                        // and successive render stages can execute concurrently.
-                        if !runtime.dependencies_done(&dependencies)? {
-                            continue;
-                        }
+                        // Intra-queue UAPI dependencies are encoded into firmware
+                        // rings; preparation does not read GPU-produced data.
                         engine.issued.reserve(1, GFP_KERNEL)?;
                         let job = &mut engine.jobs[index];
                         crate::mem::sync();
@@ -1116,13 +1072,14 @@ impl WorkItem for Execution {
                                 p,
                                 execution.support.as_deref().ok_or(EIO)?,
                                 execution.timestamps[job.next],
+                                &dependencies,
                             ),
                             Parameters::Compute(p) => runtime.submit_compute(
                                 execution.firmware.clone(),
                                 &mut execution.space.lock(),
                                 p,
-                                &execution.memory,
                                 execution.timestamps[job.next],
+                                &dependencies,
                             ),
                         };
                         let receipt = match receipt {
@@ -1539,7 +1496,7 @@ impl File {
             }
             if computes != 0 && !vm.compute_ready {
                 vm.render_broken = true;
-                runtime.map_compute_work(&mut vm.compute_space.lock())?;
+                runtime.map_compute_work(&mut vm.compute_space.lock(), vm.kernel.clone())?;
                 vm.compute_ready = true;
                 vm.render_broken = false;
             }
@@ -1548,8 +1505,8 @@ impl File {
         for mapping in &vm.mappings {
             mappings.push(mapping.clone(), GFP_KERNEL)?;
         }
-        let memory = MemoryView {
-            mappings,
+        let bindings = Bindings {
+            _mappings: mappings,
             _timestamps: timestamp_bindings,
         };
         vm.pending.retain(|f| {
@@ -1563,7 +1520,7 @@ impl File {
             try_pin_init!(Execution {
                 id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), firmware, barriers,
                 device: device.into(), _owner: inner.state.clone(),
-                render_space: vm.space.clone(), space: vm.compute_space.clone(), memory,
+                render_space: vm.space.clone(), space: vm.compute_space.clone(), _bindings: bindings,
                 support: vm.render_support.clone(),
                 parameters, timestamps, completion: worker_completion,
                 started: AtomicBool::new(false), work <- new_work!("m4-execution"),
@@ -1585,8 +1542,7 @@ impl File {
         // No fallible operation follows output-fence publication.
         // Publish the hardware lifetime fence directly. Scheduler finished
         // fences can be downgraded to scheduled dependencies by DRM; our
-        // external inputs must wait for actual completion (including CPU CDM
-        // preparation that may read data produced by the dependency).
+        // external inputs must wait for actual hardware completion.
         let fence = completion.clone();
         admission.push(completion, GFP_KERNEL)?;
         let job = job.arm();
@@ -1634,7 +1590,7 @@ impl Vm {
             sampler_count: c.sampler_count,
             scratch: compute::SCRATCH,
             marker: compute::MARKER,
-            resource: 0,
+            save_area: 0,
         })
     }
 

@@ -98,6 +98,32 @@ pub(crate) fn barrier(stamp: u64, wait: u32, event: u32, stamp_self: u32, uuid: 
     out
 }
 
+/// General G16 dependency, before a consumer TA or CDM Work. Type 1 participates
+/// in firmware's dynamic dependency graph; the internal TA-to-fragment prelude
+/// retains type 0 for partial-render scheduling.
+pub(crate) fn dependency(
+    stamp: u64,
+    wait: u32,
+    event: u32,
+    stamp_self: u32,
+    uuid: u32,
+) -> [u8; 0x40] {
+    let mut out = [0; 0x40];
+    u32_at(&mut out, 0, 4);
+    u64_at(&mut out, 4, stamp);
+    u64_at(&mut out, 0xc, stamp);
+    for (off, value) in [
+        (0x14, wait),
+        (0x20, event),
+        (0x24, stamp_self),
+        (0x28, uuid),
+        (0x30, 1),
+    ] {
+        u32_at(&mut out, off, value);
+    }
+    out
+}
+
 pub(crate) fn channel(
     queue: u64,
     head: u16,
