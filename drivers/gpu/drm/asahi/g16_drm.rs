@@ -120,6 +120,7 @@ struct TimestampBuffer {
 
 #[pin_data]
 pub(crate) struct Data {
+    gpu_revision: u32,
     core_mask: u32,
     maximum_frequency_khz: u32,
     scheduler: sched::Scheduler<SubmissionJob>,
@@ -173,6 +174,7 @@ pub(crate) fn register(pdev: &platform::Device<Core>) -> Result<DeviceRef> {
     }
     let runtime = crate::g16::Bootstrap::new(pdev)?;
     let data = try_pin_init!(Data {
+        gpu_revision: runtime.gpu_revision,
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
         scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 128, 0, 30000, c_str!("asahi_m4"))?,
         admission <- kernel::new_mutex!(KVec::new()),
@@ -441,7 +443,7 @@ impl File {
             features: 0,
             gpu_generation: 16,
             gpu_variant: b'G' as u32,
-            gpu_revision: 0,
+            gpu_revision: device.gpu_revision,
             chip_id: 0x8132,
             num_dies: 1,
             num_clusters_total: 1,
