@@ -197,6 +197,7 @@ pub(crate) struct Bootstrap {
     _opening_client: Option<crate::g16_vm::AddressSpace>,
     timestamp_ranges: KVec<core::ops::Range<u64>>,
     opening_notification_pending: bool,
+    pub(crate) gpu_revision: u32,
     pub(crate) core_mask: u32,
     pub(crate) maximum_frequency_khz: u32,
     tvb_pools: KVec<crate::g16_tvb::Tvb>,
@@ -287,6 +288,15 @@ impl Bootstrap {
         }
         let sgx_guard = sgx.try_access().ok_or(ENODEV)?;
         let sgx_io = &*sgx_guard;
+        let gpu_id = sgx_io.relaxed().read32(crate::ID_VERSION);
+        if gpu_id == 0 || gpu_id == u32::MAX {
+            dev_err!(dev, "Invalid GPU ID {:#010x}\n", gpu_id);
+            return Err(ENODEV);
+        }
+        // ID_VERSION retains the revision byte used by the Asahi UAPI:
+        // 0x00 = A0, 0x10 = B0, 0x11 = B1. This is not the firmware enum.
+        let gpu_revision = (gpu_id >> 8) & 0xff;
+        dev_info!(dev, "G16: GPU ID={:#010x} revision={:#04x}\n", gpu_id, gpu_revision);
         for offset in [0x1000104, 0x1000108] {
             sgx_io.relaxed().write32(sgx_io.relaxed().read32(offset) | 1, offset);
         }
@@ -655,6 +665,7 @@ impl Bootstrap {
             _opening_client: Some(opening_client),
             timestamp_ranges: KVec::new(),
             opening_notification_pending: true,
+            gpu_revision,
             core_mask: platform.core_mask,
             maximum_frequency_khz: platform.freq_a[10] * 1000,
             tvb_pools: KVec::new(),
