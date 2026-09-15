@@ -77,7 +77,6 @@ struct Vm {
     compute_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     mappings: KVec<Mapping>,
     pending: KVec<dma_fence::Fence>,
-    retired: KVec<Arc<shmem::SGTable<Buffer>>>,
     reservation: ARef<Object>,
     render_support: Option<Arc<crate::g16::Support>>,
     render_ready: bool,
@@ -389,7 +388,6 @@ impl File {
                 )?,
                 mappings: KVec::new(),
                 pending: KVec::new(),
-                retired: KVec::new(),
                 reservation,
                 render_support: None,
                 render_ready: false,
@@ -904,6 +902,12 @@ impl Vm {
     }
 
     fn unmap(&mut self, range: Range<u64>, runtime: &crate::g16::Bootstrap) -> Result {
+        // Callers drain this VM's jobs and hold file state against new uses.
+        // A failure may have signaled those fences while we waited. The
+        // runtime lock prevents a concurrent failure during this teardown.
+        if runtime.render_failed() {
+            return Err(EIO);
+        }
         // Prepare ownership splits before changing any page-table entry.
         let mut retained = KVec::new();
         for m in &self.mappings {
@@ -930,17 +934,15 @@ impl Vm {
                 }
             }
         }
-        self.retired.reserve(self.mappings.len(), GFP_KERNEL)?;
         self.space.lock().low.reserve_invalidation()?;
         self.compute_space.lock().low.reserve_invalidation()?;
         self.space.lock().low.unmap_pages(range.clone())?;
         self.compute_space.lock().low.unmap_pages(range.clone())?;
         self.publish_mappings(runtime);
-        for old in &self.mappings {
-            if old.range.start < range.end && range.start < old.range.end {
-                self.retired.push(old.sg.clone(), GFP_KERNEL)?;
-            }
-        }
+        // Both views are unmapped and their translation invalidations have
+        // completed. Drop removed backing now; surviving partial mappings
+        // retain their SGTable references. Any earlier error leaves the
+        // original ownership in self.mappings, including for partial unmaps.
         self.mappings = retained;
         Ok(())
     }
