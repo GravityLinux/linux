@@ -1738,7 +1738,7 @@ impl Vm {
         p.stencil_clear_value = u64::from(c.isp_bgobjvals);
         p.sampler_array = c.sampler_heap;
         p.sampler_count = u64::from(c.sampler_count);
-        if !p.valid() || p.sampler_count > 1024 || p.tib_blocks > 32 {
+        if !p.valid() || p.sampler_count > 1024 {
             return Err(EINVAL);
         }
         if p.sampler_count != 0 {
