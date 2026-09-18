@@ -10,6 +10,7 @@
 #include <linux/completion.h>
 #include <linux/kconfig.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
 #include "dcp.h"
@@ -182,6 +183,8 @@ struct afk_ringbuffer {
 	size_t block_size;
 };
 
+#include "afk-fragment.h"
+
 struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
 
@@ -205,6 +208,9 @@ struct apple_dcp_afkep {
 
 	struct list_head compact_cmds;
 	bool compact_shutting_down;
+	struct mutex compact_tx_lock;
+	struct afk_fragment_state compact_rx;
+	void *compact_rx_data;
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];

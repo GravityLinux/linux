@@ -3,6 +3,9 @@
 
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
+#include <linux/mutex.h>
+#include <linux/vmalloc.h>
 #include <linux/dma-mapping.h>
 #include <linux/kconfig.h>
 #include <linux/moduleparam.h>
@@ -65,6 +68,8 @@ enum rbep_msg_type {
 	RBEP_START_ACK = 0x86,
 	RBEP_SEND = 0xa2,
 	RBEP_RECV = 0x85,
+	RBEP_SPACE_AVAILABLE = 0xa7,
+	RBEP_WAIT_FOR_SPACE = 0xa8,
 	RBEP_SHUTDOWN = 0xc0,
 	RBEP_SHUTDOWN_ACK = 0xc1,
 };
@@ -112,6 +117,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 	init_completion(&afkep->stopped);
 	INIT_LIST_HEAD(&afkep->compact_cmds);
 	spin_lock_init(&afkep->lock);
+	mutex_init(&afkep->compact_tx_lock);
 
 	return afkep;
 
@@ -147,6 +153,8 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 	}
 
 	destroy_workqueue(afkep->wq);
+	kvfree(afkep->compact_rx_data);
+	afkep->compact_rx_data = NULL;
 }
 
 int afk_start(struct apple_dcp_afkep *ep)
@@ -321,12 +329,10 @@ static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *
     return NULL;
 }
 
-static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
-			    u8 category, const void *payload, size_t payload_size,
-			    size_t wire_size)
+static int afk_send_compact_fragment(struct apple_dcp_afkep *ep, u16 intf_id,
+				     const void *body, size_t size, u32 total)
 {
 	struct epic_compact_hdr *chdr;
-	struct epic_compact_sub_hdr *cshdr;
 	struct afk_qe *qhdr, *qhdr2 = NULL;
 	unsigned long flags;
 	void *message;
@@ -334,29 +340,24 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 	u32 rptr, wptr, old_wptr;
 	int ret = 0;
 
-	if (payload_size > wire_size)
-		return -EINVAL;
 	if (!ep->txbfr.ready)
 		return -EIO;
 
-	message_size = sizeof(*chdr) + sizeof(*cshdr) + wire_size;
+	message_size = offsetof(struct epic_compact_hdr, timestamp) + size;
 	message = kzalloc(message_size, GFP_KERNEL);
 	if (!message)
 		return -ENOMEM;
 
 	chdr = message;
-	cshdr = message + sizeof(*chdr);
 	chdr->intf_id = cpu_to_le16(intf_id);
-	chdr->length = cpu_to_le32(message_size -
-					   offsetof(struct epic_compact_hdr, timestamp));
-	cshdr->type = type;
-	cshdr->category = category;
-	cshdr->unk = type == 0x12;
-	if (payload_size)
-		memcpy(cshdr + 1, payload, payload_size);
+	chdr->length = cpu_to_le32(total);
+	memcpy(message + offsetof(struct epic_compact_hdr, timestamp), body, size);
 
 	spin_lock_irqsave(&ep->lock, flags);
-	chdr->seq = ep->qe_seq++;
+	if (ep->compact_shutting_down) {
+		ret = -ESHUTDOWN;
+		goto out_unlock;
+	}
 
 	dma_rmb();
 	rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
@@ -369,7 +370,7 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 		goto out_unlock;
 	}
 	if (wptr < rptr && advance >= rptr - wptr) {
-		ret = -ENOMEM;
+		ret = -EAGAIN;
 		goto out_unlock;
 	}
 	if (wptr >= rptr) {
@@ -377,11 +378,12 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 			(advance == ep->txbfr.bufsz - wptr && rptr != 0);
 
 		if (!fits_above && advance >= rptr) {
-			ret = -ENOMEM;
+			ret = -EAGAIN;
 			goto out_unlock;
 		}
 	}
 
+	chdr->seq = ep->qe_seq++;
 	qhdr = ep->txbfr.buf + wptr;
 	qhdr->magic = cpu_to_le32(QE_MAGIC);
 	qhdr->size = cpu_to_le32(message_size);
@@ -411,6 +413,66 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 out_unlock:
 	spin_unlock_irqrestore(&ep->lock, flags);
 	kfree(message);
+	return ret;
+}
+
+/* Serialize complete messages: fragments carry no transaction offset or tag
+ * beyond the repeated interface/length and per-fragment sequence number.
+ */
+static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
+			    u8 category, const void *payload, size_t payload_size,
+			    size_t wire_size)
+{
+	struct epic_compact_sub_hdr *sub;
+	size_t total, offset = 0, chunk;
+	unsigned long deadline;
+	bool waiting_for_space = false;
+	void *body;
+	int ret = 0;
+
+	if (payload_size > wire_size || wire_size > AFK_COMPACT_MESSAGE_MAX - 16)
+		return -EMSGSIZE;
+	total = 8 + sizeof(*sub) + wire_size;
+	body = kvzalloc(total, GFP_KERNEL);
+	if (!body)
+		return -ENOMEM;
+	sub = body + 8; /* timestamp precedes the subheader */
+	sub->type = type;
+	sub->category = category;
+	sub->unk = type == 0x12;
+	if (payload_size)
+		memcpy(sub + 1, payload, payload_size);
+
+	mutex_lock(&ep->compact_tx_lock);
+	deadline = jiffies + msecs_to_jiffies(5000);
+	while (offset < total) {
+		chunk = min_t(size_t, total - offset, AFK_COMPACT_FRAGMENT_SIZE);
+		ret = afk_send_compact_fragment(ep, intf_id, body + offset,
+					       chunk, total);
+		if (ret == -EAGAIN) {
+			if (!waiting_for_space) {
+				afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_WAIT_FOR_SPACE) |
+					 (chunk + offsetof(struct epic_compact_hdr, timestamp)));
+				waiting_for_space = true;
+			}
+			if (time_after_eq(jiffies, deadline)) {
+				ret = -ETIMEDOUT;
+				break;
+			}
+			/* DCP advances the shared consumer pointer independently. */
+			usleep_range(500, 1000);
+			continue;
+		}
+		if (ret)
+			break;
+		waiting_for_space = false;
+		offset += chunk;
+	}
+	/* Do not send a new header into an unfinished remote assembly. */
+	if (ret && offset)
+		afk_cancel_commands(ep);
+	mutex_unlock(&ep->compact_tx_lock);
+	kvfree(body);
 	return ret;
 }
 
@@ -688,11 +750,16 @@ static void afk_recv_handle_compact_reply(struct apple_dcp_afkep *ep,
 	}
 
 	list_del_init(&match->node);
-	copy_size = min(match->output_len, payload_size - sizeof(*desc));
-	if (copy_size && match->output)
-		memcpy(match->output, desc + 1, copy_size);
 	match->retcode = le32_to_cpu(desc->status);
 	match->status = 0;
+	if (call && le32_to_cpu(call->data_len) >
+	    payload_size - sizeof(*desc) - sizeof(*call)) {
+		match->status = -EMSGSIZE;
+	} else {
+		copy_size = min(match->output_len, payload_size - sizeof(*desc));
+		if (copy_size && match->output)
+			memcpy(match->output, desc + 1, copy_size);
+	}
 	complete(&match->done);
 	spin_unlock_irqrestore(&ep->lock, flags);
 }
@@ -732,7 +799,7 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *ep,
 			 le32_to_cpu(request_desc->status), call_size,
 			 min_t(int, call_size, 64), call + 1);
 
-	reply = kzalloc(payload_size, GFP_KERNEL);
+	reply = kvzalloc(payload_size, GFP_KERNEL);
 	if (!reply)
 		return;
 	reply_desc = reply;
@@ -769,45 +836,29 @@ static void afk_recv_handle_compact_call(struct apple_dcp_afkep *ep,
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: failed to reply to compact service call: %d\n",
 			ep->endpoint, ret);
-	kfree(reply);
+	kvfree(reply);
 }
 
-static bool afk_recv_handle_compact(struct apple_dcp_afkep *ep, u32 channel,
-				    u32 type, const void *data,
-				    size_t data_size)
+static void afk_recv_compact_message(struct apple_dcp_afkep *ep, u16 intf_id,
+				     const void *body, size_t size)
 {
-	const struct epic_compact_hdr *hdr = data;
-	const struct epic_compact_sub_hdr *sub;
+	const struct epic_compact_sub_hdr *sub = body + 8;
 	struct apple_epic_service *service;
-	const void *payload;
-	size_t payload_size;
-	u16 intf_id;
-
-	if (channel || type ||
-	    data_size < sizeof(*hdr) + sizeof(*sub))
-		return false;
-	sub = data + sizeof(*hdr);
-	if (le32_to_cpu(hdr->length) !=
-	    data_size - offsetof(struct epic_compact_hdr, timestamp))
-		return false;
-
-	ep->compact = true;
-	intf_id = le16_to_cpu(hdr->intf_id);
-	payload = sub + 1;
-	payload_size = data_size - sizeof(*hdr) - sizeof(*sub);
+	const void *payload = sub + 1;
+	size_t payload_size = size - 8 - sizeof(*sub);
 
 	if (sub->category == 0 && sub->type == 0x11) {
 		afk_recv_handle_compact_init(ep, intf_id, payload, payload_size);
-		return true;
+		return;
 	}
 	if (sub->category == 1 && sub->type == EPIC_SUBTYPE_STD_SERVICE) {
 		afk_recv_handle_compact_call(ep, intf_id, payload, payload_size);
-		return true;
+		return;
 	}
 	if (sub->category == 2) {
 		afk_recv_handle_compact_reply(ep, intf_id, sub->type, payload,
 					      payload_size);
-		return true;
+		return;
 	}
 	if (sub->category == 0 && sub->type == EPIC_SUBTYPE_STD_SERVICE) {
 		service = afk_epic_find_service(ep, intf_id);
@@ -833,7 +884,7 @@ static bool afk_recv_handle_compact(struct apple_dcp_afkep *ep, u32 channel,
 			service->ops->report(service, EPIC_SUBTYPE_STD_SERVICE,
 					     payload, payload_size);
 		}
-		return true;
+		return;
 	}
 	if (sub->category == 0) {
 		service = afk_epic_find_service(ep, intf_id);
@@ -847,12 +898,71 @@ static bool afk_recv_handle_compact(struct apple_dcp_afkep *ep, u32 channel,
 		if (service && service->ops->report)
 			service->ops->report(service, sub->type, payload,
 					     payload_size);
-		return true;
+		return;
 	}
 
 	dev_dbg(ep->dcp->dev,
 		"AFK[ep:%02x]: unhandled compact message %02x:%02x on interface %u\n",
 		ep->endpoint, sub->category, sub->type, intf_id);
+	return;
+}
+
+static bool afk_recv_handle_compact(struct apple_dcp_afkep *ep, u32 channel,
+				    u32 type, const void *data, size_t data_size)
+{
+	const struct epic_compact_hdr *hdr = data;
+	const size_t header_size = offsetof(struct epic_compact_hdr, timestamp);
+	struct afk_fragment_state *s = &ep->compact_rx;
+	u32 offset = s->received, total;
+	u16 intf_id;
+	int ret;
+
+	if (channel || type || data_size < header_size)
+		return false;
+	total = le32_to_cpu(hdr->length);
+	intf_id = le16_to_cpu(hdr->intf_id);
+	/* Eight-byte empty control messages also occur in native AV traces. */
+	if (!offset && total == 8 && data_size == header_size + 8)
+		return true;
+	ret = afk_fragment_accept(s, intf_id, hdr->seq, total,
+				 data_size - header_size);
+	if (ret < 0) {
+		if (!ep->compact && !offset)
+			return false;
+		goto discard;
+	}
+	ep->compact = true;
+	if (!offset && ret == 1) {
+		memset(s, 0, sizeof(*s));
+		afk_recv_compact_message(ep, intf_id, data + header_size, total);
+		return true;
+	}
+	if (!offset) {
+		ep->compact_rx_data = kvzalloc(total, GFP_KERNEL);
+		if (!ep->compact_rx_data) {
+			ret = -ENOMEM;
+			goto discard;
+		}
+	}
+	memcpy(ep->compact_rx_data + offset, data + header_size,
+	       data_size - header_size);
+	if (ret == 1) {
+		void *message = ep->compact_rx_data;
+
+		ep->compact_rx_data = NULL;
+		memset(s, 0, sizeof(*s));
+		afk_recv_compact_message(ep, intf_id, message, total);
+		kvfree(message);
+	}
+	return true;
+
+discard:
+	dev_err_ratelimited(ep->dcp->dev,
+		"AFK[ep:%02x]: invalid compact fragment intf=%u seq=%u total=%u offset=%u: %d\n",
+		ep->endpoint, intf_id, hdr->seq, total, offset, ret);
+	kvfree(ep->compact_rx_data);
+	ep->compact_rx_data = NULL;
+	memset(s, 0, sizeof(*s));
 	return true;
 }
 
@@ -1005,7 +1115,7 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 
 		if (!service->ops->call)
 			return;
-		reply = kzalloc(payload_size, GFP_KERNEL);
+		reply = kvzalloc(payload_size, GFP_KERNEL);
 		if (!reply)
 			return;
 
@@ -1013,7 +1123,7 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 					 payload + sizeof(*call), call_size,
 					 reply + sizeof(*call), call_size);
 		if (ret) {
-			kfree(reply);
+			kvfree(reply);
 			return;
 		}
 
@@ -1021,7 +1131,7 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		afk_send_epic(ep, channel, le16_to_cpu(eshdr->tag),
 			      EPIC_TYPE_NOTIFY_ACK, EPIC_CAT_REPLY,
 			      EPIC_SUBTYPE_STD_SERVICE, reply, payload_size);
-		kfree(reply);
+		kvfree(reply);
 
 		return;
 	}
@@ -1125,6 +1235,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 static bool afk_recv(struct apple_dcp_afkep *ep)
 {
 	struct afk_qe *hdr;
+	void *message;
 	u32 rptr, wptr;
 	u32 magic, size, channel, type;
 
@@ -1192,6 +1303,9 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
+	message = kmemdup(hdr->data, size, GFP_KERNEL);
+	if (!message)
+		return false;
 
 	rptr = ALIGN(rptr + sizeof(*hdr) + size, ep->rxbfr.block_size);
 	if (WARN_ON(rptr > ep->rxbfr.bufsz))
@@ -1204,14 +1318,9 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	WRITE_ONCE(*ep->rxbfr.rptr, cpu_to_le32(rptr));
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
-	/*
-	 * TODO: this is theoretically unsafe since DCP could overwrite data
-	 *       after the read pointer was updated above. Do it anyway since
-	 *       it avoids 2 problems in the DCP tracer:
-	 *       1. the tracer sees replies before the notifies from dcp
-	 *       2. the tracer tries to read buffers after they are unmapped.
-	 */
-	afk_recv_handle(ep, channel, type, hdr->data, size);
+	/* The ring entry may be overwritten as soon as rptr is published. */
+	afk_recv_handle(ep, channel, type, message, size);
+	kfree(message);
 
 	return true;
 }
@@ -1246,6 +1355,20 @@ static void afk_receive_message_worker(struct work_struct *work_)
 
 	case RBEP_INIT_RX:
 		afk_init_rxtx(work->ep, work->message, &work->ep->rxbfr);
+		break;
+
+	case RBEP_SPACE_AVAILABLE:
+		/* The sender polls the shared consumer pointer. */
+		break;
+
+	case RBEP_WAIT_FOR_SPACE:
+		/* Native compact endpoints request a wakeup when their ring fills.
+		 * Drain and publish rptr before acknowledging the request.
+		 */
+		while (afk_recv(work->ep))
+			;
+		dma_wmb();
+		afk_send(work->ep, FIELD_PREP(RBEP_TYPE, RBEP_SPACE_AVAILABLE));
 		break;
 
 	case RBEP_RECV:
@@ -1438,7 +1561,7 @@ static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
 	unsigned long waited;
 	int ret;
 
-	wrapped = kzalloc(sizeof(*desc) + wire_size, GFP_KERNEL);
+	wrapped = kvzalloc(sizeof(*desc) + wire_size, GFP_KERNEL);
 	if (!wrapped)
 		return -ENOMEM;
 	desc = wrapped;
@@ -1497,7 +1620,7 @@ remove_pending:
 	pending.status = ret;
 	spin_unlock_irqrestore(&ep->lock, flags);
 out:
-	kfree(wrapped);
+	kvfree(wrapped);
 	return ret;
 }
 
@@ -1621,7 +1744,7 @@ static int __afk_service_call(struct apple_epic_service *service, u16 group,
 	u32 request_status = 0, retcode = 0;
 	u32 retlen;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -1674,7 +1797,7 @@ static int __afk_service_call(struct apple_epic_service *service, u16 group,
 	}
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 
