@@ -1131,3 +1131,50 @@
 		power-domains = <&ps_atc3_common>, <&ps_atc3_usb_aon>;
 	};
 };
+
+&pmgr_audio {
+	ps_audio_a: power-controller@20 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x20 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_a";
+	};
+
+	ps_audio_fr: power-controller@90 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x90 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_fr";
+		power-domains = <&ps_audio_a>;
+	};
+
+	ps_audio_p: power-controller@b8 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xb8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_p";
+		power-domains = <&ps_audio_fr>;
+	};
+
+	ps_audio_base_ns_a: power-controller@d8 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xd8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_base_ns_a";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_mca0_m: power-controller@e8 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xe8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca0_m";
+		power-domains = <&ps_audio_p>;
+	};
+
+};
