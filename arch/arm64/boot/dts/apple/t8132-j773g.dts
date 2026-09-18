@@ -46,7 +46,7 @@
  * Keep the power-domains used for the HDMI port on.
  */
 &framebuffer0 {
-	power-domains = <&ps_dispext0_cpu>, <&ps_dptx_phy>;
+	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
 };
 
 &sio_dart {
