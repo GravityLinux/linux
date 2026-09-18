@@ -7,6 +7,7 @@
 
 mod float;
 mod g16;
+mod g16_alloc;
 mod g16_compute;
 mod g16_drm;
 mod g16_fw;
@@ -53,7 +54,7 @@ impl platform::Driver for M4Gpu {
         _info: Option<&Self::IdInfo>,
     ) -> impl PinInit<Self, Error> {
         let dev = pdev.as_ref();
-        if !(11..=331).contains(module_parameters::tvb_max_blocks.value()) {
+        if !(11..=g16_tvb::MAX_BLOCKS).contains(module_parameters::tvb_max_blocks.value()) {
             return Err(EINVAL);
         }
 
@@ -118,8 +119,8 @@ kernel::module_platform_driver! {
             description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies",
         },
         tvb_max_blocks: u32 {
-            default: 331,
-            description: "Maximum retained TVB blocks per context (11 through 331)",
+            default: 2193,
+            description: "Maximum retained 128 KiB TVB blocks per context (11 through 6579)",
         },
         probe_only: u32 {
             default: 0,
