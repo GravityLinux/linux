@@ -137,4 +137,10 @@
 #define TAS2764_SDOUT_HIZ_9            TAS2764_REG(0x1, 0x45)
 #define TAS2764_SDOUT_HIZ_9_FORCE_0_EN BIT(7)
 
+struct snd_soc_component;
+int tas2764_set_protected_attenuation(struct snd_soc_component *component,
+				    unsigned int attenuation);
+int tas2764_get_protected_attenuation(struct snd_soc_component *component);
+int tas2764_check_fault(struct snd_soc_component *component);
+
 #endif /* __TAS2764__ */
