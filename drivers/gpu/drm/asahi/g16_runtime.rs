@@ -797,7 +797,6 @@ impl Bootstrap {
 pub(crate) struct Support {
     slots: Arc<AtomicU64>,
     index: u32,
-    growth_base: u64,
     submissions: AtomicU64,
 }
 impl Support {
@@ -879,7 +878,6 @@ impl Bootstrap {
         let lease = Support {
             slots: self.render_support.clone(),
             index,
-            growth_base: pool.growth_base().ok_or(EINVAL)?,
             submissions: AtomicU64::new(
                 crate::module_parameters::fw_counter_start.value().wrapping_mul(2),
             ),
@@ -1110,7 +1108,6 @@ impl Bootstrap {
                     client,
                     base,
                     7 + u64::from(support.index),
-                    support.growth_base,
                 )?;
                 self.tvb_pools.push(pool, GFP_KERNEL)?;
                 self.tvb_pools.len() - 1
@@ -1259,6 +1256,7 @@ impl Bootstrap {
             .as_mut()
             .ok_or(EIO)?
             .write_live(a.render_shared_state, &use_count.to_le_bytes())?;
+        pool.increment(self._firmware_space.as_mut().ok_or(EIO)?)?;
         let (heads, epochs) = self.publish_render(
             &a, &ta, &frag, queue, initbm, pool.blocks, dependencies,
             params.vdm_barrier_fragment,

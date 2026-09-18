@@ -5,6 +5,7 @@
 //! G16 client roots. The firmware bootstrap root is separate from these
 //! roots, even when the hardware context table is using slot zero.
 
+use crate::g16_alloc::Arena;
 use crate::pgtable::{prot, UatPageTable, UAT_PGSZ};
 use core::cell::{Cell, RefCell};
 use kernel::rbtree::{RBTree, RBTreeNode};
@@ -27,8 +28,8 @@ pub(crate) struct AddressSpace {
     pub(crate) high: UatPageTable,
     // Drop the owned tables before releasing their mapped pages.
     pages: RBTree<u64, Owned<Page>>,
-    compute_scratch: core::ops::Range<u64>,
-    render_scratch: core::ops::Range<u64>,
+    compute_arena: Arena,
+    render_arena: Arena,
     scratch_free: [KVec<core::ops::Range<u64>>; 2],
     scratch_users: [usize; 2],
 }
@@ -67,8 +68,8 @@ impl AddressSpace {
             low: UatPageTable::new_with_ias(OAS, IAS)?,
             high: UatPageTable::new_with_ias(OAS, IAS)?,
             pages: RBTree::new(),
-            compute_scratch: 0..0,
-            render_scratch: 0..0,
+            compute_arena: Arena::default(),
+            render_arena: Arena::default(),
             scratch_free: [KVec::new(), KVec::new()],
             scratch_users: [0; 2],
         })
@@ -110,11 +111,11 @@ impl AddressSpace {
         let mut params = render::Parameters::default();
         params.set_private(start, end).ok_or(EINVAL)?;
         let pool = render::OperandPool::new(start, end).ok_or(EINVAL)?;
-        self.render_scratch =
-            pool.growth_end().ok_or(EINVAL)?..end.min(render::CONTEXT_BASE + (1 << 32));
-        if self.render_scratch.start > self.render_scratch.end {
+        let remaining = pool.end().ok_or(EINVAL)?..end.min(render::CONTEXT_BASE + (1 << 32));
+        if remaining.start > remaining.end {
             return Err(ENOMEM);
         }
+        self.render_arena = Arena::new(remaining);
         self.alloc_low(start, render::PRIVATE_SIZE, prot::PROT_GPU_SHARED_RW)?;
         for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
             let va = start + offset as u64;
@@ -181,7 +182,7 @@ impl AddressSpace {
     /// reserved kernel aperture. The persistent root and all backing remain
     /// owned by the VM; allocating a later command never replaces a live PTE.
     pub(crate) fn init_compute_private(&mut self, range: core::ops::Range<u64>) {
-        self.compute_scratch = range;
+        self.compute_arena = Arena::new(range);
     }
 
     pub(crate) fn prepare_compute(
@@ -227,19 +228,14 @@ impl AddressSpace {
             start..end
         } else {
             let arena = if render {
-                &mut self.render_scratch
+                &mut self.render_arena
             } else {
-                &mut self.compute_scratch
+                &mut self.compute_arena
             };
-            let start = arena.start;
-            let end = start.checked_add(size as u64).ok_or(ENOMEM)?;
-            if end > arena.end {
-                return Err(ENOMEM);
-            }
             // Partially allocated failures stay quarantined until VM teardown.
-            arena.start = end;
-            self.alloc_low(start, size, prot::PROT_GPU_SHARED_RW)?;
-            start..end
+            let range = arena.alloc(size as u64, UAT_PGSZ as u64).ok_or(ENOMEM)?;
+            self.alloc_low(range.start, size, prot::PROT_GPU_SHARED_RW)?;
+            range
         };
         self.scratch_users[index] += 1;
         Ok(Scratch { range, render })
@@ -265,14 +261,20 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Allocate all ten-block growth pages before changing visible mappings.
-    pub(crate) fn alloc_tvb_blocks(&mut self, base: u64, count: usize) -> Result<bool> {
-        if count == 0 || count > 10 || base & 0x7fff != 0 {
+    /// Allocate tiler blocks from the shared private aperture. Before mapping,
+    /// failure leaves both existing backing and the arena reservation untouched.
+    pub(crate) fn alloc_tvb_blocks(&mut self, count: usize) -> Result<Option<u64>> {
+        if count == 0 || count > crate::g16_tvb::MAX_BLOCKS as usize {
             return Err(EINVAL);
         }
+        let mut arena = self.render_arena.clone();
+        let Some(range) = arena.alloc_back(count as u64 * 0x28000, 0x8000) else {
+            return Ok(None);
+        };
+        let base = range.start;
         let mut pages = KVec::new();
         if pages.reserve(count * 8, GFP_KERNEL).is_err() {
-            return Ok(false);
+            return Ok(None);
         }
         for block in 0..count {
             let start = base + block as u64 * 0x28000;
@@ -284,17 +286,18 @@ impl AddressSpace {
             for va in (start..start + 0x20000).step_by(UAT_PGSZ) {
                 let page = match Page::alloc_page(GFP_KERNEL | __GFP_ZERO) {
                     Ok(page) => page,
-                    Err(_) => return Ok(false),
+                    Err(_) => return Ok(None),
                 };
                 clean_page(&page);
                 let node = match RBTreeNode::new(va, page, GFP_KERNEL) {
                     Ok(node) => node,
-                    Err(_) => return Ok(false),
+                    Err(_) => return Ok(None),
                 };
                 pages.push(node, GFP_KERNEL)?;
             }
         }
         // Transfer every preallocated node before the first fallible PTE edit.
+        self.render_arena = arena;
         for node in pages {
             self.pages.insert(node);
         }
@@ -309,7 +312,7 @@ impl AddressSpace {
                 )?;
             }
         }
-        Ok(true)
+        Ok(Some(base))
     }
 
     pub(crate) fn write_low(&mut self, mut va: u64, mut bytes: &[u8]) -> Result {

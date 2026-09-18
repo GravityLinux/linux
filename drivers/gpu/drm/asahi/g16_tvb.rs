@@ -9,8 +9,9 @@ use crate::{
 };
 use kernel::prelude::*;
 
-pub(crate) const GROW_BLOCKS: u32 = 10;
-pub(crate) const MAX_BLOCKS: u32 = 11 + 32 * GROW_BLOCKS;
+// Match the capacity already advertised in the buffer-manager metadata. The
+// default budget is one third of this, as in Apple8's non-memoryless path.
+pub(crate) const MAX_BLOCKS: u32 = 6579;
 
 pub(crate) struct Tvb {
     pub(crate) root: u64,
@@ -18,9 +19,9 @@ pub(crate) struct Tvb {
     pub(crate) initialized: bool,
     pub(crate) blocks: u32,
     pub(crate) counter: u32,
+    submissions: u32,
     pub(crate) refused: bool,
     scenes: u64,
-    next: u64,
 }
 impl Tvb {
     pub(crate) fn new(
@@ -28,7 +29,6 @@ impl Tvb {
         client: &mut AddressSpace,
         base: u64,
         slot: u64,
-        growth_base: u64,
     ) -> Result<Self> {
         let mut a = render::Addresses::bootstrap();
         a.buffer_manager_slot = slot;
@@ -39,7 +39,11 @@ impl Tvb {
         a.buffer_manager_counter = base + 0x10000;
         a.buffer_manager_block_list = base + 0x14000;
         a.buffer_manager_page_list = base + 0x24000;
-        fw.alloc(base, 0x40000, prot::PROT_FW_PRIV_RW)?;
+        fw.alloc(base, 0x10000, prot::PROT_FW_PRIV_RW)?;
+        // The host advances this count while earlier renders are active.
+        // Firmware must observe those writes without a cache maintenance pass.
+        fw.alloc(base + 0x10000, 0x4000, prot::PROT_FW_SHARED_RW)?;
+        fw.alloc(base + 0x14000, 0x2c000, prot::PROT_FW_PRIV_RW)?;
         for va in (base..base + 0x40000).step_by(0x4000) {
             fw.init_page(va, |bytes| a.private_page(va, bytes).ok_or(EINVAL))?;
         }
@@ -65,10 +69,19 @@ impl Tvb {
             initialized: false,
             blocks: 11,
             counter: 0,
+            submissions: 0,
             refused: false,
             scenes: 0,
-            next: growth_base,
         })
+    }
+
+    /// Count each render before publication, including renders on other queues
+    /// sharing this pool. Firmware uses this count alongside its completed count.
+    pub(crate) fn increment(&mut self, fw: &mut FirmwareSpace) -> Result {
+        let next = self.submissions.wrapping_add(1);
+        fw.write_live(self.addresses.buffer_manager_counter, &next.to_le_bytes())?;
+        self.submissions = next;
+        Ok(())
     }
 
     pub(crate) fn reserve_scene(&mut self) -> Result<u32> {
@@ -119,7 +132,11 @@ impl Tvb {
             return Err(EIO);
         }
         let limit = (*crate::module_parameters::tvb_max_blocks.value()).min(MAX_BLOCKS);
-        let new = (old + GROW_BLOCKS).min(limit).max(old);
+        // A firmware allocation request tells us the current heap lacks free
+        // pages. Give it the same 3x headroom used by Apple8's growth policy.
+        // M4 expands its page list when it consumes this event's reply, so
+        // publication stays on the verified allocation-event path.
+        let mut new = (old * 3).min(limit).max(old);
         if new > fw.read_u32(a.buffer_manager + 0x38)? || new * 8 > 0x10000 || new * 16 > 0x1c000 {
             return Err(EIO);
         }
@@ -128,18 +145,33 @@ impl Tvb {
         }
         // Allocation is all-or-nothing before publishing any leaf or list entry.
         // After mapping starts, any error requires retaining the context/reset.
-        if !client.alloc_tvb_blocks(self.next, (new - old) as usize)? {
-            return Ok(false);
-        }
+        let mut entries = KVec::new();
+        let base = loop {
+            if entries
+                .extend_with((new - old) as usize * 8, 0u8, GFP_KERNEL)
+                .is_ok()
+            {
+                if let Some(base) = client.alloc_tvb_blocks((new - old) as usize)? {
+                    break base;
+                }
+                entries.clear();
+            }
+            // Headroom is optional: under memory or VA pressure, retry a
+            // smaller allocation before asking firmware to partially render.
+            let add = new - old;
+            if add == 1 {
+                return Ok(false);
+            }
+            new = old + add / 2;
+        };
         client.sync();
         client.low.invalidate(Some(asid));
         client.high.invalidate(Some(asid));
         crate::mem::sync();
         client.low.clear_invalidations();
         client.high.clear_invalidations();
-        let mut entries = [0u8; GROW_BLOCKS as usize * 8];
         for index in 0..new - old {
-            let dva = self.next + u64::from(index) * 0x28000;
+            let dva = base + u64::from(index) * 0x28000;
             let id = (dva - render::CONTEXT_BASE) / 0x8000;
             let offset = index as usize * 8;
             entries[offset..offset + 8].copy_from_slice(&id.to_le_bytes());
@@ -154,7 +186,6 @@ impl Tvb {
         crate::mem::sync();
         // Firmware expands its page list and counts after the type-8 reply.
         self.blocks = new;
-        self.next += u64::from(new - old) * 0x28000;
         Ok(true)
     }
 }

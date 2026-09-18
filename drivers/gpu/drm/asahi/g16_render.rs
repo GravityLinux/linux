@@ -834,12 +834,6 @@ impl OperandPool {
     pub(crate) fn end(&self) -> Option<u64> {
         self.buffer.checked_add(24 * OPERAND_STRIDE)
     }
-    pub(crate) fn growth_base(&self) -> Option<u64> {
-        Some(self.end()?.checked_add(0x7fff)? & !0x7fff)
-    }
-    pub(crate) fn growth_end(&self) -> Option<u64> {
-        self.growth_base()?.checked_add(0x3200000)
-    }
     pub(crate) fn support(&self, id: u64, shared: u64) -> [u8; 0x100] {
         let mut out = [0; 0x100];
         u64_at(&mut out, 0, id);
