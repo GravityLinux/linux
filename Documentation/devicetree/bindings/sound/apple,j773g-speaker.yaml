@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,j773g-speaker.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J773g internal speaker
+
+maintainers:
+  - Niklas Sheth <hi@niklassheth.com>
+
+description: |
+  Mono internal speaker on the M4 Mac mini, using MCA TX0 and an SN012776
+  amplifier. The machine driver limits playback with an in-kernel thermal model while
+  MCA, ADMAC, DART and TAS2764 provide the hardware interfaces.
+
+properties:
+  compatible:
+    const: apple,j773g-speaker
+
+  apple,mca:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: MCA controller carrying the internal speaker on TX0.
+
+  apple,codec:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: SN012776 amplifier on the speaker I2C bus.
+
+required:
+  - compatible
+  - apple,mca
+  - apple,codec
+
+additionalProperties: false
