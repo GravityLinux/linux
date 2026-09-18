@@ -27,6 +27,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/property.h>
 #include <linux/of_clk.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
@@ -119,6 +120,17 @@
 #define SWITCH_STRIDE	0x8000
 #define CLUSTER_STRIDE	0x4000
 
+/* T8132 only, relative to cluster base: staged enables and their latch */
+#define REG_T8132_CLOCK_ENABLE	0x100
+#define REG_T8132_OUTPUT_SET	0x140
+#define REG_T8132_OUTPUT_CLR	0x144
+#define REG_T8132_TX_SET	0x160
+#define REG_T8132_TX_CLR	0x164
+#define REG_T8132_LATCH		0x170
+/* T8132 only, relative to switch base */
+#define REG_T8132_SWITCH_UNK_04	0x4
+#define REG_T8132_SWITCH_UNK_08	0x8
+
 #define MAX_NCLUSTERS	6
 
 #define APPLE_MCA_FMTBITS (SNDRV_PCM_FMTBIT_S16_LE | \
@@ -145,6 +157,7 @@ struct mca_cluster {
 	int syncgen_in_use;
 
 	unsigned int bclk_ratio;
+	unsigned long configured_bclk;
 
 	/* Masks etc. picked up via the set_tdm_slot method */
 	int tdm_slots;
@@ -157,6 +170,7 @@ struct mca_data {
 	struct device *dev;
 
 	__iomem void *switch_base;
+	const struct mca_variant *variant;
 
 	struct device *pd_dev;
 	struct reset_control *rstc;
@@ -169,9 +183,67 @@ struct mca_data {
 	struct mca_cluster clusters[] __counted_by(nclusters);
 };
 
+/*
+ * Per-SoC layout and capabilities. Register offsets throughout this file
+ * follow the T8103 cluster layout; group_off[] relocates each 0x100 group of
+ * that layout within a cluster, so the T8103 mapping is the identity.
+ */
+#define MCA_GROUP_UNMAPPED	0xffffffff
+
+struct mca_variant {
+	unsigned int cluster_stride;
+	unsigned int group_off[8];
+	unsigned int switch_off;	/* inside the cluster region if switch_in_cluster */
+	bool switch_in_cluster;
+	u32 mclk_sel_flags;		/* extra bits in REG_SYNCGEN_MCLK_SEL */
+	u32 dma_adapter_flags;		/* constant bits of the DMA adapter word */
+	bool serdes_reset;		/* pulse SERDES_STATUS_RST before starting */
+	bool staged_enables;		/* enables are staged and latched, not serdes EN */
+	bool cluster_divider;		/* divide a fixed parent instead of setting its rate */
+	bool has_rx;
+	bool clk_consumer;
+};
+
+static const struct mca_variant mca_t8103_variant = {
+	.cluster_stride = CLUSTER_STRIDE,
+	.group_off = { 0x000, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700 },
+	.dma_adapter_flags = FIELD_PREP_CONST(DMA_ADAPTER_TX_NCHANS, 0x2) |
+			     FIELD_PREP_CONST(DMA_ADAPTER_RX_NCHANS, 0x2),
+	.serdes_reset = true,
+	.has_rx = true,
+	.clk_consumer = true,
+};
+
+/*
+ * T8132 keeps a cluster's clocks and syncgen at 0x2000, its port at 0x2060,
+ * the TX serializer at 0x6000 and the DMA adapter at 0x8000, so a cluster
+ * spans 0xc000. Whether further clusters follow at that stride is not
+ * verified; the device tree maps exactly one. Capture routing is unknown.
+ */
+static const struct mca_variant mca_t8132_variant = {
+	.cluster_stride = 0xc000,
+	.group_off = { 0x2000, 0x2020, MCA_GROUP_UNMAPPED, 0x6000, MCA_GROUP_UNMAPPED,
+		       MCA_GROUP_UNMAPPED, 0x2060, MCA_GROUP_UNMAPPED },
+	.switch_off = 0x8000,
+	.switch_in_cluster = true,
+	.mclk_sel_flags = BIT(9),
+	.dma_adapter_flags = BIT(29),
+	.staged_enables = true,
+	.cluster_divider = true,
+};
+
+static void __iomem *mca_reg(struct mca_cluster *cl, unsigned int reg)
+{
+	unsigned int off = cl->host->variant->group_off[reg >> 8];
+
+	if (WARN_ON_ONCE(off == MCA_GROUP_UNMAPPED))
+		off = 0;
+	return cl->base + off + (reg & 0xff);
+}
+
 static void mca_modify(struct mca_cluster *cl, int regoffset, u32 mask, u32 val)
 {
-	__iomem void *ptr = cl->base + regoffset;
+	__iomem void *ptr = mca_reg(cl, regoffset);
 	u32 newval;
 
 	newval = (val & mask) | (readl_relaxed(ptr) & ~mask);
@@ -203,6 +275,9 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 	int serdes_conf =
 		serdes_unit + (is_tx ? REG_TX_SERDES_CONF : REG_RX_SERDES_CONF);
 
+	if (!cl->host->variant->serdes_reset)
+		return;
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -219,7 +294,7 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 		 * for the bit to clear, so wait 5 us for good measure.
 		 */
 		udelay(50);
-		WARN_ON(readl_relaxed(cl->base + serdes_unit + REG_SERDES_STATUS) &
+		WARN_ON(readl_relaxed(mca_reg(cl, serdes_unit + REG_SERDES_STATUS)) &
 			SERDES_STATUS_RST);
 		mca_modify(cl, serdes_conf, SERDES_CONF_SYNC_SEL,
 			   FIELD_PREP(SERDES_CONF_SYNC_SEL, 0));
@@ -237,32 +312,50 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 	}
 }
 
+/* T8132 stages the output mux and TX enables, then latches both. */
+static void mca_fe_trigger_staged(struct mca_cluster *cl, bool enable)
+{
+	writel_relaxed(BIT(cl->no), cl->base +
+		       (enable ? REG_T8132_OUTPUT_SET : REG_T8132_OUTPUT_CLR));
+	writel_relaxed(BIT(cl->no), cl->base +
+		       (enable ? REG_T8132_TX_SET : REG_T8132_TX_CLR));
+	writel_relaxed(BIT(cl->no), cl->base + REG_T8132_LATCH);
+}
+
 static int mca_fe_trigger(struct snd_pcm_substream *substream, int cmd,
 			  struct snd_soc_dai *dai)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
 	bool is_tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	int serdes_unit = is_tx ? CLUSTER_TX_OFF : CLUSTER_RX_OFF;
+	bool enable;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
-			   SERDES_STATUS_EN | SERDES_STATUS_RST,
-			   SERDES_STATUS_EN);
+		enable = true;
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
-			   SERDES_STATUS_EN, 0);
+		enable = false;
 		break;
 
 	default:
 		return -EINVAL;
 	}
+
+	if (cl->host->variant->staged_enables)
+		mca_fe_trigger_staged(cl, enable);
+	else if (enable)
+		mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
+			   SERDES_STATUS_EN | SERDES_STATUS_RST,
+			   SERDES_STATUS_EN);
+	else
+		mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
+			   SERDES_STATUS_EN, 0);
 
 	return 0;
 }
@@ -313,7 +406,8 @@ static int mca_fe_enable_clocks(struct mca_cluster *cl)
 		return -EINVAL;
 	}
 
-	writel_relaxed(cl->no + 1, cl->base + REG_SYNCGEN_MCLK_SEL);
+	writel_relaxed((cl->no + 1) | mca->variant->mclk_sel_flags,
+		       mca_reg(cl, REG_SYNCGEN_MCLK_SEL));
 	mca_modify(cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN,
 		   SYNCGEN_STATUS_EN);
 	mca_modify(cl, REG_STATUS, STATUS_MCLK_EN, STATUS_MCLK_EN);
@@ -381,7 +475,7 @@ static int mca_fe_prepare(struct snd_pcm_substream *substream,
 		}
 
 		writel_relaxed(port + 6 + 1,
-			       cl->base + REG_SYNCGEN_MCLK_SEL);
+			       mca_reg(cl, REG_SYNCGEN_MCLK_SEL));
 		mca_modify(cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN,
 			   SYNCGEN_STATUS_EN);
 	}
@@ -423,7 +517,7 @@ static int mca_configure_serdes(struct mca_cluster *cl, int serdes_unit,
 				unsigned int mask, int slots, int nchans,
 				int slot_width, bool is_tx, int portmask)
 {
-	__iomem void *serdes_base = cl->base + serdes_unit;
+	__iomem void *serdes_base = mca_reg(cl, serdes_unit);
 	u32 serdes_conf, serdes_conf_mask;
 
 	serdes_conf_mask = SERDES_CONF_WIDTH_MASK | SERDES_CONF_NCHANS;
@@ -542,6 +636,8 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 		break;
 
 	case SND_SOC_DAIFMT_BC_FC:
+		if (!mca->variant->clk_consumer)
+			goto err;
 		cl->clk_provider = false;
 		break;
 
@@ -581,12 +677,14 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 
 	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
-	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
-		   SERDES_CONF_BCLK_POL, serdes_conf);
+	if (mca->variant->has_rx)
+		mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
+			   SERDES_CONF_BCLK_POL, serdes_conf);
 	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+		       mca_reg(cl, CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART));
+	if (mca->variant->has_rx)
+		writel_relaxed(bitstart,
+			       mca_reg(cl, CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART));
 
 	return 0;
 
@@ -601,6 +699,37 @@ static int mca_set_bclk_ratio(struct snd_soc_dai *dai, unsigned int ratio)
 
 	cl->bclk_ratio = ratio;
 
+	return 0;
+}
+
+/*
+ * T8132 divides a fixed parent clock in the cluster instead of programming
+ * the parent's rate, and the divider can only change while the clock is idle.
+ */
+static int mca_fe_set_clocks_divider(struct mca_cluster *cl, unsigned long bclk_ratio,
+				     unsigned int samp_rate)
+{
+	struct mca_data *mca = cl->host;
+	unsigned long parent_rate = clk_get_rate(cl->clk_parent);
+	unsigned long bit_rate = bclk_ratio * samp_rate;
+	u32 divisor;
+
+	if (!bit_rate || parent_rate % bit_rate)
+		return -EINVAL;
+	if (mca_fe_clocks_in_use(cl))
+		return cl->configured_bclk == bit_rate ? 0 : -EBUSY;
+	divisor = parent_rate / bit_rate;
+	if (!divisor || divisor > FIELD_MAX(MCLK_CONF_DIV))
+		return -EINVAL;
+	writel_relaxed(FIELD_PREP(MCLK_CONF_DIV, divisor),
+		       mca_reg(cl, REG_MCLK_CONF));
+	writel_relaxed(0, mca_reg(cl, REG_SYNCGEN_HI_PERIOD));
+	writel_relaxed(bclk_ratio - 2, mca_reg(cl, REG_SYNCGEN_LO_PERIOD));
+	/* Required for output on this generation; their meaning is not known. */
+	writel_relaxed(0x10, mca->switch_base + REG_T8132_SWITCH_UNK_08);
+	writel_relaxed(1, mca->switch_base + REG_T8132_SWITCH_UNK_04);
+	writel_relaxed(1, cl->base + REG_T8132_CLOCK_ENABLE);
+	cl->configured_bclk = bit_rate;
 	return 0;
 }
 
@@ -683,10 +812,10 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 	 */
 	nchans_ceiled = min_t(int, params_channels(params), 4);
 	regval = FIELD_PREP(DMA_ADAPTER_NCHANS, nchans_ceiled) |
-		 FIELD_PREP(DMA_ADAPTER_TX_NCHANS, 0x2) |
-		 FIELD_PREP(DMA_ADAPTER_RX_NCHANS, 0x2) |
 		 FIELD_PREP(DMA_ADAPTER_TX_LSB_PAD, pad) |
-		 FIELD_PREP(DMA_ADAPTER_RX_MSB_PAD, pad);
+		 mca->variant->dma_adapter_flags;
+	if (mca->variant->has_rx)
+		regval |= FIELD_PREP(DMA_ADAPTER_RX_MSB_PAD, pad);
 
 #ifndef USE_RXB_FOR_CAPTURE
 	writel_relaxed(regval, mca->switch_base + REG_DMA_ADAPTER_A(cl->no));
@@ -699,16 +828,19 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 			       mca->switch_base + REG_DMA_ADAPTER_B(cl->no));
 #endif
 
+	if (mca->variant->cluster_divider)
+		return mca_fe_set_clocks_divider(cl, bclk_ratio, samp_rate);
+
 	if (!mca_fe_clocks_in_use(cl)) {
 		/*
 		 * Set up FSYNC duty cycle as even as possible.
 		 */
 		writel_relaxed((bclk_ratio / 2) - 1,
-			       cl->base + REG_SYNCGEN_HI_PERIOD);
+			       mca_reg(cl, REG_SYNCGEN_HI_PERIOD));
 		writel_relaxed(((bclk_ratio + 1) / 2) - 1,
-			       cl->base + REG_SYNCGEN_LO_PERIOD);
+			       mca_reg(cl, REG_SYNCGEN_LO_PERIOD));
 		writel_relaxed(FIELD_PREP(MCLK_CONF_DIV, 0x1),
-			       cl->base + REG_MCLK_CONF);
+			       mca_reg(cl, REG_MCLK_CONF));
 
 		ret = clk_set_rate(cl->clk_parent, bclk_ratio * samp_rate);
 		if (ret) {
@@ -815,7 +947,7 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		writel_relaxed(PORT_DATA_SEL_TXA(fe_cl->no),
-			       cl->base + REG_PORT_DATA_SEL);
+			       mca_reg(cl, REG_PORT_DATA_SEL));
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_TX_DATA,
 			   PORT_ENABLES_TX_DATA);
 	}
@@ -837,7 +969,7 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	}
 
 	writel_relaxed(FIELD_PREP(PORT_CLOCK_SEL, fe_cl->no + 1),
-		       cl->base + REG_PORT_CLOCK_SEL);
+		       mca_reg(cl, REG_PORT_CLOCK_SEL));
 	mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS,
 		   PORT_ENABLES_CLOCKS);
 
@@ -884,7 +1016,7 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_TX_DATA, 0);
-		writel_relaxed(0, cl->base + REG_PORT_DATA_SEL);
+		writel_relaxed(0, mca_reg(cl, REG_PORT_DATA_SEL));
 	}
 
 	if (!fe_cl->clk_provider)
@@ -897,7 +1029,7 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 		 * Turn off the lights (clocks).
 		 */
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS, 0);
-		writel_relaxed(0, cl->base + REG_PORT_CLOCK_SEL);
+		writel_relaxed(0, mca_reg(cl, REG_PORT_CLOCK_SEL));
 		mutex_lock(&mca->port_mutex);
 		cl->port_clk_driver = -1;
 		mutex_unlock(&mca->port_mutex);
@@ -1148,27 +1280,32 @@ static int apple_mca_probe(struct platform_device *pdev)
 	struct resource *res;
 	void __iomem *base;
 	int nclusters;
+	const struct mca_variant *variant = device_get_match_data(&pdev->dev);
 	int ret, i;
+
+	if (!variant)
+		return -ENODEV;
 
 	base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
-	if (resource_size(res) < CLUSTER_STRIDE)
+	if (resource_size(res) < variant->cluster_stride)
 		return -EINVAL;
-	nclusters = (resource_size(res) - CLUSTER_STRIDE) / CLUSTER_STRIDE + 1;
+	nclusters = resource_size(res) / variant->cluster_stride;
 
 	mca = devm_kzalloc(&pdev->dev, struct_size(mca, clusters, nclusters),
 			   GFP_KERNEL);
 	if (!mca)
 		return -ENOMEM;
 	mca->dev = &pdev->dev;
+	mca->variant = variant;
 	mca->nclusters = nclusters;
 	mutex_init(&mca->port_mutex);
 	platform_set_drvdata(pdev, mca);
 	clusters = mca->clusters;
 
-	mca->switch_base =
+	mca->switch_base = variant->switch_in_cluster ? base + variant->switch_off :
 		devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(mca->switch_base))
 		return PTR_ERR(mca->switch_base);
@@ -1206,7 +1343,7 @@ static int apple_mca_probe(struct platform_device *pdev)
 
 		cl->host = mca;
 		cl->no = i;
-		cl->base = base + CLUSTER_STRIDE * i;
+		cl->base = base + variant->cluster_stride * i;
 		cl->port_clk_driver = -1;
 		cl->clk_parent = of_clk_get(pdev->dev.of_node, i);
 		if (IS_ERR(cl->clk_parent)) {
@@ -1240,6 +1377,8 @@ static int apple_mca_probe(struct platform_device *pdev)
 		fe->capture.channels_max = 32;
 		fe->capture.rates = SNDRV_PCM_RATE_8000_192000;
 		fe->capture.formats = APPLE_MCA_FMTBITS;
+		if (!variant->has_rx)
+			memset(&fe->capture, 0, sizeof(fe->capture));
 		fe->symmetric_rate = 1;
 
 		fe->playback.stream_name =
@@ -1267,6 +1406,8 @@ static int apple_mca_probe(struct platform_device *pdev)
 		be->capture.channels_max = 32;
 		be->capture.rates = SNDRV_PCM_RATE_8000_192000;
 		be->capture.formats = APPLE_MCA_FMTBITS;
+		if (!variant->has_rx)
+			memset(&be->capture, 0, sizeof(be->capture));
 
 		be->playback.stream_name =
 			devm_kasprintf(&pdev->dev, GFP_KERNEL, "I2S%d TX", i);
@@ -1302,8 +1443,9 @@ static void apple_mca_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_mca_of_match[] = {
-	{ .compatible = "apple,t8103-mca", },
-	{ .compatible = "apple,mca", },
+	{ .compatible = "apple,t8132-mca", .data = &mca_t8132_variant },
+	{ .compatible = "apple,t8103-mca", .data = &mca_t8103_variant },
+	{ .compatible = "apple,mca", .data = &mca_t8103_variant },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_mca_of_match);
