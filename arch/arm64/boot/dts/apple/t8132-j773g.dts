@@ -17,6 +17,13 @@
 	compatible = "apple,j773g", "apple,t8132", "apple,arm-platform";
 	model = "Apple Mac mini (M4, 2024)";
 
+	/* Protected mono internal speaker. */
+	speaker-audio {
+		compatible = "apple,j773g-speaker";
+		apple,mca = <&mca>;
+		apple,codec = <&speaker_amp>;
+	};
+
 	aliases {
 		ethernet0 = &ethernet0;
 		sio = &sio;
@@ -266,3 +273,28 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-mini.dtsi"
+
+&i2c3 {
+	status = "okay";
+};
+
+&dart_audio {
+	status = "okay";
+};
+
+&admac {
+	status = "okay";
+};
+
+&mca {
+	status = "okay";
+};
+
+&i2c3 {
+	speaker_amp: amplifier@38 {
+		compatible = "ti,sn012776";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		shutdown-gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+	};
+};
