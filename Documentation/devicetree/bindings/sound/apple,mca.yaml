@@ -7,19 +7,51 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Apple MCA I2S transceiver
 
 description: |
-  MCA is an I2S transceiver peripheral found on M1 and other Apple chips. It is
-  composed of a number of identical clusters which can operate independently
-  or in an interlinked fashion. Up to 6 clusters have been seen on an MCA.
+  MCA is an I2S transceiver peripheral found on M1 and other Apple chips.
+  T8132 uses a single banked aperture; currently only its TX0 route is exposed.
+  Earlier hardware is composed of a number of identical clusters which can
+  operate independently or in an interlinked fashion. Up to 6 clusters have
+  been seen on an MCA.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-mca
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        dmas:
+          maxItems: 1
+        dma-names:
+          maxItems: 1
+        clocks:
+          maxItems: 1
+        power-domains:
+          maxItems: 2
+    else:
+      properties:
+        reg:
+          minItems: 2
+        dmas:
+          minItems: 16
+        dma-names:
+          minItems: 16
+        clocks:
+          minItems: 4
+        power-domains:
+          minItems: 5
 
 properties:
   compatible:
     oneOf:
+      - const: apple,t8132-mca
       - items:
           - const: apple,t6020-mca
           - const: apple,t8103-mca
@@ -32,6 +64,7 @@ properties:
           - const: apple,mca
 
   reg:
+    minItems: 1
     items:
       - description: Register region of the MCA clusters proper
       - description: Register region of the DMA glue and its FIFOs
@@ -49,7 +82,7 @@ properties:
     const: 0
 
   dmas:
-    minItems: 16
+    minItems: 1
     maxItems: 24
     description:
       DMA channels corresponding to the SERDES units in the peripheral. They are
@@ -57,7 +90,7 @@ properties:
       as associated to the TXA, RXA, TXB, RXB units.
 
   dma-names:
-    minItems: 16
+    minItems: 1
     items:
       - const: tx0a
       - const: rx0a
@@ -88,7 +121,7 @@ properties:
       based on the associated SERDES unit.
 
   clocks:
-    minItems: 4
+    minItems: 1
     maxItems: 6
     description:
       Clusters' input reference clock.
@@ -97,7 +130,7 @@ properties:
     maxItems: 1
 
   power-domains:
-    minItems: 5
+    minItems: 2
     maxItems: 7
     description:
       First a general power domain for register access, then the power
