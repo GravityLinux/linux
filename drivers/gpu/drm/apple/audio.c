@@ -47,6 +47,8 @@ struct dcp_audio {
 	unsigned int open_cookie;
 	bool power_held;
 	bool link_started;
+	snd_pcm_format_t link_format;
+	unsigned int link_channels;
 
 	struct mutex data_lock;
 	bool dcp_connected; /// dcp status keep for delayed initialization
@@ -339,6 +341,22 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		if (ret < 0)
 			goto err_close;
 
+		/* The retained link also retains its sample representation and
+		 * channel layout. A new client must not reinterpret its DMA data.
+		 */
+		if (dcpaud->link_started) {
+			ret = snd_pcm_hw_constraint_mask64(substream->runtime,
+					SNDRV_PCM_HW_PARAM_FORMAT,
+					BIT_ULL(dcpaud->link_format));
+			if (ret < 0)
+				goto err_close;
+			ret = snd_pcm_hw_constraint_single(substream->runtime,
+					SNDRV_PCM_HW_PARAM_CHANNELS,
+					dcpaud->link_channels);
+			if (ret < 0)
+				goto err_close;
+		}
+
 		ret = snd_pcm_hw_constraint_step(substream->runtime, 0,
 					 SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
 					 SZ_4K);
@@ -383,6 +401,12 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
+
+	/* Also cover reconfiguration of an already-open PCM after STOP. */
+	if (dcpaud->link_started &&
+	    (params_format(params) != dcpaud->link_format ||
+	     params_channels(params) != dcpaud->link_channels))
+		return -EINVAL;
 
 	ret = dcpaud_select_cookie(dcpaud, params);
 	if (ret < 0)
@@ -529,6 +553,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			return ret;
 		}
 		if (t8132) {
+			dcpaud->link_format = substream->runtime->format;
+			dcpaud->link_channels = substream->runtime->channels;
 			dcpaud->link_started = true;
 			return 0;
 		}
