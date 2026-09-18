@@ -438,7 +438,7 @@ impl File {
             return Err(EINVAL);
         }
         let mut params = uapi::drm_asahi_params_global {
-            features: 0,
+            features: uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIER.into(),
             gpu_generation: 16,
             gpu_variant: b'G' as u32,
             gpu_revision: device.gpu_revision,
@@ -1636,9 +1636,10 @@ impl Vm {
         use uapi::{
             drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT as DBIAS_IS_INT,
             drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as PROCESS_EMPTY_TILES,
+            drm_asahi_render_flags_DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT as VDM_BARRIER_FRAGMENT,
         };
 
-        if c.flags & !(PROCESS_EMPTY_TILES | DBIAS_IS_INT) != 0
+        if c.flags & !(PROCESS_EMPTY_TILES | DBIAS_IS_INT | VDM_BARRIER_FRAGMENT) != 0
             || c.vertex_helper.binary != 0
             || c.vertex_helper.cfg != 0
             || c.vertex_helper.data != 0
@@ -1649,6 +1650,7 @@ impl Vm {
             return Err(ENOTSUPP);
         }
         let mut p = render::Parameters::default();
+        p.vdm_barrier_fragment = c.flags & VDM_BARRIER_FRAGMENT != 0;
         p.set_private(self.kernel.start, self.kernel.end)
             .ok_or(EINVAL)?;
         p.width = u64::from(c.width_px);

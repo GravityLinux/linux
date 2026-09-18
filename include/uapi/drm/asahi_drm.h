@@ -213,6 +213,13 @@ enum drm_asahi_feature {
 	 * userspace can speculate memory accesses more aggressively.
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_FRAGMENT_BARRIER: Render commands accept
+	 * @DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT to defer render dependencies
+	 * until the fragment stage.
+	 */
+	DRM_ASAHI_FEATURE_FRAGMENT_BARRIER = (1UL) << 1,
 };
 
 /**
@@ -788,6 +795,17 @@ enum drm_asahi_render_flags {
 	 * bugs, and therefore is useful for debugging.
 	 */
 	DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING = (1U << 2),
+
+	/**
+	 * @DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT: Apply the command header's
+	 * vdm_barrier before fragment execution instead of before tiling.
+	 * The cdm_barrier and submission input fences still precede tiling.
+	 * Tiling commands on the same queue execute in submission order.
+	 * Userspace must ensure that this command's tiling accesses do not
+	 * depend on earlier fragment execution, including write-after-read
+	 * hazards. Requires @DRM_ASAHI_FEATURE_FRAGMENT_BARRIER.
+	 */
+	DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT = (1U << 3),
 
 	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.

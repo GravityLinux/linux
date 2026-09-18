@@ -98,8 +98,8 @@ pub(crate) fn barrier(stamp: u64, wait: u32, event: u32, stamp_self: u32, uuid: 
     out
 }
 
-/// General G16 dependency, before a consumer TA or CDM Work. Type 1 participates
-/// in firmware's dynamic dependency graph; the internal TA-to-fragment prelude
+/// General G16 dependency, before a consumer TA, fragment or CDM Work. Type 1
+/// participates in firmware's dynamic dependency graph; the internal TA-to-fragment prelude
 /// retains type 0 for partial-render scheduling.
 pub(crate) fn dependency(
     stamp: u64,

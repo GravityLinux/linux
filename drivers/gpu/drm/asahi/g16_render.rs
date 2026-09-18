@@ -8,6 +8,7 @@
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Parameters {
+    pub(crate) vdm_barrier_fragment: bool,
     pub(crate) request_tvb_growth: bool,
     pub(crate) fragment_sync_grow: bool,
     pub(crate) process_empty_tiles: bool,
