@@ -8,6 +8,7 @@
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/device.h>
+#include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -45,21 +46,25 @@
 #define REG_TX_STOP		0x0004
 #define REG_RX_START		0x0008
 #define REG_RX_STOP		0x000c
+#define REG_CTL			0x0010
 #define REG_UNK_28		0x0028
 #define REG_UNK_2C		0x002c
 #define REG_IMPRINT		0x0090
 #define REG_TX_SRAM_SIZE	0x0094
 #define REG_RX_SRAM_SIZE	0x0098
 
-#define REG_CHAN_CTL(ch)	(0x8000 + (ch) * 0x200)
+/* Relative to a channel's register block, see admac_chan::regs */
+#define REG_CHAN_CTL		0x00
 #define REG_CHAN_CTL_RST_RINGS	BIT(0)
+#define REG_CHAN_CONFIG		0x04
+#define REG_CHAN_BURST		0x30
 
-#define REG_DESC_RING(ch)	(0x8070 + (ch) * 0x200)
-#define REG_REPORT_RING(ch)	(0x8074 + (ch) * 0x200)
+#define REG_DESC_RING		0x70
+#define REG_REPORT_RING		0x74
 
-#define REG_RESIDUE(ch)		(0x8064 + (ch) * 0x200)
+#define REG_RESIDUE		0x64
 
-#define REG_BUS_WIDTH(ch)	(0x8040 + (ch) * 0x200)
+#define REG_BUS_WIDTH		0x40
 
 #define BUS_WIDTH_WORD_SIZE	GENMASK(3, 0)
 #define BUS_WIDTH_FRAME_SIZE	GENMASK(7, 4)
@@ -69,11 +74,11 @@
 #define BUS_WIDTH_FRAME_2_WORDS	0x10
 #define BUS_WIDTH_FRAME_4_WORDS	0x20
 
-#define REG_CHAN_SRAM_CARVEOUT(ch)	(0x8050 + (ch) * 0x200)
+#define REG_CHAN_SRAM_CARVEOUT	0x50
 #define CHAN_SRAM_CARVEOUT_SIZE		GENMASK(31, 16)
 #define CHAN_SRAM_CARVEOUT_BASE		GENMASK(15, 0)
 
-#define REG_CHAN_FIFOCTL(ch)	(0x8054 + (ch) * 0x200)
+#define REG_CHAN_FIFOCTL	0x54
 #define CHAN_FIFOCTL_LIMIT	GENMASK(31, 16)
 #define CHAN_FIFOCTL_THRESHOLD	GENMASK(15, 0)
 
@@ -83,8 +88,12 @@
 #define REG_TX_INTSTATE(idx)		(0x0030 + (idx) * 4)
 #define REG_RX_INTSTATE(idx)		(0x0040 + (idx) * 4)
 #define REG_GLOBAL_INTSTATE(idx)	(0x0050 + (idx) * 4)
-#define REG_CHAN_INTSTATUS(ch, idx)	(0x8010 + (ch) * 0x200 + (idx) * 4)
-#define REG_CHAN_INTMASK(ch, idx)	(0x8020 + (ch) * 0x200 + (idx) * 4)
+#define REG_CHAN_INTSTATUS(idx)		(0x10 + (idx) * 4)
+#define REG_CHAN_INTMASK(idx)		(0x20 + (idx) * 4)
+
+#define REG_CHAN_ENABLE		0xa0
+#define CHAN_ENABLE_MEMORY	BIT(0)
+#define CHAN_ENABLE_PERIPHERAL	BIT(1)
 
 struct admac_data;
 struct admac_tx;
@@ -92,6 +101,7 @@ struct admac_tx;
 struct admac_chan {
 	unsigned int no;
 	struct admac_data *host;
+	void __iomem *regs;
 	struct dma_chan chan;
 	struct tasklet_struct tasklet;
 
@@ -132,6 +142,7 @@ struct admac_data {
 	struct admac_sram txcache, rxcache;
 
 	bool set_unk28;
+	bool split_channels;
 	int irq;
 	int irq_index;
 	int nchannels;
@@ -154,6 +165,7 @@ struct admac_tx {
 
 struct admac_hw {
 	bool set_unk28;
+	bool split_channels;
 };
 
 static int admac_alloc_sram_carveout(struct admac_data *ad,
@@ -164,6 +176,11 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 	int i, ret = 0, nblocks;
 	ad->txcache.size = readl_relaxed(ad->base + REG_TX_SRAM_SIZE);
 	ad->rxcache.size = readl_relaxed(ad->base + REG_RX_SRAM_SIZE);
+	/* T8132 reports channel metadata in the upper half of these words. */
+	if (ad->split_channels) {
+		ad->txcache.size &= GENMASK(15, 0);
+		ad->rxcache.size &= GENMASK(15, 0);
+	}
 
 	if (dir == DMA_MEM_TO_DEV)
 		sram = &ad->txcache;
@@ -173,7 +190,7 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 	mutex_lock(&ad->cache_alloc_lock);
 
 	nblocks = sram->size / SRAM_BLOCK;
-	for (i = 0; i < nblocks; i++)
+	for (i = ad->split_channels ? 1 : 0; i < nblocks; i++)
 		if (!(sram->allocated & BIT(i)))
 			break;
 
@@ -212,9 +229,8 @@ static void admac_free_sram_carveout(struct admac_data *ad,
 	mutex_unlock(&ad->cache_alloc_lock);
 }
 
-static void admac_modify(struct admac_data *ad, int reg, u32 mask, u32 val)
+static void admac_modify(void __iomem *addr, u32 mask, u32 val)
 {
-	void __iomem *addr = ad->base + reg;
 	u32 curr = readl_relaxed(addr);
 
 	writel_relaxed((curr & ~mask) | (val & mask), addr);
@@ -325,7 +341,7 @@ static void admac_cyclic_write_desc(struct admac_data *ad, int channo,
 	int i;
 
 	for (i = 0; i < 4; i++) {
-		if (readl_relaxed(ad->base + REG_DESC_RING(channo)) & RING_FULL)
+		if (readl_relaxed(ad->channels[channo].regs + REG_DESC_RING) & RING_FULL)
 			break;
 		admac_cyclic_write_one_desc(ad, channo, tx);
 	}
@@ -359,10 +375,10 @@ static u32 admac_cyclic_read_residue(struct admac_data *ad, int channo,
 	int nreports;
 	size_t pos;
 
-	ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(channo));
-	residue1 = readl_relaxed(ad->base + REG_RESIDUE(channo));
-	ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(channo));
-	residue2 = readl_relaxed(ad->base + REG_RESIDUE(channo));
+	ring1 =    readl_relaxed(ad->channels[channo].regs + REG_REPORT_RING);
+	residue1 = readl_relaxed(ad->channels[channo].regs + REG_RESIDUE);
+	ring2 =    readl_relaxed(ad->channels[channo].regs + REG_REPORT_RING);
+	residue2 = readl_relaxed(ad->channels[channo].regs + REG_RESIDUE);
 
 	if (residue2 > residue1) {
 		/*
@@ -423,9 +439,9 @@ static void admac_start_chan(struct admac_chan *adchan)
 	u32 startbit = 1 << (adchan->no / 2);
 
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
-		       ad->base + REG_CHAN_INTSTATUS(adchan->no, ad->irq_index));
+		       adchan->regs + REG_CHAN_INTSTATUS(ad->irq_index));
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
-		       ad->base + REG_CHAN_INTMASK(adchan->no, ad->irq_index));
+		       adchan->regs + REG_CHAN_INTMASK(ad->irq_index));
 
 	switch (admac_chan_direction(adchan->no)) {
 	case DMA_MEM_TO_DEV:
@@ -460,11 +476,9 @@ static void admac_stop_chan(struct admac_chan *adchan)
 
 static void admac_reset_rings(struct admac_chan *adchan)
 {
-	struct admac_data *ad = adchan->host;
-
 	writel_relaxed(REG_CHAN_CTL_RST_RINGS,
-		       ad->base + REG_CHAN_CTL(adchan->no));
-	writel_relaxed(0, ad->base + REG_CHAN_CTL(adchan->no));
+		       adchan->regs + REG_CHAN_CTL);
+	writel_relaxed(0, adchan->regs + REG_CHAN_CTL);
 }
 
 static void admac_start_current_tx(struct admac_chan *adchan)
@@ -473,7 +487,14 @@ static void admac_start_current_tx(struct admac_chan *adchan)
 	int ch = adchan->no;
 
 	admac_reset_rings(adchan);
-	writel_relaxed(0, ad->base + REG_CHAN_CTL(ch));
+	writel_relaxed(0, adchan->regs + REG_CHAN_CTL);
+	if (ad->split_channels) {
+		/* T8132 separates the memory and peripheral sides of a channel. */
+		writel_relaxed(0x29b0000, adchan->regs + REG_CHAN_CONFIG);
+		writel_relaxed(0x302, adchan->regs + REG_CHAN_BURST);
+		writel_relaxed(CHAN_ENABLE_MEMORY | CHAN_ENABLE_PERIPHERAL,
+			       adchan->regs + REG_CHAN_ENABLE);
+	}
 
 	admac_cyclic_write_one_desc(ad, ch, adchan->current_tx);
 	admac_start_chan(adchan);
@@ -573,7 +594,7 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 		return ret;
 
 	writel_relaxed(adchan->carveout,
-		       ad->base + REG_CHAN_SRAM_CARVEOUT(adchan->no));
+		       adchan->regs + REG_CHAN_SRAM_CARVEOUT);
 	return 0;
 }
 
@@ -613,7 +634,7 @@ static int admac_drain_reports(struct admac_data *ad, int channo)
 	for (count = 0; count < 4; count++) {
 		u32 countval_hi, countval_lo, unk1, flags;
 
-		if (readl_relaxed(ad->base + REG_REPORT_RING(channo)) & RING_EMPTY)
+		if (readl_relaxed(ad->channels[channo].regs + REG_REPORT_RING) & RING_EMPTY)
 			break;
 
 		countval_lo = readl_relaxed(ad->base + REG_REPORT_READ(channo));
@@ -632,21 +653,21 @@ static void admac_handle_status_err(struct admac_data *ad, int channo)
 {
 	bool handled = false;
 
-	if (readl_relaxed(ad->base + REG_DESC_RING(channo)) & RING_ERR) {
-		writel_relaxed(RING_ERR, ad->base + REG_DESC_RING(channo));
+	if (readl_relaxed(ad->channels[channo].regs + REG_DESC_RING) & RING_ERR) {
+		writel_relaxed(RING_ERR, ad->channels[channo].regs + REG_DESC_RING);
 		dev_err_ratelimited(ad->dev, "ch%d descriptor ring error\n", channo);
 		handled = true;
 	}
 
-	if (readl_relaxed(ad->base + REG_REPORT_RING(channo)) & RING_ERR) {
-		writel_relaxed(RING_ERR, ad->base + REG_REPORT_RING(channo));
+	if (readl_relaxed(ad->channels[channo].regs + REG_REPORT_RING) & RING_ERR) {
+		writel_relaxed(RING_ERR, ad->channels[channo].regs + REG_REPORT_RING);
 		dev_err_ratelimited(ad->dev, "ch%d report ring error\n", channo);
 		handled = true;
 	}
 
 	if (unlikely(!handled)) {
 		dev_err(ad->dev, "ch%d unknown error, masking errors as cause of IRQs\n", channo);
-		admac_modify(ad, REG_CHAN_INTMASK(channo, ad->irq_index),
+		admac_modify(ad->channels[channo].regs + REG_CHAN_INTMASK(ad->irq_index),
 			     STATUS_ERR, 0);
 	}
 }
@@ -658,7 +679,7 @@ static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
 	int nreports;
 
 	writel_relaxed(STATUS_DESC_DONE,
-		       ad->base + REG_CHAN_INTSTATUS(channo, ad->irq_index));
+		       ad->channels[channo].regs + REG_CHAN_INTSTATUS(ad->irq_index));
 
 	spin_lock_irqsave(&adchan->lock, flags);
 	nreports = admac_drain_reports(ad, channo);
@@ -678,7 +699,7 @@ static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
 
 static void admac_handle_chan_int(struct admac_data *ad, int no)
 {
-	u32 cause = readl_relaxed(ad->base + REG_CHAN_INTSTATUS(no, ad->irq_index));
+	u32 cause = readl_relaxed(ad->channels[no].regs + REG_CHAN_INTSTATUS(ad->irq_index));
 
 	if (cause & STATUS_ERR)
 		admac_handle_status_err(ad, no);
@@ -753,7 +774,7 @@ static int admac_device_config(struct dma_chan *chan,
 	struct admac_data *ad = adchan->host;
 	bool is_tx = admac_chan_direction(adchan->no) == DMA_MEM_TO_DEV;
 	int wordsize = 0;
-	u32 bus_width = readl_relaxed(ad->base + REG_BUS_WIDTH(adchan->no)) &
+	u32 bus_width = readl_relaxed(adchan->regs + REG_BUS_WIDTH) &
 		~(BUS_WIDTH_WORD_SIZE | BUS_WIDTH_FRAME_SIZE);
 
 	if (ad->set_unk28) {
@@ -798,7 +819,7 @@ static int admac_device_config(struct dma_chan *chan,
 		return -EINVAL;
 	}
 
-	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(adchan->no));
+	writel_relaxed(bus_width, adchan->regs + REG_BUS_WIDTH);
 
 	/*
 	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be
@@ -809,7 +830,7 @@ static int admac_device_config(struct dma_chan *chan,
 	 */
 	writel_relaxed(FIELD_PREP(CHAN_FIFOCTL_LIMIT, 0x30 * wordsize)
 		       | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize),
-		       ad->base + REG_CHAN_FIFOCTL(adchan->no));
+		       adchan->regs + REG_CHAN_FIFOCTL);
 
 	return 0;
 }
@@ -840,6 +861,12 @@ static int admac_probe(struct platform_device *pdev)
 	ad->dev = &pdev->dev;
 	ad->nchannels = nchannels;
 	ad->set_unk28 = hw->set_unk28;
+	ad->split_channels = hw->split_channels;
+	if (ad->split_channels) {
+		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
+		if (err)
+			return err;
+	}
 	mutex_init(&ad->cache_alloc_lock);
 
 	/*
@@ -899,6 +926,13 @@ static int admac_probe(struct platform_device *pdev)
 
 		adchan->host = ad;
 		adchan->no = i;
+		/*
+		 * Channel IDs are TX0, RX0, TX1, RX1, ... on every variant. T8132
+		 * keeps the two directions in separate banks with a 0x200 stride
+		 * within each; FIFO ports and start/stop bitmaps are unchanged.
+		 */
+		adchan->regs = ad->base + 0x8000 + (hw->split_channels ?
+			(i & 1) * 0x4000 + (i / 2) * 0x200 : i * 0x200);
 		adchan->chan.device = &ad->dma;
 		spin_lock_init(&adchan->lock);
 		INIT_LIST_HEAD(&adchan->submitted);
@@ -912,6 +946,9 @@ static int admac_probe(struct platform_device *pdev)
 	if (err)
 		return dev_err_probe(&pdev->dev, err,
 				     "unable to trigger reset\n");
+
+	if (ad->split_channels)
+		writel_relaxed(0x18080001, ad->base + REG_CTL);
 
 	err = request_irq(irq, admac_interrupt, 0, dev_name(&pdev->dev), ad);
 	if (err) {
@@ -962,7 +999,12 @@ static const struct admac_hw admac_t8122_hw = {
 	.set_unk28 = true,
 };
 
+static const struct admac_hw admac_t8132_hw = {
+	.split_channels = true,
+};
+
 static const struct of_device_id admac_of_match[] = {
+	{ .compatible = "apple,t8132-admac", .data = &admac_t8132_hw },
 	{ .compatible = "apple,t8122-admac", .data = &admac_t8122_hw },
 	{ .compatible = "apple,t8103-admac", .data = &admac_t8013_hw },
 	{ .compatible = "apple,admac", .data = &admac_t8013_hw },
