@@ -69,7 +69,6 @@ struct audiosrv_data {
 	bool is_open;
 };
 
-#define DCP_AV_COMPACT_ELEMENTS_MAXSIZE 3072
 
 static void av_interface_init(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit)
@@ -306,7 +305,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	void *bfr;
 	int ret;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -317,14 +316,19 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	if (ret)
 		goto out;
 
+	/* A successful service call can still contain a truncated OSObject. */
+	if (le64_to_cpu(hdr->used_size) < sizeof(u32) ||
+	    le64_to_cpu(hdr->used_size) > output_maxsize) {
+		ret = -EMSGSIZE;
+		goto out;
+	}
 	if (output)
-		memcpy(output, bfr + sizeof(*hdr), output_maxsize);
-
+		memcpy(output, bfr + sizeof(*hdr), le64_to_cpu(hdr->used_size));
 	if (output_size)
 		*output_size = le64_to_cpu(hdr->used_size);
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 
@@ -332,7 +336,6 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
-	size_t request_maxsize = maxsize;
 	size_t size = 0;
 	int ret;
 
@@ -344,15 +347,9 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 	if (!asrv->srv) {
 		ret = -ENODEV;
 	} else {
-		/* Native advertises a much larger buffer and fragments the compact
-		 * transaction.  The 26.6 response observed on J773g is 1952 bytes,
-		 * so keep this request within one AFK ring entry. */
-		if (asrv->srv->ep->compact)
-			request_maxsize = min_t(size_t, request_maxsize,
-						    DCP_AV_COMPACT_ELEMENTS_MAXSIZE);
 		ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
 						 asrv->cmds.get_elements, elements,
-						 request_maxsize, &size);
+						 maxsize, &size);
 	}
 	up_read(&asrv->srv_rwsem);
 
@@ -363,7 +360,7 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 		dev_dbg(dev, "audiosrv: got %zd bytes worth of elements\n", size);
 	}
 
-	return ret;
+	return ret ? ret : size;
 }
 
 int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsize)

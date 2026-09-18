@@ -27,10 +27,11 @@
 
 #include "av.h"
 #include "dcp.h"
+#include <linux/unaligned.h>
 #include "audio.h"
 #include "parser.h"
 
-#define DCPAUD_ELEMENTS_MAXSIZE		16384
+#define DCPAUD_ELEMENTS_MAXSIZE		(256 * 1024)
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 
 struct dcp_audio {
@@ -55,6 +56,7 @@ struct dcp_audio {
 	struct snd_pcm_chmap_elem selected_chmap;
 	struct dcp_sound_cookie selected_cookie;
 	void *elements;
+	size_t elements_size;
 	void *productattrs;
 
 	struct snd_pcm_chmap *chmap_info;
@@ -85,6 +87,9 @@ static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
 					DCPAUD_ELEMENTS_MAXSIZE);
 	if (ret < 0)
 		return ret;
+	if (ret < sizeof(u32) || get_unaligned_le32(dcpaud->elements) != 0xd3)
+		return -EINVAL;
+	dcpaud->elements_size = ret;
 
 	ret = dcp_audiosrv_get_product_attrs(dcpaud->dcp_dev, dcpaud->productattrs,
 					     DCPAUD_PRODUCTATTRS_MAXSIZE);
@@ -132,7 +137,7 @@ static void dcpaud_fill_fmt_sieve(struct snd_pcm_hw_params *params,
 	}
 }
 
-static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
+static int dcpaud_consult_elements(struct dcp_audio *dcpaud,
 				    struct snd_pcm_hw_params *params,
 				    struct dcp_sound_format_mask *hits)
 {
@@ -140,14 +145,13 @@ static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
 	struct dcp_parse_ctx elements = {
 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
 		.blob = dcpaud->elements + 4,
-		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
+		.len = dcpaud->elements_size - 4,
 		.pos = 0,
 	};
 
 	dcpaud_fill_fmt_sieve(params, &sieve);
 	dev_dbg(dcpaud->dev, "elements in: %llx %x %x\n", sieve.formats, sieve.nchans, sieve.rates);
-	parse_sound_constraints(&elements, &sieve, hits);
-	dev_dbg(dcpaud->dev, "elements out: %llx %x %x\n", hits->formats, hits->nchans, hits->rates);
+	return parse_sound_constraints(&elements, &sieve, hits);
 }
 
 static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
@@ -157,7 +161,7 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 	struct dcp_parse_ctx elements = {
 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
 		.blob = dcpaud->elements + 4,
-		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
+		.len = dcpaud->elements_size - 4,
 		.pos = 0,
 	};
 
@@ -173,8 +177,10 @@ static int dcpaud_rule_channels(struct snd_pcm_hw_params *params,
 	struct snd_interval *c = hw_param_interval(params,
 				SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct dcp_sound_format_mask hits = {0, 0, 0};
+	int ret = dcpaud_consult_elements(dcpaud, params, &hits);
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+	if (ret)
+		return ret;
 
         return dcpaud_interval_bitmask(c, hits.nchans);
 }
@@ -198,8 +204,10 @@ static int dcpaud_rule_format(struct snd_pcm_hw_params *params,
 	struct snd_mask *f = hw_param_mask(params,
 				SNDRV_PCM_HW_PARAM_FORMAT);
 	struct dcp_sound_format_mask hits;
+	int ret = dcpaud_consult_elements(dcpaud, params, &hits);
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+	if (ret)
+		return ret;
 
         return dcpaud_refine_fmt_mask(f, hits.formats);
 }
@@ -211,8 +219,10 @@ static int dcpaud_rule_rate(struct snd_pcm_hw_params *params,
 	struct snd_interval *r = hw_param_interval(params,
 				SNDRV_PCM_HW_PARAM_RATE);
 	struct dcp_sound_format_mask hits;
+	int ret = dcpaud_consult_elements(dcpaud, params, &hits);
 
-        dcpaud_consult_elements(dcpaud, params, &hits);
+	if (ret)
+		return ret;
 
         return snd_interval_rate_bits(r, hits.rates);
 }
@@ -883,6 +893,11 @@ static const struct component_ops dcpaud_comp_ops = {
 	.unbind	= dcpaud_comp_unbind,
 };
 
+static void dcpaud_free_elements(void *data)
+{
+	kvfree(data);
+}
+
 static int dcpaud_probe(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
@@ -892,10 +907,12 @@ static int dcpaud_probe(struct platform_device *pdev)
 	if (!dcpaud)
 		return -ENOMEM;
 
-	dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
-					GFP_KERNEL);
+	dcpaud->elements = kvzalloc(DCPAUD_ELEMENTS_MAXSIZE, GFP_KERNEL);
 	if (!dcpaud->elements)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(&pdev->dev, dcpaud_free_elements, dcpaud->elements);
+	if (ret)
+		return ret;
 
 	dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
 					    GFP_KERNEL);
