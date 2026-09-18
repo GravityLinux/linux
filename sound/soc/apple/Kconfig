@@ -37,4 +37,23 @@ config SND_SOC_APPLE_MACAUDIO
 	  and it also enables the required SoC and codec drivers for overall
 	  sound support on these machines.
 
+config SND_SOC_APPLE_T8132_SPEAKER
+	tristate "Experimental T8132 Mac mini internal speaker"
+	depends on ARCH_APPLE && ARM64_16K_PAGES && I2C && GPIOLIB && OF
+	depends on DMADEVICES
+	select SND_PCM
+	select SND_SOC_APPLE_MCA
+	select SND_SOC_TAS2764
+	select APPLE_ADMAC
+	help
+	  Fixed-format J773g internal-speaker playback with an in-kernel
+	  voice-coil thermal model. Samples are attenuated and their energy
+	  is charged before they reach the DMA ring, so no userspace daemon
+	  or V/I feedback is needed. The amplifier is held at a hardware
+	  ceiling set by the ceiling_dvc module parameter.
+
+	  Uses the shared MCA, ADMAC, DART and TAS2764 drivers with J773g
+	  routing and protected PCM copies. This driver can be built into
+	  the kernel or as the snd-t8132-speaker module.
+
 endmenu
