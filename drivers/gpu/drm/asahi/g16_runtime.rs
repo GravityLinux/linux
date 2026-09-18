@@ -1259,8 +1259,10 @@ impl Bootstrap {
             .as_mut()
             .ok_or(EIO)?
             .write_live(a.render_shared_state, &use_count.to_le_bytes())?;
-        let (heads, epochs) =
-            self.publish_render(&a, &ta, &frag, queue, initbm, pool.blocks, dependencies)?;
+        let (heads, epochs) = self.publish_render(
+            &a, &ta, &frag, queue, initbm, pool.blocks, dependencies,
+            params.vdm_barrier_fragment,
+        )?;
         pool.initialized = true;
         support.submissions.store(next_submitted, Ordering::Relaxed);
         self.render_publication = self.render_publication.wrapping_add(1);
@@ -1336,15 +1338,25 @@ impl Bootstrap {
         initbm: bool,
         blocks: u32,
         dependencies: &[Option<Stamp>; 2],
+        vdm_barrier_fragment: bool,
     ) -> Result<([u32; 2], [u32; 2])> {
         let priority = queue.priority;
         let lanes = queue.lanes.as_ref().ok_or(EIO)?;
         let publication = self.render_publication;
         let firsts = [lanes[0].head, lanes[1].head];
+        // Only the render dependency can move to fragment. Compute output
+        // may feed the vertex stage, and input fences were already consumed
+        // by the scheduler before either lane was published.
+        let stage_dependencies = if vdm_barrier_fragment {
+            [[None, dependencies[1]], [dependencies[0], None]]
+        } else {
+            [*dependencies, [None, None]]
+        };
         let heads = [
-            (firsts[0] + 1 + u32::from(initbm) + dependencies.iter().flatten().count() as u32)
+            (firsts[0] + 1 + u32::from(initbm)
+                + stage_dependencies[0].iter().flatten().count() as u32)
                 % 0x500,
-            (firsts[1] + 2) % 0x500,
+            (firsts[1] + 2 + stage_dependencies[1].iter().flatten().count() as u32) % 0x500,
         ];
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         fw.write_live(a.event_control, &a.event_count_array.to_le_bytes())?;
@@ -1397,24 +1409,23 @@ impl Bootstrap {
                 fw.write_live(micro, &a.fragment_microsequence())?;
             }
             let mut pos = firsts[stage];
-            if stage == 0 {
-                // The prelude page leaves +0x40..+0xc0 free before its
-                // microsequence. All barrier bytes share the Work's lifetime.
-                for (index, dep) in dependencies.iter().flatten().enumerate() {
-                    let address = prelude + 0x40 + index as u64 * 0x40;
-                    fw.write_live(
-                        address,
-                        &g16_fw::queue::dependency(
-                            dep.address,
-                            dep.value,
-                            dep.event,
-                            a.tiling_stamp as u32,
-                            a.tiling_uuid as u32,
-                        ),
-                    )?;
-                    fw.write_live(ring + u64::from(pos) * 8, &address.to_le_bytes())?;
-                    pos = (pos + 1) % 0x500;
-                }
+            // The prelude page leaves +0x40..+0xc0 free before its
+            // microsequence. All barrier bytes share the Work's lifetime.
+            for (index, dep) in stage_dependencies[stage].iter().flatten().enumerate() {
+                let address = prelude + 0x40 + index as u64 * 0x40;
+                let (stamp, uuid) = if stage == 0 {
+                    (a.tiling_stamp, a.tiling_uuid)
+                } else {
+                    (a.fragment_stamp, a.fragment_uuid)
+                };
+                fw.write_live(
+                    address,
+                    &g16_fw::queue::dependency(
+                        dep.address, dep.value, dep.event, stamp as u32, uuid as u32,
+                    ),
+                )?;
+                fw.write_live(ring + u64::from(pos) * 8, &address.to_le_bytes())?;
+                pos = (pos + 1) % 0x500;
             }
             if stage == 1 || initbm {
                 fw.write_live(ring + u64::from(pos) * 8, &prelude.to_le_bytes())?;
