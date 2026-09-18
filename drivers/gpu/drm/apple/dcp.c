@@ -1596,7 +1596,7 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_V_13_5;
 	else if (strncmp(compat_str, "13.5.0", sizeof(compat_str)) == 0)
 		return DCP_FIRMWARE_V_13_5;
-	else if (strncmp(compat_str, "26.6.0", sizeof(compat_str)) == 0)
+	else if (strncmp(compat_str, "26.6.2", sizeof(compat_str)) == 0)
 		return DCP_FIRMWARE_V_26_6;
 
 	dev_err(dev, "DCP firmware-compat %s (FW: %s) is not supported\n",
