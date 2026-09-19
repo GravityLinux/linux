@@ -405,7 +405,7 @@ static const struct snd_soc_dapm_route speaker_routes[] = {
 static int speaker_fixup_controls(struct snd_soc_card *card)
 {
 	static const char * const locked_controls[] = {
-		"Speaker Volume", "Amp Gain Volume", "ASI1 Sel",
+		"Amp Gain Volume", "ASI1 Sel",
 		"HPF Corner Frequency", "OCE Handling", "ISENSE Switch", "VSENSE Switch",
 	};
 	/* Thermal values from the J773g AID36/AUSP_0329 ATSP preset, decoded with
@@ -425,6 +425,7 @@ static int speaker_fixup_controls(struct snd_soc_card *card)
 	struct j773g_audio *a = snd_soc_card_get_drvdata(card);
 	struct snd_soc_pcm_runtime *rtd;
 	struct snd_soc_component *codec = NULL;
+	struct snd_kcontrol *kcontrol;
 	int i, ret;
 
 	for_each_card_rtds(card, rtd)
@@ -442,6 +443,17 @@ static int speaker_fixup_controls(struct snd_soc_card *card)
 	if (ret < 0)
 		return ret;
 	ret = snd_soc_set_enum_kctl(card, "HPF Corner Frequency", "2 Hz");
+	if (ret < 0)
+		return ret;
+	/*
+	 * Protection accesses amplifier attenuation directly. Hide its codec
+	 * control so ALSA mixers do not merge it with our software playback
+	 * volume control. Other users of the codec retain their controls.
+	 */
+	kcontrol = snd_soc_card_get_kcontrol(card, "Speaker Volume");
+	if (!kcontrol)
+		return -ENOENT;
+	ret = snd_ctl_remove(card->snd_card, kcontrol);
 	if (ret < 0)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(locked_controls); i++) {
