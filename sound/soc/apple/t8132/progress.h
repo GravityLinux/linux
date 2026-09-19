@@ -32,7 +32,6 @@ struct progress {
 
 struct progress_charge {
 	u64 held, replay;     /* frames to charge at the ring peak */
-	bool underrun, ahead; /* fill below fifo; fill at least fifo + margin */
 };
 
 static inline void progress_start(struct progress *p, u64 now, u64 fine)
@@ -44,8 +43,7 @@ static inline void progress_start(struct progress *p, u64 now, u64 fine)
 }
 
 static inline struct progress_charge progress_account(struct progress *p, u64 now, u64 fine,
-						      u64 appl, unsigned int fifo,
-						      unsigned int margin)
+						      u64 appl, unsigned int fifo)
 {
 	struct progress_charge c = { 0 };
 	u64 expected = mul_u64_u64_div_u64(now - p->start_ns, PROGRESS_RATE, 1000000000ULL);
@@ -59,8 +57,6 @@ static inline struct progress_charge progress_account(struct progress *p, u64 no
 		c.replay = fine + fifo - mark;
 		p->replay_mark = fine + fifo;
 	}
-	c.underrun = fine + fifo > appl;
-	c.ahead = appl >= fine + fifo + margin;
 	return c;
 }
 
