@@ -50,10 +50,10 @@ struct j773g_audio {
 	struct snd_pcm_substream *stream;
 	struct thermal thermal;
 	struct progress progress;
-	bool running, faulted, muted;
+	bool running, faulted;
 	const char *reason;
 	int volume;
-	u64 held_frames, replay_frames, stalls, underruns, sumsq_total, preload_sumsq;
+	u64 held_frames, replay_frames, stalls, sumsq_total, preload_sumsq;
 	u32 slot_peak[MAX_SLOTS];
 };
 
@@ -105,28 +105,19 @@ static u64 speaker_position(struct snd_pcm_substream *s)
 	return fine < hw ? fine + rt->buffer_size : fine;
 }
 
-/* Charge playback the ring cannot explain, held or replayed samples, at the
- * ring peak. A replayed ring is muted in hardware until the application is
- * ahead again; the model keeps charging at the ceiling, so the register may
- * move in either direction at any time. lock is held, stream running. */
+/* Charge held or replayed samples at the ring peak and volume ceiling.
+ * ALSA handles underrun stopping; the STOP trigger mutes the amplifier.
+ * lock is held, stream running. */
 static void speaker_account(struct j773g_audio *a, u64 now)
 {
 	struct snd_pcm_runtime *rt = a->stream->runtime;
 	u64 peak = speaker_peak(a);
 	struct progress_charge c = progress_account(&a->progress, now, speaker_position(a->stream),
-						    READ_ONCE(rt->control->appl_ptr), FIFO_FRAMES,
-						    rt->period_size);
+						    READ_ONCE(rt->control->appl_ptr), FIFO_FRAMES);
 
 	thermal_charge(&a->thermal, peak * peak * (c.held + c.replay));
 	a->held_frames += c.held;
 	a->replay_frames += c.replay;
-	if (c.underrun && !a->muted) {
-		a->underruns++;
-		a->muted = true;
-		audio_amp_set_dvc(AUDIO_AMP_MUTE);
-	} else if (c.ahead && a->muted && !audio_amp_set_dvc(ceiling_dvc)) {
-		a->muted = false;
-	}
 }
 
 static void speaker_monitor(struct work_struct *work)
@@ -243,7 +234,6 @@ static int speaker_trigger(struct snd_soc_component *component,
 			break;
 		}
 		a->stream = s;
-		a->muted = false;
 		progress_start(&a->progress, now, speaker_position(s));
 		thermal_advance(&a->thermal, now);
 		/* The preloaded ring starts playing now. */
@@ -480,11 +470,11 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 
 	mutex_lock(&a->lock);
 	thermal_advance(t, ktime_get_ns());
-	n = sysfs_emit(buf, "running=%u muted=%u faulted=%u reason=%s coil_mdeg=%lld magnet_mdeg=%lld attenuation=%u att_min=%u ceiling=%u p_ceiling_mw=%u p_max_mw=%u held_frames=%llu replay_frames=%llu stalls=%llu underruns=%llu sumsq=%llu peak=%u volume=%d hardware_dvc=%d\n",
-		       a->running, a->muted, a->faulted, a->reason, div_s64(t->coil, 1000),
+	n = sysfs_emit(buf, "running=%u faulted=%u reason=%s coil_mdeg=%lld magnet_mdeg=%lld attenuation=%u att_min=%u ceiling=%u p_ceiling_mw=%u p_max_mw=%u held_frames=%llu replay_frames=%llu stalls=%llu sumsq=%llu peak=%u volume=%d hardware_dvc=%d\n",
+		       a->running, a->faulted, a->reason, div_s64(t->coil, 1000),
 		       div_s64(t->magnet, 1000), t->attenuation, t->att_min, ceiling_dvc,
 		       t->p_ceiling_mw, t->p_max_mw, a->held_frames, a->replay_frames, a->stalls,
-		       a->underruns, a->sumsq_total, speaker_peak(a), a->volume, audio_amp_read_dvc());
+		       a->sumsq_total, speaker_peak(a), a->volume, audio_amp_read_dvc());
 	mutex_unlock(&a->lock);
 	return n;
 }
