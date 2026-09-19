@@ -1573,8 +1573,19 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
-	/* firmware version is just informative */
-	dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
+	ret = dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
+
+	/* T8132 is qualified only with this exact OS firmware release. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcp") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
+		if (ret >= 0 && !strcmp(fw_str, "26.6.2"))
+			return DCP_FIRMWARE_V_26_6;
+
+		dev_err(dev, "DCP requires firmware 26.6.2 (FW: %s)\n", fw_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
+	/* Older platforms select their protocol through the compatibility version. */
 
 	ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 	if (ret < 0) {
@@ -1596,8 +1607,6 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_V_13_5;
 	else if (strncmp(compat_str, "13.5.0", sizeof(compat_str)) == 0)
 		return DCP_FIRMWARE_V_13_5;
-	else if (strncmp(compat_str, "26.6.0", sizeof(compat_str)) == 0)
-		return DCP_FIRMWARE_V_26_6;
 
 	dev_err(dev, "DCP firmware-compat %s (FW: %s) is not supported\n",
 		compat_str, fw_str);
