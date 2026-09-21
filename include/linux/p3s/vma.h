@@ -169,6 +169,38 @@ static inline unsigned long vma_folio_offset(const struct vm_area_struct *vma,
 }
 
 /*
+ * vma_file_offset - Byte offset in the file that vm_start maps
+ * @vma: Pointer to struct vm_area_struct
+ *
+ * In a 4KB VMA, vm_pgoff still counts 16KB pages, and vm_slice_off is the
+ * slice of file page vm_pgoff that vm_start maps. The file offset of
+ * vm_start is the start of that page plus the start of the slice. For
+ * example, with vm_slice_off = 1:
+ *
+ *                                vm_start
+ *                                    ▼
+ *                                    ┌─────┬─────┬─────┐
+ *  4KB VMA pages                     │  0  │  1  │  2  │
+ *                                    └─────┴─────┴─────┘
+ *                              ┌─────┬─────┬─────┬─────┐
+ *  4KB slices                  │  0  │  1  │  2  │  3  │
+ *              ┌─────┬─────────┼─────┴─────┴─────┴─────┤
+ *  16KB file   │  0  │   ...   │        vm_pgoff       │
+ *  pages       └─────┴─────────┴───────────────────────┘
+ *                              ▲     ▲
+ *                              │◄───►│ vm_slice_off << PAGE_SHIFT_4KB
+ *                              │     └─ vma_file_offset()
+ *                              └─ vm_pgoff << PAGE_SHIFT_KERNEL
+ *
+ * A native VMA has no slice, so this is the usual vm_pgoff << PAGE_SHIFT.
+ */
+static inline loff_t vma_file_offset(const struct vm_area_struct *vma)
+{
+	return ((loff_t)vma->vm_pgoff << PAGE_SHIFT_KERNEL) +
+	       ((loff_t)vma_slice_off(vma) << PAGE_SHIFT_4KB);
+}
+
+/*
  * p3s_adjust_unmapped_area_info - Align unmapped area allocations to host page
  * @info: Pointer to struct vm_unmapped_area_info
  *
