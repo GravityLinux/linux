@@ -990,6 +990,9 @@ struct vm_area_struct {
 					   units */
 	struct file * vm_file;		/* File we map to (can be NULL). */
 	void * vm_private_data;		/* was vm_pte (shared mem) */
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+	unsigned short vm_slice_off;	/* Subpage slice offset in host folio */
+#endif
 
 #ifdef CONFIG_SWAP
 	atomic_long_t swap_readahead_info;
