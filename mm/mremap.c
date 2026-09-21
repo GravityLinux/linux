@@ -31,6 +31,7 @@
 #include <asm/tlb.h>
 
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 /* Classify the kind of remap operation being performed. */
 enum mremap_type {
@@ -966,8 +967,9 @@ static unsigned long vrm_set_new_addr(struct vma_remap_struct *vrm)
 	if (vma_test(vma, VMA_MAYSHARE_BIT))
 		map_flags |= MAP_SHARED;
 
-	res = get_unmapped_area(vma->vm_file, new_addr, vrm->new_len, pgoff,
-				map_flags);
+	res = mm_mremap_get_unmapped_area(vma->vm_file, new_addr, vrm->new_len,
+					  pgoff, map_flags, vrm->addr,
+					  vrm->flags);
 	if (IS_ERR_VALUE(res))
 		return res;
 
@@ -1913,6 +1915,10 @@ static unsigned long check_mremap_params(struct vma_remap_struct *vrm)
 
 	/* The new address must be page-aligned. */
 	if (offset_in_page(vrm->new_addr))
+		return -EINVAL;
+
+	if ((flags & MREMAP_FIXED) &&
+	    !mm_mremap_fixed_keeps_slice(addr, vrm->new_addr))
 		return -EINVAL;
 
 	/* A fixed address implies a move. */
