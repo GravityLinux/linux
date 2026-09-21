@@ -27,7 +27,6 @@
 #undef STACK_TOP
 #undef DEFAULT_MAP_WINDOW
 #undef TASK_UNMAPPED_BASE
-#undef stack_guard_gap
 #undef STACK_TOP_MAX
 
 #define PAGE_SHIFT		mm_pte_shift(p3s_current_mm())
@@ -37,7 +36,6 @@
 #define STACK_TOP		mm_stack_top(p3s_current_mm())
 #define DEFAULT_MAP_WINDOW	mm_default_map_window(p3s_current_mm())
 #define TASK_UNMAPPED_BASE	mm_task_unmapped_base(p3s_current_mm())
-#define stack_guard_gap		mm_stack_guard_gap(p3s_current_mm())
 #define STACK_TOP_MAX		mm_stack_top_max(p3s_current_mm())
 
 #undef PFN_PHYS

@@ -4358,7 +4358,7 @@ struct vm_area_struct *vma_lookup(struct mm_struct *mm, unsigned long addr)
 static inline unsigned long stack_guard_start_gap(const struct vm_area_struct *vma)
 {
 	if (vma->vm_flags & VM_GROWSDOWN)
-		return stack_guard_gap;
+		return mm_stack_guard_gap(vma->vm_mm);
 
 	/* See reasoning around the VM_SHADOW_STACK definition */
 	if (vma->vm_flags & VM_SHADOW_STACK)
@@ -4383,7 +4383,7 @@ static inline unsigned long vm_end_gap(const struct vm_area_struct *vma)
 	unsigned long vm_end = vma->vm_end;
 
 	if (vma->vm_flags & VM_GROWSUP) {
-		vm_end += stack_guard_gap;
+		vm_end += mm_stack_guard_gap(vma->vm_mm);
 		if (vm_end < vma->vm_end)
 			vm_end = -PAGE_SIZE;
 	}

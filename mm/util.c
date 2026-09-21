@@ -354,6 +354,8 @@ unsigned long randomize_stack_top(unsigned long stack_top)
 #endif
 }
 
+#include <linux/p3s_user_pages.h>
+
 /**
  * randomize_page - Generate a random, page aligned address
  * @start:	The smallest acceptable address the caller will take.
@@ -443,7 +445,7 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	return PAGE_ALIGN_DOWN(mmap_upper_limit(rlim_stack) - rnd);
 #else
 	unsigned long gap = rlim_stack->rlim_cur;
-	unsigned long pad = stack_guard_gap;
+	unsigned long pad = mm_stack_guard_gap(current->mm);
 
 	/* Account for stack randomization if necessary */
 	if (current->flags & PF_RANDOMIZE)
@@ -508,6 +510,8 @@ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
 {
 	unsigned long locked_vm, limit;
 	int ret = 0;
+
+	P3S_CONTEXT_REMOTE_MM(mm);
 
 	mmap_assert_write_locked(mm);
 
@@ -1068,7 +1072,7 @@ int __weak memcmp_pages(struct page *page1, struct page *page2)
 
 	addr1 = kmap_local_page(page1);
 	addr2 = kmap_local_page(page2);
-	ret = memcmp(addr1, addr2, PAGE_SIZE);
+	ret = memcmp(addr1, addr2, PAGE_SIZE_KERNEL);
 	kunmap_local(addr2);
 	kunmap_local(addr1);
 	return ret;
