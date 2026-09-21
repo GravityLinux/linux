@@ -4433,7 +4433,8 @@ static inline pgoff_t vma_start_pgoff(const struct vm_area_struct *vma)
  */
 static inline pgoff_t vma_end_pgoff(const struct vm_area_struct *vma)
 {
-	return vma_start_pgoff(vma) + vma_pages(vma);
+	/* P3S: a 4KB file VMA can end partway through a 16KB file page. */
+	return vma_start_pgoff(vma) + vma_pgoff_pages(vma);
 }
 
 /**
