@@ -88,4 +88,27 @@ static inline unsigned long vma_folio_nr_ptes(const struct vm_area_struct *vma,
 	return folio_nr_pages(folio);
 }
 
+/*
+ * vma_anon_index_matches - Check an anonymous page's index against @addr
+ * @vma: Pointer to struct vm_area_struct
+ * @pgoff: Index of the page (page_pgoff())
+ * @addr: Virtual address the page is mapped at
+ *
+ * In a 4KB anonymous VMA, the index of a small folio is that of the slice
+ * that faulted first, and its other slices are mapped in the same 16KB
+ * window, so compare the windows. Elsewhere the index must match
+ * linear_page_index() exactly.
+ */
+static inline bool vma_anon_index_matches(const struct vm_area_struct *vma,
+					  pgoff_t pgoff, unsigned long addr)
+{
+	unsigned long first;
+
+	if (!vma_is_p3s_4k(vma) || vma->vm_ops)
+		return pgoff == vma_linear_page_index(vma, addr);
+
+	first = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT_4KB);
+	return (first & PAGE_MASK_KERNEL) == (addr & PAGE_MASK_KERNEL);
+}
+
 #endif /* __MM_P3S_RMAP_H */

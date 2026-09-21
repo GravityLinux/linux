@@ -1521,8 +1521,8 @@ static void __page_check_anon_rmap(const struct folio *folio,
 	 */
 	VM_BUG_ON_FOLIO(folio_anon_vma(folio)->root != vma->anon_vma->root,
 			folio);
-	VM_BUG_ON_PAGE(page_pgoff(folio, page) !=
-		       linear_anon_page_index(vma, address), page);
+	VM_BUG_ON_PAGE(!vma_anon_index_matches(vma, page_pgoff(folio, page),
+					       address), page);
 }
 
 static __always_inline void __folio_add_anon_rmap(struct folio *folio,
