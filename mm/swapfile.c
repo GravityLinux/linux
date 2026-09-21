@@ -2508,6 +2508,7 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
 		folio_add_lru_vma(folio, vma);
 	}
 	new_pte = pte_mkold(mk_pte(page, vma->vm_page_prot));
+	new_pte = vma_pte_add_slice(vma, addr, new_pte);
 	if (pte_swp_soft_dirty(old_pte))
 		new_pte = pte_mksoft_dirty(new_pte);
 	if (pte_swp_uffd(old_pte))
