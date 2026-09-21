@@ -237,6 +237,53 @@ static inline loff_t vma_file_offset_at(const struct vm_area_struct *vma,
 }
 
 /*
+ * vma_linear_page_index - Page offset that @addr maps
+ * @vma: Pointer to struct vm_area_struct
+ * @addr: Virtual address within @vma
+ *
+ * For a 4KB file VMA, this is the file page that backs @addr. vm_start maps
+ * slice vm_slice_off of file page vm_pgoff and each following 4KB page maps
+ * the next slice, so count the slices from the start of file page vm_pgoff
+ * to @addr and divide by the slices per page.
+ *
+ * For example, with vm_slice_off = 1 and @addr = vm_start + 0x4000, @addr
+ * is (0x4000 >> PAGE_SHIFT_4KB) = 4 pages after vm_start, or 1 + 4 = 5
+ * slices after the start of file page vm_pgoff. So it is in file page
+ * vm_pgoff + (5 >> P3S_SLICE_SHIFT) = vm_pgoff + 1:
+ *
+ *                vm_start                     @addr
+ *                    ▼                          ▼
+ *                    ┌─────┬─────┬─────┬─────┬─────┐
+ *  4KB VMA pages     │  0  │  1  │  2  │  3  │  4  │
+ *                    └─────┴─────┴─────┴─────┴─────┘
+ *              ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+ *  4KB slices  │  0  │  1  │  2  │  3  │  0  │  1  │  2  │  3  │
+ *              ├─────┴─────┴─────┴─────┼─────┴─────┴─────┴─────┤
+ *  16KB file   │        vm_pgoff       │      vm_pgoff + 1     │
+ *  pages       └───────────────────────┴───────────────────────┘
+ *                                               ▲
+ *                                               └─ vma_linear_page_index()
+ *
+ * Anonymous 4KB VMAs count 4KB pages from vm_pgoff instead. Native VMAs,
+ * and 4KB VMAs with vm_ops but no file, count 16KB pages.
+ */
+static inline pgoff_t vma_linear_page_index(const struct vm_area_struct *vma,
+					    unsigned long addr)
+{
+	if (!vma_is_p3s_4k(vma) || (vma->vm_ops && !vma->vm_file))
+		return vma->vm_pgoff +
+		       ((addr - vma->vm_start) >> PAGE_SHIFT_KERNEL);
+
+	if (!vma->vm_ops)
+		return vma->vm_pgoff +
+		       ((addr - vma->vm_start) >> PAGE_SHIFT_4KB);
+
+	return vma->vm_pgoff +
+	       ((vma_slice_off(vma) + ((addr - vma->vm_start) >> PAGE_SHIFT_4KB)) >>
+		P3S_SLICE_SHIFT);
+}
+
+/*
  * vma_pgoff_pages - Number of page offsets that @vma covers
  * @vma: Pointer to struct vm_area_struct
  *
@@ -322,6 +369,20 @@ vma_pgoff_to_address(const struct vm_area_struct *vma, pgoff_t pgoff)
 	}
 
 	return min(addr, vma->vm_end);
+}
+
+/*
+ * vma_set_split_offset - Update pgoff and slice offset after VMA split
+ * @target: Newly created or adjusted VMA
+ * @src: Source VMA being split
+ * @addr: Split boundary address
+ */
+static inline void vma_set_split_offset(struct vm_area_struct *target,
+					const struct vm_area_struct *src,
+					unsigned long addr)
+{
+	target->vm_pgoff = vma_linear_page_index(src, addr);
+	vma_set_slice_off(target, vma_slice_offset(src, addr));
 }
 
 /*

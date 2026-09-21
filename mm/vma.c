@@ -10,6 +10,7 @@
  */
 #include "vma_internal.h"
 #include "vma.h"
+#include <linux/p3s_user_pages.h>
 
 struct mmap_state {
 	struct mm_struct *mm;
@@ -19,6 +20,7 @@ struct mmap_state {
 	unsigned long end;
 	pgoff_t pgoff;
 	pgoff_t anon_pgoff;
+	unsigned short slice_off;
 	unsigned long pglen;
 	union {
 		vm_flags_t vm_flags;
@@ -53,9 +55,10 @@ struct mmap_state {
 		.vmi = vmi_,						\
 		.addr = addr_,						\
 		.end = (addr_) + (len_),				\
-		.pgoff = pgoff_,					\
+		.pgoff = mm_mmap_pgoff(mm_, file_, pgoff_),		\
 		.anon_pgoff = anon_pgoff_,				\
-		.pglen = PHYS_PFN(len_),				\
+		.slice_off = mm_mmap_slice_off(mm_, file_, pgoff_),	\
+		.pglen = (len_) >> PAGE_SHIFT,				\
 		.vma_flags = vma_flags_,				\
 		.file = file_,						\
 		.page_prot = vma_flags_to_page_prot(vma_flags_),	\
@@ -565,7 +568,8 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 		new->vm_end = addr;
 	} else {
 		new->vm_start = addr;
-		vma_add_pgoff(new, linear_page_delta(vma, addr));
+		vma_set_split_offset(new, vma, addr);
+		vma_set_anon_pgoff(new, __linear_anon_page_index(vma, addr));
 	}
 
 	err = -ENOMEM;
@@ -604,7 +608,8 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 
 	if (new_below) {
 		vma->vm_start = addr;
-		vma_add_pgoff(vma, linear_page_delta(new, addr));
+		vma_set_split_offset(vma, new, addr);
+		vma_set_anon_pgoff(vma, __linear_anon_page_index(new, addr));
 	} else {
 		vma->vm_end = addr;
 	}
@@ -2678,6 +2683,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap,
 		vma_set_anonymous(vma);
 
 	vma_set_range(vma, map->addr, map->end, map->pgoff, map->anon_pgoff);
+	vma_set_slice_off(vma, map->slice_off);
 	vma->flags = map->vma_flags;
 	vma->vm_page_prot = map->page_prot;
 
@@ -3332,6 +3338,7 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 int expand_downwards(struct vm_area_struct *vma, unsigned long address)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	P3S_CONTEXT_REMOTE_MM(mm);
 	struct vm_area_struct *prev;
 	int error = 0;
 	VMA_ITERATOR(vmi, mm, vma->vm_start);
