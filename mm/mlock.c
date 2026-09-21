@@ -27,6 +27,7 @@
 #include <linux/secretmem.h>
 
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 struct mlock_fbatch {
 	local_lock_t lock;
