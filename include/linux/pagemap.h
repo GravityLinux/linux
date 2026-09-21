@@ -1094,7 +1094,7 @@ static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 static inline pgoff_t linear_page_index(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return linear_page_delta(vma, address) + vma_start_pgoff(vma);
+	return vma_linear_page_index(vma, address);
 }
 
 static inline pgoff_t __linear_anon_page_index(const struct vm_area_struct *vma,
