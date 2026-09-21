@@ -37,6 +37,7 @@
 #include <asm/tlb.h>
 
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 static bool maybe_change_pte_writable(struct vm_area_struct *vma, pte_t pte)
 {
@@ -689,6 +690,8 @@ long change_protection(struct mmu_gather *tlb,
 {
 	pgprot_t newprot = vma->vm_page_prot;
 	long pages;
+
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 
 	/*
 	 * MM_CP_UFFD_{WP,RWP} and _RESOLVE are mutually exclusive within one
