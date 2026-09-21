@@ -34,6 +34,7 @@
 #include <linux/cleanup.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
+#include <linux/p3s/mm.h>
 #include "internal.h"
 #include "swap.h"
 
@@ -2203,6 +2204,15 @@ static bool vma_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags,
 		return false;
 
 	if (!is_vm_hugetlb_page(vma) && (vma->vm_flags & VM_SPECIAL))
+		return false;
+
+	/*
+	 * A 4KB compat task maps 4KB slices of 16KB shmem folios, which have a
+	 * single folio lock: a UFFDIO_COPY holding the folio lock for one slice
+	 * can deadlock against a fault on another slice of the same folio. Only
+	 * anonymous memory userfaultfd is supported for 4KB compat tasks.
+	 */
+	if (!vma_is_anonymous(vma) && p3s_4k_unsupported(vma->vm_mm))
 		return false;
 
 	vm_flags &= __VM_UFFD_FLAGS;
