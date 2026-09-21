@@ -237,6 +237,45 @@ static inline loff_t vma_file_offset_at(const struct vm_area_struct *vma,
 }
 
 /*
+ * vma_pgoff_pages - Number of page offsets that @vma covers
+ * @vma: Pointer to struct vm_area_struct
+ *
+ * @vma covers page offsets vm_pgoff to vm_pgoff + vma_pgoff_pages() - 1.
+ * A 4KB file VMA can start and end partway through a 16KB file page, so
+ * count the slices from the start of file page vm_pgoff to vm_end and
+ * round up to whole file pages.
+ *
+ * For example, a VMA with vm_slice_off = 2 and vm_end = vm_start + 0x4000
+ * is four 4KB pages long (0x4000 >> PAGE_SHIFT_4KB), so it covers two 16KB
+ * file pages (DIV_ROUND_UP(2 + 4, P3S_SLICES_PER_PAGE)) although it is
+ * only 16KB:
+ *
+ *                      vm_start                 vm_end
+ *                          ▼                       ▼
+ *                          ┌─────┬─────┬─────┬─────┐
+ *  4KB VMA pages           │  0  │  1  │  2  │  3  │
+ *                          └─────┴─────┴─────┴─────┘
+ *              ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+ *  4KB slices  │  0  │  1  │  2  │  3  │  0  │  1  │  2  │  3  │
+ *              ├─────┴─────┴─────┴─────┼─────┴─────┴─────┴─────┤
+ *  16KB file   │        vm_pgoff       │      vm_pgoff + 1     │
+ *  pages       └───────────────────────┴───────────────────────┘
+ *              │◄────────── vma_pgoff_pages() = 2 ────────────►│
+ *
+ * Anonymous 4KB VMAs count 4KB pages, and native VMAs count 16KB pages.
+ */
+static inline pgoff_t vma_pgoff_pages(const struct vm_area_struct *vma)
+{
+	unsigned long nr_slices = vma_size(vma) >> mm_pte_shift(vma->vm_mm);
+
+	if (!vma_is_p3s_4k(vma) || !vma->vm_ops)
+		return nr_slices;
+
+	return DIV_ROUND_UP(vma_slice_off(vma) + nr_slices,
+			    P3S_SLICES_PER_PAGE);
+}
+
+/*
  * p3s_adjust_unmapped_area_info - Align unmapped area allocations to host page
  * @info: Pointer to struct vm_unmapped_area_info
  *
