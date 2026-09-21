@@ -7,6 +7,7 @@
 
 /* asm/p3s.h is architecture-specific to arm64 */
 #ifdef CONFIG_ARM64
+#include <asm/p3s/mmu.h>
 #include <asm/p3s.h>
 #else
 #ifndef __ASSEMBLY__
