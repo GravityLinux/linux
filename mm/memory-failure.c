@@ -68,6 +68,7 @@
 #include "swap.h"
 #include "page_alloc.h"
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 static int sysctl_memory_failure_early_kill __read_mostly;
 
@@ -337,6 +338,7 @@ static void shake_page(struct page *page)
 static unsigned long dev_pagemap_mapping_shift(struct vm_area_struct *vma,
 		unsigned long address)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	unsigned long ret = 0;
 	pgd_t *pgd;
 	p4d_t *p4d;
