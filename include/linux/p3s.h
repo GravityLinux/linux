@@ -3,6 +3,7 @@
 #define _LINUX_P3S_H
 
 #include <linux/p3s/const.h>
+#include <linux/p3s/mm.h>
 
 
 #endif /* _LINUX_P3S_H */

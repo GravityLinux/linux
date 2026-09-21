@@ -2011,4 +2011,7 @@ static inline unsigned long mmf_init_legacy_flags(unsigned long flags)
 	return flags & MMF_INIT_LEGACY_MASK;
 }
 
+/* Keep at the end to ensure struct mm_struct and vm_area_struct are defined. */
+#include <linux/p3s.h>
+
 #endif /* _LINUX_MM_TYPES_H */
