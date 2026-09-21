@@ -15,6 +15,7 @@
 static void tlb_flush(struct mmu_gather *tlb);
 
 #include <asm-generic/tlb.h>
+#include <asm/p3s/tlb.h>
 
 /*
  * get the tlbi levels in arm64.  Default value is TLBI_TTL_UNKNOWN if more than
@@ -55,7 +56,7 @@ static inline void tlb_flush(struct mmu_gather *tlb)
 	struct vm_area_struct vma = TLB_FLUSH_VMA(tlb->mm, 0);
 	tlbf_t flags = (tlb->freed_tables || tlb->unshared_tables) ?
 			TLBF_NONE : TLBF_NOWALKCACHE;
-	unsigned long stride = tlb_get_unmap_size(tlb);
+	unsigned long stride = mm_tlb_get_unmap_size(tlb);
 	int tlb_level = tlb_get_level(tlb);
 
 	/*
