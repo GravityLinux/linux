@@ -27,4 +27,21 @@ static inline unsigned long vma_slice_walk_end(const struct vm_area_struct *vma,
 	return addr + min(PAGE_SIZE_KERNEL - off, vma->vm_end - addr);
 }
 
+/*
+ * vma_folio_nr_ptes - Number of PTEs that map all of @folio in @vma
+ * @vma: Pointer to struct vm_area_struct
+ * @folio: Folio mapped by @vma
+ *
+ * The rmap walks mlock a large folio only once they have counted this many
+ * PTEs in a VM_LOCKED VMA. A 4KB VMA maps each page of the folio with four
+ * PTEs, one per slice. A small folio is still mlocked on its first PTE.
+ */
+static inline unsigned long vma_folio_nr_ptes(const struct vm_area_struct *vma,
+					      const struct folio *folio)
+{
+	if (vma_is_p3s_4k(vma) && folio_test_large(folio))
+		return folio_nr_pages(folio) << P3S_SLICE_SHIFT;
+	return folio_nr_pages(folio);
+}
+
 #endif /* __MM_P3S_RMAP_H */

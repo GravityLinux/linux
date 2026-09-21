@@ -938,7 +938,7 @@ static bool folio_referenced_one(struct folio *folio,
 			pra->mapcount--;
 
 			/* Only mlock fully mapped pages */
-			if (pvmw.pte && ptes != pvmw.nr_pages)
+			if (pvmw.pte && ptes != vma_folio_nr_ptes(vma, folio))
 				continue;
 
 			/*
@@ -2263,7 +2263,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			ret = false;
 
 			/* Only mlock fully mapped pages */
-			if (pvmw.pte && ptes != pvmw.nr_pages)
+			if (pvmw.pte && ptes != vma_folio_nr_ptes(vma, folio))
 				continue;
 
 			/*
