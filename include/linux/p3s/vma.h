@@ -201,6 +201,42 @@ static inline loff_t vma_file_offset(const struct vm_area_struct *vma)
 }
 
 /*
+ * vma_file_offset_at - Byte offset in the file that @addr maps
+ * @vma: Pointer to struct vm_area_struct
+ * @addr: Virtual address within @vma
+ *
+ * vm_start maps the file byte at vma_file_offset(), and @addr maps the
+ * byte (@addr - vm_start) bytes after it. In a 4KB VMA, vm_start can map
+ * any 4KB slice of a 16KB file page.
+ *
+ * For example, with vm_slice_off = 1, vma_file_offset() is
+ * (1 << PAGE_SHIFT_4KB) = 0x1000 bytes into file page vm_pgoff. So
+ * @addr = vm_start + 0x4000 maps 0x1000 + 0x4000 = 0x5000 bytes from the
+ * start of file page vm_pgoff, which is 0x1000 bytes into file page
+ * vm_pgoff + 1:
+ *
+ *                vm_start                     @addr
+ *                    ▼                          ▼
+ *                    ┌─────┬─────┬─────┬─────┬─────┐
+ *  4KB VMA pages     │  0  │  1  │  2  │  3  │  4  │
+ *                    └─────┴─────┴─────┴─────┴─────┘
+ *              ┌───────────────────────┬───────────────────────┐
+ *  16KB file   │        vm_pgoff       │      vm_pgoff + 1     │
+ *  pages       └───────────────────────┴───────────────────────┘
+ *                    ▲                          ▲
+ *                    │◄─── @addr - vm_start ───►│
+ *                    │                          └─ vma_file_offset_at()
+ *                    └─ vma_file_offset()
+ *
+ * For a native VMA, vma_file_offset() is the usual vm_pgoff << PAGE_SHIFT.
+ */
+static inline loff_t vma_file_offset_at(const struct vm_area_struct *vma,
+					unsigned long addr)
+{
+	return vma_file_offset(vma) + (addr - vma->vm_start);
+}
+
+/*
  * p3s_adjust_unmapped_area_info - Align unmapped area allocations to host page
  * @info: Pointer to struct vm_unmapped_area_info
  *
