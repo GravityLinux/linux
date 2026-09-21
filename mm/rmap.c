@@ -2180,8 +2180,10 @@ static bool ttu_anon_swapbacked_folio(struct vm_area_struct *vma,
 	mm_prepare_for_swap_entries(mm);
 	dec_mm_counter(mm, MM_ANONPAGES);
 	inc_mm_counter(mm, MM_SWAPENTS);
+	/* The slices of a small folio share its swap entry: none is exclusive. */
 	set_pte_at(mm, address, ptep,
-		   swp_pte_prepare(entry, pteval, anon_exclusive));
+		   swp_pte_prepare(entry, pteval, anon_exclusive &&
+				   !p3s_folio_mapped_by_slices(vma, folio)));
 	return true;
 }
 
@@ -2328,6 +2330,11 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 		}
 
 		page = folio_page(folio, pfn - folio_pfn(folio));
+		/* See p3s_folio_slices_in_window(). */
+		if (folio_test_anon(folio) && PageAnonExclusive(page) &&
+		    !(flags & TTU_HWPOISON) &&
+		    !p3s_folio_slices_in_window(vma, folio, address, pvmw.pte))
+			goto walk_abort;
 
 		if (likely(pte_present(pteval))) {
 			nr_pages = folio_unmap_pte_batch(folio, &pvmw, flags, pteval);
@@ -2584,6 +2591,12 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 		subpage = folio_page(folio, pfn - folio_pfn(folio));
 		anon_exclusive = folio_test_anon(folio) &&
 				 PageAnonExclusive(subpage);
+		if (anon_exclusive &&
+		    !p3s_folio_slices_in_window(vma, folio, address, pvmw.pte)) {
+			ret = false;
+			page_vma_mapped_walk_done(&pvmw);
+			break;
+		}
 
 		if (folio_test_hugetlb(folio)) {
 			bool anon = folio_test_anon(folio);
@@ -2667,7 +2680,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 		}
 
 		VM_WARN_ON_FOLIO(writable && folio_test_anon(folio) &&
-				!anon_exclusive, folio);
+				!anon_exclusive && !vma_is_p3s_4k(vma), folio);
 
 		/* Update high watermark before we lower rss */
 		update_hiwater_rss(mm);

@@ -6,6 +6,45 @@
 #include <linux/pagemap.h>
 
 /*
+ * p3s_pte_maps_folio - Check if a PTE maps the given normal folio at addr
+ * @vma: Pointer to struct vm_area_struct
+ * @addr: Virtual address corresponding to @ptent
+ * @ptent: Page table entry value
+ * @folio: Expected folio pointer
+ */
+static inline bool p3s_pte_maps_folio(struct vm_area_struct *vma,
+				      unsigned long addr, pte_t ptent,
+				      const struct folio *folio)
+{
+	return pte_present(ptent) &&
+	       vm_normal_folio(vma, addr, ptent) == folio;
+}
+
+/*
+ * p3s_count_folio_slices - Count how many PTEs in a slice window map @folio
+ * @vma: Pointer to struct vm_area_struct
+ * @pte_base: Starting PTE pointer of the slice window
+ * @start_addr: Starting virtual address of the slice window
+ * @nr_slices: Number of slices in the window
+ * @folio: Target folio to count
+ */
+static inline unsigned int p3s_count_folio_slices(struct vm_area_struct *vma,
+						  pte_t *pte_base,
+						  unsigned long start_addr,
+						  unsigned int nr_slices,
+						  const struct folio *folio)
+{
+	unsigned int i, count = 0;
+
+	for (i = 0; i < nr_slices; i++) {
+		if (p3s_pte_maps_folio(vma, start_addr + (i << PAGE_SHIFT_4KB),
+				       ptep_get(pte_base + i), folio))
+			count++;
+	}
+	return count;
+}
+
+/*
  * vma_slice_walk_end - End of an rmap walk for a small folio from @addr
  * @vma: Pointer to struct vm_area_struct
  * @addr: Virtual address within @vma
@@ -69,6 +108,60 @@ static inline bool p3s_anon_rmap_skip(const struct vm_area_struct *vma,
 	if (vma_is_p3s_4k(vma) && !vma->vm_ops)
 		*address = vma_anon_slice_window(vma, folio_pgoff(folio));
 	return *address == -EFAULT;
+}
+
+/*
+ * p3s_folio_mapped_by_slices - Check if other slice PTEs may map @folio
+ * @vma: Pointer to struct vm_area_struct
+ * @folio: Folio mapped by a PTE of @vma
+ *
+ * True for a small folio of a 4KB VMA with more than one mapping. Its slices
+ * share one swap entry, so none of their swap PTEs may be exclusive.
+ */
+static inline bool p3s_folio_mapped_by_slices(const struct vm_area_struct *vma,
+					      const struct folio *folio)
+{
+	return vma_is_p3s_4k(vma) && !folio_test_large(folio) &&
+	       folio_mapcount(folio) > 1;
+}
+
+/*
+ * p3s_folio_slices_in_window - Check that all mappings of @folio are here
+ * @vma: Pointer to struct vm_area_struct
+ * @folio: Folio about to be unmapped by reclaim or migration
+ * @addr: Address of a PTE in @vma that maps @folio
+ * @pte: That PTE, mapped and locked
+ *
+ * A 4KB compatibility task can map a small anonymous folio with several
+ * slice PTEs, all covered by its one PageAnonExclusive flag. Unmapping the
+ * first of them clears the flag (folio_try_share_anon_rmap_pte()), so the
+ * other slices must be unmapped in the same walk: a slice left mapped
+ * writable would reference a page that is no longer exclusive. Returns
+ * true if every mapping of @folio is a PTE in the slice window at @addr,
+ * which the walk covers under the page table lock it already holds.
+ *
+ * Once the first slice has cleared the flag, try_to_unmap_one() could only
+ * stop at a later slice, and put back its possibly writable PTE, if
+ * swap_duplicate() or arch_unmap_one() failed. Neither can: the latter
+ * does nothing on arm64, and no swap PTE refers to the swap entry of an
+ * exclusive folio when the walk starts, so the walk raises its count to at
+ * most four, far below the count at which swap_duplicate() must allocate.
+ */
+static inline bool p3s_folio_slices_in_window(struct vm_area_struct *vma,
+					      struct folio *folio,
+					      unsigned long addr, pte_t *pte)
+{
+	unsigned int nr_slices;
+	unsigned long start;
+
+	if (!p3s_folio_mapped_by_slices(vma, folio))
+		return true;
+
+	vma_folio_slice_bounds(vma, addr, &nr_slices, &start);
+	return p3s_count_folio_slices(vma,
+				      pte - ((addr - start) >> PAGE_SHIFT_4KB),
+				      start, nr_slices, folio) ==
+	       folio_mapcount(folio);
 }
 
 /*
