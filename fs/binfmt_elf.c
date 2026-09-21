@@ -50,6 +50,7 @@
 #include <linux/rseq.h>
 #include <asm/param.h>
 #include <asm/page.h>
+#include <linux/p3s_user_pages.h>
 
 #ifndef ELF_COMPAT
 #define ELF_COMPAT 0
@@ -79,7 +80,9 @@ static int elf_core_dump(struct coredump_params *cprm);
 #define elf_core_dump	NULL
 #endif
 
-#if ELF_EXEC_PAGESIZE > PAGE_SIZE
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+#define ELF_MIN_ALIGN	PAGE_SIZE
+#elif ELF_EXEC_PAGESIZE > PAGE_SIZE
 #define ELF_MIN_ALIGN	ELF_EXEC_PAGESIZE
 #else
 #define ELF_MIN_ALIGN	PAGE_SIZE
@@ -98,7 +101,7 @@ static struct linux_binfmt elf_format = {
 	.load_binary	= load_elf_binary,
 #ifdef CONFIG_COREDUMP
 	.core_dump	= elf_core_dump,
-	.min_coredump	= ELF_EXEC_PAGESIZE,
+	.min_coredump	= PAGE_SIZE_KERNEL,
 #endif
 };
 
@@ -247,7 +250,7 @@ create_elf_tables(struct linux_binprm *bprm, const struct elfhdr *exec,
 	ARCH_DLINFO;
 #endif
 	NEW_AUX_ENT(AT_HWCAP, ELF_HWCAP);
-	NEW_AUX_ENT(AT_PAGESZ, ELF_EXEC_PAGESIZE);
+	NEW_AUX_ENT(AT_PAGESZ, ELF_MIN_ALIGN);
 	NEW_AUX_ENT(AT_CLKTCK, CLOCKS_PER_SEC);
 	NEW_AUX_ENT(AT_PHDR, phdr_addr);
 	NEW_AUX_ENT(AT_PHENT, sizeof(struct elf_phdr));
