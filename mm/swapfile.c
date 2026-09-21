@@ -45,6 +45,7 @@
 
 #include <asm/tlbflush.h>
 #include <linux/leafops.h>
+#include <linux/p3s/swap.h>
 #include "swap_table.h"
 #include "internal.h"
 #include "swap.h"
@@ -2591,7 +2592,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 		folio_free_swap(folio);
 		folio_unlock(folio);
 		folio_put(folio);
-	} while (addr += PAGE_SIZE, addr != end);
+	} while (addr += mm_pte_size(vma->vm_mm), addr != end);
 
 	if (pte)
 		pte_unmap(pte);
@@ -2606,10 +2607,10 @@ static inline int unuse_pmd_range(struct vm_area_struct *vma, pud_t *pud,
 	unsigned long next;
 	int ret;
 
-	pmd = pmd_offset(pud, addr);
+	pmd = mm_pmd_offset(vma->vm_mm, pud, addr);
 	do {
 		cond_resched();
-		next = pmd_addr_end(addr, end);
+		next = mm_pmd_addr_end(vma->vm_mm, addr, end);
 		ret = unuse_pte_range(vma, pmd, addr, next, type);
 		if (ret)
 			return ret;
@@ -2659,6 +2660,7 @@ static inline int unuse_p4d_range(struct vm_area_struct *vma, pgd_t *pgd,
 
 static int unuse_vma(struct vm_area_struct *vma, unsigned int type)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	pgd_t *pgd;
 	unsigned long addr, end, next;
 	int ret;
@@ -2668,7 +2670,7 @@ static int unuse_vma(struct vm_area_struct *vma, unsigned int type)
 
 	pgd = pgd_offset(vma->vm_mm, addr);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = mm_pgd_addr_end(vma->vm_mm, addr, end);
 		if (pgd_none_or_clear_bad(pgd))
 			continue;
 		ret = unuse_p4d_range(vma, pgd, addr, next, type);
@@ -3476,7 +3478,7 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
 	unsigned long swapfilepages;
 	unsigned long last_page;
 
-	if (memcmp("SWAPSPACE2", swap_header->magic.magic, 10)) {
+	if (memcmp("SWAPSPACE2", p3s_swap_header_magic(swap_header), 10)) {
 		pr_err("Unable to find swap-space signature\n");
 		return 0;
 	}
@@ -3486,7 +3488,7 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
 		swab32s(&swap_header->info.version);
 		swab32s(&swap_header->info.last_page);
 		swab32s(&swap_header->info.nr_badpages);
-		if (swap_header->info.nr_badpages > MAX_SWAP_BADPAGES)
+		if (swap_header->info.nr_badpages > p3s_swap_header_max_badpages(swap_header))
 			return 0;
 		for (i = 0; i < swap_header->info.nr_badpages; i++)
 			swab32s(&swap_header->info.badpages[i]);
@@ -3497,6 +3499,8 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
 			swap_header->info.version);
 		return 0;
 	}
+	if (p3s_convert_swap_header(swap_header))
+		return 0;
 
 	maxpages = swapfile_maximum_size;
 	last_page = swap_header->info.last_page;

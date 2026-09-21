@@ -713,7 +713,7 @@ void set_recommended_min_free_kbytes(void);
 /*
  * in mm/page_alloc.c
  */
-#define K(x) ((x) << (PAGE_SHIFT-10))
+#define K(x) ((x) << (PAGE_SHIFT_KERNEL - 10))
 
 extern char * const zone_names[MAX_NR_ZONES];
 

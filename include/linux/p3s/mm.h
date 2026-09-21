@@ -144,6 +144,23 @@ static inline unsigned long mm_pgdir_size(const struct mm_struct *mm)
 	return mm_is_p3s_4k(mm) ? PGDIR_SIZE_4KB : PGDIR_SIZE;
 }
 
+/* pmd_addr_end() and pgd_addr_end() in the page table geometry of @mm */
+static inline unsigned long mm_pmd_addr_end(const struct mm_struct *mm,
+					    unsigned long addr, unsigned long end)
+{
+	unsigned long boundary = (addr + mm_pmd_size(mm)) & ~(mm_pmd_size(mm) - 1);
+
+	return boundary - 1 < end - 1 ? boundary : end;
+}
+
+static inline unsigned long mm_pgd_addr_end(const struct mm_struct *mm,
+					    unsigned long addr, unsigned long end)
+{
+	unsigned long boundary = (addr + mm_pgdir_size(mm)) & ~(mm_pgdir_size(mm) - 1);
+
+	return boundary - 1 < end - 1 ? boundary : end;
+}
+
 static inline unsigned int mm_slices_per_page(const struct mm_struct *mm)
 {
 	return 1U << (PAGE_SHIFT_KERNEL - mm_pte_shift(mm));

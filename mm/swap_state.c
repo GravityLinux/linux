@@ -27,6 +27,7 @@
 #include "internal.h"
 #include "swap_table.h"
 #include "swap.h"
+#include <linux/p3s_user_pages.h>
 
 /* Swap readahead cluster size, as a power of 2 pages. */
 static int page_cluster;
@@ -51,17 +52,26 @@ static bool enable_vma_readahead __read_mostly = true;
 
 #define SWAP_RA_ORDER_CEILING	5
 
-#define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
+/*
+ * vma->swap_readahead_info packs the fault address with the readahead window
+ * and hit count in the bits below the page mask. Encode it in 4KB pages, the
+ * smallest process page size, rather than in the per-process PAGE_SIZE of
+ * this file: the 4KB-aligned fault addresses of 4KB processes then fit, and
+ * the layout does not depend on the context that reads or writes it. This is
+ * the encoding of a 4KB kernel. 6 bits each for the window and the hits are
+ * enough, as the window is at most 1 << SWAP_RA_ORDER_CEILING pages.
+ */
+#define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT_4KB / 2)
 #define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
 #define SWAP_RA_HITS_MAX	SWAP_RA_HITS_MASK
-#define SWAP_RA_WIN_MASK	(~PAGE_MASK & ~SWAP_RA_HITS_MASK)
+#define SWAP_RA_WIN_MASK	(~PAGE_MASK_4KB & ~SWAP_RA_HITS_MASK)
 
 #define SWAP_RA_HITS(v)		((v) & SWAP_RA_HITS_MASK)
 #define SWAP_RA_WIN(v)		(((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
-#define SWAP_RA_ADDR(v)		((v) & PAGE_MASK)
+#define SWAP_RA_ADDR(v)		((v) & PAGE_MASK_4KB)
 
 #define SWAP_RA_VAL(addr, win, hits)				\
-	(((addr) & PAGE_MASK) |					\
+	(((addr) & PAGE_MASK_4KB) |				\
 	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) |	\
 	 ((hits) & SWAP_RA_HITS_MASK))
 
@@ -915,6 +925,7 @@ static int swap_vma_ra_win(struct vm_fault *vmf, unsigned long *start,
 static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
 		struct mempolicy *mpol, pgoff_t targ_ilx, struct vm_fault *vmf)
 {
+	P3S_CONTEXT_REMOTE_MM(vmf->vma->vm_mm);
 	struct swap_io_ctx ctx = {};
 	struct blk_plug plug;
 	struct folio *folio;
