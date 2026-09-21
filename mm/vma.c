@@ -73,6 +73,7 @@ struct mmap_state {
 		.vma_flags = (map_)->vma_flags,				\
 		.pgoff = (map_)->pgoff,					\
 		.anon_pgoff = (map_)->anon_pgoff,			\
+		.slice_off = (map_)->slice_off,				\
 		.file = (map_)->file,					\
 		.prev = (map_)->prev,					\
 		.middle = vma_,						\
@@ -245,7 +246,7 @@ static bool can_vma_merge_before(struct vma_merge_struct *vmg)
 		return false;
 	if (!is_mergeable_anon_vma(vmg, /* merge_next = */ true))
 		return false;
-	if (vmg_end_pgoff(vmg) != vma_start_pgoff(vmg->next))
+	if (!vmg_can_merge_offsets(vmg, /* merge_next = */ true))
 		return false;
 	if (needs_adjacent_anon_pgoff(vmg) &&
 	    vmg_end_anon_pgoff(vmg) != vma_start_anon_pgoff(vmg->next))
@@ -268,7 +269,7 @@ static bool can_vma_merge_after(struct vma_merge_struct *vmg)
 		return false;
 	if (!is_mergeable_anon_vma(vmg, /* merge_next = */ false))
 		return false;
-	if (vma_end_pgoff(vmg->prev) != vmg_start_pgoff(vmg))
+	if (!vmg_can_merge_offsets(vmg, /* merge_next = */ false))
 		return false;
 	if (needs_adjacent_anon_pgoff(vmg) &&
 	    vma_end_anon_pgoff(vmg->prev) != vmg_start_anon_pgoff(vmg))
@@ -753,56 +754,28 @@ void validate_mm(struct mm_struct *mm)
  */
 static void vmg_adjust_set_range(struct vma_merge_struct *vmg)
 {
-	if (vmg->__adjust_middle_start) {
-		/*
-		 * vmg->start    vmg->end
-		 * |             |
-		 * v    merge    v
-		 * <------------->
-		 *         delta
-		 *        <------>
-		 * |------|----------------|
-		 * | prev |    middle      |
-		 * |------|----------------|
-		 *        ^
-		 *        |
-		 *        middle->vm_start
-		 */
-		struct vm_area_struct *middle = vmg->middle;
-		const unsigned long delta = vmg->end - middle->vm_start;
+	struct vm_area_struct *adjust;
+	unsigned short slice_off;
+	pgoff_t pgoff, anon_pgoff;
 
-		__vma_set_range(middle, vmg->end, middle->vm_end);
-		vma_add_pgoff(middle, delta >> PAGE_SHIFT);
-	} else if (vmg->__adjust_next_start) {
-		/*
-		 *                Originally:
-		 *
-		 *            vmg->start   vmg->end
-		 *            |            |
-		 *            v    merge   v
-		 *            <------------>
-		 *            .            .
-		 * merge_existing_range() updates to:
-		 *            .            .
-		 * vmg->start vmg->end     .
-		 * |          |            .
-		 * v  retain  v            .
-		 * <---------->            .
-		 *             delta       .
-		 *            <----->      .
-		 * |----------------|------|
-		 * |    middle      | next |
-		 * |----------------|------|
-		 *                  ^
-		 *                  |
-		 *                  next->vm_start
-		 */
-		struct vm_area_struct *next = vmg->next;
-		const unsigned long delta = next->vm_start - vmg->end;
+	if (vmg->__adjust_middle_start)
+		adjust = vmg->middle;
+	else if (vmg->__adjust_next_start)
+		adjust = vmg->next;
+	else
+		return;
 
-		__vma_set_range(next, vmg->end, next->vm_end);
-		vma_sub_pgoff(next, delta >> PAGE_SHIFT);
-	}
+	/*
+	 * vmg->end always lies within middle's original range, so derive the
+	 * adjusted VMA's pgoff and slice offset from middle. When next is
+	 * expanded backwards, vmg->end < next->vm_start and deriving them from
+	 * next would underflow.
+	 */
+	pgoff = vma_linear_page_index(vmg->middle, vmg->end);
+	slice_off = vma_slice_offset(vmg->middle, vmg->end);
+	anon_pgoff = __linear_anon_page_index(adjust, vmg->end);
+	vma_set_range(adjust, vmg->end, adjust->vm_end, pgoff, anon_pgoff);
+	vma_set_slice_off(adjust, slice_off);
 }
 
 /*
@@ -848,6 +821,7 @@ static int commit_merge(struct vma_merge_struct *vmg)
 			      vmg->__adjust_middle_start ? vmg->middle : NULL);
 	vma_set_range(vma, vmg->start, vmg->end, vmg_start_pgoff(vmg),
 		      vmg_start_anon_pgoff(vmg));
+	vma_set_slice_off(vma, vmg->slice_off);
 	vmg_adjust_set_range(vmg);
 	vma_iter_store_overwrite(vmg->vmi, vmg->target);
 
@@ -1018,6 +992,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 		vmg->end = next->vm_end;
 		vmg->pgoff = vma_start_pgoff(prev);
 		vmg->anon_pgoff = vma_start_anon_pgoff(prev);
+		vmg->slice_off = vma_slice_off(prev);
 
 		/*
 		 * We already ensured anon_vma compatibility above, so now it's
@@ -1037,6 +1012,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 		vmg->start = prev->vm_start;
 		vmg->pgoff = vma_start_pgoff(prev);
 		vmg->anon_pgoff = vma_start_anon_pgoff(prev);
+		vmg->slice_off = vma_slice_off(prev);
 
 		if (!vmg->__remove_middle)
 			vmg->__adjust_middle_start = true;
@@ -1058,7 +1034,8 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 
 		if (vmg->__remove_middle) {
 			vmg->end = next->vm_end;
-			vmg->pgoff = vma_start_pgoff(next) - pglen;
+			vmg->pgoff = vma_start_pgoff(middle);
+			vmg->slice_off = vma_slice_off(middle);
 			vmg->anon_pgoff = vma_start_anon_pgoff(next) - pglen;
 		} else {
 			/* We shrink middle and expand next. */
@@ -1067,6 +1044,7 @@ static __must_check struct vm_area_struct *vma_merge_existing_range(
 			vmg->end = start;
 			vmg->pgoff = vma_start_pgoff(middle);
 			vmg->anon_pgoff = vma_start_anon_pgoff(middle);
+			vmg->slice_off = vma_slice_off(middle);
 		}
 
 		err = dup_anon_vma(next, middle, &anon_dup);
@@ -1177,6 +1155,7 @@ struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg)
 		vmg->target = prev;
 		vmg->pgoff = vma_start_pgoff(prev);
 		vmg->anon_pgoff = vma_start_anon_pgoff(prev);
+		vmg->slice_off = vma_slice_off(prev);
 
 		/*
 		 * If this merge would result in removal of the next VMA but we
@@ -2028,6 +2007,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		if (!new_vma)
 			goto out;
 		vma_set_range(new_vma, addr, addr + len, pgoff, anon_pgoff);
+		vma_set_slice_off(new_vma, vma_slice_offset(vma, addr));
 		if (vma_dup_policy(vma, new_vma))
 			goto out_free_vma;
 		if (anon_vma_clone(new_vma, vma, VMA_OP_REMAP))
@@ -2092,8 +2072,8 @@ static int anon_vma_compatible(struct vm_area_struct *a, struct vm_area_struct *
 	/* Flags must be equivalent modulo mprotect(). */
 	if (!vma_flags_empty(&diff))
 		return false;
-	/* Page offset must align. */
-	if (vma_end_pgoff(a) != vma_start_pgoff(b))
+	/* Page offset must align, including the slice of a 4KB VMA. */
+	if (vma_start_pgoff(b) != vma_linear_page_index(a, b->vm_start))
 		return false;
 	/* Only reached from anon path, so either MAP_PRIVATE file or anon. */
 	if (vma_end_anon_pgoff(a) != vma_start_anon_pgoff(b))
