@@ -72,6 +72,7 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
+#include <linux/p3s_user_pages.h>
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -4272,6 +4273,7 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
 	struct lru_gen_mm_state *mm_state;
 	unsigned long max_seq;
 	int gen;
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 
 	lockdep_assert_held(pvmw->ptl);
 	VM_WARN_ON_ONCE_FOLIO(folio_test_lru(folio), folio);
