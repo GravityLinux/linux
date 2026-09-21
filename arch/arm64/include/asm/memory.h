@@ -14,6 +14,8 @@
 #include <linux/sizes.h>
 #include <asm/page-def.h>
 
+#include <linux/p3s/const.h>
+
 /*
  * Size of the PCI I/O space. This must remain a power of two so that
  * IO_SPACE_LIMIT acts as a mask for the low bits of I/O addresses.
@@ -31,7 +33,7 @@
  * of the VMEMMAP where 52-bit support is not available in hardware.
  */
 #define VMEMMAP_RANGE	(_PAGE_END(VA_BITS_MIN) - PAGE_OFFSET)
-#define VMEMMAP_SIZE	((VMEMMAP_RANGE >> PAGE_SHIFT) * sizeof(struct page))
+#define VMEMMAP_SIZE	((VMEMMAP_RANGE >> PAGE_SHIFT_KERNEL) * sizeof(struct page))
 
 /*
  * PAGE_OFFSET - the virtual address of the start of the linear map, at the
@@ -277,7 +279,7 @@ static inline bool kaslr_enabled(void) { return false; }
  * direct-mapped view.  We assume this is the first page
  * of RAM in the mem_map as well.
  */
-#define PHYS_PFN_OFFSET	(PHYS_OFFSET >> PAGE_SHIFT)
+#define PHYS_PFN_OFFSET	(PHYS_OFFSET >> PAGE_SHIFT_KERNEL)
 
 /*
  * When dealing with data aborts, watchpoints, or instruction traps we may end
@@ -390,7 +392,7 @@ static inline unsigned long virt_to_pfn(const void *kaddr)
 #define __pa_symbol(x)		__phys_addr_symbol(RELOC_HIDE((unsigned long)(x), 0))
 #define __pa_nodebug(x)		__virt_to_phys_nodebug((unsigned long)(x))
 #define __va(x)			((void *)__phys_to_virt((phys_addr_t)(x)))
-#define pfn_to_kaddr(pfn)	__va((pfn) << PAGE_SHIFT)
+#define pfn_to_kaddr(pfn)	__va((pfn) << PAGE_SHIFT_KERNEL)
 #define sym_to_pfn(x)		__phys_to_pfn(__pa_symbol(x))
 
 /*
