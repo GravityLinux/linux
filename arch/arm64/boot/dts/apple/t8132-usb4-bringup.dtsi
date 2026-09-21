@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 ACIO1 bring-up: resources from J773g ADT and runtime traces. */
+/ {
+	aliases {
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie = &usb4_1_pcie;
+		usb4_1_pcie_adapter = &usb4_1_pcie;
+	};
+	soc {
+		cio_reset_regs: syscon@380780000 {
+			compatible = "syscon", "simple-mfd";
+			reg = <0x3 0x80780000 0 0x4000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			cio_reset: reset-controller@8 {
+				compatible = "apple,t8132-cio-reset", "apple,t6000-cio-reset";
+				reg = <8 4>;
+				#reset-cells = <1>;
+			};
+		};
+		usb4_1_mbox: mailbox@409108000 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x09108000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			/* ADT orders each pair as not-empty, empty. */
+			interrupts = <AIC_IRQ 1378 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1379 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1380 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1381 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty",
+				"send-not-empty",
+				"recv-empty",
+				"recv-not-empty";
+			#mbox-cells = <0>;
+		};
+		usb4_1_acio: cio@409ac0000 {
+			compatible = "apple,t8132-usb4-acio", "apple,t8103-usb4-acio";
+			reg = <0x4 0x09ac0000 0 0xc000>, <0x4 0x09080000 0 0x20000>;
+			reg-names = "rc", "sram";
+			mboxes = <&usb4_1_mbox>;
+			resets = <&cio_reset 1>;
+			power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+					<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+			pinctrl-0 = <&acio1_pins>;
+			pinctrl-names = "default";
+			/* PCIe windows lie outside ACIO's local register aperture. */
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+			nonposted-mmio;
+			usb4_1_dart: iommu@409a80000 {
+				compatible = "apple,t8132-dart", "apple,t8110-dart";
+				reg = <0x4 0x09a80000 0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1376 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+				apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
+			};
+			usb4_1_nhi: nhi@409f00000 {
+				compatible = "apple,t8132-usb4-nhi", "apple,t8103-usb4-nhi";
+				reg = <0x4 0x09f00000 0 0x100000>,
+				      <0x4 0x09db0000 0 0x30004>;
+				reg-names = "nhi", "pdf";
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1349 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1350 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1351 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1352 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1353 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1354 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1355 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1356 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1357 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1358 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1359 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1360 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1361 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1362 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1363 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1364 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1365 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1366 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1367 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1368 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1369 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1370 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1371 IRQ_TYPE_LEVEL_HIGH>,
+					<AIC_IRQ 1372 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "txring0",
+					"txring1",
+					"txring2",
+					"txring3",
+					"txring4",
+					"txring5",
+					"txring6",
+					"txring7",
+					"txring8",
+					"txring9",
+					"txring10",
+					"txring11",
+					"rxring0",
+					"rxring1",
+					"rxring2",
+					"rxring3",
+					"rxring4",
+					"rxring5",
+					"rxring6",
+					"rxring7",
+					"rxring8",
+					"rxring9",
+					"rxring10",
+					"rxring11";
+				/* T8132 has a DART stream for each TX and RX ring. */
+				iommus = <&usb4_1_dart 0>,
+				<&usb4_1_dart 1>,
+				<&usb4_1_dart 2>,
+				<&usb4_1_dart 3>,
+				<&usb4_1_dart 4>,
+				<&usb4_1_dart 5>,
+				<&usb4_1_dart 6>,
+				<&usb4_1_dart 7>,
+				<&usb4_1_dart 8>,
+				<&usb4_1_dart 9>,
+				<&usb4_1_dart 10>,
+				<&usb4_1_dart 11>,
+				<&usb4_1_dart 16>,
+				<&usb4_1_dart 17>,
+				<&usb4_1_dart 18>,
+				<&usb4_1_dart 19>,
+				<&usb4_1_dart 20>,
+				<&usb4_1_dart 21>,
+				<&usb4_1_dart 22>,
+				<&usb4_1_dart 23>,
+				<&usb4_1_dart 24>,
+				<&usb4_1_dart 25>,
+				<&usb4_1_dart 26>,
+				<&usb4_1_dart 27>;
+				apple,thunderbolt-drom = [00];
+			};
+			usb4_1_pcie_dart: iommu@40c000000 {
+				compatible = "apple,t8132-dart", "apple,t8110-dart";
+				reg = <0x4 0x0c000000 0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1330 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+				apple,dma-range = /bits/ 64 <0x10080000000 0x7ff00000>;
+			};
+			usb4_1_pcie: pcie@1c60000000 {
+				compatible = "apple,t8132-pcie-tunnel";
+				device_type = "pci";
+				reg = <0x1c 0x60000000 0 0x10000000>,
+				      <0x4 0x0c034000 0 0x4000>,
+				      <0x4 0x0c020000 0 0x8000>,
+				      <0x4 0x0c038000 0 0x4000>,
+				      <0x4 0x0c060000 0 0x4000>,
+				      <0x4 0x09e44000 0 0x4000>,
+				      <0x4 0x0c02c000 0 0x4000>,
+				      <0x4 0x0c028000 0 0x4000>;
+				reg-names = "config",
+					"rc",
+					"port0",
+					"fabric",
+					"debug",
+					"adapter",
+					"ltssm",
+					"intr2axi";
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1329 IRQ_TYPE_LEVEL_HIGH>;
+				msi-controller;
+				msi-parent = <&usb4_1_pcie>;
+				msi-ranges = <&aic AIC_IRQ 1634 IRQ_TYPE_EDGE_RISING 32>;
+				apple,msi-vector-base = <128>;
+				/* Keep the external port in one DMA isolation group for bring-up. */
+				iommu-map-mask = <0>;
+				iommu-map = <0 &usb4_1_pcie_dart 1 1>;
+				linux,pci-domain = <2>;
+				bus-range = <0 127>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0xc 0 0xc 0 0x2 0>,
+					 <0x02000000 0 0x100000 0xe 0x00100000 0 0x3ff00000>;
+				usb4_1_pcie_port: pci@0,0 {
+					compatible = "pciclass,0604";
+					device_type = "pci";
+					reg = <0 0 0 0 0>;
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &usb4_1_pcie_port 0 0 0 0>,
+							<0 0 0 2 &usb4_1_pcie_port 0 0 0 1>,
+							<0 0 0 3 &usb4_1_pcie_port 0 0 0 2>,
+							<0 0 0 4 &usb4_1_pcie_port 0 0 0 3>;
+				};
+			};
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@1 {
+					reg = <1>;
+					usb4_1_typec: endpoint { remote-endpoint = <&typec1_usb4>; };
+				};
+				port@4 {
+					reg = <4>;
+					usb4_1_usb3: endpoint { remote-endpoint = <&dwc3_1_usb4>; };
+				};
+			};
+		};
+	};
+};
+&pinctrl_aop {
+	acio1_pins: acio1-pins { pinmux = <APPLE_PINMUX(19, 1)>; };
+};
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec1_usb4: endpoint { remote-endpoint = <&usb4_1_typec>; };
+		};
+	};
+};
+&dwc3_1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			dwc3_1_usb4: endpoint { remote-endpoint = <&usb4_1_usb3>; };
+		};
+	};
+};
