@@ -9,6 +9,7 @@
 #include <linux/page_table_check.h>
 #include <linux/swap.h>
 #include <linux/leafops.h>
+#include <linux/p3s/mm.h>
 
 #undef pr_fmt
 #define pr_fmt(fmt)	"page_table_check: " fmt
@@ -115,7 +116,7 @@ static void page_table_check_set(unsigned long pfn, unsigned long pgcnt,
 
 		if (anon) {
 			BUG_ON(atomic_read(&ptc->file_map_count));
-			BUG_ON(atomic_inc_return(&ptc->anon_map_count) > 1 && rw);
+			BUG_ON(atomic_inc_return(&ptc->anon_map_count) > P3S_SLICES_PER_PAGE && rw);
 		} else {
 			BUG_ON(atomic_read(&ptc->anon_map_count));
 			BUG_ON(atomic_inc_return(&ptc->file_map_count) < 0);
@@ -218,9 +219,19 @@ void __page_table_check_ptes_set(struct mm_struct *mm, unsigned long addr,
 	page_table_check_pte_flags(pte);
 
 	for (i = 0; i < nr; i++)
-		__page_table_check_pte_clear(mm, addr + PAGE_SIZE * i, ptep_get(ptep + i));
-	if (pte_user_accessible_page(mm, addr, pte) && !pte_special(pte))
-		page_table_check_set(pte_pfn(pte), nr, pte_write(pte));
+		__page_table_check_pte_clear(mm, addr + mm_pte_size(mm) * i,
+					     ptep_get(ptep + i));
+	if (pte_user_accessible_page(mm, addr, pte) && !pte_special(pte)) {
+		if (mm_is_p3s_4k(mm)) {
+			for (i = 0; i < nr; i++) {
+				pte_t slice_pte = __pte(pte_val(pte) + (i << PAGE_SHIFT_4KB));
+
+				page_table_check_set(pte_pfn(slice_pte), 1, pte_write(slice_pte));
+			}
+		} else {
+			page_table_check_set(pte_pfn(pte), nr, pte_write(pte));
+		}
+	}
 }
 EXPORT_SYMBOL(__page_table_check_ptes_set);
 
