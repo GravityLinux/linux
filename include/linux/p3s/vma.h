@@ -372,6 +372,30 @@ vma_pgoff_to_address(const struct vm_area_struct *vma, pgoff_t pgoff)
 }
 
 /*
+ * vma_anon_slice_window - First address of the slices of a page in @vma
+ * @vma: Anonymous VMA
+ * @pgoff: Index of a small anonymous folio
+ *
+ * In a 4KB anonymous VMA, @pgoff counts 4KB pages and the slices of the
+ * folio are mapped within one 16KB-aligned window of addresses. A VMA split
+ * or a 4KB mremap() can leave some of them in a VMA whose page range does
+ * not contain @pgoff; unsigned wrap-around then gives the address of the
+ * window below vm_start. Returns the first address of the window within
+ * @vma, or -EFAULT if @vma holds no part of the window.
+ */
+static inline unsigned long vma_anon_slice_window(const struct vm_area_struct *vma,
+						  pgoff_t pgoff)
+{
+	unsigned long win = (vma->vm_start +
+			     ((pgoff - vma->vm_pgoff) << PAGE_SHIFT_4KB)) &
+			    PAGE_MASK_KERNEL;
+
+	if (win >= vma->vm_end || win + PAGE_SIZE_KERNEL <= vma->vm_start)
+		return -EFAULT;
+	return max(win, vma->vm_start);
+}
+
+/*
  * vma_set_split_offset - Update pgoff and slice offset after VMA split
  * @target: Newly created or adjusted VMA
  * @src: Source VMA being split
