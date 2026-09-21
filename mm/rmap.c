@@ -2415,7 +2415,7 @@ finish_unmap:
 		 * If we are sure that we batched the entire folio and cleared
 		 * all PTEs, we can just optimize and stop right here.
 		 */
-		if (nr_pages == folio_nr_pages(folio))
+		if (nr_pages == folio_nr_pages(folio) && !vma_is_p3s_4k(vma))
 			goto walk_done;
 		continue;
 walk_abort:

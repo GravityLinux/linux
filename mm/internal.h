@@ -23,6 +23,7 @@
 #include "vma.h"
 #include "p3s/filemap.h"
 #include "p3s/pgtable.h"
+#include "p3s/rmap.h"
 
 struct folio_batch;
 struct hstate;
@@ -1091,7 +1092,7 @@ static inline unsigned long vma_address_end(struct page_vma_mapped_walk *pvmw)
 
 	/* Common case, plus ->pgoff is invalid for KSM */
 	if (pvmw->nr_pages == 1)
-		return pvmw->address + PAGE_SIZE;
+		return vma_slice_walk_end(vma, pvmw->address);
 
 	if (pvmw->pgoff_is_anon) {
 		pgoff_vma_start = vma_start_anon_pgoff(vma);
