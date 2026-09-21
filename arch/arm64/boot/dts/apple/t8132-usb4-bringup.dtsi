@@ -148,6 +148,7 @@
 			};
 			usb4_1_pcie: pcie@1c60000000 {
 				compatible = "apple,t8132-pcie-tunnel";
+				dma-coherent;
 				device_type = "pci";
 				reg = <0x1c 0x60000000 0 0x10000000>,
 				      <0x4 0x0c034000 0 0x4000>,
