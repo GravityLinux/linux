@@ -27,6 +27,7 @@
 
 #include "internal.h"
 #include "swap.h"
+#include <linux/p3s_user_pages.h>
 
 static inline void sanity_check_pinned_pages(struct page **pages,
 					     unsigned long npages)
@@ -1356,6 +1357,7 @@ static long __get_user_pages(struct mm_struct *mm,
 		unsigned int gup_flags, struct page **pages,
 		int *locked)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	long ret = 0, i = 0;
 	struct vm_area_struct *vma = NULL;
 	unsigned long page_mask = 0;
@@ -1653,6 +1655,7 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
 						int *locked,
 						unsigned int flags)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	long ret, pages_done;
 	bool must_unlock = false;
 
@@ -3122,7 +3125,7 @@ static inline void gup_fast_pgd_range(unsigned long addr, unsigned long end,
  */
 static bool gup_fast_permitted(unsigned long start, unsigned long end)
 {
-	return true;
+	return current->mm && !mm_is_p3s_4k(current->mm);
 }
 #endif
 
@@ -3438,7 +3441,7 @@ long memfd_pin_folios(struct file *memfd, loff_t start, loff_t end,
 		      pgoff_t *offset)
 {
 	unsigned int flags, nr_folios, nr_found;
-	unsigned int i, pgshift = PAGE_SHIFT;
+	unsigned int i, pgshift = PAGE_SHIFT_KERNEL;
 	pgoff_t start_idx, end_idx;
 	struct folio *folio = NULL;
 	struct folio_batch fbatch;
