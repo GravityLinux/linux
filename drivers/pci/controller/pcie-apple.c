@@ -31,6 +31,8 @@
 #include <linux/of_irq.h>
 #include <linux/pci-ecam.h>
 #include <linux/pci-pwrctrl.h>
+#include <linux/soc/apple/tunable.h>
+#include <linux/workqueue.h>
 
 #include "pci-host-common.h"
 
@@ -131,6 +133,8 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PORT_TUNSTAT_PERST_ON		BIT(0)
 #define   PORT_TUNSTAT_PERST_ACK_PEND	BIT(1)
 #define PORT_PREFMEM_ENABLE		0x00994
+#define PORT_T8132_TUNNEL_GATE		0x01088
+#define   PORT_T8132_TUNNEL_GATE_BLOCK	BIT(0)
 
 /* T602x (M2-pro and co) */
 #define PORT_T602X_MSIADDR	0x016c
@@ -152,6 +156,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
 
 struct hw_info {
+	bool tunneled;
 	u32 phy_lane_ctl;
 	u32 port_msiaddr;
 	u32 port_msiaddr_hi;
@@ -185,6 +190,17 @@ static const struct hw_info t602x_hw = {
 	.max_rid2sid		= 512,
 };
 
+/* T8132's tunneled port retains the original port register layout. */
+static const struct hw_info t8132_tunnel_hw = {
+	.tunneled = true,
+	.port_msiaddr = PORT_MSIADDR,
+	.port_msiaddr_hi = PORT_MSIADDR + 4,
+	.port_perst = PORT_PERST,
+	.port_rid2sid = PORT_RID2SID,
+	.port_msimap = PORT_T602X_MSIMAP,
+	.max_rid2sid = 256,
+};
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -195,11 +211,18 @@ struct apple_pcie {
 	struct completion	event;
 	struct irq_fwspec	fwspec;
 	u32			nvecs;
+	u32			msi_vector_base;
+	void __iomem		*config_base;
+	struct delayed_work	rescan_work;
+	bool			registered;
+	bool			removing;
 };
 
 struct apple_pcie_port {
 	raw_spinlock_t		lock;
 	struct apple_pcie	*pcie;
+	unsigned int		parent_irq;
+	unsigned int		link_irqs[2];
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
@@ -222,9 +245,12 @@ static void rmw_clear(u32 clr, void __iomem *addr)
 
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
 {
+	struct apple_pcie *pcie = irq_data_get_irq_chip_data(data);
+
 	msg->address_hi = upper_32_bits(DOORBELL_ADDR);
 	msg->address_lo = lower_32_bits(DOORBELL_ADDR);
-	msg->data = data->hwirq;
+
+	msg->data = data->hwirq + pcie->msi_vector_base;
 }
 
 static struct irq_chip apple_msi_bottom_chip = {
@@ -401,6 +427,24 @@ static void apple_port_irq_handler(struct irq_desc *desc)
 	chained_irq_exit(chip, desc);
 }
 
+static void apple_pcie_port_cleanup(void *data)
+{
+	struct apple_pcie_port *port = data;
+	int i;
+
+	writel(~0U, port->base + PORT_INTMSK);
+	for (i = 0; i < ARRAY_SIZE(port->link_irqs); i++) {
+		if (port->link_irqs[i]) {
+			free_irq(port->link_irqs[i], port);
+			irq_dispose_mapping(port->link_irqs[i]);
+		}
+	}
+	irq_set_chained_handler_and_data(port->parent_irq, NULL, NULL);
+	synchronize_irq(port->parent_irq);
+	irq_dispose_mapping(port->parent_irq);
+	irq_domain_remove(port->domain);
+}
+
 static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 {
 	struct fwnode_handle *fwnode = &port->np->fwnode;
@@ -426,6 +470,13 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 	writel_relaxed(~0, port->base + PORT_LINKCMDSTS);
 
 	irq_set_chained_handler_and_data(irq, apple_port_irq_handler, port);
+	port->parent_irq = irq;
+	if (pcie->hw->tunneled) {
+		int ret = devm_add_action_or_reset(pcie->dev, apple_pcie_port_cleanup, port);
+
+		if (ret)
+			return ret;
+	}
 
 	/* Configure MSI base address */
 	BUILD_BUG_ON(upper_32_bits(DOORBELL_ADDR));
@@ -436,10 +487,13 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 
 	/* Enable MSIs, shared between all ports */
 	if (pcie->hw->port_msimap) {
-		for (int i = 0; i < pcie->nvecs; i++)
-			writel_relaxed(FIELD_PREP(PORT_MSIMAP_TARGET, i) |
+		for (int i = 0; i < pcie->nvecs; i++) {
+			u32 vector = pcie->msi_vector_base + i;
+
+			writel_relaxed(FIELD_PREP(PORT_MSIMAP_TARGET, vector) |
 				       PORT_MSIMAP_ENABLE,
-				       port->base + pcie->hw->port_msimap + 4 * i);
+				       port->base + pcie->hw->port_msimap + 4 * vector);
+		}
 	} else {
 		writel_relaxed(0, port->base + PORT_MSIBASE);
 		val = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
@@ -459,6 +513,10 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 		dev_info_ratelimited(port->pcie->dev, "Link up on %pOF\n",
 				     port->np);
 		complete_all(&port->pcie->event);
+		if (port->pcie->hw->tunneled && READ_ONCE(port->pcie->registered) &&
+		    !READ_ONCE(port->pcie->removing))
+			mod_delayed_work(system_wq, &port->pcie->rescan_work,
+					 msecs_to_jiffies(100));
 		break;
 	case PORT_INT_LINK_DOWN:
 		dev_info_ratelimited(port->pcie->dev, "Link down on %pOF\n",
@@ -500,7 +558,11 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 
 		ret = request_irq(irq, apple_pcie_port_irq, 0,
 				  port_irqs[i].name, port);
-		WARN_ON(ret);
+		if (ret) {
+			irq_dispose_mapping(irq);
+			return ret;
+		}
+		port->link_irqs[i] = irq;
 	}
 
 	return 0;
@@ -644,6 +706,80 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	return 0;
 }
 
+static int apple_pcie_apply_tunable(struct apple_pcie *pcie,
+				    struct device_node *np, const char *property,
+				    const char *resource, void __iomem *base)
+{
+	struct platform_device *pdev = to_platform_device(pcie->dev);
+	struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, resource);
+	struct apple_tunable *tunable;
+
+	if (!res)
+		return -EINVAL;
+	if (!base) {
+		base = devm_ioremap_resource(pcie->dev, res);
+		if (IS_ERR(base))
+			return PTR_ERR(base);
+	}
+	tunable = devm_apple_tunable_parse(pcie->dev, np, property, res);
+	if (IS_ERR(tunable))
+		return dev_err_probe(pcie->dev, PTR_ERR(tunable),
+				     "%s missing or invalid\n", property);
+	apple_tunable_apply(base, tunable);
+	return 0;
+}
+
+static int apple_pcie_tunnel_setup_link(struct apple_pcie *pcie,
+					 struct apple_pcie_port *port)
+{
+	struct platform_device *pdev = to_platform_device(pcie->dev);
+	void __iomem *ltssm, *intr2axi;
+	u32 status;
+	int ret;
+
+	ltssm = devm_platform_ioremap_resource_byname(pdev, "ltssm");
+	if (IS_ERR(ltssm))
+		return PTR_ERR(ltssm);
+	intr2axi = devm_platform_ioremap_resource_byname(pdev, "intr2axi");
+	if (IS_ERR(intr2axi))
+		return PTR_ERR(intr2axi);
+
+	/* The enclosing ACIO has already powered and clocked the tunnel fabric. */
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = readl_poll_timeout(port->base + PORT_STATUS, status,
+				status != ~0U && (status & PORT_STATUS_READY), 100, 250000);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "tunneled port not ready (%#x)\n", status);
+
+	/* Auxiliary LTSSM initialization also used by m1n1's external-port setup. */
+	writel(2, ltssm + 0x10);
+	writel(4, ltssm + 0x1c);
+	rmw_set(BIT(1), ltssm + 0x20);
+	writel(1, ltssm + 0x14);
+
+	/* DesignWare DBI read-only override is needed for the RC tunables. */
+	rmw_set(BIT(0), pcie->config_base + 0x8bc);
+	ret = apple_pcie_apply_tunable(pcie, pcie->dev->of_node,
+				       "apple,tunable-rc", "config", pcie->config_base);
+	rmw_clear(BIT(0), pcie->config_base + 0x8bc);
+	if (ret)
+		return ret;
+	ret = apple_pcie_apply_tunable(pcie, port->np, "apple,tunable",
+				       "port0", port->base);
+	if (ret)
+		return ret;
+
+	writel(3, port->base + 0x4020);
+	writel(1, intr2axi + 0x80);
+	dev_dbg(pcie->dev, "tunnel init: link=%#x appclk=%#x gate=%#x perst=%#x\n",
+		 readl(port->base + PORT_LINKSTS), readl(port->base + PORT_APPCLK),
+		 readl(port->base + PORT_T8132_TUNNEL_GATE),
+		 readl(port->base + pcie->hw->port_perst));
+	return 0;
+}
+
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
 				 struct device_node *np)
 {
@@ -682,24 +818,27 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (IS_ERR(port->base))
 		return PTR_ERR(port->base);
 
-	snprintf(name, sizeof(name), "phy%d", port->idx);
-	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
-	if (res)
-		port->phy = devm_ioremap_resource(&platform->dev, res);
-	else
-		port->phy = pcie->base + CORE_PHY_DEFAULT_BASE(port->idx);
+	if (!pcie->hw->tunneled) {
+		snprintf(name, sizeof(name), "phy%d", port->idx);
+		res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
+		if (res)
+			port->phy = devm_ioremap_resource(&platform->dev, res);
+		else
+			port->phy = pcie->base + CORE_PHY_DEFAULT_BASE(port->idx);
+	}
 
 	/* link might be already brought up by u-boot, skip setup then */
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
-		ret = apple_pcie_setup_link(pcie, port, np);
+		ret = pcie->hw->tunneled ? apple_pcie_tunnel_setup_link(pcie, port) :
+			apple_pcie_setup_link(pcie, port, np);
 		if (ret)
 			return ret;
 	}
 
 	if (pcie->hw->port_refclk)
 		rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
-	else
+	else if (!pcie->hw->tunneled)
 		rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
 
 	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
@@ -726,15 +865,23 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	of_node_get(np);
 
 	ret = apple_pcie_port_register_irqs(port);
-	WARN_ON(ret);
+	if (ret)
+		return ret;
 
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
 		unsigned long timeout, left;
+
+		/* T8132 blocks the tunneled link until this gate is released. */
+		if (pcie->hw->tunneled)
+			rmw_clear(PORT_T8132_TUNNEL_GATE_BLOCK,
+				  port->base + PORT_T8132_TUNNEL_GATE);
 		/* start link training */
 		writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
 
-		timeout = link_up_timeout * HZ / 1000;
+		/* Router discovery and retimer enumeration precede tunnel activation. */
+		timeout = msecs_to_jiffies(pcie->hw->tunneled ?
+					 max(link_up_timeout, 2000) : link_up_timeout);
 		left = wait_for_completion_timeout(&pcie->event, timeout);
 		if (!left)
 			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
@@ -759,6 +906,11 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
 };
 
+static void apple_pcie_msi_cleanup(void *data)
+{
+	irq_domain_remove(data);
+}
+
 static int apple_msi_init(struct apple_pcie *pcie)
 {
 	struct fwnode_handle *fwnode = dev_fwnode(pcie->dev);
@@ -769,6 +921,7 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		.host_data	= pcie,
 	};
 	struct of_phandle_args args = {};
+	struct irq_domain *domain;
 	int ret;
 
 	ret = of_parse_phandle_with_args(to_of_node(fwnode), "msi-ranges",
@@ -794,10 +947,13 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		return -ENXIO;
 	}
 
-	if (!msi_create_parent_irq_domain(&info, &apple_msi_parent_ops)) {
+	domain = msi_create_parent_irq_domain(&info, &apple_msi_parent_ops);
+	if (!domain) {
 		dev_err(pcie->dev, "failed to create IRQ domain\n");
 		return -ENOMEM;
 	}
+	if (pcie->hw->tunneled)
+		return devm_add_action_or_reset(pcie->dev, apple_pcie_msi_cleanup, domain);
 	return 0;
 }
 
@@ -906,6 +1062,22 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 	if (WARN_ON(!pcie))
 		return -ENOENT;
 
+	pcie->config_base = cfg->win;
+	if (pcie->hw->tunneled) {
+		ret = apple_pcie_apply_tunable(pcie, dev->of_node,
+					       "apple,tunable-debug", "debug", NULL);
+		if (ret)
+			return ret;
+		ret = apple_pcie_apply_tunable(pcie, dev->of_node,
+					       "apple,tunable-fabric", "fabric", NULL);
+		if (ret)
+			return ret;
+		ret = apple_pcie_apply_tunable(pcie, dev->of_node,
+					       "apple,tunable-pcie-adapter", "adapter", NULL);
+		if (ret)
+			return ret;
+	}
+
 	// Ensure all ports can be powered on before attempting initialization
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
 		ret = pci_pwrctrl_create_device(of_port, pcie->dev);
@@ -974,16 +1146,35 @@ static int apple_pcie_probe_port(struct device_node *np)
 	return 0;
 }
 
+static void apple_pcie_rescan(struct work_struct *work)
+{
+	struct apple_pcie *pcie = container_of(to_delayed_work(work),
+					       struct apple_pcie, rescan_work);
+	struct pci_host_bridge *bridge = dev_get_drvdata(pcie->dev);
+
+	if (READ_ONCE(pcie->removing))
+		return;
+	pci_lock_rescan_remove();
+	pci_rescan_bus(bridge->bus);
+	pci_unlock_rescan_remove();
+}
+
 static int apple_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct pci_host_bridge *bridge;
 	struct device_node *of_port;
 	struct apple_pcie *pcie;
+	const struct hw_info *hw = of_device_get_match_data(dev);
 	int ret;
 
-	/* Check for probe dependencies for all ports first */
+	if (!hw)
+		return -ENODEV;
+
+	/* A tunneled port uses the ACIO's reset, with no external PERST GPIO. */
 	for_each_available_child_of_node(dev->of_node, of_port) {
+		if (hw->tunneled)
+			continue;
 		ret = apple_pcie_probe_port(of_port);
 		if (ret) {
 			of_node_put(of_port);
@@ -997,24 +1188,50 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
-	pcie->hw = of_device_get_match_data(dev);
-	if (!pcie->hw)
-		return -ENODEV;
+	pcie->hw = hw;
+	if (hw->tunneled) {
+		ret = of_property_read_u32(dev->of_node, "apple,msi-vector-base",
+					   &pcie->msi_vector_base);
+		if (ret)
+			return ret;
+	}
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);
 
 	mutex_init(&pcie->lock);
 	INIT_LIST_HEAD(&pcie->ports);
+	INIT_DELAYED_WORK(&pcie->rescan_work, apple_pcie_rescan);
 
 	ret = apple_msi_init(pcie);
 	if (ret)
 		return ret;
 
-	return pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	if (!ret)
+		WRITE_ONCE(pcie->registered, true);
+	return ret;
+}
+
+static void apple_pcie_remove(struct platform_device *pdev)
+{
+	struct pci_host_bridge *bridge = platform_get_drvdata(pdev);
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct apple_pcie_port *port;
+
+	WRITE_ONCE(pcie->removing, true);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		writel(~0U, port->base + PORT_INTMSK);
+		synchronize_irq(port->parent_irq);
+	}
+	cancel_delayed_work_sync(&pcie->rescan_work);
+	pci_host_common_remove(pdev);
+	list_for_each_entry(port, &pcie->ports, entry)
+		of_node_put(port->np);
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t8132-pcie-tunnel", .data = &t8132_tunnel_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }
@@ -1023,6 +1240,7 @@ MODULE_DEVICE_TABLE(of, apple_pcie_of_match);
 
 static struct platform_driver apple_pcie_driver = {
 	.probe	= apple_pcie_probe,
+	.remove = apple_pcie_remove,
 	.driver	= {
 		.name			= "pcie-apple",
 		.of_match_table		= apple_pcie_of_match,
