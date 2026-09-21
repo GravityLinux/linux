@@ -8,6 +8,23 @@
 #include <asm/processor.h>
 #include <asm/sysreg.h>
 
+#if defined(CONFIG_ARM64_64K_PAGES)
+#define TCR_TG0_KERNEL		TCR_TG0_64K
+#elif defined(CONFIG_ARM64_16K_PAGES)
+#define TCR_TG0_KERNEL		TCR_TG0_16K
+#else
+#define TCR_TG0_KERNEL		TCR_TG0_4K
+#endif
+
+static inline unsigned long mm_tcr_geometry(const struct mm_struct *mm)
+{
+	if (mm_is_p3s_4k(mm))
+		return TCR_TG0_4K | TCR_T0SZ(VA_BITS_4KB);
+
+	return TCR_TG0_KERNEL | TCR_T0SZ(vabits_actual);
+}
+
+
 static inline unsigned long mm_task_size(const struct mm_struct *mm)
 {
 	return mm_is_p3s_4k(mm) ? TASK_SIZE_4KB : TASK_SIZE;
@@ -61,5 +78,19 @@ static inline void mm_dup_mmap(const struct mm_struct *oldmm,
 {
 	mm_set_pte_shift(mm, mm_pte_shift(oldmm));
 }
+
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+
+#define mm_switch_tcr(mm)						\
+do {									\
+	if ((mm) != &init_mm)						\
+		__cpu_set_tcr_geometry(mm_tcr_geometry(mm));		\
+} while (0)
+
+#else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
+
+#define mm_switch_tcr(mm)	do { } while (0)
+
+#endif /* CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
 
 #endif /* _ASM_ARM64_P3S_MMU_H */
