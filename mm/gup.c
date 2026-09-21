@@ -2175,6 +2175,7 @@ EXPORT_SYMBOL(fault_in_readable);
  * get_dump_page() - pin user page in memory while writing it to core dump
  * @addr: user address
  * @locked: a pointer to an int denoting whether the mmap sem is held
+ * @page_offset: returns the byte offset of @addr in the pinned native page
  *
  * Returns struct page pointer of user page pinned for dump,
  * to be freed afterwards by put_page().
@@ -2187,13 +2188,40 @@ EXPORT_SYMBOL(fault_in_readable);
  * Called without mmap_lock (takes and releases the mmap_lock by itself).
  */
 #ifdef CONFIG_ELF_CORE
-struct page *get_dump_page(unsigned long addr, int *locked)
+struct page *get_dump_page(unsigned long addr, int *locked, unsigned long *page_offset)
 {
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	bool must_unlock = false;
 	struct page *page;
 	int ret;
 
-	ret = __get_user_pages_locked(current->mm, addr, 1, &page, locked,
+	*page_offset = 0;
+	if (mm_is_p3s_4k(mm)) {
+		/*
+		 * The offset needs the VMA: look it up and get the page under
+		 * one mmap_lock hold. If the caller does not hold the lock,
+		 * take it and set *locked so that GUP neither takes nor drops
+		 * it; without FOLL_UNLOCKABLE, a fault cannot drop it either.
+		 */
+		if (!*locked) {
+			if (mmap_read_lock_killable(mm))
+				return NULL;
+			*locked = 1;
+			must_unlock = true;
+		}
+		/* No VMA, e.g. the gate area: GUP handles it with offset 0. */
+		vma = vma_lookup(mm, addr);
+		if (vma)
+			*page_offset = vma_folio_offset(vma, addr);
+	}
+
+	ret = __get_user_pages_locked(mm, addr, 1, &page, locked,
 				      FOLL_FORCE | FOLL_DUMP | FOLL_GET);
+	if (must_unlock && *locked) {
+		mmap_read_unlock(mm);
+		*locked = 0;
+	}
 	return (ret == 1) ? page : NULL;
 }
 #endif /* CONFIG_ELF_CORE */

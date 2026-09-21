@@ -62,6 +62,7 @@
 #include "internal.h"
 
 #include <trace/events/sched.h>
+#include <linux/p3s_user_pages.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/coredump.h>
@@ -1224,7 +1225,7 @@ static int __dump_emit(struct coredump_params *cprm, const void *addr, int nr)
 
 static int __dump_skip(struct coredump_params *cprm, size_t nr)
 {
-	static char zeroes[PAGE_SIZE];
+	static char zeroes[PAGE_SIZE_KERNEL];
 	struct file *file = cprm->file;
 
 	if (file->f_mode & FMODE_LSEEK) {
@@ -1234,10 +1235,10 @@ static int __dump_skip(struct coredump_params *cprm, size_t nr)
 		return 1;
 	}
 
-	while (nr > PAGE_SIZE) {
-		if (!__dump_emit(cprm, zeroes, PAGE_SIZE))
+	while (nr > PAGE_SIZE_KERNEL) {
+		if (!__dump_emit(cprm, zeroes, PAGE_SIZE_KERNEL))
 			return 0;
-		nr -= PAGE_SIZE;
+		nr -= PAGE_SIZE_KERNEL;
 	}
 
 	return __dump_emit(cprm, zeroes, nr);
@@ -1267,7 +1268,8 @@ void dump_skip(struct coredump_params *cprm, size_t nr)
 EXPORT_SYMBOL(dump_skip);
 
 #ifdef CONFIG_ELF_CORE
-static int dump_emit_page(struct coredump_params *cprm, struct page *page)
+static int dump_emit_page(struct coredump_params *cprm, struct page *page,
+			  unsigned long offset)
 {
 	struct bio_vec bvec;
 	struct iov_iter iter;
@@ -1288,7 +1290,7 @@ static int dump_emit_page(struct coredump_params *cprm, struct page *page)
 	if (dump_interrupted())
 		return 0;
 	pos = file->f_pos;
-	bvec_set_page(&bvec, page, PAGE_SIZE, 0);
+	bvec_set_page(&bvec, page, PAGE_SIZE, offset);
 	iov_iter_bvec(&iter, ITER_SOURCE, &bvec, 1, PAGE_SIZE);
 	n = __kernel_write_iter(cprm->file, &iter, &pos);
 	if (n != PAGE_SIZE)
@@ -1343,6 +1345,7 @@ int dump_user_range(struct coredump_params *cprm, unsigned long start,
 	ret = 0;
 	locked = 0;
 	for (addr = start; addr < start + len; addr += PAGE_SIZE) {
+		unsigned long page_offset;
 		struct page *page;
 
 		if (!locked) {
@@ -1358,13 +1361,15 @@ int dump_user_range(struct coredump_params *cprm, unsigned long start,
 		 * NULL when encountering an empty page table entry that would
 		 * otherwise have been filled with the zero page.
 		 */
-		page = get_dump_page(addr, &locked);
+		page = get_dump_page(addr, &locked, &page_offset);
 		if (page) {
 			if (locked) {
 				mmap_read_unlock(current->mm);
 				locked = 0;
 			}
-			int stop = !dump_emit_page(cprm, dump_page_copy(page, dump_page));
+			int stop = !dump_emit_page(cprm,
+						   dump_page_copy(page, dump_page),
+						   page_offset);
 			put_page(page);
 			if (stop)
 				goto out;
@@ -1642,7 +1647,7 @@ static unsigned long vma_dump_size(struct vm_area_struct *vma,
 	 * dump the first page to aid in determining what was mapped here.
 	 */
 	if (FILTER(ELF_HEADERS) &&
-	    vma->vm_pgoff == 0 && (vma->vm_flags & VM_READ)) {
+	    !vma_file_offset(vma) && (vma->vm_flags & VM_READ)) {
 		if ((READ_ONCE(file_inode(vma->vm_file)->i_mode) & 0111) != 0)
 			return PAGE_SIZE;
 
@@ -1744,7 +1749,7 @@ static bool dump_vma_snapshot(struct coredump_params *cprm)
 		m->end = vma->vm_end;
 		m->flags = vma->vm_flags;
 		m->dump_size = vma_dump_size(vma, cprm->mm_flags);
-		m->pgoff = vma->vm_pgoff;
+		m->pgoff = vma_file_offset(vma) >> PAGE_SHIFT;
 		m->file = vma->vm_file;
 		if (m->file)
 			get_file(m->file);
