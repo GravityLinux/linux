@@ -276,6 +276,55 @@ static inline pgoff_t vma_pgoff_pages(const struct vm_area_struct *vma)
 }
 
 /*
+ * vma_pgoff_to_address - Address in @vma where page offset @pgoff starts
+ * @vma: Pointer to struct vm_area_struct
+ * @pgoff: Page offset to look up
+ *
+ * For a file VMA, returns the address that maps slice 0 of file page
+ * @pgoff, clamped to the VMA: vm_start, plus (@pgoff - vm_pgoff) file
+ * pages, minus the vm_slice_off slices of file page vm_pgoff that are
+ * before vm_start.
+ *
+ * For example, with vm_slice_off = 1, @pgoff = vm_pgoff + 1 gives vm_start
+ * plus one 16KB file page (0x4000) minus one slice (0x1000), which is
+ * vm_start + 0x3000, the start of VMA page 3. File page vm_pgoff starts
+ * before vm_start, so @pgoff = vm_pgoff gives vm_start:
+ *
+ *  @pgoff        vm_pgoff        vm_pgoff + 1
+ *                    ▼                 ▼
+ *                    ┌─────┬─────┬─────┬─────┬─────┐
+ *  4KB VMA pages     │  0  │  1  │  2  │  3  │  4  │
+ *                    └─────┴─────┴─────┴─────┴─────┘
+ *              ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+ *  4KB slices  │  0  │  1  │  2  │  3  │  0  │  1  │  2  │  3  │
+ *              ├─────┴─────┴─────┴─────┼─────┴─────┴─────┴─────┤
+ *  16KB file   │        vm_pgoff       │      vm_pgoff + 1     │
+ *  pages       └───────────────────────┴───────────────────────┘
+ *
+ * A page after the VMA gives vm_end. For an anonymous VMA, @pgoff
+ * counts pages of the process page size.
+ */
+static inline unsigned long
+vma_pgoff_to_address(const struct vm_area_struct *vma, pgoff_t pgoff)
+{
+	unsigned long addr;
+
+	if (pgoff <= vma->vm_pgoff)
+		return vma->vm_start;
+
+	if (vma->vm_ops) {
+		addr = vma->vm_start +
+			((pgoff - vma->vm_pgoff) << PAGE_SHIFT_KERNEL) -
+			((unsigned long)vma_slice_off(vma) << PAGE_SHIFT_4KB);
+	} else {
+		addr = vma->vm_start +
+			((pgoff - vma->vm_pgoff) << mm_pte_shift(vma->vm_mm));
+	}
+
+	return min(addr, vma->vm_end);
+}
+
+/*
  * p3s_adjust_unmapped_area_info - Align unmapped area allocations to host page
  * @info: Pointer to struct vm_unmapped_area_info
  *
