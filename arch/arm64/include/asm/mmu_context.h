@@ -25,6 +25,7 @@
 #include <asm/cputype.h>
 #include <asm/sysreg.h>
 #include <asm/tlbflush.h>
+#include <asm/p3s/mmu.h>
 
 extern bool rodata_full;
 
@@ -171,6 +172,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 
 	/* pkey 0 is the default, so always reserve it. */
 	mm->context.pkey_allocation_map = BIT(0);
+	mm_init_new_context(tsk, mm);
 
 	return 0;
 }
@@ -185,6 +187,7 @@ static inline void arch_dup_pkeys(struct mm_struct *oldmm,
 static inline int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm)
 {
 	arch_dup_pkeys(oldmm, mm);
+	mm_dup_mmap(oldmm, mm);
 
 	return 0;
 }
