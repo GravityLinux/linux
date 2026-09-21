@@ -76,4 +76,19 @@ static inline unsigned long vma_offset_in_page(const struct vm_area_struct *vma,
 #define p3s_adjust_unmapped_area_info(info) ((void)(info))
 #endif
 
+/*
+ * vma_folio_slices_exclusive - Small anon folio mapped only by this process
+ * @vma: Pointer to struct vm_area_struct mapping @folio
+ * @folio: Folio found through a PTE of @vma
+ *
+ * In a 4KB compatibility process a small anonymous folio can be mapped by
+ * up to four 4KB slice PTEs, so its mapcount can exceed its page count while
+ * every mapping still belongs to this process (PageAnonExclusive). A macro
+ * because the folio flag helpers are not yet defined where this header is
+ * included from <linux/mm_types.h>.
+ */
+#define vma_folio_slices_exclusive(vma, folio)				\
+	(vma_is_p3s_4k(vma) && folio_test_anon(folio) &&		\
+	 !folio_test_large(folio) && PageAnonExclusive(&(folio)->page))
+
 #endif /* _LINUX_P3S_VMA_H */
