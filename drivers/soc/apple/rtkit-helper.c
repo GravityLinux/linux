@@ -9,6 +9,7 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/of.h>
+#include <linux/mutex.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/soc/apple/rtkit.h>
@@ -19,6 +20,10 @@
 struct apple_rtkit_helper {
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	struct mutex lock;
+	bool started;
+	bool stopping;
+	bool stopped;
 
 	void __iomem *asc_base;
 
@@ -65,13 +70,64 @@ static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem
 
 static void apple_rtkit_helper_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 {
-	// no-op
+	struct apple_rtkit_helper *helper = cookie;
+
+	if (!bfr->buffer)
+		return;
+
+	/*
+	 * RTKit destroys buffers after the acknowledged shutdown transition,
+	 * or during final devres cleanup. Only the former establishes that a
+	 * running coprocessor has relinquished DMA ownership.
+	 */
+	if (helper->started && !helper->stopping && !helper->stopped) {
+		dev_crit(helper->dev, "Retaining RTKit DMA buffer after failed shutdown\n");
+		get_device(helper->dev);
+		return;
+	}
+	dma_free_coherent(helper->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
 static const struct apple_rtkit_ops apple_rtkit_helper_ops = {
 	.shmem_setup = apple_rtkit_helper_shmem_setup,
 	.shmem_destroy = apple_rtkit_helper_shmem_destroy,
 };
+
+bool apple_rtkit_helper_is_running(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	bool running;
+
+	mutex_lock(&helper->lock);
+	running = !helper->stopped && apple_rtkit_is_running(helper->rtk);
+	mutex_unlock(&helper->lock);
+	return running;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_helper_is_running);
+
+int apple_rtkit_helper_stop(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	int ret = 0;
+
+	mutex_lock(&helper->lock);
+	if (helper->stopped)
+		goto done;
+
+	helper->stopping = true;
+	ret = apple_rtkit_shutdown(helper->rtk);
+	helper->stopping = false;
+	if (ret) {
+		dev_err(dev, "Coprocessor shutdown failed: %d; DMA must remain mapped\n", ret);
+		goto done;
+	}
+	helper->stopped = true;
+	writel(0, helper->asc_base + APPLE_ASC_CPU_CONTROL);
+done:
+	mutex_unlock(&helper->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_helper_stop);
 
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
@@ -89,6 +145,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	helper->dev = dev;
+	mutex_init(&helper->lock);
 	platform_set_drvdata(pdev, helper);
 
 	helper->asc_base = devm_platform_ioremap_resource_byname(pdev, "asc");
@@ -109,25 +166,23 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(helper->rtk),
 				     "Failed to intialize RTKit");
 
+	helper->started = true;
 	writel_relaxed(APPLE_ASC_CPU_CONTROL_RUN,
 		       helper->asc_base + APPLE_ASC_CPU_CONTROL);
 
 	/* Works for both wake and boot */
 	ret = apple_rtkit_wake(helper->rtk);
-	if (ret != 0)
+	if (ret) {
+		apple_rtkit_helper_stop(dev);
 		return dev_err_probe(dev, ret, "Failed to wake up coprocessor");
+	}
 
 	return 0;
 }
 
 static void apple_rtkit_helper_remove(struct platform_device *pdev)
 {
-	struct apple_rtkit_helper *helper = platform_get_drvdata(pdev);
-
-	if (apple_rtkit_is_running(helper->rtk))
-		apple_rtkit_quiesce(helper->rtk);
-
-	writel_relaxed(0, helper->asc_base + APPLE_ASC_CPU_CONTROL);
+	apple_rtkit_helper_stop(&pdev->dev);
 }
 
 static const struct of_device_id apple_rtkit_helper_of_match[] = {
@@ -143,6 +198,7 @@ static struct platform_driver apple_rtkit_helper_driver = {
 	},
 	.probe = apple_rtkit_helper_probe,
 	.remove = apple_rtkit_helper_remove,
+	.shutdown = apple_rtkit_helper_remove,
 };
 module_platform_driver(apple_rtkit_helper_driver);
 

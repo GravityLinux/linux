@@ -5,6 +5,7 @@ menu "DockChannel HID support"
 config HID_DOCKCHANNEL
 	tristate "HID over DockChannel transport layer for Apple Silicon SoCs"
 	depends on APPLE_DOCKCHANNEL && INPUT && OF && HID
+	depends on APPLE_RTKIT_HELPER
 	help
 	  Say Y here if you use an M2 or later Apple Silicon based laptop.
 	  The keyboard and touchpad are HID based devices connected via the

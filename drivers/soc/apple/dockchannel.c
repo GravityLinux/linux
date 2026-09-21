@@ -12,6 +12,7 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
 #include <linux/platform_device.h>
+#include <linux/spinlock.h>
 #include <linux/soc/apple/dockchannel.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
@@ -52,6 +53,8 @@ struct dockchannel {
 
 	u32 fifo_size;
 	bool awaiting;
+	bool stopped;
+	spinlock_t await_lock;
 	struct completion tx_comp;
 	struct completion rx_comp;
 
@@ -98,8 +101,9 @@ static irqreturn_t dockchannel_rx_irq_thread(int irq, void *data)
 	struct dockchannel *dockchannel = data;
 	size_t avail = readl_relaxed(dockchannel->data_base + DATA_RX_COUNT);
 
-	dockchannel->awaiting = false;
-	dockchannel->data_available(dockchannel->cookie, avail);
+	WRITE_ONCE(dockchannel->awaiting, false);
+	if (!READ_ONCE(dockchannel->stopped))
+		dockchannel->data_available(dockchannel->cookie, avail);
 
 	return IRQ_HANDLED;
 }
@@ -112,6 +116,9 @@ int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t co
 	while (left > 0) {
 		size_t avail = readl_relaxed(dockchannel->data_base + DATA_TX_FREE);
 		size_t block = min(left, avail);
+
+		if (READ_ONCE(dockchannel->stopped))
+			return -ESHUTDOWN;
 
 		if (avail == 0) {
 			size_t threshold = min((size_t)(dockchannel->fifo_size / 2), left);
@@ -194,8 +201,16 @@ int dockchannel_await(struct dockchannel *dockchannel,
 {
 	size_t threshold = min((size_t)dockchannel->fifo_size, count);
 
+	unsigned long flags;
+
+	spin_lock_irqsave(&dockchannel->await_lock, flags);
+	if (dockchannel->stopped) {
+		spin_unlock_irqrestore(&dockchannel->await_lock, flags);
+		return -ESHUTDOWN;
+	}
 	if (!count) {
 		dockchannel->awaiting = false;
+		spin_unlock_irqrestore(&dockchannel->await_lock, flags);
 		disable_irq(dockchannel->rx_irq);
 		return 0;
 	}
@@ -205,10 +220,27 @@ int dockchannel_await(struct dockchannel *dockchannel,
 	dockchannel->awaiting = true;
 	writel_relaxed(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
 	enable_irq(dockchannel->rx_irq);
+	spin_unlock_irqrestore(&dockchannel->await_lock, flags);
 
 	return threshold;
 }
 EXPORT_SYMBOL(dockchannel_await);
+
+/*
+ * Permanently prevent rearming and wait for the current receive callback.
+ * Must not be called from that callback. The consumer must join its senders
+ * before releasing the channel; an in-flight send has a bounded FIFO timeout.
+ */
+void dockchannel_cancel(struct dockchannel *dockchannel)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dockchannel->await_lock, flags);
+	dockchannel->stopped = true;
+	spin_unlock_irqrestore(&dockchannel->await_lock, flags);
+	disable_irq(dockchannel->rx_irq);
+}
+EXPORT_SYMBOL_GPL(dockchannel_cancel);
 
 struct dockchannel *dockchannel_init(struct platform_device *pdev)
 {
@@ -235,6 +267,7 @@ struct dockchannel *dockchannel_init(struct platform_device *pdev)
 
 	init_completion(&dockchannel->tx_comp);
 	init_completion(&dockchannel->rx_comp);
+	spin_lock_init(&dockchannel->await_lock);
 
 	dockchannel->tx_irq = platform_get_irq_byname(pdev, "tx");
 	if (dockchannel->tx_irq < 0) {

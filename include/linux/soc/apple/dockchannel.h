@@ -21,6 +21,7 @@ int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count);
 int dockchannel_await(struct dockchannel *dockchannel,
 		      void (*callback)(void *cookie, size_t avail),
 		      void *cookie, size_t count);
+void dockchannel_cancel(struct dockchannel *dockchannel);
 
 #endif
 #endif
