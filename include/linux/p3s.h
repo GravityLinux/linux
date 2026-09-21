@@ -4,6 +4,7 @@
 
 #include <linux/p3s/const.h>
 #include <linux/p3s/mm.h>
+#include <linux/p3s/vma.h>
 
 /* asm/p3s.h is architecture-specific to arm64 */
 #ifdef CONFIG_ARM64
