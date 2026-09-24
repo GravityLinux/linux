@@ -76,6 +76,9 @@ static bool trampoline_passthrough_dict_v26_6(struct apple_dcp *dcp, int tag,
 }
 
 static_assert(sizeof(struct dcp_swap_v26_6_0) == 0x588);
+static_assert(offsetof(struct dcp_swap_v26_6_0, bl_update) == 0x354);
+static_assert(offsetof(struct dcp_swap_v26_6_0, bl_flags) == 0x358);
+static_assert(offsetof(struct dcp_swap_v26_6_0, bl_nits) == 0x35e);
 static_assert(sizeof(struct dcp_swap_start_req_v26_6_0) == 0x10);
 static_assert(sizeof(struct dcp_swap_start_resp_v26_6_0) == 0x8);
 static_assert(sizeof(struct dcp_swap_submit_req_v26_6_0) == 0x1bd8);
@@ -120,6 +123,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	/* set_tiling_state: 26.6 returns the value followed by success. */
 	[115] = trampoline_get_tiling_state,
 	[121] = dcpep_cb_boot_1,
+	[122] = trampoline_false, /* native display sleep/wake query */
 	[123] = trampoline_false,
 	[125] = trampoline_read_edt_data,
 	[127] = trampoline_prop_start,
@@ -134,6 +138,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[300] = trampoline_pr_publish,
 	[400] = trampoline_nop,
 	[401] = trampoline_get_uint_prop,
+	[406] = trampoline_nop, /* set_fx_prop: host property notification */
 	[408] = trampoline_get_frequency,
 	[411] = trampoline_map_reg,
 	[413] = trampoline_true,
@@ -150,8 +155,10 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[575] = trampoline_hotplug,
 	[576] = trampoline_nop,
 	[581] = trampoline_nop,
+	[582] = trampoline_true, /* create_default_fb_surface */
 	[590] = trampoline_swap_complete,
 	[592] = trampoline_swap_complete_intent_gated,
+	[594] = trampoline_nop, /* native display re-enable notification: empty ACK */
 	[595] = trampoline_nop,
 	[598] = trampoline_nop,
 	[599] = trampoline_nop,

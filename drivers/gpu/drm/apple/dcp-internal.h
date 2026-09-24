@@ -300,8 +300,6 @@ struct apple_dcp {
 	int hdmi_hpd_irq;
 };
 
-void *dcp_vmap_wc(phys_addr_t phys, size_t size, void **map_base);
-
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 
 int dcp_backlight_register(struct apple_dcp *dcp);

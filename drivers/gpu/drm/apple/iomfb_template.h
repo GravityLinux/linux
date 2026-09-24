@@ -59,6 +59,11 @@ struct DCP_FW_NAME(dcp_swap) {
 #else
 	u32 bl_update;
 #endif
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	u8 bl_flags[6];
+	__le64 bl_nits; /* IEEE-754 binary64, unaligned at 0x35e */
+	u8 unk_2f3[0x2b];
+#else
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
 #else
@@ -72,6 +77,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
 	u8 unk_2f3[0x2d];
+#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unk_320[0x13f];
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)

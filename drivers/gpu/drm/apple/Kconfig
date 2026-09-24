@@ -5,12 +5,13 @@ config DRM_APPLE
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_RTKIT
 	depends on OF_ADDRESS
+	depends on TYPEC || !TYPEC
 	select APPLE_PMP_REPORT
 	select DRM_CLIENT_SELECTION
 	select DRM_KMS_HELPER
-	select DRM_KMS_DMA_HELPER
 	select DRM_GEM_DMA_HELPER
 	select VIDEOMODE_HELPERS
+	select VMAP_PFN
 	depends on BACKLIGHT_CLASS_DEVICE
 	select MULTIPLEXER
 	help

@@ -19,6 +19,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -309,28 +310,65 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	complete(&dcp->start_done);
 }
 
-void *dcp_vmap_wc(phys_addr_t phys, size_t size, void **map_base)
+static int dcp_vmap_wc(phys_addr_t phys, size_t size,
+		       void __iomem **iomem, void **map_base)
 {
 	unsigned long offset = offset_in_page(phys);
-	unsigned int count = DIV_ROUND_UP(offset + size, PAGE_SIZE);
 	unsigned long first_pfn = PHYS_PFN(phys);
-	struct page **pages;
+	phys_addr_t last;
+	size_t span, nr_pages;
+	unsigned int count, i;
 	void *base;
-	unsigned int i;
 
-	pages = kcalloc(count, sizeof(*pages), GFP_KERNEL);
-	if (!pages)
-		return NULL;
-	for (i = 0; i < count; i++)
-		pages[i] = pfn_to_page(first_pfn + i);
+	if (!size)
+		return -EINVAL;
+	if (check_add_overflow(phys, (phys_addr_t)size - 1, &last) ||
+	    check_add_overflow(size, offset, &span))
+		return -EOVERFLOW;
+	if (last > PHYS_MASK)
+		return -EOVERFLOW;
+	nr_pages = (span - 1) / PAGE_SIZE + 1;
+	if (nr_pages > UINT_MAX)
+		return -E2BIG;
+	count = nr_pages;
 
-	base = vmap(pages, count, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
-	kfree(pages);
+	if (pfn_valid(first_pfn)) {
+		struct page **pages = kmalloc_array(count, sizeof(*pages), GFP_KERNEL);
+
+		if (!pages)
+			return -ENOMEM;
+		for (i = 0; i < count; i++) {
+			if (!pfn_valid(first_pfn + i)) {
+				kfree(pages);
+				return -EINVAL;
+			}
+			pages[i] = pfn_to_page(first_pfn + i);
+		}
+		base = vmap(pages, count, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+		kfree(pages);
+	} else {
+		unsigned long *pfns = kmalloc_array(count, sizeof(*pfns), GFP_KERNEL);
+
+		if (!pfns)
+			return -ENOMEM;
+		for (i = 0; i < count; i++) {
+			if (pfn_valid(first_pfn + i)) {
+				kfree(pfns);
+				return -EINVAL;
+			}
+			pfns[i] = first_pfn + i;
+		}
+		/* Retained firmware carveouts need not have struct page entries.
+		 * vmap_pfn preserves WC without manufacturing invalid pages. */
+		base = vmap_pfn(pfns, count, pgprot_writecombine(PAGE_KERNEL));
+		kfree(pfns);
+	}
 	if (!base)
-		return NULL;
+		return -ENOMEM;
 
 	*map_base = base;
-	return base + offset;
+	*iomem = (void __iomem *)(base + offset);
+	return 0;
 }
 
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
@@ -341,22 +379,37 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		struct iommu_domain *domain =
 			iommu_get_domain_for_dev(dcp->dev);
 		phys_addr_t phy_addr;
+		size_t offset;
+		int ret;
 
 		if (!domain)
-			return -ENOMEM;
+			return -ENODEV;
 
-		// TODO: get map from device-tree
+		if (!bfr->size)
+			return -EINVAL;
+		if (bfr->size - 1 > (dma_addr_t)-1 - bfr->iova)
+			return -EOVERFLOW;
 		phy_addr = iommu_iova_to_phys(domain, bfr->iova);
 		if (!phy_addr)
-			return -ENOMEM;
+			return -EINVAL;
+		if (offset_in_page(phy_addr) != offset_in_page(bfr->iova))
+			return -EINVAL;
+		if (phy_addr > PHYS_MASK || bfr->size - 1 > PHYS_MASK - phy_addr)
+			return -EOVERFLOW;
+		/* The CPU alias is contiguous; verify the entire retained mapping,
+		 * not just the first DART page. */
+		for (offset = PAGE_SIZE - offset_in_page(bfr->iova);
+		     offset < bfr->size; offset += PAGE_SIZE) {
+			if (iommu_iova_to_phys(domain, bfr->iova + offset) != phy_addr + offset)
+				return -EINVAL;
+		}
 
 		/* Retained DCP buffers may be accessed through a realtime path.
 		 * A WB alias creates AMCC directory state that can fault when DCP
 		 * subsequently accesses the same memory. */
-		bfr->iomem = (void __iomem *)dcp_vmap_wc(phy_addr, bfr->size,
-							 &bfr->private);
-		if (!bfr->iomem)
-			return -ENOMEM;
+		ret = dcp_vmap_wc(phy_addr, bfr->size, &bfr->iomem, &bfr->private);
+		if (ret)
+			return ret;
 
 		bfr->is_mapped = true;
 		dev_info(dcp->dev,
@@ -841,8 +894,14 @@ static void dcp_dpavctrl_service_init(struct apple_epic_service *service,
 		dcp->dpavctrl_late_service = service;
 	}
 
-	if (service->ep->num_channels >= 4)
+	/* The internal panel announces only the AV controller on interface 5
+	 * and the deferred DP controller on interface 7, not the HDMI quartet. */
+	if (dcp_has_panel(dcp)) {
+		if (dcp->dpavctrl_av_controller[1] && dcp->dpavctrl_late_service)
+			complete_all(&dcp->dpavctrl_ready);
+	} else if (service->ep->num_channels >= 4) {
 		complete_all(&dcp->dpavctrl_ready);
+	}
 }
 
 static const struct apple_epic_service_ops dcp_dpavctrl_ops[] = {

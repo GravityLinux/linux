@@ -210,7 +210,10 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	if (ret)
 		return ret;
 
-	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+		dcp->brightness.nits = brightness;
+	else
+		dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
 	drm_modeset_unlock(&dcp->crtc->base.mutex);
@@ -233,7 +236,11 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.brightness = dcp->brightness.nits,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
-	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+		props.max_brightness = dcp->brightness.maximum;
+	else
+		props.max_brightness = min(dcp->brightness.maximum,
+					  MAX_BRIGHTNESS_PART2 - 1);
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);
@@ -241,7 +248,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		return PTR_ERR(bl_dev);
 
 	dcp->brightness.bl_dev = bl_dev;
-	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6)
+		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
 
 	return 0;
 }

@@ -16,6 +16,7 @@
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -80,6 +81,24 @@ static dcp_bool_arg_t dcp_bool_arg(bool value)
 		.value = value,
 		.padding = { 0xaa, 0xaa, 0xaa },
 	};
+}
+
+/* Native 26.6 brightness and display-off swaps use binary64 nits, not iDAC. */
+static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits)
+{
+	u64 bits = 0;
+
+	if (nits) {
+		unsigned int exponent = fls(nits) - 1;
+
+		/* All u32 integers are exactly representable; no kernel FP use. */
+		bits = (u64)(exponent + 1023) << 52;
+		bits |= ((u64)nits << (52 - exponent)) & GENMASK_ULL(51, 0);
+	}
+
+	swap->bl_update = 1;
+	swap->bl_flags[1] = 1;
+	put_unaligned_le64(bits, &swap->bl_nits);
 }
 #else
 typedef struct dcp_set_power_state_req dcp_power_state_req_t;
@@ -308,6 +327,7 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
+#if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	case IOMFB_PROPERTY_NITS_V13_3:
 #else
@@ -323,6 +343,7 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 		}
 		break;
 	}
+#endif
 	default:
 		dev_dbg(dcp->dev, "pr_publish: id: %d = %u\n", prop->id, prop->value);
 	}
@@ -1171,6 +1192,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		dcp_swap_set_brightness(&swap->swap, 0);
+#else
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 		swap->swap.bl_update = 1;
 #else
@@ -1178,6 +1202,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
+#endif
 	}
 
 	/* Null all surfaces */
@@ -1495,24 +1520,32 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 		dcp_drm_crtc_vblank(dcp->crtc);
 }
 
-static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
-					  void *cookie)
-{
-	struct dcp_wait_cookie *wait = cookie;
-
-	if (wait) {
-		complete(&wait->done);
-		kref_put(&wait->refcount, release_wait_cookie);
-	}
-}
-
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 struct dcp_modeset_cookie {
 	/* Must be first: release_wait_cookie() frees this allocation. */
 	struct dcp_wait_cookie wait;
 	struct dcp_set_digital_out_mode_req actual;
 	struct dcp_set_digital_out_mode_req bootstrap;
+	u32 result;
 };
+#endif
+
+static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
+					  void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	if (wait) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		((struct dcp_modeset_cookie *)cookie)->result =
+			get_unaligned_le32(data);
+#endif
+		complete(&wait->done);
+		kref_put(&wait->refcount, release_wait_cookie);
+	}
+}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 
 static void dcp_get_mode_info(struct apple_dcp *dcp,
 			      const struct dcp_set_digital_out_mode_req *mode,
@@ -1548,6 +1581,11 @@ static void dcp_modeset_after_bootstrap(struct apple_dcp *dcp, void *data,
 {
 	struct dcp_modeset_cookie *modeset = cookie;
 
+	if (get_unaligned_le32(data)) {
+		complete_set_digital_out_mode(dcp, data, cookie);
+		return;
+	}
+
 	dcp_get_mode_info(dcp, &modeset->actual,
 			  dcp_modeset_after_actual_info, cookie);
 }
@@ -1581,7 +1619,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 
 	dev_info(dcp->dev,
-		 "set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
+		 "select_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		 mode->color_mode_id, mode->timing_mode_id,
 		 DRM_MODE_ARG(&crtc_state->mode));
 	if (mode->color_mode_id == mode->sdr_rgb.id)
@@ -1594,7 +1632,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		cmode = &mode->best;
 	if (cmode)
 		dev_info(dcp->dev,
-			"set_digital_out_mode() color mode depth:%hhu format:%u "
+			"select_mode() color mode depth:%hhu format:%u "
 			"colorimetry:%u eotf:%u range:%u vrr:%u\n", cmode->depth,
 			cmode->format, cmode->colorimetry, cmode->eotf,
 			cmode->range, mode->vrr);
@@ -1608,6 +1646,17 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->use_timestamps = mode->vrr;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/*
+	 * Native fixed-panel mode changes use A407 source/destination geometry,
+	 * not the external digital-output A364/A413 sequence. Accept only the
+	 * single firmware-advertised non-VRR timing, already matched above.
+	 */
+	if (dcp_has_panel(dcp) && dcp->main_display &&
+	    dcp->nr_modes == 1 && !mode->vrr) {
+		dcp->valid_mode = true;
+		return 0;
+	}
+
 	modeset_cookie = kzalloc(sizeof(*modeset_cookie), GFP_KERNEL);
 	if (!modeset_cookie)
 		return -ENOMEM;
@@ -1658,6 +1707,15 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 */
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	if (ret > 0 && modeset_cookie->result) {
+		dev_err(dcp->dev, "set_digital_out_mode returned 0x%08x\n",
+			modeset_cookie->result);
+		ret = -EIO;
+	}
+	if (ret <= 0)
+		dcp->valid_mode = false;
+#endif
 
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->during_modeset = false;
@@ -1668,7 +1726,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	} else if (ret < 0) {
 		dev_info(dcp->dev,
-			 "waiting on set_digital_out_mode failed:%d\n", ret);
+			 "set_digital_out_mode failed:%d\n", ret);
 		return -EIO;
 
 	} else if (ret > 0) {
@@ -1798,6 +1856,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		dcp_swap_set_brightness(&req->swap, dcp->brightness.nits);
+#else
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 		req->swap.bl_update = 1;
 #else
@@ -1805,6 +1866,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 
@@ -1840,6 +1902,13 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 
 	dcp->active = true;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/* 26.6 no longer publishes the legacy initial-nits property (D300/15).
+	 * Start with the requested value zero; userspace sets its desired nits.
+	 */
+	if (dcp_has_panel(dcp) && dcp->brightness.maximum > 0)
+		schedule_work(&dcp->bl_register_wq);
+#endif
 	complete(&dcp->start_done);
 }
 
