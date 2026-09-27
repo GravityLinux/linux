@@ -36,6 +36,7 @@
 
 /* 4KB virtual address space limits */
 #define VA_BITS_4KB              39
+#define MMAP_RND_BITS_4KB        (VA_BITS_4KB - PAGE_SHIFT_4KB - 3)
 #define TASK_SIZE_4KB            (_AC(1, UL) << VA_BITS_4KB)
 #define DEFAULT_MAP_WINDOW_4KB   TASK_SIZE_4KB
 #define STACK_TOP_MAX_4KB        DEFAULT_MAP_WINDOW_4KB

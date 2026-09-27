@@ -409,6 +409,8 @@ unsigned long arch_mmap_rnd(void)
 #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
 		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
 
+	rnd &= mm_mmap_rnd_mask(current->mm);
+
 	return rnd << PAGE_SHIFT;
 }
 
