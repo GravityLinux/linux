@@ -147,7 +147,8 @@ static inline unsigned int vma_slice_offset(const struct vm_area_struct *vma,
 		return (addr >> PAGE_SHIFT_4KB) & P3S_SLICE_MASK;
 
 	/*
-	 * Other VMAs (files, shmem) map folios by offset: vm_start maps slice
+	 * Other VMAs (files, shmem, private /dev/zero) map folios by offset.
+	 * A /dev/zero VMA can retain vm_file without vm_ops. vm_start maps slice
 	 * vm_slice_off of its folio. Count the 4KB pages from vm_start to
 	 * @addr on top of that slice; the low bits are the slice of the folio
 	 * that backs @addr.
