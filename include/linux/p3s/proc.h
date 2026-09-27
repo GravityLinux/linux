@@ -3,6 +3,15 @@
 #define _LINUX_P3S_PROC_H
 
 #include <linux/mm.h>
+#include <linux/hugetlb.h>
+
+/* Preserve architecture-specific MMU page sizes outside P3S VMAs. */
+static inline unsigned long p3s_vma_mmu_pagesize(struct vm_area_struct *vma)
+{
+	if (vma_is_p3s_4k(vma))
+		return vma_page_size(vma);
+	return vma_mmu_pagesize(vma);
+}
 
 /*
  * vma_slice_ptes - Count the PTEs around @ptep that map @page
