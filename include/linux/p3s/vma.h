@@ -189,6 +189,14 @@ static inline unsigned long vma_folio_offset(const struct vm_area_struct *vma,
 	       vma_offset_in_page(vma, addr);
 }
 
+/* Bytes to the end of the backing kernel page, bounded by @vma. */
+static inline unsigned long vma_kernel_page_bytes(const struct vm_area_struct *vma,
+						  unsigned long addr)
+{
+	return min(PAGE_SIZE_KERNEL - vma_folio_offset(vma, addr),
+		   vma->vm_end - addr);
+}
+
 /*
  * vma_file_offset - Byte offset in the file that vm_start maps
  * @vma: Pointer to struct vm_area_struct
