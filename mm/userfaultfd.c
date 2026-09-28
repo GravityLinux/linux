@@ -1446,8 +1446,11 @@ static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
 			 pmd_t *dst_pmd, pmd_t dst_pmdval,
 			 spinlock_t *dst_ptl, spinlock_t *src_ptl,
 			 struct folio *src_folio,
-			 struct swap_info_struct *si, swp_entry_t entry)
+			 struct swap_info_struct *si, swp_entry_t entry,
+			 unsigned long len)
 {
+	int nr;
+
 	/*
 	 * Check if the folio still belongs to the target swap entry after
 	 * acquiring the lock. Folio can be freed in the swap cache while
@@ -1463,6 +1466,13 @@ static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
 				 dst_pmd, dst_pmdval)) {
 		double_pt_unlock(dst_ptl, src_ptl);
 		return -EAGAIN;
+	}
+
+	nr = p3s_uffd_swap_nr(src_addr, dst_addr, len, src_pte,
+			      dst_pte, orig_src_pte, src_folio, entry);
+	if (nr < 0) {
+		double_pt_unlock(dst_ptl, src_ptl);
+		return nr;
 	}
 
 	/*
@@ -1497,9 +1507,11 @@ static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
 	if (userfaultfd_rwp(dst_vma))
 		orig_src_pte = pte_swp_mkuffd(orig_src_pte);
 	set_pte_at(mm, dst_addr, dst_pte, orig_src_pte);
+	p3s_uffd_move_swap_siblings(mm, dst_addr, src_addr, dst_pte, src_pte, nr,
+				    userfaultfd_rwp(dst_vma));
 	double_pt_unlock(dst_ptl, src_ptl);
 
-	return PAGE_SIZE;
+	return nr * PAGE_SIZE;
 }
 
 static int move_zeropage_pte(struct mm_struct *mm,
@@ -1738,7 +1750,7 @@ retry:
 			goto out;
 		}
 
-		if (!pte_swp_exclusive(orig_src_pte)) {
+		if (!pte_swp_exclusive(orig_src_pte) && !vma_is_p3s_4k(src_vma)) {
 			ret = -EBUSY;
 			goto out;
 		}
@@ -1783,7 +1795,7 @@ retry:
 		}
 		ret = move_swap_pte(mm, dst_vma, dst_addr, src_addr, dst_pte, src_pte,
 				orig_dst_pte, orig_src_pte, dst_pmd, dst_pmdval,
-				dst_ptl, src_ptl, src_folio, si, entry);
+				dst_ptl, src_ptl, src_folio, si, entry, len);
 	}
 
 out:
