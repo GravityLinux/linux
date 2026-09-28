@@ -29,4 +29,9 @@ static inline void p3s_assert_matching_pte_shift(const struct mm_struct *mm)
 #endif /* !__ASSEMBLY__ */
 #endif /* CONFIG_ARM64 */
 
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+int p3s_remap_pfn_slice(struct vm_area_struct *vma, unsigned long addr,
+			unsigned long pfn, unsigned int slice, pgprot_t prot);
+#endif
+
 #endif /* _LINUX_P3S_H */

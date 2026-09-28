@@ -5,7 +5,9 @@
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/p3s/mm.h>
+#include <linux/cacheflush.h>
 #include "vma.h"
+#include "p3s/pgtable.h"
 
 enum p3s_4k_mode p3s_4k_mode __ro_after_init = P3S_4K_MODE_OFF;
 EXPORT_SYMBOL(p3s_4k_mode);
@@ -30,6 +32,40 @@ static int __init parse_p3s_4k(char *str)
 	return -EINVAL;
 }
 early_param("p3s_4k", parse_p3s_4k);
+
+/* Map one explicit physical slice when it differs from the VMA phase. */
+int p3s_remap_pfn_slice(struct vm_area_struct *vma, unsigned long addr,
+			unsigned long pfn, unsigned int slice, pgprot_t prot)
+{
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long frame;
+	pte_t *pte;
+	spinlock_t *ptl;
+	int err = 0;
+
+	if (!mm_is_p3s_4k(mm) ||
+	    !mm_pte_aligned(mm, addr) || addr < vma->vm_start ||
+	    addr >= vma->vm_end || PAGE_SIZE_4KB > vma->vm_end - addr ||
+	    slice >= mm_slices_per_page(mm))
+		return -EINVAL;
+	if (!pfn_modify_allowed(pfn, prot))
+		return -EACCES;
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	flush_cache_range(vma, addr, addr + PAGE_SIZE_4KB);
+	pte = get_locked_pte(mm, addr, &ptl);
+	if (!pte)
+		return -ENOMEM;
+	if (!pte_none(ptep_get(pte))) {
+		err = -EBUSY;
+		goto unlock;
+	}
+	frame = (pfn << P3S_SLICE_SHIFT) + slice;
+	set_pte_at(mm, addr, pte, pte_mkspecial(mm_frame_pte(mm, frame, prot)));
+unlock:
+	pte_unmap_unlock(pte, ptl);
+	return err;
+}
 
 #define vmg_is_p3s_4k(vmg)	mm_is_p3s_4k((vmg)->mm)
 
