@@ -139,23 +139,17 @@ static bool valid_vma(struct vm_area_struct *vma, bool is_register)
 	if (is_register)
 		flags |= VM_WRITE;
 
-	/* Breakpoints are written at kernel page offsets */
-	if (vma_is_p3s_4k(vma))
-		return false;
-
 	return vma->vm_file && (vma->vm_flags & flags) == VM_MAYEXEC;
 }
 
 static unsigned long offset_to_vaddr(struct vm_area_struct *vma, loff_t offset)
 {
-	return vma->vm_start + offset -
-		((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+	return vma->vm_start + offset - vma_file_offset(vma);
 }
 
 static loff_t vaddr_to_offset(struct vm_area_struct *vma, unsigned long vaddr)
 {
-	return ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT) +
-		(vaddr - vma->vm_start);
+	return vma_file_offset_at(vma, vaddr);
 }
 
 /**
@@ -309,7 +303,7 @@ find_ref_ctr_vma(struct uprobe *uprobe, struct mm_struct *mm)
 }
 
 static int
-__update_ref_ctr(struct mm_struct *mm, unsigned long vaddr, short d)
+__update_ref_ctr(struct vm_area_struct *vma, unsigned long vaddr, short d)
 {
 	void *kaddr;
 	struct page *page;
@@ -319,7 +313,7 @@ __update_ref_ctr(struct mm_struct *mm, unsigned long vaddr, short d)
 	if (!vaddr || !d)
 		return -EINVAL;
 
-	ret = get_user_pages_remote(mm, vaddr, 1,
+	ret = get_user_pages_remote(vma->vm_mm, vaddr, 1,
 				    FOLL_WRITE, &page, NULL);
 	if (unlikely(ret <= 0)) {
 		/*
@@ -330,7 +324,7 @@ __update_ref_ctr(struct mm_struct *mm, unsigned long vaddr, short d)
 	}
 
 	kaddr = kmap_local_page(page);
-	ptr = kaddr + (vaddr & ~PAGE_MASK);
+	ptr = kaddr + vma_folio_offset(vma, vaddr);
 
 	if (unlikely(*ptr + d < 0)) {
 		pr_warn("ref_ctr going negative. vaddr: 0x%lx, "
@@ -368,7 +362,7 @@ static int update_ref_ctr(struct uprobe *uprobe, struct mm_struct *mm,
 
 	if (rc_vma) {
 		rc_vaddr = offset_to_vaddr(rc_vma, uprobe->ref_ctr_offset);
-		ret = __update_ref_ctr(mm, rc_vaddr, d);
+		ret = __update_ref_ctr(rc_vma, rc_vaddr, d);
 		if (ret)
 			update_ref_ctr_warn(uprobe, mm, d);
 
@@ -411,7 +405,8 @@ static int __uprobe_write(struct vm_area_struct *vma,
 		unsigned long insn_vaddr, uprobe_opcode_t *insn, int nbytes,
 		bool is_register)
 {
-	const unsigned long vaddr = insn_vaddr & PAGE_MASK;
+	const unsigned long vaddr = insn_vaddr & vma_page_mask(vma);
+	unsigned long page_offset = vma_folio_offset(vma, insn_vaddr);
 	bool pmd_mappable;
 
 	/* For now, we'll only handle PTE-mapped folios. */
@@ -436,7 +431,11 @@ static int __uprobe_write(struct vm_area_struct *vma,
 	 */
 	flush_cache_page(vma, vaddr, pte_pfn(fw->pte));
 	fw->pte = ptep_clear_flush(vma, vaddr, fw->ptep);
-	copy_to_page(fw->page, insn_vaddr, insn, nbytes);
+	copy_to_page(fw->page, page_offset, insn, nbytes);
+
+	/* Other slices can remain mapped while this PTE is replaced. */
+	if (vma_is_p3s_4k(vma))
+		flush_dcache_page(fw->page);
 
 	/*
 	 * When unregistering, we may only zap a PTE if uffd is disabled and
@@ -505,7 +504,7 @@ int uprobe_write(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 		 uprobe_write_verify_t verify, bool is_register, bool do_update_ref_ctr,
 		 void *data)
 {
-	const unsigned long vaddr = insn_vaddr & PAGE_MASK;
+	const unsigned long vaddr = insn_vaddr & vma_page_mask(vma);
 	struct mm_struct *mm = vma->vm_mm;
 	struct uprobe *uprobe;
 	int ret, ref_ctr_updated = 0;
@@ -537,7 +536,8 @@ retry:
 		goto out;
 	folio = page_folio(page);
 
-	ret = verify(page, insn_vaddr, insn, nbytes, data);
+	ret = verify(page, vma_folio_offset(vma, insn_vaddr),
+		     insn, nbytes, data);
 	if (ret <= 0) {
 		folio_put(folio);
 		goto out;
@@ -568,7 +568,7 @@ retry:
 		 * be able to do it under PTL.
 		 */
 		mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
-					vaddr, vaddr + PAGE_SIZE);
+					vaddr, vaddr + vma_page_size(vma));
 		mmu_notifier_invalidate_range_start(&range);
 	}
 
@@ -1489,7 +1489,7 @@ static int unapply_uprobe(struct uprobe *uprobe, struct mm_struct *mm)
 		    file_inode(vma->vm_file) != uprobe->inode)
 			continue;
 
-		offset = (loff_t)vma_start_pgoff(vma) << PAGE_SHIFT;
+		offset = vma_file_offset(vma);
 		if (uprobe->offset <  offset ||
 		    uprobe->offset >= offset + vma->vm_end - vma->vm_start)
 			continue;
@@ -1583,7 +1583,7 @@ static int delayed_ref_ctr_inc(struct vm_area_struct *vma)
 			continue;
 
 		vaddr = offset_to_vaddr(vma, du->uprobe->ref_ctr_offset);
-		ret = __update_ref_ctr(vma->vm_mm, vaddr, 1);
+		ret = __update_ref_ctr(vma, vaddr, 1);
 		if (ret) {
 			update_ref_ctr_warn(du->uprobe, vma->vm_mm, 1);
 			if (!err)
@@ -2398,7 +2398,7 @@ static void mmf_recalc_uprobes(struct mm_struct *mm)
 	mm_flags_clear(MMF_HAS_UPROBES, mm);
 }
 
-static int is_trap_at_addr(struct mm_struct *mm, unsigned long vaddr)
+static int is_trap_at_addr(struct vm_area_struct *vma, unsigned long vaddr)
 {
 	struct page *page;
 	uprobe_opcode_t opcode;
@@ -2418,7 +2418,8 @@ static int is_trap_at_addr(struct mm_struct *mm, unsigned long vaddr)
 	if (result < 0)
 		return result;
 
-	uprobe_copy_from_page(page, vaddr, &opcode, UPROBE_SWBP_INSN_SIZE);
+	uprobe_copy_from_page(page, vma_folio_offset(vma, vaddr), &opcode,
+			      UPROBE_SWBP_INSN_SIZE);
 	put_page(page);
  out:
 	/* This needs to return true for any variant of the trap insn */
@@ -2454,8 +2455,7 @@ static struct uprobe *find_active_uprobe_speculative(unsigned long bp_vaddr)
 	if (!vm_file)
 		return NULL;
 
-	offset = (loff_t)(vma_start_pgoff(vma) << PAGE_SHIFT) +
-		(bp_vaddr - vma->vm_start);
+	offset = vaddr_to_offset(vma, bp_vaddr);
 	uprobe = find_uprobe_rcu(vm_file->f_inode, offset);
 	if (!uprobe)
 		return NULL;
@@ -2489,7 +2489,7 @@ static struct uprobe *find_active_uprobe_rcu(unsigned long bp_vaddr, int *is_swb
 		}
 
 		if (!uprobe)
-			*is_swbp = is_trap_at_addr(mm, bp_vaddr);
+			*is_swbp = is_trap_at_addr(vma, bp_vaddr);
 	} else {
 		*is_swbp = -EFAULT;
 	}
