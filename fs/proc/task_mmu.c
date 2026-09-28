@@ -18,6 +18,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
+#include <linux/p3s/shmem.h>
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
 #include <linux/minmax.h>
@@ -1038,6 +1039,11 @@ static int smaps_pte_hole(unsigned long addr, unsigned long end,
 {
 	struct mem_size_stats *mss = walk->private;
 	struct vm_area_struct *vma = walk->vma;
+
+	if (vma_is_p3s_4k(vma)) {
+		mss->swap += vma_shmem_swap_usage(vma, addr, end);
+		return 0;
+	}
 
 	mss->swap += shmem_partial_swap_usage(walk->vma->vm_file->f_mapping,
 					      linear_page_index(vma, addr),
