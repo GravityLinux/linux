@@ -61,6 +61,7 @@
 #include <linux/seq_file.h>
 
 #include "internal.h"
+#include <linux/p3s/perf.h>
 
 #include <asm/irq_regs.h>
 
@@ -8531,6 +8532,7 @@ static u64 perf_virt_to_phys(u64 virt)
  */
 static u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	u64 size = 0;
 
 #ifdef CONFIG_HAVE_GUP_FAST
@@ -8564,7 +8566,7 @@ static u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr)
 	if (pud_leaf(pud))
 		return pud_leaf_size(pud);
 
-	pmdp = pmd_offset_lockless(pudp, pud, addr);
+	pmdp = mm_pmd_offset(mm, &pud, addr);
 again:
 	pmd = pmdp_get_lockless(pmdp);
 	if (!pmd_present(pmd))
@@ -8579,7 +8581,7 @@ again:
 
 	pte = ptep_get_lockless(ptep);
 	if (pte_present(pte))
-		size = __pte_leaf_size(pmd, pte);
+		size = p3s_perf_pte_size(mm, __pte_leaf_size(pmd, pte));
 	pte_unmap(ptep);
 #endif /* CONFIG_HAVE_GUP_FAST */
 
@@ -9906,7 +9908,7 @@ static bool perf_addr_filter_vma_adjust(struct perf_addr_filter *filter,
 					struct perf_addr_filter_range *fr)
 {
 	unsigned long vma_size = vma->vm_end - vma->vm_start;
-	unsigned long off = vma_start_pgoff(vma) << PAGE_SHIFT;
+	unsigned long off = vma_file_offset(vma);
 	struct file *file = vma->vm_file;
 
 	if (!perf_addr_filter_match(filter, file, off, vma_size))
@@ -9992,7 +9994,7 @@ void perf_event_mmap(struct vm_area_struct *vma)
 			/* .tid */
 			.start  = vma->vm_start,
 			.len    = vma->vm_end - vma->vm_start,
-			.pgoff  = (u64)vma_start_pgoff(vma) << PAGE_SHIFT,
+			.pgoff  = p3s_mmap_pgoff(vma),
 		},
 		/* .maj (attr_mmap2 only) */
 		/* .min (attr_mmap2 only) */
