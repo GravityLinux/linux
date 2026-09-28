@@ -967,7 +967,7 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
 				continue;
 		}
 		folio = swap_cache_read_folio(&ctx, entry, gfp_mask, mpol, ilx,
-					      addr != vmf->address);
+					      entry.val != targ_entry.val);
 		if (si)
 			put_swap_device(si);
 		if (!folio)
