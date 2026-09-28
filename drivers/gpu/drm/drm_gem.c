@@ -1378,8 +1378,12 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct drm_gem_object *obj;
 	int ret;
 
+	/* GEM offsets are opaque kernel-page-aligned object cookies. */
+	if (vma_slice_off(vma))
+		return -EINVAL;
+
 	obj = drm_gem_object_lookup_at_offset(filp, vma->vm_pgoff,
-					      vma_pages(vma));
+					      vma_pgoff_pages(vma));
 	if (IS_ERR(obj))
 		return PTR_ERR(obj);
 
