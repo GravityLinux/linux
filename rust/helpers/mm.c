@@ -3,6 +3,11 @@
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
 
+__rust_helper unsigned int rust_helper_mm_pte_shift(const struct mm_struct *mm)
+{
+	return mm_pte_shift(mm);
+}
+
 __rust_helper void rust_helper_mmgrab(struct mm_struct *mm)
 {
 	mmgrab(mm);
