@@ -219,6 +219,32 @@ static inline unsigned long vma_folio_nr_ptes(const struct vm_area_struct *vma,
 	return folio_nr_pages(folio);
 }
 
+/* Merge access bits while batching contiguous PTEs of one P3S folio. */
+static inline int p3s_madvise_folio_pte_batch(struct vm_area_struct *vma,
+					      unsigned long addr,
+					      unsigned long end,
+					      struct folio *folio, pte_t *ptep,
+					      pte_t *ptentp)
+{
+	unsigned long size = mm_pte_size(vma->vm_mm);
+	int max_nr = (end - addr) / size;
+	int nr;
+
+	/* Unlike mlock's threshold, count all slices of a small folio. */
+	max_nr = min_t(int, max_nr, folio_size(folio) / size);
+	for (nr = 1; nr < max_nr; nr++) {
+		pte_t next = ptep_get(ptep + nr);
+
+		if (!p3s_pte_maps_folio(vma, addr + nr * size, next, folio))
+			break;
+		if (pte_young(next))
+			*ptentp = pte_mkyoung(*ptentp);
+		if (pte_dirty(next))
+			*ptentp = pte_mkdirty(*ptentp);
+	}
+	return nr;
+}
+
 /*
  * vma_anon_index_matches - Check an anonymous page's index against @addr
  * @vma: Pointer to struct vm_area_struct

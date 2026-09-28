@@ -348,11 +348,16 @@ static inline bool can_do_file_pageout(struct vm_area_struct *vma)
 	       file_permission(vma->vm_file, MAY_WRITE) == 0;
 }
 
-static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+static inline int madvise_folio_pte_batch(struct vm_area_struct *vma,
+					  unsigned long addr, unsigned long end,
 					  struct folio *folio, pte_t *ptep,
 					  pte_t *ptentp)
 {
 	int max_nr = (end - addr) / PAGE_SIZE;
+
+	if (vma_is_p3s_4k(vma))
+		return p3s_madvise_folio_pte_batch(vma, addr, end,
+						    folio, ptep, ptentp);
 
 	return folio_pte_batch_flags(folio, NULL, ptep, ptentp, max_nr,
 				     FPB_MERGE_YOUNG_DIRTY);
@@ -492,9 +497,10 @@ restart:
 		 * fail to split a folio, leave it in place and advance to the
 		 * next pte in the range.
 		 */
-		if (folio_test_large(folio)) {
-			nr = madvise_folio_pte_batch(addr, end, folio, pte, &ptent);
-			if (nr < folio_nr_pages(folio)) {
+		if (folio_test_large(folio) || vma_is_p3s_4k(vma)) {
+			nr = madvise_folio_pte_batch(vma, addr, end, folio,
+						     pte, &ptent);
+			if (nr < vma_folio_nr_ptes(vma, folio)) {
 				int err;
 
 				if (folio_maybe_mapped_shared(folio))
@@ -525,11 +531,11 @@ restart:
 		/*
 		 * Do not interfere with other mappings of this folio and
 		 * non-LRU folio. If we have a large folio at this point, we
-		 * know it is fully mapped so if its mapcount is the same as its
-		 * number of pages, it must be exclusive.
+		 * know it is fully mapped so if its mapcount is the same as
+		 * the number of PTEs in the batch, it must be exclusive.
 		 */
 		if (!folio_test_lru(folio) ||
-		    (folio_mapcount(folio) != folio_nr_pages(folio) &&
+		    (folio_mapcount(folio) != nr &&
 		     !vma_folio_slices_exclusive(vma, folio)))
 			continue;
 
@@ -723,8 +729,9 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 		 * next pte in the range.
 		 */
 		if (folio_test_large(folio)) {
-			nr = madvise_folio_pte_batch(addr, end, folio, pte, &ptent);
-			if (nr < folio_nr_pages(folio)) {
+			nr = madvise_folio_pte_batch(vma, addr, end, folio,
+						     pte, &ptent);
+			if (nr < vma_folio_nr_ptes(vma, folio)) {
 				int err;
 
 				if (folio_maybe_mapped_shared(folio))
