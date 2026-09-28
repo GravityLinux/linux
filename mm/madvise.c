@@ -676,8 +676,8 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 	pte_t *start_pte, *pte, ptent;
 	struct folio *folio;
 	int nr_swap = 0;
-	unsigned long next;
-	int nr, max_nr;
+	unsigned long next, start = addr;
+	int nr, nr_mapped, max_nr;
 
 	next = pmd_addr_end(addr, end);
 	if (pmd_trans_huge(*pmd))
@@ -692,6 +692,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 	lazy_mmu_mode_enable();
 	for (; addr != end; pte += nr, addr += PAGE_SIZE * nr) {
 		nr = 1;
+		nr_mapped = 1;
 		ptent = ptep_get(pte);
 
 		if (pte_none(ptent))
@@ -728,9 +729,13 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 		 * fail to split a folio, leave it in place and advance to the
 		 * next pte in the range.
 		 */
-		if (folio_test_large(folio)) {
+		if (folio_test_large(folio) || vma_is_p3s_4k(vma)) {
 			nr = madvise_folio_pte_batch(vma, addr, end, folio,
 						     pte, &ptent);
+			nr_mapped = nr;
+			if (!p3s_folio_slices_in_range(vma, start, addr, end,
+						       pte, folio, &nr_mapped))
+				continue;
 			if (nr < vma_folio_nr_ptes(vma, folio)) {
 				int err;
 
@@ -762,10 +767,10 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				continue;
 			/*
 			 * If we have a large folio at this point, we know it is
-			 * fully mapped so if its mapcount is the same as its
-			 * number of pages, it must be exclusive.
+			 * fully mapped so if its mapcount is the same as the
+			 * number of PTEs in the batch, it must be exclusive.
 			 */
-			if (folio_mapcount(folio) != folio_nr_pages(folio)) {
+			if (folio_mapcount(folio) != nr_mapped) {
 				folio_unlock(folio);
 				continue;
 			}

@@ -219,6 +219,44 @@ static inline unsigned long vma_folio_nr_ptes(const struct vm_area_struct *vma,
 	return folio_nr_pages(folio);
 }
 
+/**
+ * p3s_folio_slices_in_range - Check MADV_FREE coverage of a small folio
+ * @vma: VMA containing the range
+ * @start: Start of the current page-table walk
+ * @addr: Address of the current PTE
+ * @end: End of the current page-table walk
+ * @pte: Current PTE, mapped and locked
+ * @folio: Folio mapped by the batch
+ * @nr: Contiguous batch size on entry, covered mapcount on return
+ *
+ * A small 16KB folio can have four 4KB slice PTEs. Before MADV_FREE can
+ * clear its folio-wide dirty state, the advised range must contain every
+ * mapping. Count across holes in its slice window, but only within the
+ * range held under this PTL. Keep this count separate from the contiguous
+ * batch used to update PTEs. Native and large folios keep their checks.
+ */
+static inline bool p3s_folio_slices_in_range(struct vm_area_struct *vma,
+					     unsigned long start,
+					     unsigned long addr,
+					     unsigned long end, pte_t *pte,
+					     const struct folio *folio, int *nr)
+{
+	unsigned long first, last;
+	unsigned int nr_slices;
+
+	if (!vma_is_p3s_4k(vma) || folio_test_large(folio))
+		return true;
+
+	vma_folio_slice_bounds(vma, addr, &nr_slices, &first);
+	last = min(end, first + (nr_slices << PAGE_SHIFT_4KB));
+	first = max(start, first);
+	*nr = p3s_count_folio_slices(vma,
+				     pte - ((addr - first) >> PAGE_SHIFT_4KB),
+				     first, (last - first) >> PAGE_SHIFT_4KB,
+				     folio);
+	return folio_mapcount(folio) == *nr;
+}
+
 /* Merge access bits while batching contiguous PTEs of one P3S folio. */
 static inline int p3s_madvise_folio_pte_batch(struct vm_area_struct *vma,
 					      unsigned long addr,
