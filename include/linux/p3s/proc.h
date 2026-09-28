@@ -5,6 +5,21 @@
 #include <linux/mm.h>
 #include <linux/hugetlb.h>
 
+/**
+ * mm_pinned_vm_pages - pinned_vm of @mm in pages of mm_pte_size(@mm)
+ * @mm: mm_struct to report
+ *
+ * pinned_vm counts kernel pages, e.g. from perf_mmap(), while task_mem()
+ * prints the other counters of @mm in its own page size. Keep the 64-bit
+ * counter width for native configurations with a 32-bit unsigned long.
+ *
+ * Return: Pinned memory expressed in pages of mm_pte_size(@mm) bytes.
+ */
+static inline u64 mm_pinned_vm_pages(const struct mm_struct *mm)
+{
+	return (u64)atomic64_read(&mm->pinned_vm) * mm_slices_per_page(mm);
+}
+
 /* Preserve architecture-specific MMU page sizes outside P3S VMAs. */
 static inline unsigned long p3s_vma_mmu_pagesize(struct vm_area_struct *vma)
 {
