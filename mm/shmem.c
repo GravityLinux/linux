@@ -2827,6 +2827,9 @@ unsigned long shmem_get_unmapped_area(struct file *file,
 			return addr;
 	}
 
+	if (mm_is_p3s_4k(current->mm))
+		return addr;
+
 	if (len < hpage_size)
 		return addr;
 
