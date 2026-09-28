@@ -157,6 +157,15 @@ static inline unsigned int vma_slice_offset(const struct vm_area_struct *vma,
 	       P3S_SLICE_MASK;
 }
 
+/* Object offsets survive mremap; anonymous slices follow their address. */
+static inline unsigned short
+vma_mremap_slice_off(const struct vm_area_struct *vma, unsigned long old_addr,
+		     unsigned long new_addr)
+{
+	return vma_slice_offset(vma, vma->vm_file || vma->vm_ops ?
+				    old_addr : new_addr);
+}
+
 /*
  * vma_folio_offset - Byte offset of @addr within the 16KB page backing it
  * @vma: Pointer to struct vm_area_struct

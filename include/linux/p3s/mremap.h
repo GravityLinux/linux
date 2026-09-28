@@ -16,20 +16,24 @@ unsigned long __get_unmapped_area(struct file *file, unsigned long addr,
 
 /**
  * mm_mremap_fixed_keeps_slice - Check that MREMAP_FIXED keeps the slice
+ * @vma: Source VMA
  * @old_addr: Source address being remapped
  * @new_addr: MREMAP_FIXED destination
  *
- * In a 4KB process, @new_addr must be at the same slice of a 16KB-aligned
- * window as @old_addr (see mm_mremap_get_unmapped_area()). Copying the
- * pages to new folios at other slices would break get_user_pages() and DMA
- * pins on the old folios. Android ART's MREMAP_FIXED users,
+ * File and object mappings keep their backing offset without copying pages.
+ * For anonymous mappings in a 4KB process, @new_addr must be at the same
+ * slice of a 16KB-aligned window as @old_addr (see
+ * mm_mremap_get_unmapped_area()). Copying the pages to new folios at
+ * other slices would break get_user_pages() and DMA pins on the old
+ * folios. Android ART's MREMAP_FIXED users,
  * MarkCompact::KernelPrepareRangeForUffd (2MB-aligned ranges) and
  * MemMap::ReplaceWith (16KB-aligned mmap() addresses), always meet this.
  */
-static inline bool mm_mremap_fixed_keeps_slice(unsigned long old_addr,
+static inline bool mm_mremap_fixed_keeps_slice(const struct vm_area_struct *vma,
+					       unsigned long old_addr,
 					       unsigned long new_addr)
 {
-	return !mm_is_p3s_4k(current->mm) ||
+	return vma->vm_file || vma->vm_ops || !vma_is_p3s_4k(vma) ||
 	       !((old_addr ^ new_addr) & ~PAGE_MASK_KERNEL);
 }
 
@@ -72,8 +76,8 @@ static inline bool mm_mremap_fixed_keeps_slice(unsigned long old_addr,
  * the 16KB window that contains it.
  *
  * An MREMAP_FIXED @addr goes to __get_unmapped_area() unchanged.
- * check_mremap_params() has already rejected one at another slice with
- * mm_mremap_fixed_keeps_slice().
+ * check_prep_vma() rejects cross-slice anonymous moves before unmapping the
+ * destination. File and object mappings retain their source slice instead.
  */
 static inline unsigned long mm_mremap_get_unmapped_area(struct file *file,
 		unsigned long addr, unsigned long len, unsigned long pgoff,

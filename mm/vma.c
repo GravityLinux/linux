@@ -1926,16 +1926,20 @@ static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma)
  * prior to moving page table entries, to effect an mremap move.
  */
 struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
-	unsigned long addr, unsigned long len, pgoff_t pgoff,
-	pgoff_t anon_pgoff, bool *need_rmap_locks, bool keep_source)
+	unsigned long old_addr, unsigned long addr, unsigned long len,
+	pgoff_t pgoff, pgoff_t anon_pgoff, bool *need_rmap_locks,
+	bool keep_source)
 {
 	struct vm_area_struct *vma = *vmap;
 	unsigned long old_vma_start = vma->vm_start;
+	unsigned short slice_off = vma_mremap_slice_off(vma, old_addr, addr);
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *new_vma;
 	bool can_self_merge = false;
 	VMA_ITERATOR(vmi, mm, addr);
 	VMG_VMA_STATE(vmg, &vmi, NULL, vma, addr, addr + len);
+
+	vmg_set_slice_off(&vmg, slice_off);
 
 	/*
 	 * If a vma has not yet been faulted, update its anonymous pgoff to
@@ -2007,7 +2011,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		if (!new_vma)
 			goto out;
 		vma_set_range(new_vma, addr, addr + len, pgoff, anon_pgoff);
-		vma_set_slice_off(new_vma, vma_slice_offset(vma, addr));
+		vma_set_slice_off(new_vma, slice_off);
 		if (vma_dup_policy(vma, new_vma))
 			goto out_free_vma;
 		if (anon_vma_clone(new_vma, vma, VMA_OP_REMAP))
