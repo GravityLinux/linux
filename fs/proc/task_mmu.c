@@ -1085,10 +1085,11 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 			mss->swap += PAGE_SIZE;
 			mapcount = swp_swapcount(entry);
 			if (mapcount >= 2) {
-				u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
+				u64 pss_delta = (u64)PAGE_SIZE_KERNEL << PSS_SHIFT;
 
 				do_div(pss_delta, mapcount);
-				mss->swap_pss += pss_delta;
+				mss->swap_pss += min(pss_delta,
+						     (u64)PAGE_SIZE << PSS_SHIFT);
 			} else {
 				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
 			}
