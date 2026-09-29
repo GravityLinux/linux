@@ -86,6 +86,20 @@ fn main() {
     let mut ctx = [0; 0x200];
     lifecycle::after_render_second_context(&mut ctx).unwrap();
     emit(&ctx);
+    for n in [1,2,3,4,35,36,127,128,239,240,255,256,257] {
+        let mut spec = lifecycle::Retained::new(n).unwrap();
+        spec.status = [0xfffffc2001a00000 + n as u64 * 16,
+                       0xfffffc2001a00008 + n as u64 * 16];
+        emit(&spec.after_render_event().to_le_bytes());
+        emit(&spec.after_render_context_address().unwrap().to_le_bytes());
+        let regs = spec.program(0x30000000000,0x10000600000,n%2).unwrap();
+        let mut page = [0;0x4000];
+        spec.after_render_descriptor(&mut page,&regs,0x10000600030,0,0,
+            [0xfffffc2181400000+n as u64*16,0xfffffc2181400008+n as u64*16]).unwrap();
+        emit(&page);
+        let mut ctx = [0;0x200];
+        spec.after_render_context(&mut ctx).unwrap(); emit(&ctx);
+    }
     for case in 0..8u32 {
         let old = [
             0xfffffc200165a870 + case as u64 * 0x4000,

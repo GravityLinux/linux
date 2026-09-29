@@ -286,6 +286,70 @@ impl Retained {
         }
         .build(out, registers)
     }
+    /// Ordinary force_fresh startup keeps queue one after ordinal one,
+    /// omits later optionals and preserves its shared dispatch locations.
+    pub(crate) fn after_render_event(&self) -> u64 {
+        match self.ordinal {
+            3 => 0xfffffc20c05e98c0,
+            n if n % 2 == 0 => 0xfffffc20c05e9c80,
+            _ => AFTER_RENDER_EVENT,
+        }
+    }
+    pub(crate) fn after_render_context_address(&self) -> Result<u64> {
+        Ok(AFTER_RENDER_CONTEXT + c::context_offset(self.ordinal - 1, 256)? as u64)
+    }
+    pub(crate) fn after_render_descriptor(
+        &self,
+        out: &mut [u8],
+        registers: &[c::Register],
+        end: u64,
+        sampler: u64,
+        sampler_count: u32,
+        timestamps: [u64; 2],
+    ) -> Result {
+        c::Descriptor {
+            scheduler: self.scheduler,
+            low_alias: self.descriptor_low,
+            cdm_terminator: end.checked_sub(4).ok_or(Error::Invalid)?,
+            sequence: self.ordinal as u64,
+            context: 3,
+            grid: 5,
+            dispatch: [0xfffffc20001c8014, 0xfffffc20c07c0014],
+            status: self.status,
+            timestamps,
+            shared_control: SUPPORT,
+            zero_page: ZERO,
+            support_control: 0xe0a00001,
+            support_flags: 0,
+            ordinal: self.ordinal,
+            queue_submission: self.ordinal + 1,
+            queue_ordinal: 0,
+            submission_index: self.ordinal + 1,
+            sampler_array: sampler,
+            sampler_count,
+        }
+        .build(out, registers)
+    }
+    pub(crate) fn after_render_context(&self, out: &mut [u8]) -> Result {
+        let step = (self.descriptor - DESCRIPTOR_BASE) / 0x20;
+        c::Context {
+            descriptor: self.descriptor,
+            queue: AFTER_RENDER_QUEUE,
+            grid: 5,
+            flags: 0x1000000000000000,
+            word_220: 0xffff080200000001,
+            word_330: 0,
+            word_338: 8,
+            word_350: 0x000110038001a002 + step,
+            word_358: 0x000020038001a03b + step,
+            word_378: 0x003fffffffffffff,
+            item_index: self.ordinal - 1,
+            points: None,
+            event_slot: None,
+            completion: None,
+        }
+        .build(out)
+    }
     pub(crate) fn optional_body(&self) -> [u8; 0xc0] {
         c::Optional {
             context_low: 0x70004d8000,

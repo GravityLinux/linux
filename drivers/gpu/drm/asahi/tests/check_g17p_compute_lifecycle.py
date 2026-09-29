@@ -61,6 +61,18 @@ emit('post-render:second-descriptor',c.build_compute_descriptor(regs,a['schedule
 emit('post-render:second-optional',c.build_compute_optional(a['context_low'],a['context_high'],grid_index=a['grid'],submission_ordinal=a['optional_submission'],shared_control=a['shared_support'],channel_control=a['channel_control'],uuid=a['uuid'],field_46=a['optional_field_46'],field_1e=2,field_32=a['optional_field_32'],field_56=a['optional_field_56'],field_5e=2,first_submit=True,item_index=0))
 step=(a['descriptor']-ns['DESCRIPTOR'])//0x20
 emit('post-render:second-context',c.build_compute_queue_context_item(a['descriptor'],a['queue'],a['grid'],flags_200=a['qctx_flags'],word_220=a['qctx_word_220'],word_330=0,word_338=a['qctx_word_338'],word_350=0x000110038001a002+step,word_358=0x000020038001a03b+step,word_378=0x003fffffffffffff,item_index=0))
+# Ordinary persistent queue one: fresh descriptors, optional once, shared
+# dispatch records and per-command relocated statuses; context wraps at 256.
+for n in (1,2,3,4,35,36,127,128,239,240,255,256,257):
+    a=ns['_work_addresses'](n); persistent=ns['_queue_addresses'](1)
+    scheduler,slot,_=ns['_scheduler_for_ordinal'](a,n)
+    descriptor=ns['DESCRIPTOR']+(n%240)*ns['DESCRIPTOR_STRIDE']
+    low=ns['DESCRIPTOR_LOW']+(descriptor-ns['DESCRIPTOR'])
+    emit(f'post-render-{n}:addresses',struct.pack('<QQ',a['event'],persistent['context_high']+c.compute_queue_context_record_offset(n-1)))
+    regs=c.apply_compute_uapi_registers(ns['_registers_for_workload'](n,command_slot=n%2),preempt_base=0x30000000000+(n%2)*ns['CLIENT_WORKLOAD_STRIDE'],cdm_base=0x10000600000,usc_exec_base=0x10000000000,helper_binary=0,helper_data=0,helper_cfg=0)
+    emit(f'post-render-{n}:descriptor',c.build_compute_descriptor(regs,scheduler,low,0x1000060002c,submit_sequence=n,context_id=persistent['context_id'],grid_index=persistent['grid'],dispatch_a=persistent['dispatch_a'],dispatch_b=persistent['dispatch_b'],status_a=0xfffffc2001a00000+n*16,status_b=0xfffffc2001a00008+n*16,user_timestamp_start=0xfffffc2181400000+n*16,user_timestamp_end=0xfffffc2181400008+n*16,zero_page=persistent['zero_page'],shared_control=persistent['shared_support'],protection_index=1,support_control=0xe0a00001,support_flags=0,work_ordinal=n,queue_submission=n+1,queue_ordinal=0,submission_index=n+1,sampler_array=0,sampler_count=0))
+    step=(descriptor-ns['DESCRIPTOR'])//0x20
+    emit(f'post-render-{n}:context',c.build_compute_queue_context_item(descriptor,persistent['queue'],persistent['grid'],flags_200=persistent['qctx_flags'],word_220=persistent['qctx_word_220'],word_330=0,word_338=persistent['qctx_word_338'],word_350=0x000110038001a002+step,word_358=0x000020038001a03b+step,word_378=0x003fffffffffffff,item_index=n-1))
 # Execute the actual transport switch over synthetic owned RAM. Only physical
 # allocation is replaced; queue decoding, mutation and retirement stay source.
 from types import SimpleNamespace as NS
