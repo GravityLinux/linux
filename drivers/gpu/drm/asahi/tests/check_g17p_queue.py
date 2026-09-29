@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Compare ordered Rust publication writes with actual G17PSubmitter.stage."""
-import argparse,ast,importlib.util,struct,subprocess,tempfile
+import argparse,ast,importlib.util,struct,subprocess,tempfile,sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 parser=argparse.ArgumentParser(description=__doc__)
@@ -14,7 +14,15 @@ g17p=importlib.util.module_from_spec(spec);spec.loader.exec_module(g17p)
 parsed=ast.parse((source/'g17p_backend.py').read_text())
 ns=dict(struct=struct,g17p=g17p)
 exec(compile(ast.Module(body=[n for n in parsed.body if isinstance(n,ast.ClassDef) and n.name in ('G17PSubmitter','G17PChannels')],type_ignores=[]),'g17p_backend.py','exec'),ns)
-expected=[]
+# Execute the runtime's actual mailbox register definitions, independently of
+# the Rust literal. The firmware's channel-table index is a separate value.
+sys.path.insert(0, str(args.m1n1/'proxyclient'))
+from m1n1.utils import Register64
+mailbox_ast=ast.parse((args.m1n1/'proxyclient/experiments/agx_g17p_boot.py').read_text())
+mailbox_ns=dict(Register64=Register64)
+exec(compile(ast.Module(body=[n for n in mailbox_ast.body if isinstance(n,ast.ClassDef) and n.name in ('GpuMsg','DoorbellMsg')],type_ignores=[]),'agx_g17p_boot.py','exec'),mailbox_ns)
+mailbox=mailbox_ns['DoorbellMsg'](TYPE=g17p.MSG_WORK_DOORBELL, CHANNEL=0x0a)
+expected=[f'compute-mailbox {int(mailbox.value):x}']
 for case in range(192):
     kind=('tiling','fragment','compute')[case%3]
     producer=(0,1,254,255)[case%4]
