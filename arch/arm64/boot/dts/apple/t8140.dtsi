@@ -23,6 +23,16 @@
 		gpu = &gpu;
 	};
 
+	reserved-memory {
+		/* m1n1 supplies the ADT ranges before the kernel can use them. */
+		uat_ttbs: uat-ttbs { status = "disabled"; no-map; };
+		uat_pagetables: uat-pagetables { status = "disabled"; no-map; };
+		uat_l2: uat-l2 { status = "disabled"; no-map; };
+		uat_handoff: uat-handoff { status = "disabled"; no-map; };
+		gpu_firmware: gpu-firmware { status = "disabled"; no-map; };
+		gpu_firmware_secondary: gpu-firmware-secondary { status = "disabled"; no-map; };
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -149,8 +159,45 @@
 
 		gpu: gpu@480000000 {
 			compatible = "apple,agx-t8140", "apple,agx-g17p";
-			reg = <0x4 0x80000000 0 0x4000000>;
-			reg-names = "sgx";
+			reg = <0x4 0x80000000 0 0x4000000>,
+			      <0x4 0x82600000 0 0x88000>,
+			      <0x4 0x82e00000 0 0x88000>,
+			      <0x4 0x80d00000 0 0x12c000>;
+			reg-names = "sgx", "asc", "asc-secondary", "sgx-aux";
+			power-domains = <&ps_gfx>;
+			mboxes = <&agx_mbox>, <&agx1_mbox>;
+			mbox-names = "primary", "secondary";
+			memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_l2>,
+					<&uat_handoff>, <&gpu_firmware>, <&gpu_firmware_secondary>;
+			memory-region-names = "ttbs", "pagetables", "l2", "handoff",
+					      "firmware", "firmware-secondary";
+		};
+
+		agx_mbox: mailbox@482608000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x82608000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 995 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+			                  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_gfx>;
+		};
+
+		agx1_mbox: mailbox@482e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x82e08000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 998 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 999 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+			                  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
 			power-domains = <&ps_gfx>;
 		};
 
