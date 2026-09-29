@@ -11,6 +11,10 @@ use super::{
     g17p_render_graph as graph,
 };
 pub(crate) const SUBMISSIONS: u32 = 128;
+// The source's 128-draw qualification used two physical pairs, 64 each.
+// Keep its object geometry, but bound this sole retained pair until the second
+// owner and further pool reuse are ported. This is checked before any batch.
+pub(crate) const OWNER_SUBMISSIONS: u32 = 64;
 pub(crate) const DESCRIPTORS: [u64; 2] = [0xfffffc20c0018000, 0xfffffc20c00b0000];
 pub(crate) const QUEUES: [u64; 2] = [0xfffffc20c0000000, 0xfffffc20c00000c0];
 pub(crate) const POINTERS: [u64; 2] = [0xfffffc2000010000, 0xfffffc2000012870];
