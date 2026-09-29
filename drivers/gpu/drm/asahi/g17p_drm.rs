@@ -1161,10 +1161,8 @@ impl File {
             return Ok(0);
         }
         let mut replacement = if let Some(client) = runtime.session.compute_client()? {
-            if client.owner != (inner.id, vm.id) {
-                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
-            }
-            if client.bindings.len() != vm.bindings.len()
+            if client.owner != (inner.id, vm.id)
+                || client.bindings.len() != vm.bindings.len()
                 || !vm.bindings.iter().enumerate().all(|(i, b)| {
                     client.bindings[i] == (b.start, b.size, b.offset, b.flags)
                         && core::ptr::eq(&*client.buffers[i], &*b.bo)

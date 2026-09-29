@@ -391,10 +391,24 @@ impl Session {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         }
         if let Some(client) = replacement {
+            compute::idle(
+                self.memory.as_ref().ok_or(EINVAL)?,
+                self.vm.as_ref().ok_or(EINVAL)?,
+                work,
+            )?;
+            let previous_owner = work.client.owner;
             // The source's compute mirror uses this same low root in native
             // slots 2/3. Flush both ASIDs before releasing the old GEMs.
             work.client.rebind(client, false)?;
             dev_info!(dev, "G17P: retained compute caller mappings refreshed\n");
+            if previous_owner != work.client.owner {
+                dev_info!(
+                    dev,
+                    "G17P: synchronous compute VM handoff {:?} -> {:?}\n",
+                    previous_owner,
+                    work.client.owner
+                );
+            }
         }
         let result = compute::stage_next(
             self.memory.as_mut().ok_or(EINVAL)?,
