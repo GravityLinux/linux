@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Initial T8140 / G17P GPU identification support.
+//! T8140 / G17P firmware startup and native DRM memory support.
 //!
 //! Validates boot resources, constructs the unpublished firmware graph and
-//! boots both RTKit instances. DRM registration follows in the synchronous port.
+//! boots both RTKit instances and registers the native Asahi memory UAPI.
 
 use kernel::{
     c_str, device::Core, devres::Devres, io::mem::IoMem, io::Io, of, platform, prelude::*,
@@ -16,12 +16,14 @@ mod g17p_boot;
 mod g17p_compute;
 #[allow(dead_code)]
 mod g17p_compute_memory;
+mod g17p_drm;
 mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
 mod g17p_memory;
 mod g17p_opening;
 mod g17p_platform;
+mod g17p_user_vm;
 // Core queue port is exercised by source differential tests until submit is wired.
 #[allow(dead_code)]
 mod g17p_queue;
@@ -39,6 +41,7 @@ struct NeoGpu {
     _platform: g17p_platform::Platform,
     _image: g17p_image::Image,
     _session: g17p_boot::Session,
+    _drm: kernel::sync::aref::ARef<kernel::drm::Device<g17p_drm::Driver>>,
 }
 
 kernel::of_device_table!(
@@ -58,7 +61,7 @@ impl platform::Driver for NeoGpu {
     ) -> impl PinInit<Self, Error> {
         let request = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
         let sgx = KBox::pin_init(request.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
-        {
+        let (version, counts, mask) = {
             let regs = sgx.try_access().ok_or(ENODEV)?;
             let version = regs.read32(ID_VERSION);
             if version == 0 || version == u32::MAX {
@@ -73,19 +76,29 @@ impl platform::Driver for NeoGpu {
                 regs.read32(ID_COUNTS_2),
                 regs.read32(ID_CLUSTERS),
             );
-            dev_info!(
-                pdev.as_ref(),
-                "GPU identification complete; DRM registration is not implemented yet\n"
-            );
-        }
+            (version, regs.read32(ID_COUNTS_1), regs.read32(0xe01500))
+        };
         let platform = g17p_platform::Platform::new(pdev.as_ref())?;
         let image = g17p_image::Image::new(pdev.as_ref(), &platform)?;
         let session = g17p_boot::Session::new(pdev, &platform, &sgx, &image)?;
+        use kernel::dma::Device as _;
+        // SAFETY: UAT consumes 42-bit DMA addresses, as validated by this driver.
+        unsafe {
+            pdev.dma_set_mask_and_coherent(kernel::dma::DmaMask::try_new(42)?)?;
+        }
+        let max_mhz = platform
+            .performance
+            .iter()
+            .map(|state| state.frequency_a_mhz.max(state.frequency_b_mhz))
+            .max()
+            .ok_or(EINVAL)?;
+        let drm = g17p_drm::register(pdev.as_ref(), version, counts, mask, max_mhz)?;
         Ok(Self {
             _sgx: sgx,
             _platform: platform,
             _image: image,
             _session: session,
+            _drm: drm,
         })
     }
 }
