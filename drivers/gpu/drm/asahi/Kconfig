@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0
 
 config DRM_ASAHI_NEO
-	tristate "Apple A18 Pro GPU identification driver"
+	tristate "Apple A18 Pro GPU driver (experimental)"
 	depends on RUST && DRM=y
 	depends on ARM64 && ARCH_APPLE && PAGE_SIZE_16KB
 	depends on PM
+	select RUST_DRM_GEM_SHMEM_HELPER
 	help
-	  Initial Rust driver for the T8140 (A18 Pro / G17P) GPU in the
-	  MacBook Neo. Binds to the GPU and reads its identification registers.
-	  Firmware startup, rendering and the DRM userspace interface are not
-	  implemented yet.
+	  Experimental Rust driver for the T8140 (A18 Pro / G17P) GPU in
+	  the MacBook Neo. Supports firmware startup and Asahi DRM memory
+	  management. GPU submissions and rendering are not connected yet.
 
 config DRM_ASAHI_M4
 	tristate "Apple M4 GPU driver"
