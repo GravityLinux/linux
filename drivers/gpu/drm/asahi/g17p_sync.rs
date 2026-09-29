@@ -114,8 +114,13 @@ impl Plan {
             if waited == 0 {
                 return Err(ETIMEDOUT);
             }
-            // SAFETY: The live fence is signaled; the helper locks its status.
-            let status = unsafe { bindings::dma_fence_get_status(fence.raw()) };
+            // Chain wrappers do not propagate the contained point's error.
+            // Wait the whole chain, then inspect this point's actual fence.
+            // SAFETY: The owned chain retains its immutable contained fence
+            // (or returns itself), and get_status locks the live object.
+            let status = unsafe {
+                bindings::dma_fence_get_status(bindings::dma_fence_chain_contained(fence.raw()))
+            };
             if status < 0 {
                 return Err(Error::from_errno(status));
             }
