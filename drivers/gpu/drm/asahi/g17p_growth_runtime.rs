@@ -37,6 +37,9 @@ pub(crate) struct Service {
     compute_terminals: u32,
     compute_owners: KVec<u32>,
     fragment: u64,
+    state: u64,
+    list: u64,
+    receipt: Option<super::g17p_dependency::Receipt>,
 }
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
     memory.read_firmware32(vm.physical(memory, 2, va)?)
@@ -97,10 +100,44 @@ impl Service {
         command: Channel,
         report: Channel,
     ) -> Result<Self> {
+        Self::new_graph(memory, vm, ttbs, root, command, report, STATE, LIST)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn new_dependency(
+        memory: &Memory,
+        vm: &Vm,
+        ttbs: u64,
+        root: u64,
+        command: Channel,
+        report: Channel,
+    ) -> Result<Self> {
+        use super::g17p_dependency::LEAVES;
+        Self::new_graph(
+            memory, vm, ttbs, root, command, report, LEAVES[4], LEAVES[1],
+        )
+    }
+    #[allow(dead_code)]
+    pub(crate) fn expect_dependency_receipt(&mut self, sequence: u32) -> Result {
+        if self.receipt.as_ref().is_some_and(|r| r.pending()) {
+            return Err(EBUSY);
+        }
+        self.receipt = Some(super::g17p_dependency::Receipt::new(sequence));
+        Ok(())
+    }
+    fn new_graph(
+        memory: &Memory,
+        vm: &Vm,
+        ttbs: u64,
+        root: u64,
+        command: Channel,
+        report: Channel,
+        state: u64,
+        list: u64,
+    ) -> Result<Self> {
         verify_root(memory, ttbs, root)?;
         if report.states[1].checked_add(256 * 0x48) != Some(report.ring)
-            || word(memory, vm, STATE)? != 8
-            || word(memory, vm, STATE + 4)? != 8
+            || word(memory, vm, state)? != 8
+            || word(memory, vm, state + 4)? != 8
         {
             return Err(EIO);
         }
@@ -121,6 +158,9 @@ impl Service {
             compute_terminals: 0,
             compute_owners: KVec::with_capacity(36, GFP_KERNEL)?,
             fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
+            state,
+            list,
+            receipt: None,
         })
     }
     fn consume(&mut self, memory: &mut Memory, vm: &Vm, next: u32) -> Result {
@@ -141,7 +181,7 @@ impl Service {
         let mut prior = KVec::with_capacity(old as usize, GFP_KERNEL)?;
         for i in 0..old {
             let mut body = [0; 8];
-            read(memory, vm, LIST + i as u64 * 8, &mut body)?;
+            read(memory, vm, self.list + i as u64 * 8, &mut body)?;
             let id = u64::from_le_bytes(body);
             let address = id
                 .checked_mul(g::UNIT)
@@ -174,12 +214,12 @@ impl Service {
         for (i, address) in addresses.into_iter().enumerate() {
             ids[i * 8..i * 8 + 8].copy_from_slice(&g::block_id(address).ok_or(EIO)?.to_le_bytes());
         }
-        vm.write(memory, 2, LIST + old as u64 * 8, &ids)?;
+        vm.write(memory, 2, self.list + old as u64 * 8, &ids)?;
         g17p_memory::sync();
         let mut counts = [0; 8];
         counts[..4].copy_from_slice(&new.to_le_bytes());
         counts[4..].copy_from_slice(&new.to_le_bytes());
-        vm.write(memory, 2, STATE, &counts)?;
+        vm.write(memory, 2, self.state, &counts)?;
         g17p_memory::sync();
         Ok(new)
     }
@@ -208,6 +248,10 @@ impl Service {
         let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
         let next = (self.cursor + 1) & 255;
         let owner = g::Owner { vm: 1, pool: 0 };
+        if opcode == 13 && self.receipt.as_mut().is_some_and(|r| r.consume(0, &body)) {
+            self.consume(memory, vm, next)?;
+            return Ok(Action::Consumed);
+        }
         if compute_ordinal.is_some() && opcode != 1 {
             // No live render can request growth here. Retain unexpected
             // evidence without allocating, replying, or advancing credits.
@@ -273,8 +317,8 @@ impl Service {
         if head >= 256 || slot >= 256 || (slot + 1) & 255 == head {
             return Err(EIO);
         }
-        let old = word(memory, vm, STATE)?;
-        if old != word(memory, vm, STATE + 4)? {
+        let old = word(memory, vm, self.state)?;
+        if old != word(memory, vm, self.state + 4)? {
             return Err(EIO);
         }
         let (new, refused) = match self.allocate(memory, vm, root, old) {

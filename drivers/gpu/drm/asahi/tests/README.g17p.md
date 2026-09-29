@@ -322,3 +322,34 @@ report credits. Queue zero is 3/3/3, queue one 515/515/515, render queues6/6/6,
 primary credits5/5, secondary0/0. All six CPU contexts are inspected and Linux
 resumes. Remaining render-owner paths, native C/R/C dependency waves and general
 source parity are still open; no asynchronous or Mesa parity is claimed.
+
+The native C/R/C profile now has a separate unpublished object constructor in
+`g17p_dependency.rs`. It includes four fresh queues, UUID0x16, compact36-register
+CL descriptors, distinct scheduler/completion owners, moved render pools and
+status leaves, native render descriptors and dependency context points. The
+opening and closing CL descriptors both restart their local ordinal at zero.
+The class registration receipt matches exactly its owned0x28-byte prefix, once
+on primary; malformed fields, secondary receipts and duplicates remain unknown.
+The release transition preserves the source's render cursor/inner-state writes
+and partial primary/secondary index updates. Growth storage is selected by its
+owned graph, so the native graph cannot overwrite the repurposed compute support.
+
+Run `check_g17p_dependency.py /path/to/m1n1` with Python3 and Rust. The source-only
+oracle executes the actual shim topology/register methods over synthetic owned
+RAM and compares362 objects /936944bytes, including32 complete CL descriptors,
+32 render descriptors, variable CDM/samplers/timestamps/completion values,
+registration receipts and rejection cases, and the source-authored host index
+transition. No target, firmware binary or captured page is imported.
+
+These are construction and report-service prerequisites. The native opt-in
+still needs its execution-root join, fresh scheduler backing and deferred
+publication sequence wired into Linux before hardware qualification. Ordinary
+synchronous submission remains the active runtime path.
+
+Kernel#73 regression of the graph-selected growth service passes the existing
+`g17p-drm-retained-wave` workload (13227558checks) and memory UAPI (6234checks).
+R/Cx258/R output, all56 compute pages, all eight final images,516 timestamps,
+aggregate fences, invalid suffixes and exhausted-capacity rejection pass.
+Post-close queue/status/descriptor/context/report audit passes on all six CPUs;
+Linux resumes. This validates the ordinary path after the refactor, while the
+native dependency runtime remains unqualified.
