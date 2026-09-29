@@ -44,7 +44,7 @@ impl Client {
     /// Update only the caller-owned part of the quiescent retained root. Both
     /// generations of GEM references remain pinned until the final TLBI.
     pub(crate) fn rebind(&mut self, next: Self, render: bool) -> Result {
-        if self.owner != next.owner {
+        if render && self.owner != next.owner {
             return Err(EINVAL);
         }
         let address = |base: u64| {
@@ -93,6 +93,7 @@ impl Client {
         // precedes release of old BOs; the root and all private state survive.
         self.buffers = next.buffers;
         self.bindings = next.bindings;
+        self.owner = next.owner;
         Ok(())
     }
     pub(crate) fn cache(&self, invalidate: bool) -> Result {
@@ -481,6 +482,28 @@ pub(crate) fn build(
 
 /// Prepare one later item on the completed retained transport. No producer
 /// becomes visible until the session validates and explicitly publishes it.
+pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Counters, u32)> {
+    let mut values = [0; 3];
+    for (value, address) in values.iter_mut().zip(work.channel.states) {
+        *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+    }
+    let counters = q::Counters::new(values).map_err(|_| EIO)?;
+    let done = memory.read_firmware32(vm.physical(memory, 2, POINTERS)?)?;
+    if done != work.publication.write_after
+        || values[0] != values[1]
+        || values[1] != values[2]
+        || !work.publication.completed(done, counters)
+    {
+        return Err(EBUSY);
+    }
+    for offset in [0x30, 0x40] {
+        if memory.read_firmware32(vm.physical(memory, 2, POINTERS + offset)?)? != done {
+            return Err(EBUSY);
+        }
+    }
+    Ok((counters, done))
+}
+
 pub(crate) fn stage_next(
     memory: &mut Memory,
     vm: &Vm,
@@ -492,19 +515,7 @@ pub(crate) fn stage_next(
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
     let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
-    let mut counters = [0; 3];
-    for (index, address) in work.channel.states.iter().enumerate() {
-        counters[index] = memory.read_firmware32(vm.physical(memory, 2, *address)?)?;
-    }
-    let counters = q::Counters::new(counters).map_err(|_| EIO)?;
-    let done = memory.read_firmware32(vm.physical(memory, 2, POINTERS)?)?;
-    if !work.publication.completed(done, counters) {
-        return Err(EBUSY);
-    }
-    let write_index = memory.read_firmware32(vm.physical(memory, 2, POINTERS + 0x40)?)?;
-    if write_index != work.publication.write_after {
-        return Err(EIO);
-    }
+    let (counters, write_index) = idle(memory, vm, work)?;
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     let write = |memory: &mut Memory, address, bytes: &[u8]| vm.write(memory, 2, address, bytes);
