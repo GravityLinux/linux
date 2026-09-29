@@ -486,6 +486,7 @@ impl Session {
             self.render.as_ref().ok_or(EINVAL)?.client.root.root()
         );
         let mut last = [[0u32; 6]; 2];
+        let mut status_changed = [false; 2];
         let mut command_status = 0;
         for _ in 0..500 {
             if self
@@ -522,6 +523,15 @@ impl Session {
                     queue::Counters::new([last[stage][3], last[stage][4], last[stage][5]])
                         .map_err(|_| EIO)?;
                 done &= work.publications[stage].completed(last[stage][0], counters);
+                // Match the shim's two independent 0x40-byte status gates.
+                // build() initializes these retained private records to zero.
+                let pa = vm.physical(memory, 2, render::STATUS[stage])?;
+                memory.invalidate(pa, 0x40)?;
+                status_changed[stage] = false;
+                for offset in (0..0x40).step_by(8) {
+                    status_changed[stage] |= memory.read64(pa + offset)? != 0;
+                }
+                done &= status_changed[stage];
             }
             let after = self.report_snapshot(image)?;
             for (peer, (report, before)) in after.iter().zip(startup.iter()).enumerate() {
@@ -559,10 +569,11 @@ impl Session {
         }
         dev_err!(
             dev,
-            "G17P: caller render timeout: TA {:?}, 3D {:?}, status {:#x}; retaining graph\n",
+            "G17P: caller render timeout: TA {:?}, 3D {:?}, status {:#x}, changed {:?}; retaining graph\n",
             last[0],
             last[1],
-            command_status
+            command_status,
+            status_changed
         );
         Err(ETIMEDOUT)
     }
@@ -868,7 +879,7 @@ impl Session {
         }
         dev_info!(
             dev,
-            "G17P: control start 0x89/0x84 complete; CL2 outer producer withheld\n"
+            "G17P: control start 0x89/0x84 complete; first-work outer producers withheld\n"
         );
         Ok(())
     }
