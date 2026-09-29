@@ -6,7 +6,9 @@
 
 use super::{
     g17p_image::Image,
+    g17p_layout as layout,
     g17p_memory::{self, Memory},
+    g17p_opening as opening,
     g17p_platform::Platform,
     g17p_vm::Vm,
 };
@@ -31,6 +33,7 @@ struct Data {
     crashed: AtomicBool,
     last_message: AtomicU64,
     acknowledged: AtomicBool,
+    wakeups: AtomicU64,
 }
 
 struct CrashBuffer {
@@ -96,6 +99,14 @@ impl rtkit::Operations for Operations {
         data.last_message.store(message, Ordering::Release);
         if endpoint == 0x20 && message >> 48 == 0x09 {
             data.acknowledged.store(true, Ordering::Release);
+        }
+        if endpoint == 0x20 && message >> 48 == 0x42 {
+            let count = data.wakeups.fetch_add(1, Ordering::Relaxed) + 1;
+            // A wakeup is neither a work ID nor evidence of completion. Bound
+            // console traffic while keeping every callback counted.
+            if count > 4 && !count.is_power_of_two() {
+                return;
+            }
         }
         dev_info!(
             data.dev.as_ref(),
@@ -176,6 +187,7 @@ impl Session {
                     crashed: AtomicBool::new(false),
                     last_message: AtomicU64::new(0),
                     acknowledged: AtomicBool::new(false),
+                    wakeups: AtomicU64::new(0),
                 },
                 GFP_KERNEL,
             )?;
@@ -282,6 +294,7 @@ impl Session {
                 .all(|p| p.data.acknowledged.load(Ordering::Acquire))
             {
                 dev_info!(dev, "G17P: both firmware instances acknowledged Rust initdata; no workload submitted\n");
+                session.start_control(dev, image)?;
                 return Ok(session);
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
@@ -296,6 +309,65 @@ impl Session {
             );
         }
         return Err(ETIMEDOUT);
+    }
+
+    fn start_control(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        for (index, peer) in self.peers.iter_mut().enumerate() {
+            if peer.data.crashed.load(Ordering::Acquire) {
+                return Err(EIO);
+            }
+            peer.rtkit
+                .as_mut()
+                .ok_or(EINVAL)?
+                .as_mut()
+                .send_message(0x21, 0x0089000000000000)?;
+            if index == 0 {
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(12));
+            }
+        }
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        let status = image.graph.base
+            + layout::NATIVE_PRIMARY_WORK_STATE_OFFSET as u64
+            + layout::NATIVE_STATUS_B_OFFSET as u64;
+        for (offset, value) in opening::status_config(image.graph.addresses[1]) {
+            let va = status + offset as u64;
+            memory.invalidate(vm.physical(memory, 2, va)?, 8)?;
+            vm.write(memory, 2, va, &value.to_le_bytes())?;
+        }
+        self.peers[0]
+            .rtkit
+            .as_mut()
+            .ok_or(EINVAL)?
+            .as_mut()
+            .send_message(0x21, 0x0084000000000011)?;
+        // These are presented-consumed counters, not a completion fence. A
+        // bounded observation catches startup corruption/crashes before probe
+        // succeeds without claiming that a GPU workload has run.
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(100));
+        for (peer, channels) in self.peers.iter().zip(image.graph.channels.iter()) {
+            if peer.data.crashed.load(Ordering::Acquire) {
+                return Err(EIO);
+            }
+            let mut counters = [0u32; 3];
+            for (index, va) in channels[12].states.iter().enumerate() {
+                counters[index] = memory.read_firmware32(vm.physical(memory, 2, *va)?)?;
+            }
+            dev_info!(
+                dev,
+                "G17P: {} opening counters {:?} (source-presented consumed)\n",
+                peer.data.name,
+                counters
+            );
+            if counters != [1, 1, 1] {
+                return Err(EIO);
+            }
+        }
+        dev_info!(
+            dev,
+            "G17P: control start 0x89/0x84 sent with empty work rings; no GPU workload submitted\n"
+        );
+        Ok(())
     }
 }
 

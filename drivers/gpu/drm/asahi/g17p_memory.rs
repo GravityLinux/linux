@@ -156,6 +156,37 @@ impl Memory {
         })
     }
 
+    /// Observe a firmware-owned counter after discarding the CPU's clean copy.
+    /// Callers must have cleaned every host write in the containing cache line.
+    pub(crate) fn read_firmware32(&self, address: u64) -> Result<u32> {
+        if address & 3 != 0 {
+            return Err(EINVAL);
+        }
+        self.invalidate(address, 4)?;
+        self.access(address, 4, |p| {
+            // SAFETY: access bounds the aligned word in live shared RAM.
+            u32::from_le(unsafe { p.cast::<u32>().read_volatile() })
+        })
+    }
+
+    /// Only for clean lines shared with firmware, never dirty host data.
+    pub(crate) fn invalidate(&self, address: u64, size: usize) -> Result {
+        sync();
+        self.chunks(address, size, |pointer, _, count| {
+            let start = (pointer as usize) & !63;
+            let end = pointer as usize + count;
+            for address in (start..end).step_by(64) {
+                // SAFETY: Whole lines fit this owned page. All host writes to
+                // shared fields are cleaned before firmware can see them.
+                unsafe {
+                    core::arch::asm!("dc ivac, {address}", address = in(reg) address, options(nostack, preserves_flags))
+                };
+            }
+        })?;
+        sync();
+        Ok(())
+    }
+
     pub(crate) fn write64(&mut self, address: u64, value: u64) -> Result {
         if address & 7 != 0 {
             return Err(EINVAL);

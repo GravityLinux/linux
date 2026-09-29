@@ -45,6 +45,8 @@ mod g17p_abi;
 mod g17p_initgraph;
 #[path = "../g17p_layout.rs"]
 mod g17p_layout;
+#[path = "../g17p_opening.rs"]
+mod g17p_opening;
 #[path = "../g17p_topology.rs"]
 mod g17p_topology;
 #[path = "../g17p_vm.rs"]
@@ -162,7 +164,7 @@ fn main() {
     let mut storage = g17p_image::Storage(OBJECT_LAYOUT.iter().map(|o| vec![0; o.size]).collect());
     let graph =
         g17p_initgraph::build(&mut storage, 0xfffffc2000000000, &g17p_layout::PERFORMANCE).unwrap();
-    let image = g17p_image::Image {
+    let mut image = g17p_image::Image {
         graph,
         buffers: storage.0,
     };
@@ -191,6 +193,30 @@ fn main() {
     assert_eq!(memory.read64(platform.regions[0].base).unwrap(), 0);
     memory.write64(g17p_topology::SHARED_L2, 0).unwrap();
     let _vm = g17p_vm::Vm::build(&device::Device, &mut memory, &platform, &image).unwrap();
+    // Keep the independent initdata byte check, allowing only the intentional
+    // opening control ring/counter writes to the original generated image.
+    for (slot, channels) in image.graph.channels.iter().enumerate() {
+        let control = channels[12];
+        for (va, bytes) in
+            std::iter::once((control.ring, g17p_opening::message(slot == 1).to_vec())).chain(
+                control
+                    .states
+                    .into_iter()
+                    .map(|va| (va, 1u32.to_le_bytes().to_vec())),
+            )
+        {
+            let index = OBJECT_LAYOUT
+                .iter()
+                .enumerate()
+                .position(|(i, o)| {
+                    va >= image.graph.addresses[i]
+                        && va + bytes.len() as u64 <= image.graph.addresses[i] + o.size as u64
+                })
+                .unwrap();
+            let offset = (va - image.graph.addresses[index]) as usize;
+            image.buffers[index][offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+    }
     let high_root = 0x10021598000;
     let low_root = 0x10034bcc000;
     for (peer, values) in originals.iter().enumerate() {
@@ -253,11 +279,7 @@ fn main() {
             checked += 1;
         }
     }
-    for (slot, tag, low) in [
-        (0, 0, low_root),
-        (1, 64, 0x10057ba0000),
-        (2, 1, 0x10057ba0000),
-    ] {
+    for (slot, tag, low) in [(0, 0, low_root), (1, 1, 0x10057ba0000)] {
         assert_eq!(
             memory.read64(platform.regions[0].base + slot * 16).unwrap(),
             tag << 48 | low | 1
@@ -268,6 +290,38 @@ fn main() {
                 .unwrap(),
             tag << 48 | high_root | 1
         );
+    }
+    for slot in 2..64 {
+        assert_eq!(
+            memory.read64(platform.regions[0].base + slot * 16).unwrap(),
+            0
+        );
+        assert_eq!(
+            memory
+                .read64(platform.regions[0].base + slot * 16 + 8)
+                .unwrap(),
+            0
+        );
+    }
+    for &(first, count, flags) in g17p_topology::RENDER_RUNS {
+        for index in 0..count {
+            let va = first + index as u64 * 0x4000;
+            let pte = memory.walk(0x10057ba0000, va);
+            assert_eq!(pte & !MASK, flags, "render flags at {va:x}");
+            assert!(memory.pages[&(pte & MASK)].iter().all(|b| *b == 0));
+            checked += 1;
+        }
+    }
+    for (high, low) in g17p_opening::CONTEXTS {
+        for index in 0..8 {
+            let delta = index * 0x4000;
+            let hp = memory.walk(high_root, high + delta) & MASK;
+            let cp = memory.walk(low_root, low + delta) & MASK;
+            let rp = memory.walk(0x10057ba0000, low + delta) & MASK;
+            assert_eq!(hp, cp);
+            assert_ne!(cp, rp);
+            assert!(memory.pages[&rp].iter().all(|b| *b == 0));
+        }
     }
     println!("PASS: {checked} firmware/alias/MMIO leaves, all object bytes, private roots, context tags, L2 collision rejection");
 }

@@ -5,8 +5,8 @@
 //! backing belongs to Memory. Firmware-private top-table entries survive.
 
 use super::{
-    g17p_image::Image, g17p_initgraph, g17p_layout, g17p_memory::Memory, g17p_platform::Platform,
-    g17p_topology as topology,
+    g17p_image::Image, g17p_initgraph, g17p_layout, g17p_memory::Memory, g17p_opening as opening,
+    g17p_platform::Platform, g17p_topology as topology,
 };
 use kernel::{device, prelude::*};
 
@@ -63,9 +63,9 @@ impl Vm {
             let from = platform.regions[1].base + delta;
             let to = vm.roots[2] + delta;
             memory.zero(to, PAGE as usize)?;
-            for index in 0..3 {
+            for index in 0..(if delta == 0 { 3 } else { PAGE / 8 }) {
                 let word = memory.read64(from + index * 8)?;
-                if word & 3 != 3 {
+                if index < 3 && word & 3 != 3 {
                     return Err(EINVAL);
                 }
                 if index == 2 && word & ADDRESS != topology::SHARED_L2 {
@@ -116,6 +116,63 @@ impl Vm {
                 size as usize,
                 0x00c0_0000_0000_0447,
             )?;
+        }
+        // The Python context constructor allocates each page independently,
+        // before extent filling. The render view is distinct and remains blank
+        // at publication; context 0 later aliases the generated high view.
+        for (kind, &(high, low)) in opening::CONTEXTS.iter().enumerate() {
+            for index in 0..opening::CONTEXT_PAGES {
+                for (group, first, flags) in [
+                    (2, high, 0x00c0_0000_0000_044b),
+                    (1, low, 0x00c0_0000_0000_0c8b),
+                ] {
+                    let pa = memory.allocate(PAGE as usize)?;
+                    if index == 0 && group == 2 {
+                        memory.write(pa, &opening::context(kind).ok_or(EINVAL)?)?;
+                    }
+                    memory.clean(pa, PAGE as usize)?;
+                    vm.span(
+                        memory,
+                        group,
+                        first + index as u64 * PAGE,
+                        pa,
+                        PAGE as usize,
+                        flags,
+                    )?;
+                }
+            }
+        }
+        let channel = memory.allocate(PAGE as usize)?;
+        memory.write(channel, &opening::channel_control())?;
+        memory.clean(channel, PAGE as usize)?;
+        vm.span(
+            memory,
+            2,
+            opening::CHANNEL_CONTROL,
+            channel,
+            PAGE as usize,
+            0x00c0_0000_0000_0443,
+        )?;
+
+        // Zero-backed render address-space shape. No fixture workload bytes
+        // are installed. Actual caller BOs replace their own mappings later.
+        let mut render = 0;
+        for &(first, count, flags) in topology::RENDER_RUNS {
+            for index in 0..count {
+                let va = first + index as u64 * PAGE;
+                if vm.lookup(memory, 1, va)?.is_none() {
+                    let pa = memory.allocate(PAGE as usize)?;
+                    memory.clean(pa, PAGE as usize)?;
+                    vm.span(memory, 1, va, pa, PAGE as usize, flags)?;
+                }
+                render += 1;
+            }
+        }
+        for va in opening::EXTRA_RENDER {
+            let pa = memory.allocate(PAGE as usize)?;
+            memory.clean(pa, PAGE as usize)?;
+            vm.span(memory, 1, va, pa, PAGE as usize, 0x00c0_0000_0000_0c8b)?;
+            render += 1;
         }
         // map_firmware_extent(): retain existing objects; fill the remaining
         // source shape with fresh zeroes. Split at native PA discontinuities.
@@ -175,32 +232,61 @@ impl Vm {
                 return Err(EIO);
             }
         }
-        for index in 3..64 {
-            memory.write64(
-                vm.roots[2] + SECONDARY + index * 8,
-                memory.read64(vm.roots[2] + index * 8)?,
-            )?;
+        vm.write(memory, 2, opening::SUPPORT, &opening::support())?;
+        vm.write(memory, 2, opening::STATE, &2u32.to_le_bytes())?;
+        // Stage both control rings before publishing initdata, with the same
+        // already-consumed prefix as the current partial Python entrypoint.
+        for (slot, channels) in image.graph.channels.iter().enumerate() {
+            let control = &channels[12];
+            vm.write(memory, 2, control.ring, &opening::message(slot == 1))?;
+            for va in control.states {
+                vm.write(memory, 2, va, &1u32.to_le_bytes())?;
+            }
+        }
+        for index in 2..64 {
+            let word = memory.read64(vm.roots[2] + index * 8)?;
+            if word != 0 {
+                memory.write64(vm.roots[2] + SECONDARY + index * 8, word)?;
+            }
         }
         for table in &vm.tables {
             memory.clean(*table, PAGE as usize)?;
         }
-        // Bind the same source context tags as Python. Render backing and
-        // control staging will be added before the first workload doorbell.
-        for (slot, tag, low) in [
-            (0u64, 0u64, vm.roots[0]),
-            (1, 64, vm.roots[1]),
-            (2, 1, vm.roots[1]),
-        ] {
-            memory.write64(platform.regions[0].base + slot * 16, (tag << 48) | low | 1)?;
+        // bind_contexts(macos_table=True), then the separate context-0 root:
+        // slots 0/1 tagged 0/1. Capture root enumeration is not a HW slot ID.
+        memory.zero(platform.regions[0].base, 64 * 16)?;
+        for (slot, low) in [(0u64, vm.roots[0]), (1, vm.roots[1])] {
+            memory.write64(platform.regions[0].base + slot * 16, (slot << 48) | low | 1)?;
             memory.write64(
                 platform.regions[0].base + slot * 16 + 8,
-                (tag << 48) | vm.roots[2] | 1,
+                (slot << 48) | vm.roots[2] | 1,
             )?;
         }
         memory.clean(platform.regions[0].base, 64 * 16)?;
-        dev_info!(dev, "G17P: source VM ready: {} leaves, {} tables, {} extent pages, {} context-0 aliases; roots {:#x}/{:#x}/{:#x}\n",
-            vm.leaves, vm.tables.len(), extent, aliases, vm.roots[0], vm.roots[1], vm.roots[2]);
+        dev_info!(dev, "G17P: source VM ready: {} leaves, {} tables, {} extent pages, {} context-0 aliases, {} render pages; roots {:#x}/{:#x}/{:#x}\n",
+            vm.leaves, vm.tables.len(), extent, aliases, render, vm.roots[0], vm.roots[1], vm.roots[2]);
         Ok(vm)
+    }
+
+    pub(crate) fn physical(&self, memory: &Memory, group: usize, va: u64) -> Result<u64> {
+        let offset = va & (PAGE - 1);
+        Ok((self.lookup(memory, group, va - offset)?.ok_or(EINVAL)? & ADDRESS) + offset)
+    }
+
+    /// Driver-owned RAM fields only. Each page is separately translated and
+    /// bounded by Memory, then cleaned before a mailbox can expose the write.
+    pub(crate) fn write(&self, memory: &mut Memory, group: usize, va: u64, bytes: &[u8]) -> Result {
+        va.checked_add(bytes.len() as u64).ok_or(EINVAL)?;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let at = va + offset as u64;
+            let size = (bytes.len() - offset).min((PAGE - (at & (PAGE - 1))) as usize);
+            let pa = self.physical(memory, group, at)?;
+            memory.write(pa, &bytes[offset..offset + size])?;
+            memory.clean(pa, size)?;
+            offset += size;
+        }
+        Ok(())
     }
 
     fn backing(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result<u64> {
