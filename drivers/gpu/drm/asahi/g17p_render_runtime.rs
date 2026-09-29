@@ -183,7 +183,6 @@ pub(crate) fn build(
     }
     vm.alias_firmware(memory, DESCRIPTORS[0], 0x7000000000, PAGE)?;
     vm.alias_firmware(memory, DESCRIPTORS[1], 0x7000098000, PAGE)?;
-    let write = |memory: &mut Memory, address, body: &[u8]| vm.write(memory, 2, address, body);
     let kinds = [
         graph::Leaf::PrimaryIndex,
         graph::Leaf::SecondaryIndex,
@@ -194,7 +193,7 @@ pub(crate) fn build(
     ];
     for (kind, address) in kinds.into_iter().zip(LEAVES) {
         graph::leaf(&mut page, kind, 0, &graph::CONTEXT2_INDEX_GROUPS, 8, 0).map_err(|_| EINVAL)?;
-        write(memory, address, &page)?;
+        vm.write(memory, 2, address, &page)?;
     }
     graph::leaf(
         &mut page,
@@ -219,6 +218,7 @@ pub(crate) fn build(
     ] {
         vm.render_firmware_alias(memory, low, high)?;
     }
+    let write = |memory: &mut Memory, address, body: &[u8]| vm.write(memory, 2, address, body);
     graph::record_array_a(&mut page[..graph::POOL_A_SIZE], LEAVES[2] + 4, 0).map_err(|_| EINVAL)?;
     write(memory, POOLS[0], &page[..graph::POOL_A_SIZE])?;
     page.fill(0);
