@@ -81,10 +81,36 @@ static inline void mm_dup_mmap(const struct mm_struct *oldmm,
 
 #ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
 
+static inline bool mm_tcr_needs_switch(const struct mm_struct *mm)
+{
+	unsigned long geometry;
+
+	if (mm == &init_mm)
+		return false;
+	geometry = read_sysreg(tcr_el1) & (TCR_TG0_MASK | TCR_T0SZ_MASK);
+	return geometry != mm_tcr_geometry(mm);
+}
+
+/*
+ * Block old table walks and ASID-tagged TLB hits before changing TG0/T0SZ.
+ * TTBR writes are ordered with each other, but need an ISB before TCR.
+ * Each user ASID retains a fixed geometry, so its non-global translations
+ * can stay cached; ASID rollover still invalidates them before reuse.
+ * Leave the reserved ASID active until the caller installs the target MM.
+ *
+ * This is a macro because mmu_context.h defines the TTBR helpers after
+ * including this header.
+ */
 #define mm_switch_tcr(mm)						\
 do {									\
-	if ((mm) != &init_mm)						\
+	if (mm_tcr_needs_switch(mm)) {					\
+		unsigned long __ttbr1 = read_sysreg(ttbr1_el1);		\
+									\
+		cpu_set_reserved_ttbr0_nosync();			\
+		write_sysreg(__ttbr1 & ~TTBR_ASID_MASK, ttbr1_el1);	\
+		isb();							\
 		__cpu_set_tcr_geometry(mm_tcr_geometry(mm));		\
+	}								\
 } while (0)
 
 #else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
