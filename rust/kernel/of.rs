@@ -244,6 +244,27 @@ impl Node {
         }
     }
 
+    /// Translates one `reg` entry into a CPU-addressable resource.
+    ///
+    /// This describes the resource; callers must establish ownership before
+    /// accessing it. The index addresses entries, not individual cells.
+    pub fn address_to_resource(&self, index: usize) -> Result<Resource> {
+        #[cfg(not(CONFIG_OF_ADDRESS))]
+        {
+            Err(ENOSYS)
+        }
+        #[cfg(CONFIG_OF_ADDRESS)]
+        {
+            let res = Resource::zeroed();
+            // SAFETY: We own a reference to this node, and `res` is a valid
+            // writable resource for the duration of the translation.
+            to_result(unsafe {
+                bindings::of_address_to_resource(self.raw_node, index.try_into()?, res.as_raw())
+            })?;
+            Ok(res)
+        }
+    }
+
     #[allow(unused_variables)]
     /// Look up a node property by name, returning a `Property` object if found.
     pub(crate) fn find_property(&self, propname: &CStr) -> Option<Property<'_>> {
