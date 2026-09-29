@@ -35,7 +35,7 @@ pub(crate) struct Service {
     limited: bool,
     terminals: u32,
     compute_terminals: u32,
-    compute_owner: Option<u32>,
+    compute_owners: KVec<u32>,
     fragment: u64,
 }
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
@@ -77,14 +77,17 @@ impl Service {
         self.compute_terminals
     }
     pub(crate) fn begin_compute(&mut self, ordinal: u32) -> Result {
-        if self.compute_owner.is_some() {
+        if self.compute_owners.len() == 36 || self.compute_owners.contains(&ordinal) {
             return Err(EBUSY);
         }
-        self.compute_owner = Some(ordinal);
+        self.compute_owners.push(ordinal, GFP_KERNEL)?;
         Ok(())
     }
-    pub(crate) fn finish_compute(&mut self) {
-        self.compute_owner = None;
+    pub(crate) fn finish_compute(&mut self, ordinal: u32) -> Result {
+        if let Some(index) = self.compute_owners.iter().position(|v| *v == ordinal) {
+            self.compute_owners.remove(index).map_err(|_| EIO)?;
+        }
+        Ok(())
     }
     pub(crate) fn new(
         memory: &Memory,
@@ -116,7 +119,7 @@ impl Service {
             limited: false,
             terminals: 0,
             compute_terminals: 0,
-            compute_owner: None,
+            compute_owners: KVec::with_capacity(36, GFP_KERNEL)?,
             fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
         })
     }
@@ -243,10 +246,10 @@ impl Service {
             if subtype != 3 && body[8..16] == [0; 8] {
                 // render_startup.completion_handler routes every non-render
                 // mask to the oldest active CL owner, exactly once.
-                if compute_ordinal.is_none() || self.compute_owner != compute_ordinal {
+                if compute_ordinal.is_none() || self.compute_owners.is_empty() {
                     return Err(EIO);
                 }
-                self.compute_owner = None;
+                self.compute_owners.remove(0).map_err(|_| EIO)?;
                 self.compute_terminals = self.compute_terminals.checked_add(1).ok_or(EIO)?;
                 self.consume(memory, vm, next)?;
                 return Ok(Action::Consumed);

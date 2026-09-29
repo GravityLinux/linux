@@ -168,7 +168,8 @@ a dormant render graph with both producers withheld. Its first render adopts
 that graph, installs caller mappings with break-before-make, replaces the
 placeholder descriptors, and preserves compute roots and history. Alternating mixed
 command buffers now use this ordinary synchronous path. Prepublished native
-dependency waves and consecutive-compute publication waves still need porting.
+dependency waves still need porting; consecutive computes use the bounded
+publication path described below.
 
 Generate `g17p_drm_mixed_workload.h` with the compute generator's
 `--batch-count 2 --mixed`, and `g17p_drm_render_workload.h` with the render
@@ -233,5 +234,49 @@ Post-close audits check all final images/results, retained roots and shared
 caller pages, retired inner cursors, all timestamp guards, and complete report
 sequences/credits (5/5 for render-first, 9/9 for compute-first). Six CPU contexts
 are collected. These are ordinary synchronous alternating-engine buffers;
-prepublished native dependency waves and consecutive-compute waves remain
+prepublished native dependency waves remain
 separate unfinished source paths.
+
+
+Consecutive compute commands use source publication waves of at most 36,
+bounded further by CL2 channel credits and the 128-command transport interval.
+Every staged command owns a distinct status pair and a saved queue target;
+mutable descriptor/scheduler/context resources cannot alias within a wave.
+Both producers are released per command, then one CL2 notification publishes
+the wave. The ioctl waits for every command, invalidates caller outputs after
+the last, and only then completes aggregate fences. A fault retains the whole
+session's GPU-visible storage. Shared render reports use a FIFO of active
+compute owners. This remains synchronous at the userspace boundary.
+
+Generate and cross-compile the larger native test using the same flags above:
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/make_g17p_compute_workload.py /path/to/m1n1 /tmp/g17p_drm_wave_workload.h --batch-count 64
+# Compile g17p_drm_wave.c, then run on a fresh boot:
+g17p-drm-wave
+# On a separate fresh boot, exercise the shared report FIFO:
+g17p-drm-mixed-batch --compute-wave
+```
+
+The first test submits 64/64/64/64/2 commands with 258 distinct input sets,
+64 independent output pages, 516 guarded timestamps, a timestamp rebind after
+128 commands and five aggregate binary/timeline fence pairs. It checks earlier
+outputs and timestamp history, malformed suffix rejection and admission when
+only two commands remain. Kernel #70 passes 8632642 native checks plus 6234
+memory UAPI checks. Its ten notification groups include full 36-command waves,
+both transport handoffs, descriptor/context/channel wrap and exact post-close
+retention of all 64 output pages, 258 status pairs and timestamp aliases.
+The status allocator is the source's relocatable per-command completion-page
+mechanism, also used for retained direct commands rather than reusing their
+old shared completion pair.
+
+The mixed test mode uses R/C/C/R with separate output for every command and
+cross-engine barriers. It retains the same whole-buffer rejection, timestamp,
+image and aggregate-fence checks as the alternating modes. Kernel #70 passes
+3245407 checks plus 6234 memory checks. Post-close audit verifies sixteen full
+images, two compute pages, twelve timestamps, independent status pairs, both
+compute queues retired, render queues retired and exact FIFO report order
+(growth, render3, compute16, compute32, render3) with credits 5/5. All six CPUs
+are inspected and Linux resumes. The full source
+port still needs additional owner/lifecycle paths and native dependency waves;
+these tests do not establish asynchronous or Mesa parity.

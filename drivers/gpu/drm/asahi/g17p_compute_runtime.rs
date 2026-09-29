@@ -32,7 +32,6 @@ const OPERANDS: u64 = 0x7000238000;
 const OPERAND_TABLE: u64 = 0x7000208000;
 const STATE: u64 = 0x7000220000;
 const ROBUSTNESS: u64 = 0x1000018000;
-pub(crate) const STATUS: [u64; 2] = [0xfffffc2000024c68, 0xfffffc2000024c70];
 
 pub(crate) struct Client {
     pub(crate) root: UserVm,
@@ -141,8 +140,75 @@ pub(crate) struct Submission {
     ring: u64,
     transport: TransportPool,
     robustness: u64,
+    status_base: u64,
+}
+/// Host-only completion/lease record, retained independently of the newest
+/// command. No command may borrow another live command's mutable storage.
+pub(crate) struct Pending {
+    pub(crate) publication: q::Publication,
+    pub(crate) channel: abi::Channel,
+    pub(crate) ordinal: u32,
+    pub(crate) pointers: u64,
+    pub(crate) status: [u64; 2],
+    pub(crate) timestamps: [u64; 2],
+    pub(crate) resources: [u64; 10],
 }
 impl Submission {
+    pub(crate) fn resources(&self, ordinal: u32) -> Result<[u64; 10]> {
+        let status = self.status_base + ordinal as u64 * 0x10;
+        if ordinal == 0 {
+            return Ok([
+                DESCRIPTOR,
+                OPTIONAL,
+                EVENT,
+                SCHEDULER,
+                SHARED_STATE + 4,
+                CTX_HIGH + 0x200,
+                0xfffffc20001c8008,
+                0xfffffc20c07c0008,
+                status,
+                status + 8,
+            ]);
+        }
+        let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
+        if self.after_render {
+            return Ok([
+                spec.descriptor,
+                lifecycle::AFTER_RENDER_OPTIONAL,
+                lifecycle::AFTER_RENDER_EVENT,
+                spec.scheduler,
+                spec.scheduler_slot,
+                lifecycle::AFTER_RENDER_CONTEXT + 0x200,
+                0xfffffc20001c8014,
+                0xfffffc20c07c0014,
+                status,
+                status + 8,
+            ]);
+        }
+        Ok([
+            spec.descriptor,
+            spec.optional,
+            spec.event,
+            spec.scheduler,
+            spec.scheduler_slot,
+            spec.context_record,
+            spec.dispatch[0],
+            spec.dispatch[1],
+            status,
+            status + 8,
+        ])
+    }
+    pub(crate) fn pending(&self) -> Result<Pending> {
+        Ok(Pending {
+            publication: self.publication,
+            channel: self.channel,
+            ordinal: self.ordinal,
+            pointers: self.pointers,
+            status: self.status,
+            timestamps: self.timestamps,
+            resources: self.resources(self.ordinal)?,
+        })
+    }
     pub(crate) fn capacity(&self) -> u32 {
         if self.after_render {
             2
@@ -286,12 +352,10 @@ pub(crate) fn build(
     parameters: &Parameters,
     after_render: bool,
 ) -> Result<Submission> {
-    let status = if after_render {
-        let base = vm.fresh_firmware_page(memory, lifecycle::AFTER_RENDER_STATUS)?;
-        [base, base + 8]
-    } else {
-        STATUS
-    };
+    // Source status_addresses: one relocatable pair for every live command,
+    // including commands submitted together on the retained direct transport.
+    let status_base = vm.fresh_firmware_page(memory, lifecycle::AFTER_RENDER_STATUS)?;
+    let status = [status_base, status_base + 8];
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     let lists = client_storage(memory, &mut client.root, 0x7000000000, 0x200000)?;
@@ -371,22 +435,7 @@ pub(crate) fn build(
             (spec.event, 0x40),
             (spec.dispatch[0], 8),
             (spec.dispatch[1], 8),
-            (
-                if after_render {
-                    status[0] + 0x10
-                } else {
-                    spec.status[0]
-                },
-                8,
-            ),
-            (
-                if after_render {
-                    status[1] + 0x10
-                } else {
-                    spec.status[1]
-                },
-                8,
-            ),
+            (status_base + ordinal as u64 * 0x10, 0x10),
             (lifecycle::SUPPORT, PAGE),
             (lifecycle::SUPPORT_STATE, PAGE),
             (lifecycle::ZERO, PAGE),
@@ -661,6 +710,7 @@ pub(crate) fn build(
         after_render,
         pointers: POINTERS,
         robustness,
+        status_base,
         ring: RING,
         transport: TransportPool {
             slots: [None, None],
@@ -698,17 +748,44 @@ pub(crate) fn stage_next(
     vm: &mut Vm,
     work: &mut Submission,
     parameters: &Parameters,
+    pending: bool,
 ) -> Result {
     let ordinal = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
     if ordinal >= work.capacity() || parameters.preempt != work.preempt {
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
-    let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
-    let (counters, mut write_index) = idle(memory, vm, work)?;
+    let mut spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
+    spec.status = [
+        work.status_base + ordinal as u64 * 0x10,
+        work.status_base + ordinal as u64 * 0x10 + 8,
+    ];
+    let (counters, mut write_index) = if pending {
+        let mut values = [0; 3];
+        for (value, address) in values.iter_mut().zip(work.channel.states) {
+            *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+        }
+        let counters = q::Counters::new(values).map_err(|_| EIO)?;
+        if counters.slot().map_err(|_| EBUSY)? != work.publication.producer {
+            return Err(EIO);
+        }
+        let mut inner = [0; 3];
+        for (value, offset) in inner.iter_mut().zip([0, 0x30, 0x40]) {
+            *value = memory.read_firmware32(vm.physical(memory, 2, work.pointers + offset)?)?;
+        }
+        if inner[2] != work.publication.write_after || inner[0] > inner[1] || inner[1] > inner[2] {
+            return Err(EIO);
+        }
+        (counters, inner[2])
+    } else {
+        idle(memory, vm, work)?
+    };
     if work.after_render {
         return stage_after_render(memory, vm, work, parameters, counters);
     }
     if ordinal % lifecycle::TRANSPORT_INTERVAL == 0 {
+        if pending {
+            return Err(EBUSY);
+        }
         let next = work
             .transport
             .switch(memory, vm, work.pointers, work.ring, write_index)?;

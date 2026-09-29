@@ -1189,11 +1189,10 @@ impl File {
                 }
             }
         }
-        // The ordinary source path completes each alternating engine before
-        // advancing to the next. The ioctl's aggregate fence is installed
-        // only when every command has completed; barriers were checked against
-        // the preceding per-engine counts when decoding the whole buffer.
-        for command in &parameters {
+        // Stage consecutive compute commands in source publication waves;
+        // render transitions still complete synchronously before advancing.
+        let mut commands = parameters.iter().peekable();
+        while let Some(command) = commands.next() {
             match command {
                 Command::Render(p) => {
                     if runtime.session.render_client()?.is_some() {
@@ -1213,21 +1212,18 @@ impl File {
                     }
                 }
                 Command::Compute(p) => {
-                    if runtime.session.compute_client()?.is_some() {
-                        runtime.session.submit_next_compute(
-                            dev.as_ref(),
-                            &runtime.image,
-                            compute_client.take(),
-                            p,
-                        )?;
-                    } else {
-                        runtime.session.submit_compute(
-                            dev.as_ref(),
-                            &runtime.image,
-                            compute_client.take().ok_or(EIO)?,
-                            p,
-                        )?;
+                    let mut run = KVec::with_capacity(64, GFP_KERNEL)?;
+                    run.push(p, GFP_KERNEL)?;
+                    while let Some(Command::Compute(p)) = commands.peek() {
+                        run.push(p, GFP_KERNEL)?;
+                        commands.next();
                     }
+                    runtime.session.submit_computes(
+                        dev.as_ref(),
+                        &runtime.image,
+                        compute_client.take(),
+                        &run,
+                    )?;
                 }
             }
         }

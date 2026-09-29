@@ -192,6 +192,7 @@ impl<E> From<Error> for StageError<E> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Publication {
     pub(crate) slot: u8,
     pub(crate) producer: u8,
