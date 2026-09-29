@@ -20,6 +20,7 @@ fn hash(h: &mut u64, value: u8) {
 }
 fn main() {
     println!("compute-mailbox {COMPUTE_DOORBELL:x}");
+    println!("pointer-offsets {POINTER_DONE:x} {POINTER_READ:x} {POINTER_WRITE:x}");
     for case in 0u32..192 {
         let kind = match case % 3 {
             0 => Kind::Tiling,

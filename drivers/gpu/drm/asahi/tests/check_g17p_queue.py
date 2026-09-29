@@ -23,6 +23,7 @@ mailbox_ns=dict(Register64=Register64)
 exec(compile(ast.Module(body=[n for n in mailbox_ast.body if isinstance(n,ast.ClassDef) and n.name in ('GpuMsg','DoorbellMsg')],type_ignores=[]),'agx_g17p_boot.py','exec'),mailbox_ns)
 mailbox=mailbox_ns['DoorbellMsg'](TYPE=g17p.MSG_WORK_DOORBELL, CHANNEL=0x0a)
 expected=[f'compute-mailbox {int(mailbox.value):x}']
+expected.append(f'pointer-offsets {g17p.QUEUE_PTR_DONE:x} {g17p.QUEUE_PTR_READ:x} {g17p.QUEUE_PTR_WRITE:x}')
 for case in range(192):
     kind=('tiling','fragment','compute')[case%3]
     producer=(0,1,254,255)[case%4]
