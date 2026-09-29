@@ -37,6 +37,7 @@ mod g17p_queue;
 mod g17p_render;
 #[allow(dead_code)]
 mod g17p_render_graph;
+mod g17p_render_lifecycle;
 mod g17p_render_runtime;
 mod g17p_sync;
 mod g17p_timestamp;

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Cold caller-first partial render, following G17PFirstRender's retained owner.
+//! Caller-first partial render and a retained pair-zero append.
 //! Firmware objects and caller GEMs remain owned through both RTKit shutdowns.
 
 use super::{
@@ -15,25 +15,10 @@ use super::{
 };
 use kernel::prelude::*;
 const PAGE: usize = 0x4000;
-pub(crate) const DESCRIPTORS: [u64; 2] = [0xfffffc20c0018000, 0xfffffc20c00b0000];
-pub(crate) const QUEUES: [u64; 2] = [0xfffffc20c0000000, 0xfffffc20c00000c0];
-pub(crate) const POINTERS: [u64; 2] = [0xfffffc2000010000, 0xfffffc2000012870];
-const RINGS: [u64; 2] = [0xfffffc20c0008000, 0xfffffc20c000a870];
-const OPTIONAL: [u64; 2] = [0xfffffc20c06000c0, 0xfffffc20c0600000];
-const EVENTS: [u64; 2] = [0xfffffc20c05e8040, 0xfffffc20c05e8000];
-const POOLS: [u64; 2] = [0xfffffc20c0820100, 0xfffffc20c0830080];
-const SHARED: [u64; 2] = [0xfffffc20c0860000, 0xfffffc20c0832800];
-pub(crate) const STATUS: [u64; 2] = [0xfffffc2001608000, 0xfffffc2001628000];
-const LEAVES: [u64; 6] = [
-    0xfffffc20c0848000,
-    0xfffffc20c0838000,
-    0xfffffc20015f8000,
-    0xfffffc2001618000,
-    0xfffffc2001610000,
-    0xfffffc2001620000,
-];
-const JOB_LIST: u64 = 0xfffffc2000000000;
-const FW_TIMESTAMPS: [u64; 2] = [0xfffffc2000024c68, 0xfffffc2000024c70];
+use super::g17p_render_lifecycle::{
+    self as life, EVENTS, FW_TIMESTAMPS, JOB_LIST, LEAVES, OPTIONAL, POOLS, QUEUES, RINGS, SHARED,
+};
+pub(crate) use super::g17p_render_lifecycle::{DESCRIPTORS, POINTERS, STATUS};
 
 pub(crate) fn first_parameters() -> Parameters {
     Parameters {
@@ -63,6 +48,7 @@ pub(crate) struct Submission {
     pub(crate) channels: [abi::Channel; 2],
     pub(crate) timestamps: [u64; 4],
     pub(crate) growth: Option<super::g17p_growth_runtime::Service>,
+    pub(crate) ordinal: u32,
     deferred: [KVec<Deferred>; 2],
     empty_high: [u64; 2],
 }
@@ -126,6 +112,14 @@ pub(crate) fn build(
         (0x1000190000, 4 * PAGE as u64),
         (p.aux_fb, PAGE as u64),
         (0x7000000000, 0x10000),
+        (
+            opening::CONTEXTS[0].1,
+            opening::CONTEXT_PAGES as u64 * PAGE as u64,
+        ),
+        (
+            opening::CONTEXTS[1].1,
+            opening::CONTEXT_PAGES as u64 * PAGE as u64,
+        ),
         (0x7000208000, PAGE as u64),
         (
             super::g17p_growth::GROWTH_BASE,
@@ -181,8 +175,18 @@ pub(crate) fn build(
     for address in LEAVES {
         vm.submission_leaf(memory, address)?;
     }
-    vm.alias_firmware(memory, DESCRIPTORS[0], 0x7000000000, PAGE)?;
-    vm.alias_firmware(memory, DESCRIPTORS[1], 0x7000098000, PAGE)?;
+    vm.alias_firmware(
+        memory,
+        DESCRIPTORS[0],
+        0x7000000000,
+        life::SUBMISSIONS as usize * r::TA_SIZE,
+    )?;
+    vm.alias_firmware(
+        memory,
+        DESCRIPTORS[1],
+        0x7000098000,
+        life::SUBMISSIONS as usize * r::FRAGMENT_SIZE,
+    )?;
     let kinds = [
         graph::Leaf::PrimaryIndex,
         graph::Leaf::SecondaryIndex,
@@ -503,6 +507,7 @@ pub(crate) fn build(
             p.fragment_user_timestamp_end,
         ],
         growth: None,
+        ordinal: 0,
     })
 }
 
@@ -547,4 +552,194 @@ impl Submission {
         g17p_memory::sync();
         Ok(())
     }
+}
+
+/// Append only after the previous submission passed queues, status, timestamps
+/// and report validation. Preserve all firmware-owned pool and directory state.
+pub(crate) fn stage_next(
+    memory: &mut Memory,
+    vm: &Vm,
+    work: &mut Submission,
+    p: &Parameters,
+) -> Result {
+    let item = life::Item::new(work.ordinal + 1).map_err(|_| EINVAL)?;
+    let mut counters = [q::Counters::new([0; 3]).map_err(|_| EIO)?; 2];
+    let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
+    for index in 0..2 {
+        let previous = work.publications[index].write_after;
+        for at in [0, 0x30, 0x40] {
+            if word(POINTERS[index] + at)? != previous {
+                return Err(EBUSY);
+            }
+        }
+        let channel = work.channels[index];
+        counters[index] = q::Counters::new([
+            word(channel.states[0])?,
+            word(channel.states[1])?,
+            word(channel.states[2])?,
+        ])
+        .map_err(|_| EIO)?;
+        if !work.publications[index].completed(previous, counters[index]) {
+            return Err(EBUSY);
+        }
+        counters[index].slot().map_err(|_| EBUSY)?;
+    }
+    if counters[0].0 != counters[1].0 {
+        return Err(EIO);
+    }
+    // Allocate/build the entire append before editing any live resource state.
+    // Every destination was mapped and retained before the first publication.
+    let mut objects: [KVec<Deferred>; 2] = [KVec::new(), KVec::new()];
+    for index in 0..2 {
+        let kind = if index == 0 {
+            Kind::Tiling
+        } else {
+            Kind::Fragment
+        };
+        for (address, size, ty) in [
+            (item.descriptor_address(kind), kind.size(), 0),
+            (item.optional_address(kind), 0xc0, 1),
+            (
+                opening::CONTEXTS[index].0 + 0x200 * (item.ordinal as u64 + 1),
+                graph::CONTEXT_SIZE,
+                2,
+            ),
+        ] {
+            let mut body = KVVec::with_capacity(size, GFP_KERNEL)?;
+            body.resize(size, 0, GFP_KERNEL)?;
+            match ty {
+                0 => item.descriptor(kind, p, &mut body),
+                1 => item.optional(kind, &mut body),
+                _ => item.context(kind, &mut body),
+            }
+            .map_err(|_| EINVAL)?;
+            for off in (0..size).step_by(PAGE) {
+                vm.physical(memory, 2, address + off as u64)?;
+            }
+            vm.physical(memory, 2, address + size as u64 - 1)?;
+            objects[index].push(Deferred { address, body }, GFP_KERNEL)?;
+        }
+    }
+    work.client.cache(false)?;
+    work.growth
+        .as_mut()
+        .ok_or(EINVAL)?
+        .bind_work(item.descriptor_address(Kind::Fragment))?;
+    let write = |memory: &mut Memory, address, body: &[u8]| vm.write(memory, 2, address, body);
+    let records = item.records();
+    let node = item.ordinal + item.ordinal / 2;
+    write(
+        memory,
+        POOLS[0] + records[0] as u64 * 0x100 + 8,
+        &node.to_le_bytes(),
+    )?;
+    write(
+        memory,
+        POOLS[0] + records[0] as u64 * 0x100 + 0x10,
+        &0x50u32.to_le_bytes(),
+    )?;
+    write(
+        memory,
+        POOLS[1] + records[1] as u64 * 0x80 + 0x4c,
+        &1u32.to_le_bytes(),
+    )?;
+    // Source lifecycle before -> fragment -> tiling. No producer yet visible.
+    write(memory, LEAVES[4] + 0x60, &1u32.to_le_bytes())?;
+    write(memory, item.slot(), &0u32.to_le_bytes())?;
+    for index in [1, 0] {
+        for object in &objects[index] {
+            write(memory, object.address, &object.body)?;
+        }
+        // Current startup holds independently allocated copies of this context
+        // view; update both owned copies, as the first-work builder does.
+        vm.write(
+            memory,
+            1,
+            opening::CONTEXTS[index].1 + 0x200 * (item.ordinal as u64 + 1),
+            &objects[index][2].body,
+        )?;
+        let phase = if index == 1 { 1u32 } else { 2u32 };
+        write(memory, item.slot(), &phase.to_le_bytes())?;
+        write(
+            memory,
+            opening::STATE,
+            &(2 * item.ordinal + phase).to_le_bytes(),
+        )?;
+        write(
+            memory,
+            item.status(if index == 0 {
+                Kind::Tiling
+            } else {
+                Kind::Fragment
+            }),
+            &[0; 0x40],
+        )?;
+        if index == 1 {
+            write(memory, LEAVES[5], &(item.ordinal + 1).to_le_bytes())?;
+            for address in FW_TIMESTAMPS {
+                write(memory, address, &[0; 8])?;
+            }
+        }
+    }
+    // Retired prior PB release, then the same retained owner is selected again.
+    write(memory, SHARED[0] + 0x0c, &u32::MAX.to_le_bytes())?;
+    write(memory, SHARED[0] + 0x0c, &0u32.to_le_bytes())?;
+    write(memory, SHARED[0], &item.ordinal.to_le_bytes())?;
+    write(memory, 0xfffffc20015e0000, &opening::resource_record())?;
+    g17p_memory::sync();
+    for index in 0..2 {
+        let kind = if index == 0 {
+            Kind::Tiling
+        } else {
+            Kind::Fragment
+        };
+        let channel = work.channels[index];
+        work.publications[index] = q::Stage {
+            queue: QUEUES[index],
+            pointers: POINTERS[index],
+            item_ring: RINGS[index],
+            item_capacity: 0x2870 / 8,
+            write_index: work.publications[index].write_after,
+            channel_ring: channel.ring,
+            channel_producer: channel.states[2],
+            counters: counters[index],
+            slot: None,
+            items: &[
+                item.descriptor_address(kind),
+                item.optional_address(kind),
+                item.event_address(kind),
+            ],
+            group: item.ordinal + 1,
+            grid: index as u32,
+            kind: if index == 0 {
+                q::Kind::Tiling
+            } else {
+                q::Kind::Fragment
+            },
+            first: false,
+            in_place: false,
+            announce: false,
+            defer_inner: false,
+            defer_outer: true,
+            event_subtype: None,
+            event_counter: None,
+            event_counter_low: 0,
+        }
+        .publish(&mut Writer { memory, vm })
+        .map_err(|e| match e {
+            q::StageError::Access(e) => e,
+            _ => EINVAL,
+        })?;
+    }
+    for index in 0..2 {
+        work.deferred[index].clear();
+    }
+    work.ordinal = item.ordinal;
+    work.timestamps = [
+        p.ta_user_timestamp_start,
+        p.ta_user_timestamp_end,
+        p.fragment_user_timestamp_start,
+        p.fragment_user_timestamp_end,
+    ];
+    Ok(())
 }

@@ -1114,19 +1114,38 @@ impl File {
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
         if parameters.iter().any(|p| matches!(p, Command::Render(_))) {
-            // Connect the cold render owner first. Reject an unsupported mixed
-            // or repeated batch before any prefix can become visible.
+            // The retained pair supports one synchronous append. Reject mixed or
+            // multi-render batches before any prefix can become visible.
             if parameters.len() != 1 {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            runtime.session.require_first_work()?;
+            if runtime.session.render_remaining()? == 0 {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+            if let Some(client) = runtime.session.render_client()? {
+                if client.owner != (inner.id, vm.id)
+                    || client.bindings.len() != vm.bindings.len()
+                    || !vm.bindings.iter().enumerate().all(|(i, b)| {
+                        client.bindings[i] == (b.start, b.size, b.offset, b.flags)
+                            && core::ptr::eq(&*client.buffers[i], &*b.bo)
+                    })
+                {
+                    return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+                }
+            }
             let Command::Render(render) = &parameters[0] else {
                 return Err(EINVAL);
             };
-            let client = vm.snapshot((inner.id, vm.id), true)?;
-            runtime
-                .session
-                .submit_render(dev.as_ref(), &runtime.image, client, render)?;
+            if runtime.session.render_client()?.is_some() {
+                runtime
+                    .session
+                    .submit_next_render(dev.as_ref(), &runtime.image, render)?;
+            } else {
+                let client = vm.snapshot((inner.id, vm.id), true)?;
+                runtime
+                    .session
+                    .submit_render(dev.as_ref(), &runtime.image, client, render)?;
+            }
             sync.complete();
             return Ok(0);
         }
