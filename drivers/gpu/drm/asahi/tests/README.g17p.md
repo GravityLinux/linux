@@ -140,8 +140,29 @@ validated reports and a new terminal since that publication. Completed linked
 scheduler heads are quiesced before return/rebind. The source's 128-job test
 used two physical pairs (64 each); do not equate its harness limit with a
 qualified 128-job lifetime for this sole pair. Further reuse, a second render
-owner, mixed engines and general source parity remain unfinished. The 64-job
+owner, mixed command batches and general source parity remain unfinished. The 64-job
 retirement/boundary run passes on T8140 with 512 full-image comparisons,
 256 timestamps, 64 new terminals, exact credits, an empty scheduler head
 and a post-close retained-memory audit. Raw evidence is recorded in the
 local m1n1 EXPERIMENT_LOG.md. These results do not complete source parity.
+
+The ordinary render-first transition now retains the render root, pool and
+control history while constructing the source's two post-render compute queue
+owners. It allocates fresh compute status storage and keeps private robustness
+state in the reserved VM aperture, preserving caller program pages. One shared
+report reader routes non-render masks to the active compute command once;
+compute terminals do not satisfy a render terminal baseline. Returning to
+render preserves its existing queue lifetime. Compute-first rendering and
+mixed command buffers are still pending.
+
+Generate `g17p_drm_mixed_workload.h` with the compute generator's
+`--batch-count 2 --mixed`, and `g17p_drm_render_workload.h` with the render
+generator's `--triangles 131072`. Compile `g17p_drm_mixed.c` as above and run
+`g17p-drm-mixed` on a fresh boot. It runs R/C/R/C/R on one VM, keeping disjoint
+caller graphs resident at the fixed USC base. T8140 passes 4605071 checks:
+three pressure renders, two independent add3 outputs, all output tails,
+16 ordered timestamps and five binary/timeline fence pairs. Post-close audit
+confirms retained outputs, separate roots, both compute queues retired, render
+queues retired, three render and two compute report records, exact credits,
+and six online CPUs. This qualifies the transition; it does not complete the
+synchronous source port or asynchronous plan stages.

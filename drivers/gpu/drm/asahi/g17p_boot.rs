@@ -354,9 +354,6 @@ impl Session {
     }
 
     pub(crate) fn compute_client(&self) -> Result<Option<&compute::Client>> {
-        if self.render.is_some() {
-            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
-        }
         if self.phase == Phase::Failed {
             return Err(EIO);
         }
@@ -366,14 +363,27 @@ impl Session {
         Ok(self.compute.as_ref().map(|work| &work.client))
     }
 
+    pub(crate) fn require_compute_owner(&self, owner: (u64, u32)) -> Result {
+        if self
+            .render
+            .as_ref()
+            .is_some_and(|work| work.client.owner != owner)
+        {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        Ok(())
+    }
+
     pub(crate) fn compute_remaining(&self) -> Result<usize> {
         self.compute_client()?;
-        Ok(self
-            .compute
-            .as_ref()
-            .map_or(compute::SUBMISSIONS as usize, |work| {
-                (compute::SUBMISSIONS - work.ordinal - 1) as usize
-            }))
+        Ok(self.compute.as_ref().map_or(
+            if self.render.is_some() {
+                2
+            } else {
+                compute::SUBMISSIONS as usize
+            },
+            |work| (work.capacity() - work.ordinal - 1) as usize,
+        ))
     }
 
     pub(crate) fn submit_next_compute(
@@ -387,7 +397,7 @@ impl Session {
             return Err(EIO);
         }
         let work = self.compute.as_mut().ok_or(EINVAL)?;
-        if work.ordinal + 1 >= compute::SUBMISSIONS || work.preempt != parameters.preempt {
+        if work.ordinal + 1 >= work.capacity() || work.preempt != parameters.preempt {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         }
         if let Some(client) = replacement {
@@ -430,17 +440,51 @@ impl Session {
         client: compute::Client,
         parameters: &compute::Parameters,
     ) -> Result {
-        self.require_first_work()?;
+        let after_render = self.render.is_some();
+        self.require_compute_owner(client.owner)?;
+        if after_render {
+            if self.phase != Phase::Running || self.compute.is_some() {
+                return Err(EIO);
+            }
+            let memory = self.memory.as_mut().ok_or(EINVAL)?;
+            let vm = self.vm.as_ref().ok_or(EINVAL)?;
+            render::quiesce(memory, vm, self.render.as_ref().ok_or(EINVAL)?)?;
+            let control = image.graph.channels[0][12];
+            let mut counts = [0; 3];
+            for (value, address) in counts.iter_mut().zip(control.states) {
+                *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+            }
+            if counts[0] != counts[1] || counts[1] != counts[2] {
+                return Err(EBUSY);
+            }
+            dev_info!(
+                dev,
+                "G17P: post-render compute retains control history {:?}\n",
+                counts
+            );
+        } else {
+            self.require_first_work()?;
+        }
         let ttbs = self.ttbs;
-        let work = self
-            .stage(|memory, vm| compute::build(memory, vm, image, ttbs, client, parameters))
-            .inspect_err(|error| {
-                dev_err!(
-                    dev,
-                    "G17P: first compute graph preparation failed: {:?}\n",
-                    error
-                );
-            })?;
+        let built = compute::build(
+            self.memory.as_mut().ok_or(EINVAL)?,
+            self.vm.as_mut().ok_or(EINVAL)?,
+            image,
+            ttbs,
+            client,
+            parameters,
+            after_render,
+        );
+        if built.is_err() && after_render {
+            self.phase = Phase::Failed;
+        }
+        let work = built.inspect_err(|error| {
+            dev_err!(
+                dev,
+                "G17P: first compute graph preparation failed: {:?}\n",
+                error
+            );
+        })?;
         // Ownership precedes the first mailbox publication. Even an initdata
         // timeout or firmware error keeps every reachable client page pinned.
         self.compute = Some(work);
@@ -455,7 +499,7 @@ impl Session {
         if self.phase == Phase::Failed {
             return Err(EIO);
         }
-        if self.compute.is_some() {
+        if self.compute.is_some() && self.render.is_none() {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         }
         Ok(self.render.as_ref().map(|work| &work.client))
@@ -674,6 +718,7 @@ impl Session {
                     self.vm.as_ref().ok_or(EINVAL)?,
                     &mut work.client.root,
                     self.ttbs,
+                    None,
                 )?;
                 match action {
                     Action::Idle => break,
@@ -889,9 +934,18 @@ impl Session {
             .cache(timestamps, false)?;
         if self.phase == Phase::Prepared {
             self.start(dev, image)?;
+        } else if self.phase != Phase::Running {
+            return Err(EIO);
         }
         let startup = self.report_snapshot(image)?;
         let work = self.compute.as_ref().ok_or(EINVAL)?;
+        if let Some(render) = self.render.as_mut() {
+            render
+                .growth
+                .as_mut()
+                .ok_or(EINVAL)?
+                .begin_compute(work.ordinal)?;
+        }
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
         let memory = self.memory.as_mut().ok_or(EINVAL)?;
         if let Some((address, value)) = work.publication.deferred_inner {
@@ -923,6 +977,25 @@ impl Session {
             {
                 return Err(EIO);
             }
+            if let Some(render) = self.render.as_mut() {
+                for _ in 0..32 {
+                    use super::g17p_growth_runtime::Action;
+                    let action = render.growth.as_mut().ok_or(EINVAL)?.step(
+                        self.memory.as_mut().ok_or(EINVAL)?,
+                        vm,
+                        &mut render.client.root,
+                        self.ttbs,
+                        Some(self.compute.as_ref().ok_or(EINVAL)?.ordinal),
+                    )?;
+                    match action {
+                        Action::Idle => break,
+                        Action::Consumed => (),
+                        // No render is live during this serialized compute
+                        // publication; a new growth request cannot be attributed.
+                        _ => return Err(EIO),
+                    }
+                }
+            }
             let work = self.compute.as_ref().ok_or(EINVAL)?;
             let memory = self.memory.as_ref().ok_or(EINVAL)?;
             for (index, offset) in [
@@ -933,11 +1006,8 @@ impl Session {
             .into_iter()
             .enumerate()
             {
-                last[index] = memory.read_firmware32(vm.physical(
-                    memory,
-                    2,
-                    compute::POINTERS + offset,
-                )?)?;
+                last[index] =
+                    memory.read_firmware32(vm.physical(memory, 2, work.pointers + offset)?)?;
             }
             for (index, address) in work.channel.states.into_iter().enumerate() {
                 last[index + 3] = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
@@ -945,6 +1015,14 @@ impl Session {
             let counters = queue::Counters::new([last[3], last[4], last[5]]).map_err(|_| EIO)?;
             if work.publication.completed(last[0], counters) {
                 let after = self.report_snapshot(image)?;
+                if self.render.as_ref().is_some_and(|render| {
+                    render
+                        .growth
+                        .as_ref()
+                        .is_none_or(|service| service.cursor() != after[0].firmware)
+                }) {
+                    continue;
+                }
                 for (peer, (report, before)) in after.iter().zip(startup.iter()).enumerate() {
                     for (index, body) in report.records.iter().enumerate() {
                         let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
@@ -989,6 +1067,12 @@ impl Session {
                     &last[3..], command_status
                 );
                 self.acknowledge_reports(image, &after)?;
+                if let Some(render) = &mut self.render {
+                    let service = render.growth.as_mut().ok_or(EINVAL)?;
+                    service.finish_compute();
+                    dev_info!(dev, "G17P: mixed reports: render terminals {}, compute terminals {}, cursor {}\n",
+                        service.terminals(), service.compute_terminals(), service.cursor());
+                }
                 return Ok(());
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
