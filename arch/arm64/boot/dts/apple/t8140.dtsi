@@ -693,7 +693,7 @@
 		};
 
 		nvme: nvme@3cdcc0000 {
-			compatible = "apple,t8140-nvme-ans2", "apple,t8103-nvme-ans2";
+			compatible = "apple,t8140-nvme-ans2", "apple,t8132-nvme-ans2";
 			reg = <0x3 0xcdcc0000 0x0 0x60000>,
 			      <0x3 0x89600000 0x0 0x4000>;
 			reg-names = "nvme", "ans";
