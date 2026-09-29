@@ -388,12 +388,12 @@ impl Session {
         ))
     }
 
-    pub(crate) fn submit_next_compute(
+    fn prepare_next_compute(
         &mut self,
         dev: &kernel::device::Device,
-        image: &Image,
         replacement: Option<compute::Client>,
         parameters: &compute::Parameters,
+        pending: bool,
     ) -> Result {
         if self.phase != Phase::Running {
             return Err(EIO);
@@ -428,6 +428,7 @@ impl Session {
             self.vm.as_mut().ok_or(EINVAL)?,
             work,
             parameters,
+            pending,
         );
         if staged.is_ok() && old_pointers != work.pointers {
             dev_info!(
@@ -438,14 +439,14 @@ impl Session {
                 work.pointers
             );
         }
-        let result = staged.and_then(|()| self.run_compute(dev, image));
+        let result = staged;
         if result.is_err() {
             self.phase = Phase::Failed;
         }
         result
     }
 
-    pub(crate) fn submit_compute(
+    fn prepare_compute(
         &mut self,
         dev: &kernel::device::Device,
         image: &Image,
@@ -526,11 +527,7 @@ impl Session {
         // Ownership precedes the first mailbox publication. Even an initdata
         // timeout or firmware error keeps every reachable client page pinned.
         self.compute = Some(work);
-        let result = self.run_compute(dev, image);
-        if result.is_err() {
-            self.phase = Phase::Failed;
-        }
-        result
+        Ok(())
     }
 
     pub(crate) fn render_client(&self) -> Result<Option<&compute::Client>> {
@@ -986,53 +983,156 @@ impl Session {
         Ok(())
     }
 
-    fn run_compute(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
-        let timestamps = self.compute.as_ref().ok_or(EINVAL)?.timestamps;
-        self.timestamps
-            .as_ref()
-            .ok_or(EINVAL)?
-            .cache(timestamps, false)?;
-        if self.phase == Phase::Prepared {
-            self.start(dev, image)?;
-            if let Some(work) = self.dormant_render.as_ref() {
-                work.initialize_operands(
-                    self.memory.as_mut().ok_or(EINVAL)?,
-                    self.vm.as_ref().ok_or(EINVAL)?,
-                )?;
+    /// The source groups consecutive CL commands into bounded publication
+    /// waves, not frontend-asynchronous ioctls. Retain every command's lease
+    /// until its own queue target and distinct completion word are observed.
+    pub(crate) fn submit_computes(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        mut client: Option<compute::Client>,
+        parameters: &[&compute::Parameters],
+    ) -> Result {
+        if parameters.is_empty() {
+            return Err(EINVAL);
+        }
+        let result = (|| {
+            let mut first = 0;
+            let mut frames: KVec<compute::Pending> = KVec::with_capacity(36, GFP_KERNEL)?;
+            while first < parameters.len() {
+                frames.clear();
+                let next = self.compute.as_ref().map_or(0, |w| w.ordinal + 1);
+                let after_render = self
+                    .compute
+                    .as_ref()
+                    .map_or(self.render.is_some(), |w| w.after_render);
+                let channel = self
+                    .compute
+                    .as_ref()
+                    .map_or(image.graph.channels[0][8], |w| w.channel);
+                let memory = self.memory.as_ref().ok_or(EINVAL)?;
+                let vm = self.vm.as_ref().ok_or(EINVAL)?;
+                let mut values = [0; 3];
+                for (value, address) in values.iter_mut().zip(channel.states) {
+                    *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+                }
+                let credits = queue::Counters::new(values).map_err(|_| EIO)?.available() as usize;
+                // Startup executes its opening command before entering the
+                // retained wave lifetime, as in the source direct bootstrap.
+                let room = if self.phase == Phase::Prepared {
+                    1
+                } else if after_render {
+                    36
+                } else {
+                    (128 - next % 128) as usize
+                };
+                let count = (parameters.len() - first).min(36).min(credits).min(room);
+                if count == 0 {
+                    return Err(EBUSY);
+                }
+                let mut startup = None;
+                for index in 0..count {
+                    if let Some(work) = self.compute.as_ref() {
+                        let resources = work.resources(work.ordinal + 1)?;
+                        if frames.iter().any(|prior| {
+                            resources.iter().zip(prior.resources).any(|(a, b)| *a == b)
+                        }) {
+                            return Err(EBUSY);
+                        }
+                        self.prepare_next_compute(
+                            dev,
+                            client.take(),
+                            parameters[first + index],
+                            index != 0,
+                        )?;
+                    } else {
+                        self.prepare_compute(
+                            dev,
+                            image,
+                            client.take().ok_or(EINVAL)?,
+                            parameters[first + index],
+                        )?;
+                    }
+                    let frame = self.compute.as_ref().ok_or(EINVAL)?.pending()?;
+                    self.timestamps
+                        .as_ref()
+                        .ok_or(EINVAL)?
+                        .cache(frame.timestamps, false)?;
+                    if self.phase == Phase::Prepared {
+                        self.start(dev, image)?;
+                        if let Some(work) = self.dormant_render.as_ref() {
+                            work.initialize_operands(
+                                self.memory.as_mut().ok_or(EINVAL)?,
+                                self.vm.as_ref().ok_or(EINVAL)?,
+                            )?;
+                        }
+                    } else if self.phase != Phase::Running {
+                        return Err(EIO);
+                    }
+                    if index == 0 {
+                        startup = Some(self.report_snapshot(image)?);
+                    }
+                    if let Some(render) = self.render.as_mut() {
+                        render
+                            .growth
+                            .as_mut()
+                            .ok_or(EINVAL)?
+                            .begin_compute(frame.ordinal)?;
+                    }
+                    // Metadata and report owner precede either producer.
+                    frames.push(frame, GFP_KERNEL)?;
+                    let frame = frames.last().ok_or(EIO)?;
+                    let memory = self.memory.as_mut().ok_or(EINVAL)?;
+                    let vm = self.vm.as_ref().ok_or(EINVAL)?;
+                    if let Some((address, value)) = frame.publication.deferred_inner {
+                        vm.write(memory, 2, address, &value.to_le_bytes())?;
+                        g17p_memory::sync();
+                    }
+                    let (address, value) = frame.publication.deferred_outer.ok_or(EINVAL)?;
+                    vm.write(memory, 2, address, &value.to_le_bytes())?;
+                    g17p_memory::sync();
+                }
+                self.peers[0]
+                    .rtkit
+                    .as_mut()
+                    .ok_or(EINVAL)?
+                    .as_mut()
+                    .send_message(0x21, queue::COMPUTE_DOORBELL)?;
+                dev_info!(dev, "G17P: compute wave {}..{} published before one CL2 notification, client root {:#x}\n",
+                          frames[0].ordinal, frames[count-1].ordinal,
+                          self.compute.as_ref().ok_or(EINVAL)?.client.root.root());
+                for (index, frame) in frames.iter().enumerate() {
+                    let last = index + 1 == count;
+                    self.finish_compute(
+                        dev,
+                        image,
+                        frame,
+                        startup.as_ref().ok_or(EIO)?,
+                        last,
+                        last || (index + 1) % 32 == 0,
+                    )?;
+                }
+                first += count;
             }
-        } else if self.phase != Phase::Running {
-            return Err(EIO);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.phase = Phase::Failed;
         }
-        let startup = self.report_snapshot(image)?;
-        let work = self.compute.as_ref().ok_or(EINVAL)?;
-        if let Some(render) = self.render.as_mut() {
-            render
-                .growth
-                .as_mut()
-                .ok_or(EINVAL)?
-                .begin_compute(work.ordinal)?;
-        }
+        result
+    }
+
+    fn finish_compute(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        frame: &compute::Pending,
+        startup: &[Report; 2],
+        copyback: bool,
+        service_reports: bool,
+    ) -> Result {
+        let timestamps = frame.timestamps;
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
-        let memory = self.memory.as_mut().ok_or(EINVAL)?;
-        if let Some((address, value)) = work.publication.deferred_inner {
-            vm.write(memory, 2, address, &value.to_le_bytes())?;
-            g17p_memory::sync();
-        }
-        let (address, value) = work.publication.deferred_outer.ok_or(EINVAL)?;
-        vm.write(memory, 2, address, &value.to_le_bytes())?;
-        g17p_memory::sync();
-        self.peers[0]
-            .rtkit
-            .as_mut()
-            .ok_or(EINVAL)?
-            .as_mut()
-            .send_message(0x21, queue::COMPUTE_DOORBELL)?;
-        dev_info!(
-            dev,
-            "G17P: caller compute {} published on CL2, client root {:#x}\n",
-            work.ordinal,
-            work.client.root.root()
-        );
         let mut last = [0u32; 6];
         let mut command_status = 0;
         for _ in 0..200 {
@@ -1051,7 +1151,7 @@ impl Session {
                         vm,
                         &mut render.client.root,
                         self.ttbs,
-                        Some(self.compute.as_ref().ok_or(EINVAL)?.ordinal),
+                        Some(frame.ordinal),
                     )?;
                     match action {
                         Action::Idle => break,
@@ -1062,7 +1162,7 @@ impl Session {
                     }
                 }
             }
-            let work = self.compute.as_ref().ok_or(EINVAL)?;
+            let work = frame;
             let memory = self.memory.as_ref().ok_or(EINVAL)?;
             for (index, offset) in [
                 queue::POINTER_DONE,
@@ -1121,7 +1221,9 @@ impl Session {
                     kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
                     continue;
                 }
-                work.client.cache(true)?;
+                if copyback {
+                    self.compute.as_ref().ok_or(EINVAL)?.client.cache(true)?;
+                }
                 self.timestamps
                     .as_ref()
                     .ok_or(EINVAL)?
@@ -1132,10 +1234,12 @@ impl Session {
                     &last[..3],
                     &last[3..], command_status
                 );
-                self.acknowledge_reports(image, &after)?;
+                if service_reports {
+                    self.acknowledge_reports(image, &after)?;
+                }
                 if let Some(render) = &mut self.render {
                     let service = render.growth.as_mut().ok_or(EINVAL)?;
-                    service.finish_compute();
+                    service.finish_compute(frame.ordinal)?;
                     dev_info!(dev, "G17P: mixed reports: render terminals {}, compute terminals {}, cursor {}\n",
                         service.terminals(), service.compute_terminals(), service.cursor());
                 }

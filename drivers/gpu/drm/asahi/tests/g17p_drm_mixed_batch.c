@@ -40,7 +40,11 @@ int main(int argc, char **argv)
 {
 	setbuf(stdout, NULL);
 	int compute_first = argc == 2 && !strcmp(argv[1], "--compute-first");
-	CHECK(argc == 1 || compute_first);
+	int compute_wave = argc == 2 && !strcmp(argv[1], "--compute-wave");
+	CHECK(argc == 1 || compute_first || compute_wave);
+	unsigned kinds[4];
+	for (unsigned step = 0; step < 4; step++)
+		kinds[step] = compute_wave ? (step == 1 || step == 2) : ((step & 1) ^ compute_first);
 
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); CHECK(fd >= 0);
 	uint32_t vm = vm_new(fd);
@@ -84,7 +88,7 @@ int main(int argc, char **argv)
 	struct drm_asahi_timestamp *stamps[4][4];
 	unsigned counts[2] = {0}, position = 0;
 	for (unsigned step = 0; step < 4; step++) {
-		unsigned kind = (step & 1) ^ compute_first, n = step / 2;
+		unsigned kind = kinds[step], n = counts[kind];
 		if (kind) {
 			struct compute_packet packet = { .header = { .cmd_type = DRM_ASAHI_CMD_COMPUTE, .size = sizeof(packet.cmd) },
 				.cmd = { .cdm_ctrl_stream_base = batch_workloads[n].cdm,
@@ -121,12 +125,12 @@ int main(int argc, char **argv)
 	unsigned batches = compute_first ? 2 : 1;
 	uint64_t last = 0;
 	printf("G17P_NATIVE_MIXED_BATCH_BEGIN %s, %u batches, every command has distinct outputs\n",
-		compute_first ? "C/R/C/R" : "R/C/R/C", batches);
+		compute_first ? "C/R/C/R" : compute_wave ? "R/C/C/R" : "R/C/R/C", batches);
 	for (unsigned batch = 0; batch < batches; batch++) {
 		for (unsigned target = 0; target < 16; target++) memset(images[target], 0xa5, RENDER_OUTPUT_SIZE);
 		for (unsigned n = 0; n < 2; n++) memset(outputs[n], 0xa5, PAGE);
 		for (unsigned step = 0; step < 4; step++) {
-			unsigned count = ((step & 1) ^ compute_first) ? 2 : 4;
+			unsigned count = kinds[step] ? 2 : 4;
 			for (unsigned i = 0; i < count; i++) {
 				unsigned offset = 64 + (batch * 4 + step) * 64 + i * 8;
 				stamps[step][i]->handle = object.object_handle; stamps[step][i]->offset = offset;
@@ -149,7 +153,7 @@ int main(int argc, char **argv)
 		if (!compute_first) {
 			/* Prospective post-render compute capacity is two, although no
 			 * compute owner exists yet. Do not run a prefix before discovering it. */
-			memcpy(buffer.bytes + position, headers[3], sizeof(struct compute_packet));
+			memcpy(buffer.bytes + position, headers[compute_wave ? 2 : 3], sizeof(struct compute_packet));
 			submit.cmdbuf_size = position + sizeof(struct compute_packet);
 			BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP); submit.cmdbuf_size = position;
 		}
@@ -163,7 +167,7 @@ int main(int argc, char **argv)
 		errno = 0; int result = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit), error = errno;
 		printf("MIXED_BATCH %u rc=%d errno=%d\n", batch, result, error); CHECK(result == 0);
 		for (unsigned step = 0; step < 4; step++) {
-			unsigned count = ((step & 1) ^ compute_first) ? 2 : 4, offset = PAGE + 64 + (batch * 4 + step) * 64;
+			unsigned count = kinds[step] ? 2 : 4, offset = PAGE + 64 + (batch * 4 + step) * 64;
 			uint64_t values[4]; memcpy(values, timestamps + offset, count * 8);
 			for (unsigned i = 0; i < count; i += 2) CHECK(values[i] && values[i + 1] > values[i]);
 			CHECK(values[0] > last); last = values[count - 1];
