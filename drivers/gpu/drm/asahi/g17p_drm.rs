@@ -758,10 +758,10 @@ impl File {
         vm: &Vm,
         objects: &[Timestamp],
         bytes: &[u8],
-    ) -> Result<super::g17p_compute_runtime::Parameters> {
+    ) -> Result<KVec<super::g17p_compute_runtime::Parameters>> {
         use super::g17p_compute_runtime as compute;
         let mut offset = 0;
-        let mut command = None;
+        let mut commands = KVec::new();
         while offset < bytes.len() {
             let header = bytes.get(offset..offset + 8).ok_or(EINVAL)?;
             let kind = u16::from_le_bytes(header[0..2].try_into().unwrap());
@@ -787,12 +787,17 @@ impl File {
                 }
                 continue;
             }
-            if kind != 1 || command.is_some() {
+            if kind != 1 {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            if barriers.iter().any(|b| *b != 0 && *b != u16::MAX) {
+            if commands.len() == 64
+                || (barriers[0] != 0 && barriers[0] != u16::MAX)
+                || (barriers[1] != u16::MAX && barriers[1] as usize > commands.len())
+            {
                 return Err(EINVAL);
             }
+            // All previous commands finish before the next one starts in
+            // this synchronous port, satisfying each validated barrier.
             if payload
                 .get(64..)
                 .unwrap_or_default()
@@ -844,16 +849,22 @@ impl File {
             if cmd.sampler_count != 0 {
                 vm.cover(cmd.sampler_heap, cmd.sampler_count as u64 * 8, READ)?;
             }
-            command = Some(compute::Parameters {
-                preempt: vm.kernel_start,
-                cdm: base,
-                end,
-                sampler: cmd.sampler_heap,
-                sampler_count: cmd.sampler_count,
-                timestamps,
-            });
+            commands.push(
+                compute::Parameters {
+                    preempt: vm.kernel_start,
+                    cdm: base,
+                    end,
+                    sampler: cmd.sampler_heap,
+                    sampler_count: cmd.sampler_count,
+                    timestamps,
+                },
+                GFP_KERNEL,
+            )?;
         }
-        command.ok_or(EINVAL)
+        if commands.is_empty() {
+            return Err(EINVAL);
+        }
+        Ok(commands)
     }
     fn submit(dev: &Device, data: &uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
         if data.flags != 0
@@ -908,14 +919,23 @@ impl File {
             {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            runtime
-                .session
-                .submit_next_compute(dev.as_ref(), &runtime.image, &parameters)?;
-        } else {
-            let client = vm.snapshot((inner.id, vm.id))?;
-            runtime
-                .session
-                .submit_compute(dev.as_ref(), &runtime.image, client, &parameters)?;
+        }
+        // Admit the complete batch before its first publication. In
+        // particular, exhaustion may never execute an accepted prefix.
+        if parameters.len() > runtime.session.compute_remaining()? {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
+        for parameters in &parameters {
+            if runtime.session.compute_client()?.is_some() {
+                runtime
+                    .session
+                    .submit_next_compute(dev.as_ref(), &runtime.image, parameters)?;
+            } else {
+                let client = vm.snapshot((inner.id, vm.id))?;
+                runtime
+                    .session
+                    .submit_compute(dev.as_ref(), &runtime.image, client, parameters)?;
+            }
         }
         sync.complete();
         Ok(0)

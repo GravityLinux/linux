@@ -361,6 +361,16 @@ impl Session {
         Ok(self.compute.as_ref().map(|work| &work.client))
     }
 
+    pub(crate) fn compute_remaining(&self) -> Result<usize> {
+        self.compute_client()?;
+        Ok(self
+            .compute
+            .as_ref()
+            .map_or(compute::SUBMISSIONS as usize, |work| {
+                (compute::SUBMISSIONS - work.ordinal - 1) as usize
+            }))
+    }
+
     pub(crate) fn submit_next_compute(
         &mut self,
         dev: &kernel::device::Device,

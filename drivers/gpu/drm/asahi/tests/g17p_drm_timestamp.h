@@ -58,7 +58,7 @@ static void timestamp_check(struct timestamp_test *t, unsigned count)
 	for (unsigned i = 0; i < count; i++)
 		CHECK(!memcmp(t->map + PAGE + 64 + i * 16, t->saved[i], 16));
 }
-static void timestamp_after(struct timestamp_test *t, unsigned n)
+static inline void timestamp_after(struct timestamp_test *t, unsigned n)
 {
 	memcpy(t->saved[n], t->map + PAGE + 64 + n * 16, 16);
 	uint64_t start = t->saved[n][0], end = t->saved[n][1];
