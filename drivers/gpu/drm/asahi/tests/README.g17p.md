@@ -225,8 +225,9 @@ binary/timeline fences cover each aggregate ioctl.
 
 Trailing invalid flags, future barriers, missing timestamp handles and a valid
 VM binding overlapping render-private storage all reject before any prefix.
-The render-first case also rejects a third compute against the prospective
-two-command post-render capacity before constructing either engine. Rejections
+Kernel #69 also rejected a third compute against its then-unported later
+post-render lifetime. That artificial two-command limit and its obsolete test
+assertions are removed by the retained path below. Rejections
 preserve all outputs, timestamps and aggregate fences, including on the live
 compute-first runtime. Both runs subsequently pass 6234 memory UAPI checks.
 
@@ -280,3 +281,44 @@ compute queues retired, render queues retired and exact FIFO report order
 are inspected and Linux resumes. The full source
 port still needs additional owner/lifecycle paths and native dependency waves;
 these tests do not establish asynchronous or Mesa parity.
+
+
+Ordinary post-render compute now covers the source's 258-command window.
+Ordinal zero uses the opening owner, ordinal one starts queue/grid five, and
+later commands retain that queue with fresh descriptors, two ring entries
+(descriptor/event) and no further optional item. Allocate only the current
+command's scheduler/event/descriptor storage and preserve queue, support,
+job-list and context-page history. Emit the source's initial context-two 0x2e
+control tick before ordinal two, without a separate control doorbell. The first
+two commands have independent dispatch storage and can share a notification;
+later ordinary commands reuse queue one's dispatch locations, so retire their
+leases before staging the next. The ioctl remains synchronous.
+
+The expanded lifecycle oracle compares 396 full objects / 1103264 bytes with
+pure Python constructors, including post-render descriptors, event placements
+and all context/descriptor wrap boundaries. Generate the usual two-graph mixed
+header and pressure-render header, compile `g17p_drm_retained_mixed.c`, and run
+`g17p-drm-retained-mixed` on a fresh boot. Kernel #71 passes 146475917 checks:
+R/Cx258/R, changing inputs, all eight full images throughout, every compute
+output/guard, 524 timestamps with complete history, 260 aggregate fence pairs,
+capacity rejection before a prefix and exhaustion. Rendering succeeds again
+after compute. Subsequent memory UAPI checks pass 6234.
+
+For consecutive buffers on this same owner, generate
+`g17p_drm_retained_wave_workload.h` with `--batch-count 56 --mixed`, compile
+`g17p_drm_retained_wave.c`, then run `g17p-drm-retained-wave` on a fresh boot.
+The first eight caller graph namespaces belong to render, leaving 56 disjoint
+source compute graphs. It submits 56/56/56/56/34 commands between two pressure
+renders: 258 distinct input sets, 56 independent output pages, 516 timestamp
+values with live alias rebind and five aggregate binary/timeline fence pairs.
+Kernel #71 passes 13227558 checks plus 6234 memory checks. Invalid suffixes,
+input wait errors and a 35-command buffer with only 34 placements remaining
+preserve every prefix output, timestamp and fence.
+
+Both post-close audits verify final render and compute outputs, independent
+completion words, the latest 240 descriptors, all 256 retained context records,
+the full 515-entry queue-one ring, channel and report wrap, timestamps and exact
+report credits. Queue zero is 3/3/3, queue one 515/515/515, render queues6/6/6,
+primary credits5/5, secondary0/0. All six CPU contexts are inspected and Linux
+resumes. Remaining render-owner paths, native C/R/C dependency waves and general
+source parity are still open; no asynchronous or Mesa parity is claimed.

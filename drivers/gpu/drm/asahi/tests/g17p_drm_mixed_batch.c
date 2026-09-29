@@ -150,13 +150,6 @@ int main(int argc, char **argv)
 		bind(fd, vm, collision, 0x10001b0000, PAGE, 0, DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE, 0);
 		BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
 		bind(fd, vm, 0, 0x10001b0000, PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0); { struct drm_gem_close gc = { .handle = collision }; OK(fd, DRM_IOCTL_GEM_CLOSE, &gc); }
-		if (!compute_first) {
-			/* Prospective post-render compute capacity is two, although no
-			 * compute owner exists yet. Do not run a prefix before discovering it. */
-			memcpy(buffer.bytes + position, headers[compute_wave ? 2 : 3], sizeof(struct compute_packet));
-			submit.cmdbuf_size = position + sizeof(struct compute_packet);
-			BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP); submit.cmdbuf_size = position;
-		}
 		render_check(images, 0); compute_check(outputs, 0); CHECK(memcmp(timestamps, expected, sizeof(expected)) == 0);
 		uint64_t submitted = UINT64_MAX;
 		struct drm_syncobj_timeline_array query = { .handles = (uintptr_t)&timeline.handle,
@@ -177,10 +170,6 @@ int main(int argc, char **argv)
 		CHECK(memcmp(timestamps, expected, sizeof(expected)) == 0);
 		render_check(images, 1); compute_check(outputs, 2);
 		OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait); OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
-	}
-	if (!compute_first) {
-		BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
-		render_check(images, 1); compute_check(outputs, 2); CHECK(memcmp(timestamps, expected, sizeof(expected)) == 0);
 	}
 	CHECK(close(fd) == 0);
 	printf("G17P_NATIVE_MIXED_BATCH_PASS %u batches, %u renders / %u compute, every output and timestamp, cross-engine barriers, aggregate fences and rejected suffixes; checks=%u\n",

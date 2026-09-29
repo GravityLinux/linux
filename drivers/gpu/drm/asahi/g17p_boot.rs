@@ -376,16 +376,14 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn compute_remaining(&self, render_first: bool) -> Result<usize> {
+    pub(crate) fn compute_remaining(&self, _render_first: bool) -> Result<usize> {
         self.compute_client()?;
-        Ok(self.compute.as_ref().map_or(
-            if self.render.is_some() || render_first {
-                2
-            } else {
-                compute::SUBMISSIONS as usize
-            },
-            |work| (work.capacity() - work.ordinal - 1) as usize,
-        ))
+        Ok(self
+            .compute
+            .as_ref()
+            .map_or(compute::SUBMISSIONS as usize, |work| {
+                (work.capacity() - work.ordinal - 1) as usize
+            }))
     }
 
     fn prepare_next_compute(
@@ -1022,7 +1020,13 @@ impl Session {
                 let room = if self.phase == Phase::Prepared {
                     1
                 } else if after_render {
-                    36
+                    // Later ordinary commands reuse queue one's dispatch
+                    // records. End the wave before rewriting a live lease.
+                    if next == 0 {
+                        2
+                    } else {
+                        1
+                    }
                 } else {
                     (128 - next % 128) as usize
                 };
@@ -1079,6 +1083,9 @@ impl Session {
                             .ok_or(EINVAL)?
                             .begin_compute(frame.ordinal)?;
                     }
+                    if after_render && frame.ordinal == 2 {
+                        self.stage_compute_tick(image)?;
+                    }
                     // Metadata and report owner precede either producer.
                     frames.push(frame, GFP_KERNEL)?;
                     let frame = frames.last().ok_or(EIO)?;
@@ -1120,6 +1127,26 @@ impl Session {
             self.phase = Phase::Failed;
         }
         result
+    }
+
+    /// Source stage_runtime_tick(0, context_word=2, update_sequence=True)
+    /// precedes the first retained ordinary command; the CL kick carries it.
+    fn stage_compute_tick(&mut self, image: &Image) -> Result {
+        let channel = image.graph.channels[0][12];
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        let producer = memory.read_firmware32(vm.physical(memory, 2, channel.states[2])?)?;
+        if producer >= 256 {
+            return Err(EBUSY);
+        }
+        let mut body = [0; 0x40];
+        body[..4].copy_from_slice(&0x2eu32.to_le_bytes());
+        body[12..16].copy_from_slice(&2u32.to_le_bytes());
+        vm.write(memory, 2, channel.ring + producer as u64 * 0x40, &body)?;
+        g17p_memory::sync();
+        vm.write(memory, 2, channel.states[2], &(producer + 1).to_le_bytes())?;
+        g17p_memory::sync();
+        Ok(())
     }
 
     fn finish_compute(

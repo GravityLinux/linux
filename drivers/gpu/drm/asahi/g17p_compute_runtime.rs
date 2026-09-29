@@ -175,10 +175,10 @@ impl Submission {
             return Ok([
                 spec.descriptor,
                 lifecycle::AFTER_RENDER_OPTIONAL,
-                lifecycle::AFTER_RENDER_EVENT,
+                spec.after_render_event(),
                 spec.scheduler,
                 spec.scheduler_slot,
-                lifecycle::AFTER_RENDER_CONTEXT + 0x200,
+                spec.after_render_context_address().map_err(|_| EINVAL)?,
                 0xfffffc20001c8014,
                 0xfffffc20c07c0014,
                 status,
@@ -210,11 +210,7 @@ impl Submission {
         })
     }
     pub(crate) fn capacity(&self) -> u32 {
-        if self.after_render {
-            2
-        } else {
-            SUBMISSIONS
-        }
+        SUBMISSIONS
     }
 }
 // The source direct bootstrap reserves 258 logical command placements while
@@ -780,7 +776,11 @@ pub(crate) fn stage_next(
         idle(memory, vm, work)?
     };
     if work.after_render {
-        return stage_after_render(memory, vm, work, parameters, counters);
+        return if ordinal == 1 {
+            stage_after_render(memory, vm, work, parameters, counters)
+        } else {
+            stage_retained_after_render(memory, vm, work, parameters, counters, write_index)
+        };
     }
     if ordinal % lifecycle::TRANSPORT_INTERVAL == 0 {
         if pending {
@@ -1024,6 +1024,121 @@ fn stage_after_render(
     work.pointers = pointers;
     work.ring = ring;
     work.status = status;
+    work.timestamps = parameters.timestamps;
+    Ok(())
+}
+
+/// stage_next_workload(persistent_runtime_queue, optional_once,
+/// fresh_descriptors, fast_sequential), retaining queue-one firmware history.
+fn stage_retained_after_render(
+    memory: &mut Memory,
+    vm: &mut Vm,
+    work: &mut Submission,
+    parameters: &Parameters,
+    counters: q::Counters,
+    write_index: u32,
+) -> Result {
+    let ordinal = work.ordinal + 1;
+    let mut spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
+    spec.status = [
+        work.status_base + ordinal as u64 * 16,
+        work.status_base + ordinal as u64 * 16 + 8,
+    ];
+    let event = spec.after_render_event();
+    let context = spec.after_render_context_address().map_err(|_| EINVAL)?;
+    // The source grows only this command's storage. Do not clear retained
+    // scheduler pools, queue records, job lists, support or context pages.
+    for (address, size) in [
+        (spec.scheduler, 0x100),
+        (spec.scheduler_slot, 4),
+        (event, 0x40),
+        (context, 0x200),
+        (spec.status[0], 16),
+    ] {
+        vm.ensure_firmware(memory, address, size)?;
+    }
+    vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
+    let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+    page.resize(PAGE, 0, GFP_KERNEL)?;
+    vm.write(memory, 2, spec.scheduler, &spec.scheduler_body())?;
+    vm.write(memory, 2, spec.scheduler_slot, &1u32.to_le_bytes())?;
+    vm.write(
+        memory,
+        2,
+        lifecycle::SUPPORT_STATE,
+        &(ordinal + 1).to_le_bytes(),
+    )?;
+    for address in [0xfffffc20001c8014, 0xfffffc20c07c0014] {
+        vm.write(memory, 2, address, &[0; 4])?;
+    }
+    for address in spec.status {
+        vm.write(memory, 2, address, &[0; 8])?;
+    }
+    let mut registers = spec
+        .program(parameters.preempt, parameters.cdm, ordinal % 2)
+        .map_err(|_| EINVAL)?;
+    for (number, value) in &mut registers {
+        if *number == 0x14070 {
+            *value = (work.robustness + (ordinal % 2) as u64 * 0x8000) | 1;
+        }
+    }
+    spec.after_render_descriptor(
+        &mut page,
+        &registers,
+        parameters.end,
+        parameters.sampler,
+        parameters.sampler_count,
+        parameters.timestamps,
+    )
+    .map_err(|_| EINVAL)?;
+    vm.write(memory, 2, spec.descriptor, &page[..0x1000])?;
+    spec.after_render_context(&mut page[..0x200])
+        .map_err(|_| EINVAL)?;
+    vm.write(memory, 2, context, &page[..0x200])?;
+    vm.write(memory, 2, event, &[0; 0x40])?;
+    vm.flush_tables(memory)?;
+    super::g17p_memory::sync();
+    // SAFETY: Make newly owned firmware/context-zero leaves visible to GPU.
+    unsafe {
+        core::arch::asm!(
+            ".inst 0xd508811f",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    work.client.cache(false)?;
+    let publication = q::Stage {
+        queue: lifecycle::AFTER_RENDER_QUEUE,
+        pointers: work.pointers,
+        item_ring: work.ring,
+        item_capacity: 0x2870 / 8,
+        write_index,
+        channel_ring: work.channel.ring,
+        channel_producer: work.channel.states[2],
+        counters,
+        slot: None,
+        items: &[spec.descriptor, event],
+        group: ordinal + 1,
+        grid: 5,
+        kind: q::Kind::Compute,
+        first: false,
+        in_place: false,
+        announce: false,
+        defer_inner: true,
+        defer_outer: true,
+        event_subtype: None,
+        event_counter: None,
+        event_counter_low: 2,
+    }
+    .publish(&mut Writer { memory, vm })
+    .map_err(|error| match error {
+        q::StageError::Access(e) => e,
+        q::StageError::Protocol(_) => EINVAL,
+    })?;
+    work.ordinal = ordinal;
+    work.publication = publication;
+    work.status = spec.status;
     work.timestamps = parameters.timestamps;
     Ok(())
 }
