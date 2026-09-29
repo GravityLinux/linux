@@ -439,8 +439,15 @@ impl Session {
     ) -> Result {
         self.require_first_work()?;
         let ttbs = self.ttbs;
-        let work =
-            self.stage(|memory, vm| render::build(memory, vm, image, ttbs, client, parameters))?;
+        let work = self
+            .stage(|memory, vm| render::build(memory, vm, image, ttbs, client, parameters))
+            .inspect_err(|error| {
+                dev_err!(
+                    dev,
+                    "G17P: first render graph preparation failed: {:?}\n",
+                    error
+                );
+            })?;
         self.render = Some(work);
         let result = self.run_render(dev, image);
         if result.is_err() {
