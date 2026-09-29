@@ -215,20 +215,24 @@ pub(crate) fn build(
     for i in 0..36 {
         c::u64_at(&mut page, i * 0x100, SHARED_STATE + i as u64 * 4);
     }
-    page[0x100..0x200].copy_from_slice(
-        &c::Scheduler {
-            slot: SHARED_STATE + 4,
-            work_id: 0,
-            phase: 0,
-            job_list: 0,
-            node_id: 0,
-            completion_kind: 0,
-        }
-        .build(),
-    );
+    for index in 0..3 {
+        page[(index + 1) * 0x100..(index + 2) * 0x100].copy_from_slice(
+            &c::Scheduler {
+                slot: SHARED_STATE + 4 + index as u64 * 4,
+                work_id: 0,
+                phase: 0,
+                job_list: 0,
+                node_id: 0,
+                completion_kind: 0,
+            }
+            .build(),
+        );
+    }
     write(memory, SCHEDULERS, &page)?;
     page.fill(0);
-    c::u32_at(&mut page, 4, 1);
+    for index in 1..4 {
+        c::u32_at(&mut page, index * 4, 1);
+    }
     write(memory, SHARED_STATE, &page)?;
     cm::Support {
         compact: None,
@@ -322,22 +326,8 @@ pub(crate) fn build(
         }
         .build(),
     )?;
-    let registers = c::Program {
-        preempt: parameters.preempt,
-        cdm: parameters.cdm,
-        identity: 0x010001d7020001dc,
-        context: 2,
-        ordinal: 0,
-        robustness: ROBUSTNESS,
-        operand_state: STATE,
-        usc_exec_base: c::USC_EXEC_BASE,
-        helper_binary: 0,
-        helper_data: 0,
-        helper_cfg: 0,
-        execution_gate: 1,
-    }
-    .build()
-    .map_err(|_| EINVAL)?;
+    let registers =
+        lifecycle::opening_program(parameters.preempt, parameters.cdm).map_err(|_| EINVAL)?;
     c::Descriptor {
         scheduler: SCHEDULER,
         low_alias: DESCRIPTOR_LOW,
@@ -364,6 +354,7 @@ pub(crate) fn build(
     write(memory, DESCRIPTOR, &page)?;
     page.fill(0);
     write(memory, EVENT, &page[..0x400])?;
+    prepare_cold_queues(memory, vm, &mut page)?;
     let channel = image.graph.channels[0][q::COMPUTE_CHANNEL];
     if channel.ring != 0xfffffc20c07a1dc0 {
         return Err(EINVAL);
@@ -400,13 +391,16 @@ pub(crate) fn build(
     vm.flush_tables(memory)?;
     // Exact first-work client context table: independent empty upper roots.
     // Install only after the graph and all caller references are owned.
-    for context in 0..4 {
+    for context in 0..3 {
         let high = memory.allocate(PAGE)?;
         memory.clean(high, PAGE)?;
         memory.write64(ttbs + context * 16 + 8, (context << 48) | high | 1)?;
     }
     memory.write64(ttbs + 2 * 16, (2 << 48) | client.root.root() | 1)?;
     memory.write64(ttbs + 3 * 16, (3 << 48) | client.root.root() | 1)?;
+    // The source bootstrap aliases the same empty upper root in slots 2/3.
+    let upper = memory.read64(ttbs + 2 * 16 + 8)? & 0x3ffffffc000;
+    memory.write64(ttbs + 3 * 16 + 8, (3 << 48) | upper | 1)?;
     memory.clean(ttbs, 64 * 16)?;
     super::g17p_memory::sync();
     // SAFETY: Invalidate GPU ASID translations after publishing owned roots.
@@ -542,5 +536,176 @@ pub(crate) fn stage_next(
     work.ordinal = ordinal;
     work.publication = publication;
     work.status = spec.status;
+    Ok(())
+}
+
+/// The retained source bootstrap constructs all three queue owners before
+/// initdata, even though only queue zero has its first descriptor published.
+fn prepare_cold_queues(memory: &mut Memory, vm: &mut Vm, page: &mut [u8]) -> Result {
+    for slot in 1u64..3 {
+        let (
+            queue,
+            pointers,
+            ring,
+            high,
+            low,
+            optional,
+            event,
+            scheduler,
+            scheduler_slot,
+            support,
+            state,
+            zero,
+            grid,
+            uuid,
+            word220,
+        ) = if slot == 1 {
+            (
+                0xfffffc20c00003c0,
+                0xfffffc200166d0e0,
+                0xfffffc20c08b50e0,
+                0xfffffc20002a0000,
+                0x7000500000,
+                0xfffffc20c0603e40,
+                0xfffffc20c05e96c0,
+                0xfffffc20c0870200,
+                0xfffffc2001638008,
+                0xfffffc20c08d0000,
+                0xfffffc2001688000,
+                0xfffffc2001698000,
+                5,
+                0x159,
+                0xffff080200000001,
+            )
+        } else {
+            (
+                0xfffffc20c0000540,
+                0xfffffc20016ba870,
+                0xfffffc20c0912870,
+                0xfffffc20002f0000,
+                0x7000550000,
+                0xfffffc20c0604ec0,
+                0xfffffc20c05e9c80,
+                0xfffffc20c0870300,
+                0xfffffc200163800c,
+                0xfffffc20c0908000,
+                0xfffffc20016a8000,
+                0xfffffc20016c8000,
+                7,
+                0x183,
+                0xffff080300000001,
+            )
+        };
+        let control = 0xfffffc20c07b80c0;
+        for (address, size) in [
+            (queue, 0xc0),
+            (pointers, 0x80),
+            (ring, 0x2870),
+            (optional, 0xc0),
+            (event, 0x400),
+            (scheduler, 0x100),
+            (scheduler_slot, 4),
+            (support, PAGE),
+            (state, PAGE),
+            (zero, PAGE),
+            (control, 0x40),
+        ] {
+            vm.ensure_firmware(memory, address, size)?;
+        }
+        vm.alias_firmware(memory, high, low, 8 * PAGE)?;
+        let write =
+            |memory: &mut Memory, address, bytes: &[u8]| vm.write(memory, 2, address, bytes);
+        if slot == 1 {
+            write(memory, control, &lifecycle::channel_control())?;
+        }
+        write(
+            memory,
+            scheduler,
+            &c::Scheduler {
+                slot: scheduler_slot,
+                work_id: slot as u32,
+                phase: 0,
+                job_list: 0,
+                node_id: 0,
+                completion_kind: 0,
+            }
+            .build(),
+        )?;
+        write(memory, scheduler_slot, &1u32.to_le_bytes())?;
+        cm::Support {
+            compact: None,
+            header: 3,
+            word_08: 0,
+            word_10: 2,
+            resource_class: 0x15,
+            word_20: if slot == 2 {
+                Some(0x0000159000000090)
+            } else {
+                None
+            },
+            word_28: if slot == 2 {
+                Some(0x0000150000000000)
+            } else {
+                None
+            },
+            client_state: OPERAND_TABLE,
+            firmware_state: state,
+            cursor: 0xa8,
+            field_54: slot as u32,
+            field_5c: 1,
+            final_kind: 2,
+        }
+        .build(page)
+        .map_err(|_| EINVAL)?;
+        write(memory, support, page)?;
+        cm::shared_state(page, slot as u32 + 1).map_err(|_| EINVAL)?;
+        write(memory, state, page)?;
+        page.fill(0);
+        write(memory, zero, page)?;
+        page[..0x60].copy_from_slice(&q::pointers(u32::MAX));
+        c::u32_at(page, 0x60, 0x500);
+        write(memory, pointers, &page[..0x80])?;
+        page.fill(0);
+        write(memory, ring, &page[..0x2870])?;
+        write(
+            memory,
+            queue,
+            &q::Record {
+                pointers,
+                ring,
+                job_list: JOB_LIST + 0x30,
+                context: control,
+                uuid,
+                priority: 2,
+                prio5: 2,
+                unk_2c: 2,
+                unk_38: 0,
+                unk_30: None,
+                unk_94: 0,
+                sentinel_size: 2,
+            }
+            .build()
+            .map_err(|_| EINVAL)?,
+        )?;
+        c::Context {
+            descriptor: DESCRIPTOR + slot * 0x1040,
+            queue,
+            grid,
+            flags: 0x1000000000000000,
+            word_220: word220,
+            word_330: 0,
+            word_338: 8,
+            word_350: 0x000110038001a002 + slot * (0x1040 / 0x20),
+            word_358: 0x000020038001a03b + slot * (0x1040 / 0x20),
+            word_378: 0x003fffffffffffff,
+            item_index: 0,
+            points: None,
+            event_slot: None,
+            completion: None,
+        }
+        .build(&mut page[0x200..0x400])
+        .map_err(|_| EINVAL)?;
+        write(memory, high, page)?;
+    }
     Ok(())
 }
