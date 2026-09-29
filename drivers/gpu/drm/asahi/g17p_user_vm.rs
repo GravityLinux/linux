@@ -117,7 +117,16 @@ impl UserVm {
         Ok(())
     }
     pub(crate) fn map_page(&mut self, va: u64, pa: u64, writable: bool) -> Result {
+        let flags = 0x0080000000000c8b | if writable { 1 << 54 } else { 0 };
+        self.map_owned_page(va, pa, flags)
+    }
+    /// Preserve the source attributes of driver-owned private render pages.
+    /// This is an internal mapping API; userspace cannot supply PTE flags.
+    pub(crate) fn map_owned_page(&mut self, va: u64, pa: u64, flags: u64) -> Result {
         if pa & !ADDRESS != 0 {
+            return Err(EINVAL);
+        }
+        if flags & !0x00c0000000000fff != 0 || flags & 3 != 3 {
             return Err(EINVAL);
         }
         let (table, index) = self.leaf(va, false)?.ok_or(EINVAL)?;
@@ -125,7 +134,6 @@ impl UserVm {
             return Err(EBUSY);
         }
         // Current source uses Shared/AP=2/nG, with UXN for writable resources.
-        let flags = 0x0080000000000c8b | if writable { 1 << 54 } else { 0 };
         let pte = pa | flags;
         self.write(table, index, pte)?;
         if self.read(table, index)? != pte {

@@ -245,7 +245,11 @@ impl Vm {
         }
         Ok(())
     }
-    fn snapshot(&self, owner: (u64, u32)) -> Result<super::g17p_compute_runtime::Client> {
+    fn snapshot(
+        &self,
+        owner: (u64, u32),
+        render: bool,
+    ) -> Result<super::g17p_compute_runtime::Client> {
         let mut root = UserVm::new()?;
         let mut buffers = KVec::new();
         let mut bindings = KVec::new();
@@ -255,7 +259,12 @@ impl Vm {
                 (binding.start, binding.size, binding.offset, binding.flags),
                 GFP_KERNEL,
             )?;
-            root.prepare(binding.start, binding.size)?;
+            let address = if render && binding.start < 0x1000000000 {
+                binding.start + 0x1000000000
+            } else {
+                binding.start
+            };
+            root.prepare(address, binding.size)?;
             let mut pages = KVec::new();
             let extent = if binding.flags & SINGLE != 0 {
                 PAGE
@@ -286,7 +295,7 @@ impl Vm {
                 } else {
                     index as usize
                 }];
-                root.map_page(binding.start + index * PAGE, pa, binding.flags & WRITE != 0)?;
+                root.map_page(address + index * PAGE, pa, binding.flags & WRITE != 0)?;
             }
         }
         Ok(super::g17p_compute_runtime::Client {
@@ -318,6 +327,11 @@ impl Vm {
         Ok(())
     }
 }
+enum Command {
+    Compute(super::g17p_compute_runtime::Parameters),
+    Render(super::g17p_render::Parameters),
+}
+
 struct Queue {
     id: u32,
     vm: u32,
@@ -754,14 +768,191 @@ impl File {
         state.queues.swap_remove(index);
         Ok(0)
     }
-    fn compute_parameters(
+    fn render_parameters(
         vm: &Vm,
         objects: &[Timestamp],
-        bytes: &[u8],
-    ) -> Result<KVec<super::g17p_compute_runtime::Parameters>> {
+        payload: &[u8],
+        fragment_count: usize,
+    ) -> Result<super::g17p_render::Parameters> {
+        if payload
+            .get(240..)
+            .unwrap_or_default()
+            .iter()
+            .any(|b| *b != 0)
+        {
+            return Err(E2BIG);
+        }
+        let mut body = [0u8; 240];
+        let size = payload.len().min(body.len());
+        body[..size].copy_from_slice(&payload[..size]);
+        const {
+            assert!(core::mem::size_of::<uapi::drm_asahi_cmd_render>() == 240);
+        }
+        // SAFETY: The copied ABI body contains integer fields only.
+        let cmd = unsafe {
+            core::ptr::read_unaligned(body.as_ptr().cast::<uapi::drm_asahi_cmd_render>())
+        };
+        if cmd.flags & !(2 | (1 << 18)) != 0
+            || cmd.vertex_helper.binary != 0
+            || cmd.vertex_helper.cfg != 0
+            || cmd.vertex_helper.data != 0
+            || cmd.fragment_helper.binary != 0
+            || cmd.fragment_helper.cfg != 0
+            || cmd.fragment_helper.data != 0
+            || !(1..=16384).contains(&cmd.width_px)
+            || !(1..=16384).contains(&cmd.height_px)
+            || !(1..=2048).contains(&cmd.layers)
+            || !matches!(
+                (cmd.utile_width_px, cmd.utile_height_px),
+                (32, 32) | (32, 16) | (16, 16)
+            )
+        {
+            return Err(EINVAL);
+        }
+        let sample_bits = match cmd.samples {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => return Err(EINVAL),
+        };
+        let utile_bytes = cmd.sample_size_B as u64
+            * cmd.utile_width_px as u64
+            * cmd.utile_height_px as u64
+            * cmd.samples as u64;
+        if utile_bytes > 32768 || cmd.vdm_ctrl_stream_base == 0 || cmd.vdm_ctrl_stream_base & 3 != 0
+        {
+            return Err(EINVAL);
+        }
+        vm.cover(cmd.vdm_ctrl_stream_base, 4, READ)?;
+        for (address, flags) in [
+            (cmd.isp_scissor_base, READ),
+            (cmd.isp_dbias_base, READ),
+            (cmd.isp_oclqry_base, WRITE),
+        ] {
+            if address != 0 {
+                if address & 7 != 0 {
+                    return Err(EINVAL);
+                }
+                vm.cover(address, 8, flags)?;
+            }
+        }
+        if cmd.isp_scissor_base == 0 {
+            return Err(EINVAL);
+        }
+        for zls in [&cmd.depth, &cmd.stencil] {
+            if (zls.base == 0 && (zls.comp_base != 0 || zls.stride != 0 || zls.comp_stride != 0))
+                || (zls.comp_base == 0 && zls.comp_stride != 0)
+                || (cmd.layers > 1 && zls.base != 0 && zls.stride == 0)
+                || (zls.stride != 0 && zls.stride & 0x3fff != 1)
+                || zls.comp_stride & 0x3fff != 0
+            {
+                return Err(EINVAL);
+            }
+            if zls.base != 0 {
+                let stride = if zls.stride != 0 {
+                    ((zls.stride as u64 >> 14) + 1) * PAGE
+                } else {
+                    0
+                };
+                vm.cover(zls.base, stride * (cmd.layers as u64 - 1) + 1, READ | WRITE)?;
+            }
+            if zls.comp_base != 0 {
+                vm.cover(
+                    zls.comp_base,
+                    ((zls.comp_stride as u64 >> 14) + 1) * 0x80 * (cmd.layers as u64 - 1) + 1,
+                    READ | WRITE,
+                )?;
+            }
+        }
+        if cmd.sampler_count > 1024
+            || (cmd.sampler_heap == 0) != (cmd.sampler_count == 0)
+            || cmd.sampler_heap & 7 != 0
+        {
+            return Err(EINVAL);
+        }
+        if cmd.sampler_count != 0 {
+            vm.cover(cmd.sampler_heap, cmd.sampler_count as u64 * 8, READ)?;
+        }
+        for program in [&cmd.bg, &cmd.eot, &cmd.partial_bg, &cmd.partial_eot] {
+            if program.usc == 0 {
+                return Err(EINVAL);
+            }
+            vm.cover(USC_EXEC_BASE + (program.usc as u64 & !7), 4, READ)?;
+        }
+        let resolve = |ts: &uapi::drm_asahi_timestamp| -> Result<u64> {
+            if ts.handle == 0 {
+                return if ts.offset == 0 { Ok(0) } else { Err(EINVAL) };
+            }
+            let object = objects.iter().find(|o| o.id == ts.handle).ok_or(ENOENT)?;
+            let offset = ts.offset as u64;
+            if offset & 7 != 0 || offset + 8 > object.size {
+                return Err(EINVAL);
+            }
+            Ok(object.address + offset)
+        };
+        let mut p = super::g17p_render_runtime::first_parameters();
+        p.width = cmd.width_px as u64;
+        p.height = cmd.height_px as u64;
+        p.layers = cmd.layers as u64;
+        p.encoder = if cmd.vdm_ctrl_stream_base < 0x1000000000 {
+            cmd.vdm_ctrl_stream_base + 0x1000000000
+        } else {
+            cmd.vdm_ctrl_stream_base
+        };
+        p.scissor_array = cmd.isp_scissor_base;
+        p.depth_bias_array = cmd.isp_dbias_base;
+        p.occlusion_query_base = cmd.isp_oclqry_base;
+        p.depth_buffer = cmd.depth.base;
+        p.depth_aux_buffer = cmd.depth.comp_base;
+        p.depth_stride = cmd.depth.stride as u64;
+        p.depth_aux_stride = cmd.depth.comp_stride as u64;
+        p.stencil_buffer = cmd.stencil.base;
+        p.stencil_aux_buffer = cmd.stencil.comp_base;
+        p.stencil_stride = cmd.stencil.stride as u64;
+        p.stencil_aux_stride = cmd.stencil.comp_stride as u64;
+        p.depth_flags = cmd.zls_ctrl;
+        p.depth_dimensions = cmd.isp_zls_pixels as u64;
+        p.multisample_control = cmd.ppp_multisamplectl;
+        p.ppp_control = cmd.ppp_ctrl as u64;
+        p.utile_width = cmd.utile_width_px as u64;
+        p.utile_height = cmd.utile_height_px as u64;
+        p.samples = cmd.samples as u64;
+        p.sample_size = cmd.sample_size_B as u64;
+        p.utile_config = ((p.utile_width / 16) << 12) | ((p.utile_height / 16) << 14) | sample_bits;
+        p.tib_blocks = utile_bytes.div_ceil(2048);
+        p.process_empty_tiles = cmd.flags & 2 != 0;
+        p.tile_config =
+            0x280 | u64::from(p.layers > 1) | if p.process_empty_tiles { 0x10000 } else { 0 };
+        p.merge_upper_x_bits = cmd.isp_merge_upper_x as u64;
+        p.merge_upper_y_bits = cmd.isp_merge_upper_y as u64;
+        p.store_pipeline = USC_EXEC_BASE + cmd.eot.usc as u64;
+        p.store_pipeline_bind = cmd.eot.rsrc_spec as u64;
+        p.load_pipeline = USC_EXEC_BASE + cmd.bg.usc as u64;
+        p.load_pipeline_bind = 0xffff800000000000 | cmd.bg.rsrc_spec as u64;
+        p.partial_store_pipeline = USC_EXEC_BASE + cmd.partial_eot.usc as u64;
+        p.partial_store_pipeline_bind = cmd.partial_eot.rsrc_spec as u64;
+        p.partial_load_pipeline = USC_EXEC_BASE + cmd.partial_bg.usc as u64;
+        p.partial_load_pipeline_bind = 0xffff800000000000 | cmd.partial_bg.rsrc_spec as u64;
+        p.depth_clear_value_bits = cmd.isp_bgobjdepth as u64;
+        p.stencil_clear_value = cmd.isp_bgobjvals as u64;
+        p.sampler_array = cmd.sampler_heap;
+        p.sampler_count = cmd.sampler_count as u64;
+        p.aux_fb_flags =
+            (if fragment_count > 1 { 0xc000 } else { 0xc001 }) | (cmd.flags as u64 & (1 << 18));
+        p.ta_user_timestamp_start = resolve(&cmd.ts_vtx.start)?;
+        p.ta_user_timestamp_end = resolve(&cmd.ts_vtx.end)?;
+        p.fragment_user_timestamp_start = resolve(&cmd.ts_frag.start)?;
+        p.fragment_user_timestamp_end = resolve(&cmd.ts_frag.end)?;
+        p.validate().map_err(|_| EINVAL)?;
+        Ok(p)
+    }
+
+    fn parameters(vm: &Vm, objects: &[Timestamp], bytes: &[u8]) -> Result<KVec<Command>> {
         use super::g17p_compute_runtime as compute;
         let mut offset = 0;
         let mut commands = KVec::new();
+        let mut counts = [0usize; 2];
+        let mut fragment_count = 0;
         while offset < bytes.len() {
             let header = bytes.get(offset..offset + 8).ok_or(EINVAL)?;
             let kind = u16::from_le_bytes(header[0..2].try_into().unwrap());
@@ -773,7 +964,10 @@ impl File {
             offset += 8;
             let payload = bytes.get(offset..offset + size).ok_or(EINVAL)?;
             offset += size;
-            if kind == 4 {
+            if matches!(kind, 2 | 3 | 4) {
+                if kind == 3 {
+                    fragment_count = size / 24;
+                }
                 if barriers != [u16::MAX; 2] || size % 24 != 0 || size / 24 > 16 {
                     return Err(EINVAL);
                 }
@@ -787,14 +981,27 @@ impl File {
                 }
                 continue;
             }
-            if kind != 1 {
+            if kind > 1 {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
             if commands.len() == 64
-                || (barriers[0] != 0 && barriers[0] != u16::MAX)
-                || (barriers[1] != u16::MAX && barriers[1] as usize > commands.len())
+                || (barriers[0] != u16::MAX && barriers[0] as usize > counts[0])
+                || (barriers[1] != u16::MAX && barriers[1] as usize > counts[1])
             {
                 return Err(EINVAL);
+            }
+            counts[kind as usize] += 1;
+            if kind == 0 {
+                commands.push(
+                    Command::Render(Self::render_parameters(
+                        vm,
+                        objects,
+                        payload,
+                        fragment_count,
+                    )?),
+                    GFP_KERNEL,
+                )?;
+                continue;
             }
             // All previous commands finish before the next one starts in
             // this synchronous port, satisfying each validated barrier.
@@ -850,14 +1057,14 @@ impl File {
                 vm.cover(cmd.sampler_heap, cmd.sampler_count as u64 * 8, READ)?;
             }
             commands.push(
-                compute::Parameters {
+                Command::Compute(compute::Parameters {
                     preempt: vm.kernel_start,
                     cdm: base,
                     end,
                     sampler: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count,
                     timestamps,
-                },
+                }),
                 GFP_KERNEL,
             )?;
         }
@@ -891,7 +1098,7 @@ impl File {
                 .find(|q| q.id == data.queue_id)
                 .ok_or(ENOENT)?;
             let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
-            Self::compute_parameters(vm, &state.objects, &bytes)?;
+            Self::parameters(vm, &state.objects, &bytes)?;
         }
         // No file/runtime lock across waits. A concurrent producer may need
         // this very file. Revalidate mappings after the wait before staging.
@@ -903,9 +1110,26 @@ impl File {
             .find(|q| q.id == data.queue_id)
             .ok_or(ENOENT)?;
         let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
-        let parameters = Self::compute_parameters(vm, &state.objects, &bytes)?;
+        let parameters = Self::parameters(vm, &state.objects, &bytes)?;
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
+        if parameters.iter().any(|p| matches!(p, Command::Render(_))) {
+            // Connect the cold render owner first. Reject an unsupported mixed
+            // or repeated batch before any prefix can become visible.
+            if parameters.len() != 1 {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+            runtime.session.require_first_work()?;
+            let Command::Render(render) = &parameters[0] else {
+                return Err(EINVAL);
+            };
+            let client = vm.snapshot((inner.id, vm.id), true)?;
+            runtime
+                .session
+                .submit_render(dev.as_ref(), &runtime.image, client, render)?;
+            sync.complete();
+            return Ok(0);
+        }
         if let Some(client) = runtime.session.compute_client()? {
             // This admission step supports the retained address space. A
             // changed binding set or another VM needs the later VM-handoff
@@ -925,13 +1149,16 @@ impl File {
         if parameters.len() > runtime.session.compute_remaining()? {
             return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
         }
-        for parameters in &parameters {
+        for command in &parameters {
+            let Command::Compute(parameters) = command else {
+                return Err(EINVAL);
+            };
             if runtime.session.compute_client()?.is_some() {
                 runtime
                     .session
                     .submit_next_compute(dev.as_ref(), &runtime.image, parameters)?;
             } else {
-                let client = vm.snapshot((inner.id, vm.id))?;
+                let client = vm.snapshot((inner.id, vm.id), false)?;
                 runtime
                     .session
                     .submit_compute(dev.as_ref(), &runtime.image, client, parameters)?;
