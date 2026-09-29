@@ -395,12 +395,9 @@ pub(crate) fn build(
             opening::CONTEXTS[index].0 + 0x200,
             &page[..graph::CONTEXT_SIZE],
         )?;
-        vm.write(
-            memory,
-            1,
-            opening::CONTEXTS[index].1 + 0x200,
-            &page[..graph::CONTEXT_SIZE],
-        )?;
+        // Context 0 already aliases the firmware context pages. The render
+        // root at this same low DVA is independent operand backing and must
+        // remain blank until the GPU uses it (partial bootstrap's clear pass).
         let channel = channels[index];
         publications.push(
             q::Stage {
@@ -661,14 +658,8 @@ pub(crate) fn stage_next(
         for object in &objects[index] {
             write(memory, object.address, &object.body)?;
         }
-        // Current startup holds independently allocated copies of this context
-        // view; update both owned copies, as the first-work builder does.
-        vm.write(
-            memory,
-            1,
-            opening::CONTEXTS[index].1 + 0x200 * (item.ordinal as u64 + 1),
-            &objects[index][2].body,
-        )?;
+        // Do not copy this firmware record into the render-root operand
+        // backing at the same low DVA. Context 0 already aliases the high view.
         let phase = if index == 1 { 1u32 } else { 2u32 };
         write(memory, item.slot(), &phase.to_le_bytes())?;
         write(
