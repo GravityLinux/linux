@@ -78,6 +78,7 @@ pub(crate) struct Submission {
     pub(crate) channel: abi::Channel,
     pub(crate) ordinal: u32,
     pub(crate) preempt: u64,
+    pub(crate) status: [u64; 2],
 }
 // Admission is bounded until transport handoff and context reuse are wired.
 pub(crate) const SUBMISSIONS: u32 = 32;
@@ -122,11 +123,18 @@ pub(crate) fn build(
     // Source maps a zero native-control page at 0x70013a0000 before
     // allocating operands, which replace that leaf. Map the final owner once:
     // the control address and blank low queue contexts lie in these tranches.
-    for i in 0..21 {
+    for i in 0..42 {
         client_storage(memory, &mut client.root, OPERANDS + i * 0x108000, 0x100000)?;
     }
     client_storage(memory, &mut client.root, ROBUSTNESS, PAGE)?;
+    client_storage(memory, &mut client.root, ROBUSTNESS + 0x8000, PAGE)?;
     client_storage(memory, &mut client.root, parameters.preempt, 0xc000)?;
+    client_storage(
+        memory,
+        &mut client.root,
+        parameters.preempt + 0x78000,
+        0xc000,
+    )?;
     cm::PageLists {
         base: OPERANDS,
         entries: 21,
@@ -416,6 +424,7 @@ pub(crate) fn build(
         channel,
         ordinal: 0,
         preempt: parameters.preempt,
+        status: STATUS,
     })
 }
 
@@ -486,7 +495,7 @@ pub(crate) fn stage_next(
         write(memory, address, &[0; 8])?;
     }
     let registers = spec
-        .program(parameters.preempt, parameters.cdm, 0)
+        .program(parameters.preempt, parameters.cdm, ordinal % 2)
         .map_err(|_| EINVAL)?;
     spec.descriptor_body(
         &mut page,
@@ -532,5 +541,6 @@ pub(crate) fn stage_next(
     })?;
     work.ordinal = ordinal;
     work.publication = publication;
+    work.status = spec.status;
     Ok(())
 }

@@ -486,6 +486,7 @@ impl Session {
             work.client.root.root()
         );
         let mut last = [0u32; 6];
+        let mut command_status = 0;
         for _ in 0..200 {
             if self
                 .peers
@@ -531,12 +532,22 @@ impl Session {
                         }
                     }
                 }
+                let status_pa = vm.physical(memory, 2, work.status[1])?;
+                memory.invalidate(status_pa, 8)?;
+                command_status = memory.read64(status_pa)?;
+                // Source completion has a second gate: transport retirement
+                // may precede command execution or a fatal report. Every
+                // command's status pair was cleared before publication.
+                if command_status == 0 {
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+                    continue;
+                }
                 work.client.cache(true)?;
                 dev_info!(
                     dev,
-                    "G17P: caller compute retired: queue {:?}, channel {:?}; reports validated\n",
+                    "G17P: caller compute complete: queue {:?}, channel {:?}, status {:#x}; reports validated\n",
                     &last[..3],
-                    &last[3..]
+                    &last[3..], command_status
                 );
                 self.acknowledge_reports(image, &after)?;
                 return Ok(());
@@ -545,9 +556,9 @@ impl Session {
         }
         dev_err!(
             dev,
-            "G17P: caller compute timeout: queue {:?}, channel {:?}; retaining all GPU memory\n",
+            "G17P: caller compute timeout: queue {:?}, channel {:?}, status {:#x}; retaining all GPU memory\n",
             &last[..3],
-            &last[3..]
+            &last[3..], command_status
         );
         Err(ETIMEDOUT)
     }
