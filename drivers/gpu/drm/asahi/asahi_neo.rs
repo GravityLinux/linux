@@ -9,6 +9,8 @@ use kernel::{
     c_str, device::Core, devres::Devres, io::mem::IoMem, io::Io, of, platform, prelude::*,
 };
 
+mod g17p_platform;
+
 const SGX_SIZE: usize = 0x4000000;
 const ID_VERSION: usize = 0xd04000;
 const ID_COUNTS_1: usize = 0xd04010;
@@ -17,6 +19,7 @@ const ID_CLUSTERS: usize = 0xd0401c;
 
 struct NeoGpu {
     _sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
+    _platform: g17p_platform::Platform,
 }
 
 kernel::of_device_table!(
@@ -56,7 +59,11 @@ impl platform::Driver for NeoGpu {
                 "Identification only; firmware and DRM initialization are not implemented\n"
             );
         }
-        Ok(Self { _sgx: sgx })
+        let platform = g17p_platform::Platform::new(pdev.as_ref())?;
+        Ok(Self {
+            _sgx: sgx,
+            _platform: platform,
+        })
     }
 }
 
