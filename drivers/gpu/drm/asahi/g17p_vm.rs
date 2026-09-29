@@ -313,6 +313,19 @@ impl Vm {
         Ok(())
     }
 
+    /// The timestamp registry retains the caller's pinned backing before
+    /// installing this alias, including on a partial failure.
+    pub(crate) fn timestamp_page(&mut self, memory: &mut Memory, va: u64, pa: u64) -> Result {
+        if !(super::g17p_timestamp::BASE..super::g17p_timestamp::BASE + super::g17p_timestamp::SIZE)
+            .contains(&va)
+        {
+            return Err(EINVAL);
+        }
+        // Source iomap_at_root defaults: OS=1, UXN=1, AF=1, AP=1,
+        // AttrIndex=Shared (2), VALID/TYPE=1; global mapping.
+        self.span(memory, 2, va, pa, PAGE as usize, 0x00c000000000044b)
+    }
+
     /// Extend driver-owned firmware storage before first-work publication.
     pub(crate) fn ensure_firmware(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result {
         let first = va & !(PAGE - 1);

@@ -71,6 +71,7 @@ pub(crate) struct Parameters {
     pub(crate) end: u64,
     pub(crate) sampler: u64,
     pub(crate) sampler_count: u32,
+    pub(crate) timestamps: [u64; 2],
 }
 pub(crate) struct Submission {
     pub(crate) client: Client,
@@ -79,6 +80,7 @@ pub(crate) struct Submission {
     pub(crate) ordinal: u32,
     pub(crate) preempt: u64,
     pub(crate) status: [u64; 2],
+    pub(crate) timestamps: [u64; 2],
 }
 // Admission is bounded until transport handoff and context reuse are wired.
 pub(crate) const SUBMISSIONS: u32 = 32;
@@ -337,7 +339,7 @@ pub(crate) fn build(
         grid: 4,
         dispatch: [0xfffffc20001c8008, 0xfffffc20c07c0008],
         status: STATUS,
-        timestamps: [0; 2],
+        timestamps: parameters.timestamps,
         shared_control: SUPPORT,
         zero_page: ZERO,
         support_control: 0xe0a00001,
@@ -419,6 +421,7 @@ pub(crate) fn build(
         ordinal: 0,
         preempt: parameters.preempt,
         status: STATUS,
+        timestamps: parameters.timestamps,
     })
 }
 
@@ -497,6 +500,7 @@ pub(crate) fn stage_next(
         parameters.end,
         parameters.sampler,
         parameters.sampler_count,
+        parameters.timestamps,
     )
     .map_err(|_| EINVAL)?;
     write(memory, spec.descriptor, &page[..0x1000])?;
@@ -536,6 +540,7 @@ pub(crate) fn stage_next(
     work.ordinal = ordinal;
     work.publication = publication;
     work.status = spec.status;
+    work.timestamps = parameters.timestamps;
     Ok(())
 }
 

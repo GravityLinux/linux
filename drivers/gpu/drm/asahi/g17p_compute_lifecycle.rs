@@ -126,6 +126,7 @@ impl Retained {
         end: u64,
         sampler: u64,
         sampler_count: u32,
+        timestamps: [u64; 2],
     ) -> Result {
         c::Descriptor {
             scheduler: self.scheduler,
@@ -136,7 +137,7 @@ impl Retained {
             grid: 4,
             dispatch: self.dispatch,
             status: self.status,
-            timestamps: [0; 2],
+            timestamps,
             shared_control: SUPPORT,
             zero_page: ZERO,
             support_control: 0xe0a00001,

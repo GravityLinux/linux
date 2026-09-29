@@ -40,8 +40,18 @@ fn main() {
             }
             emit(&spec.scheduler_body());
             let mut page = [0; 0x4000];
-            spec.descriptor_body(&mut page, &regs, 0x10000600030, 0, 0)
-                .unwrap();
+            spec.descriptor_body(
+                &mut page,
+                &regs,
+                0x10000600030,
+                0,
+                0,
+                [
+                    0xfffffc2181400000 + n as u64 * 16,
+                    0xfffffc2181400008 + n as u64 * 16,
+                ],
+            )
+            .unwrap();
             emit(&page);
             emit(&spec.optional_body());
             let mut ctx = [0; 0x200];

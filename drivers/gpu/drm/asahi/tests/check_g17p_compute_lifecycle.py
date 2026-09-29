@@ -45,7 +45,7 @@ for n in (1,2,3,4,34,35,36,127,128,239,240,255,256,383,384,1024):
         emit(f'{n}/{slot}:scheduler',c.build_compute_scheduler_record(scheduler_slot,work_id=work_id))
         emit(f'{n}/{slot}:descriptor',c.build_compute_descriptor(regs,scheduler,low,0x1000060002c,
             submit_sequence=n,context_id=persistent['context_id'],grid_index=transport['grid'],dispatch_a=dispatch[0],dispatch_b=dispatch[1],status_a=status[0],status_b=status[1],
-            user_timestamp_start=0,user_timestamp_end=0,zero_page=persistent['zero_page'],shared_control=persistent['shared_support'],protection_index=1,support_control=0xe0a00001,support_flags=0,
+            user_timestamp_start=0xfffffc2181400000+n*16,user_timestamp_end=0xfffffc2181400008+n*16,zero_page=persistent['zero_page'],shared_control=persistent['shared_support'],protection_index=1,support_control=0xe0a00001,support_flags=0,
             work_ordinal=n,queue_submission=n+1,queue_ordinal=0,submission_index=n+1,sampler_array=0,sampler_count=0))
         emit(f'{n}/{slot}:optional',c.build_compute_optional(transport['context_low'],transport['context_high'],grid_index=transport['grid'],submission_ordinal=persistent['optional_submission']+n,
             shared_control=persistent['shared_support'],channel_control=transport['channel_control'],uuid=persistent['uuid'],field_46=persistent['optional_field_46'],field_1e=2,field_32=persistent['optional_field_32'],field_56=persistent['optional_field_56'],field_5e=2,first_submit=True,item_index=0))
