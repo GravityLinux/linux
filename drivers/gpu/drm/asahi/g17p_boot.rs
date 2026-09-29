@@ -615,6 +615,7 @@ impl Session {
             return Err(EIO);
         }
         let startup = self.report_snapshot(image)?;
+        let terminal_baseline;
         {
             let work = self.render.as_mut().ok_or(EINVAL)?;
             let vm = self.vm.as_ref().ok_or(EINVAL)?;
@@ -630,6 +631,11 @@ impl Session {
                     image.graph.channels[0][13],
                 )?);
             }
+            // wait_pair_completed() requires this publication's new growth
+            // terminal in addition to both queues and independent statuses.
+            // Capture before either work producer is restored; a drained ring
+            // alone cannot establish that firmware has issued this terminal.
+            terminal_baseline = work.growth.as_ref().ok_or(EINVAL)?.terminals();
             work.restore(memory, vm, 1)?;
             work.restore(memory, vm, 0)?;
         }
@@ -702,7 +708,7 @@ impl Session {
             let work = self.render.as_ref().ok_or(EINVAL)?;
             let memory = self.memory.as_ref().ok_or(EINVAL)?;
             let vm = self.vm.as_ref().ok_or(EINVAL)?;
-            let mut done = true;
+            let mut done = work.growth.as_ref().ok_or(EINVAL)?.terminals() > terminal_baseline;
             for stage in 0..2 {
                 for (i, offset) in [
                     queue::POINTER_DONE,
@@ -775,7 +781,7 @@ impl Session {
                         .ok_or(EINVAL)?
                         .cache([pair[0], pair[1]], true)?;
                 }
-                dev_info!(dev,"G17P: caller render complete: TA {:?}, 3D {:?}, status {:#x}; reports validated\n",last[0],last[1],command_status);
+                dev_info!(dev,"G17P: caller render complete: TA {:?}, 3D {:?}, status {:#x}; reports validated, terminals {} cursor {}\n",last[0],last[1],command_status,work.growth.as_ref().ok_or(EINVAL)?.terminals(),work.growth.as_ref().ok_or(EINVAL)?.cursor());
                 self.acknowledge_reports(image, &after)?;
                 // Same control-done boundary as the source synchronous shim.
                 self.peers[0]

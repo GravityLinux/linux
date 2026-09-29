@@ -68,6 +68,9 @@ impl Service {
     pub(crate) fn cursor(&self) -> u32 {
         self.cursor
     }
+    pub(crate) fn terminals(&self) -> u32 {
+        self.terminals
+    }
     pub(crate) fn new(
         memory: &Memory,
         vm: &Vm,
