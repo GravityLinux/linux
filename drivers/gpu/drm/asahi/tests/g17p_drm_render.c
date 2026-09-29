@@ -14,7 +14,7 @@ static void check_unpublished(unsigned char **maps)
 static void check_images(unsigned char **outputs)
 {
 	for (unsigned target = 0; target < 8; target++) {
-		float value = (target + 1)/8.0f;
+		float value = RENDER_TRIANGLES * ((target + 1)/8.0f);
 		unsigned char expected[4]; memcpy(expected, &value, 4);
 		for (unsigned byte = 0; byte < RENDER_OUTPUT_SIZE; byte++) {
 			unsigned char want = 0;
@@ -70,7 +70,7 @@ int main(void)
 	};
 	struct drm_asahi_submit submit = { .queue_id = q.queue_id, .cmdbuf = (uintptr_t)buffer.bytes,
 		.cmdbuf_size = sizeof(render_command), .syncs = (uintptr_t)syncs, .out_sync_count = 2 };
-	printf("G17P_NATIVE_RENDER_BEGIN vm=%u queue=%u buffers=%zu\n", vm, q.queue_id, sizeof(workloads)/sizeof(workloads[0]));
+	printf("G17P_NATIVE_RENDER_BEGIN vm=%u queue=%u buffers=%zu triangles=%u\n", vm, q.queue_id, sizeof(workloads)/sizeof(workloads[0]), RENDER_TRIANGLES);
 	uint32_t flags = cmd->flags; cmd->flags |= 1U << 31;
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); cmd->flags = flags;
 	cmd->width_px = 0; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); cmd->width_px = 128;
@@ -88,7 +88,7 @@ int main(void)
 		float a, b;
 		memcpy(&a, outputs[target] + RENDER_PIXEL_0, 4);
 		memcpy(&b, outputs[target] + RENDER_PIXEL_1, 4);
-		printf("OUTPUT %u pixels=%g,%g expected=%g\n", target, a, b, (target + 1)/8.0);
+		printf("OUTPUT %u pixels=%g,%g expected=%g\n", target, a, b, RENDER_TRIANGLES * ((target + 1)/8.0));
 	}
 	CHECK(rc == 0);
 	uint64_t stamps[4]; memcpy(stamps, timestamps + PAGE + 64, sizeof(stamps));

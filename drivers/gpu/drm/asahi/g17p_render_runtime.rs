@@ -62,6 +62,7 @@ pub(crate) struct Submission {
     pub(crate) publications: [q::Publication; 2],
     pub(crate) channels: [abi::Channel; 2],
     pub(crate) timestamps: [u64; 4],
+    pub(crate) growth: Option<super::g17p_growth_runtime::Service>,
     deferred: [KVec<Deferred>; 2],
     empty_high: [u64; 2],
 }
@@ -125,6 +126,10 @@ pub(crate) fn build(
         (p.aux_fb, PAGE as u64),
         (0x7000000000, 0x10000),
         (0x7000208000, PAGE as u64),
+        (
+            super::g17p_growth::GROWTH_BASE,
+            super::g17p_growth::GROWTH_END - super::g17p_growth::GROWTH_BASE,
+        ),
     ] {
         if overlap(&client, va, len) {
             return Err(EINVAL);
@@ -489,6 +494,7 @@ pub(crate) fn build(
             p.fragment_user_timestamp_start,
             p.fragment_user_timestamp_end,
         ],
+        growth: None,
     })
 }
 

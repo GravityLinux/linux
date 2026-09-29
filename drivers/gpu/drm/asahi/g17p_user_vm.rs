@@ -152,4 +152,54 @@ impl UserVm {
         }
         Ok(())
     }
+
+    /// Add disjoint growth pages to a live retained root. Validate every leaf
+    /// and allocate every child first; an allocation failure publishes nothing.
+    /// Each new child is populated/cleaned before its parent link is visible.
+    pub(crate) fn grow(&mut self, pages: &[(u64, u64)]) -> Result {
+        if pages.is_empty() {
+            return Err(EINVAL);
+        }
+        let mut writes: KVec<(usize, u64, usize, u64)> = KVec::new();
+        for &(va, physical) in pages {
+            if va >= 1 << 42 || va & (PAGE - 1) != 0 || physical == 0 || physical & !ADDRESS != 0 {
+                return Err(EINVAL);
+            }
+            let mut table = self.root();
+            for (depth, index) in [((va >> 36) & 63) as usize, ((va >> 25) & 2047) as usize]
+                .into_iter()
+                .enumerate()
+            {
+                let mut entry =
+                    if let Some(row) = writes.iter().find(|r| r.1 == table && r.2 == index) {
+                        row.3
+                    } else {
+                        self.read(table, index)?
+                    };
+                if entry == 0 {
+                    entry = self.table()? | 3;
+                    writes.push((depth, table, index, entry), GFP_KERNEL)?;
+                }
+                if entry & 3 != 3 {
+                    return Err(EINVAL);
+                }
+                table = entry & ADDRESS;
+                self.page(table)?;
+            }
+            let index = ((va >> 14) & 2047) as usize;
+            if self.read(table, index)? != 0 || writes.iter().any(|r| r.1 == table && r.2 == index)
+            {
+                return Err(EBUSY);
+            }
+            writes.push((2, table, index, physical | 0x00c0000000000c8b), GFP_KERNEL)?;
+        }
+        // No allocation or user-controlled validation after this boundary.
+        for depth in [2, 1, 0] {
+            for &(_, table, index, entry) in writes.iter().filter(|r| r.0 == depth) {
+                self.write(table, index, entry)?;
+            }
+            super::g17p_memory::sync();
+        }
+        Ok(())
+    }
 }
