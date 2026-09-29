@@ -2,3 +2,4 @@
 
 obj-$(CONFIG_DRM_ASAHI) += asahi.o
 obj-$(CONFIG_DRM_ASAHI_M4) += asahi_m4.o
+obj-$(CONFIG_DRM_ASAHI_NEO) += asahi_neo.o
