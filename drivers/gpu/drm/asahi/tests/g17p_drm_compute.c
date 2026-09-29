@@ -6,7 +6,7 @@
 #undef main
 #include "g17p_drm_workload.h"
 
-static void workload_bind(int fd, uint32_t vm, uint64_t address,
+static uint32_t workload_bind(int fd, uint32_t vm, uint64_t address,
 			  const void *data, size_t size, int writable)
 {
 	uint32_t bo = bo_new(fd, size, DRM_ASAHI_GEM_WRITEBACK, 0);
@@ -15,6 +15,7 @@ static void workload_bind(int fd, uint32_t vm, uint64_t address,
 	CHECK(munmap(map, size) == 0);
 	bind(fd, vm, bo, address, size, 0,
 	     DRM_ASAHI_BIND_READ | (writable ? DRM_ASAHI_BIND_WRITE : 0), 0);
+	return bo;
 }
 
 int main(void)
@@ -32,10 +33,11 @@ int main(void)
 	float *values = calloc(1, PAGE);
 	CHECK(values != NULL);
 	for (unsigned i = 0; i < 64; i++) values[i] = 1000.0f + i;
-	workload_bind(fd, vm, COMPUTE_INPUT_A, values, PAGE, 1);
+	uint32_t input_a = workload_bind(fd, vm, COMPUTE_INPUT_A, values, PAGE, 1);
 	for (unsigned i = 0; i < 64; i++) values[i] = 0.5f;
-	workload_bind(fd, vm, COMPUTE_INPUT_B, values, PAGE, 1);
+	uint32_t input_b = workload_bind(fd, vm, COMPUTE_INPUT_B, values, PAGE, 1);
 	free(values);
+	float *a = bo_map(fd, input_a, PAGE), *b = bo_map(fd, input_b, PAGE);
 	uint32_t output = bo_new(fd, PAGE, DRM_ASAHI_GEM_WRITEBACK, 0);
 	float *result = bo_map(fd, output, PAGE);
 	memset(result, 0xa5, PAGE);
@@ -60,15 +62,29 @@ int main(void)
 		.cmdbuf = (uintptr_t)&commands, .cmdbuf_size = sizeof(commands) };
 	printf("G17P_NATIVE_COMPUTE_BEGIN vm=%u queue=%u CDM=%llx output=%llx\n",
 		vm, q.queue_id, COMPUTE_CDM, COMPUTE_OUTPUT);
-	int rc = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit);
-	int saved_errno = errno;
-	printf("SUBMIT rc=%d errno=%d output[0..3]=%g,%g,%g,%g\n", rc,
-		saved_errno, result[0], result[1], result[2], result[3]);
-	CHECK(rc == 0);
-	for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + i);
-	for (unsigned i = 256; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
+	for (unsigned n = 0; n < 32; n++) {
+		for (unsigned i = 0; i < 64; i++) {
+			a[i] = 1000.0f + n * 100.0f + i;
+			b[i] = 0.5f + n * 0.25f;
+		}
+		memset(result, 0xa5, PAGE);
+		errno = 0;
+		int rc = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit);
+		int saved_errno = errno;
+		printf("SUBMIT %u rc=%d errno=%d output[0..3]=%g,%g,%g,%g\n", n, rc,
+			saved_errno, result[0], result[1], result[2], result[3]);
+		CHECK(rc == 0);
+		for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + n * 100.25f + i);
+		for (unsigned i = 256; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
+	}
+	/* This admission stage must refuse exhaustion before publishing work. */
+	memset(result, 0xa5, PAGE);
+	CHECK(ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit) == -1 && errno == EOPNOTSUPP);
+	for (unsigned i = 0; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
+	CHECK(munmap(a, PAGE) == 0);
+	CHECK(munmap(b, PAGE) == 0);
 	CHECK(munmap(result, PAGE) == 0);
 	CHECK(close(fd) == 0);
-	printf("G17P_NATIVE_COMPUTE_PASS exact 64 float results and intact tail; checks=%u\n", checks);
+	printf("G17P_NATIVE_COMPUTE_PASS 32 distinct submissions, exact 2048 floats and intact tails; checks=%u\n", checks);
 	return 0;
 }
