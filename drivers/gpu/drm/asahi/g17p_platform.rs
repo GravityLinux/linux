@@ -126,6 +126,25 @@ fn performance(node: &of::Node) -> Result<[PerfState; STATES]> {
 }
 
 impl Platform {
+    /// Keep the shim's qualified calibration until a new profile is validated.
+    /// Frequency/voltage and index inputs must agree with the live ADT tables;
+    /// the remaining scale/relative ladders have no established derivation yet.
+    pub(crate) fn firmware_performance(&self) -> Result<super::g17p_abi::Performance> {
+        let expected = super::g17p_layout::PERFORMANCE;
+        for (index, state) in self.performance.iter().enumerate() {
+            if state.frequency_a_mhz != expected.freq_a[index]
+                || state.frequency_b_mhz != expected.freq_b[index]
+                || state.core_mv != expected.core_voltage[index]
+                || state.memory_mv != expected.memory_voltage[index]
+                || state.index_a != expected.index_a[index]
+                || state.index_b != expected.index_b[index]
+            {
+                return Err(ENOTSUPP);
+            }
+        }
+        Ok(expected)
+    }
+
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
         let node = dev.of_node().ok_or(ENODEV)?;
         let abi: u32 = node.get_property(c_str!("apple,neo-boot-abi"))?;

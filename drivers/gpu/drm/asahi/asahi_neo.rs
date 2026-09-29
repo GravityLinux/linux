@@ -2,13 +2,17 @@
 
 //! Initial T8140 / G17P GPU identification support.
 //!
-//! This first bring-up stage only reads identification registers. Firmware
-//! startup and the Asahi DRM interface will follow in the synchronous port.
+//! Validates boot resources and constructs the unpublished firmware graph.
+//! Firmware startup and DRM registration will follow in the synchronous port.
 
 use kernel::{
     c_str, device::Core, devres::Devres, io::mem::IoMem, io::Io, of, platform, prelude::*,
 };
 
+mod g17p_abi;
+mod g17p_image;
+mod g17p_initgraph;
+mod g17p_layout;
 mod g17p_platform;
 
 const SGX_SIZE: usize = 0x4000000;
@@ -20,6 +24,7 @@ const ID_CLUSTERS: usize = 0xd0401c;
 struct NeoGpu {
     _sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
     _platform: g17p_platform::Platform,
+    _image: g17p_image::Image,
 }
 
 kernel::of_device_table!(
@@ -60,9 +65,11 @@ impl platform::Driver for NeoGpu {
             );
         }
         let platform = g17p_platform::Platform::new(pdev.as_ref())?;
+        let image = g17p_image::Image::new(pdev.as_ref(), &platform)?;
         Ok(Self {
             _sgx: sgx,
             _platform: platform,
+            _image: image,
         })
     }
 }
