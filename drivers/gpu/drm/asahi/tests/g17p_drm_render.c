@@ -11,6 +11,19 @@ static void check_unpublished(unsigned char **maps)
 		for (unsigned byte = 0; byte < RENDER_OUTPUT_SIZE; byte++)
 			CHECK(maps[target][byte] == 0xa5);
 }
+static void check_images(unsigned char **outputs)
+{
+	for (unsigned target = 0; target < 8; target++) {
+		float value = (target + 1)/8.0f;
+		unsigned char expected[4]; memcpy(expected, &value, 4);
+		for (unsigned byte = 0; byte < RENDER_OUTPUT_SIZE; byte++) {
+			unsigned char want = 0;
+			if (byte >= RENDER_PIXEL_0 && byte < RENDER_PIXEL_0 + 4) want = expected[byte - RENDER_PIXEL_0];
+			if (byte >= RENDER_PIXEL_1 && byte < RENDER_PIXEL_1 + 4) want = expected[byte - RENDER_PIXEL_1];
+			CHECK(outputs[target][byte] == want);
+		}
+	}
+}
 int main(void)
 {
 	setbuf(stdout, NULL);
@@ -83,16 +96,7 @@ int main(void)
 	CHECK(stamps[0] && stamps[1] > stamps[0] && stamps[2] && stamps[3] > stamps[2]);
 	for (unsigned byte = 0; byte < PAGE * 3; byte++)
 		if (byte < PAGE + 64 || byte >= PAGE + 96) CHECK(timestamps[byte] == 0xa5);
-	for (unsigned target = 0; target < 8; target++) {
-		float value = (target + 1)/8.0f;
-		unsigned char expected[4]; memcpy(expected, &value, 4);
-		for (unsigned byte = 0; byte < RENDER_OUTPUT_SIZE; byte++) {
-			unsigned char want = 0;
-			if (byte >= RENDER_PIXEL_0 && byte < RENDER_PIXEL_0 + 4) want = expected[byte - RENDER_PIXEL_0];
-			if (byte >= RENDER_PIXEL_1 && byte < RENDER_PIXEL_1 + 4) want = expected[byte - RENDER_PIXEL_1];
-			CHECK(outputs[target][byte] == want);
-		}
-	}
+	check_images(outputs);
 	struct drm_syncobj_wait wait = { .handles = (uintptr_t)&binary.handle, .count_handles = 1, .timeout_nsec = 0 };
 	OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait);
 	uint64_t point = 1;
@@ -101,6 +105,8 @@ int main(void)
 	OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
 	/* Until repeat publication is ported, refusal must retain successful output. */
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
+	check_images(outputs);
+	CHECK(memcmp(stamps, timestamps + PAGE + 64, sizeof(stamps)) == 0);
 	for (unsigned target = 0; target < 8; target++) CHECK(munmap(outputs[target], RENDER_OUTPUT_SIZE) == 0);
 	CHECK(munmap(timestamps, PAGE * 3) == 0);
 	CHECK(close(fd) == 0);
