@@ -10,6 +10,8 @@ python3 drivers/gpu/drm/asahi/tests/import_g17p_layout.py /path/to/m1n1 --check
 python3 drivers/gpu/drm/asahi/tests/import_g17p_topology.py /path/to/m1n1 --check
 python3 drivers/gpu/drm/asahi/tests/check_g17p_abi.py /path/to/m1n1
 python3 drivers/gpu/drm/asahi/tests/check_g17p_initgraph.py /path/to/m1n1
+python3 drivers/gpu/drm/asahi/tests/check_g17p_render.py /path/to/m1n1
+python3 drivers/gpu/drm/asahi/tests/check_g17p_render_graph.py /path/to/m1n1
 rustc --edition=2021 drivers/gpu/drm/asahi/tests/g17p_vm.rs -o /tmp/g17p-vm-test
 /tmp/g17p-vm-test
 ```
@@ -30,6 +32,25 @@ The import tools copy named source constants from `g17p_initdata.py` and
 
 These checks prove serialization parity. They do not prove firmware startup,
 GPU execution, rendered output, or the later asynchronous stages.
+
+The render oracle requires Python 3.10 or newer to import the source dataclass.
+It compares the 73/89 ordered main programs, all three partial programs,
+class-2/class-4 control objects and full descriptor bodies by executing the
+actual `G17PWorkBuilder.item` constructor against an in-memory allocator.
+Its 192 parameter sets vary dimensions, layers, samples, every address,
+pipeline low bytes, status namespaces, duplicate registers, timestamps,
+pool selection, alias relocation and structural-tail options. The kernel's
+integer-only merge calculation matches Python for all 16384 supported
+dimensions. Unsupported USC bases fail before any output mutation.
+
+The render graph oracle compares complete pool arrays, leaf pages, packed
+shared/optional records and operand directories. Its 512 queue-context cases
+cover ordinary, partial-opening, dependency and extended-context forms,
+explicit points/completion values, locator relocation and retained bytes on
+slot reuse. Event initialization is limited to the host's 64-byte record;
+adjacent bytes remain intact. These render constructors compile into the
+driver, but runtime render publication and rendered-output validation remain
+pending; the checks do not imply hardware render support.
 
 The topology import also generates the T8140 source-memory DT include. It
 reserves the union of prescribed RAM leaf/table pages, including the second
