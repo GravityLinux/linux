@@ -118,7 +118,8 @@ int main(void)
 			command.compute.ts.start.handle = command.compute.ts.end.handle = owners[0].object;
 			syncs[0].handle = owners[0].binary; syncs[1].handle = owners[0].timeline;
 			syncs[1].timeline_value = 17;
-			BAD(owners[0].fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
+			command.compute.flags = 1;
+			BAD(owners[0].fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
 		}
 	}
 	for (unsigned i = 0; i < 2; i++) {

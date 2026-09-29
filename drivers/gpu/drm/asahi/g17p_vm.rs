@@ -397,6 +397,41 @@ impl Vm {
         Ok(address)
     }
 
+    /// A transport pool allocation belongs to Memory before it becomes
+    /// reachable. Existing mappings are never overwritten or adopted.
+    pub(crate) fn transport_backing(&mut self, memory: &mut Memory, address: u64) -> Result<u64> {
+        if address & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        for offset in [0, PAGE] {
+            if self.lookup(memory, 2, address + offset)?.is_some() {
+                return Err(EBUSY);
+            }
+        }
+        let pa = memory.allocate(2 * PAGE as usize)?;
+        memory.clean(pa, 2 * PAGE as usize)?;
+        self.span(
+            memory,
+            2,
+            address,
+            pa,
+            2 * PAGE as usize,
+            0x00c0000000000443,
+        )?;
+        self.flush_tables(memory)?;
+        // SAFETY: Publish the owned absent-to-present GPU mappings before
+        // redirecting the retired queue, as map_firmware_existing_at does.
+        unsafe {
+            core::arch::asm!(
+                ".inst 0xd508811f",
+                "dsb sy",
+                "isb",
+                options(nostack, preserves_flags)
+            );
+        }
+        Ok(pa)
+    }
+
     /// Reclassify a source-owned submission leaf before first publication.
     /// The initial extent may describe an older read-only status alias at
     /// this DVA; the new leaf is firmware-writable, as in alloc_at().

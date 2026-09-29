@@ -11,6 +11,38 @@ pub(crate) const CONTEXT_HIGH: u64 = 0xfffffc2000278000;
 pub(crate) const SUPPORT: u64 = 0xfffffc20c08d0000;
 pub(crate) const SUPPORT_STATE: u64 = 0xfffffc2001688000;
 pub(crate) const ZERO: u64 = 0xfffffc2001698000;
+pub(crate) const TRANSPORT_BASE: u64 = 0xfffffc20cf000000;
+pub(crate) const TRANSPORT_INTERVAL: u32 = 128;
+
+/// G17PComputeTransportPool changes just the retired queue's two backing
+/// pointers and mirrored read index; all other firmware-owned bytes survive.
+pub(crate) fn transport_record(
+    record: &mut [u8; 0xc0],
+    old: [u64; 2],
+    done: u32,
+    slot: u32,
+) -> Result<[u64; 2]> {
+    if slot > 1
+        || u64::from_le_bytes(record[..8].try_into().unwrap()) != old[0]
+        || u64::from_le_bytes(record[8..16].try_into().unwrap()) != old[1]
+        || u32::from_le_bytes(record[0x1c..0x20].try_into().unwrap()) != done
+    {
+        return Err(Error::Invalid);
+    }
+    let pointers = TRANSPORT_BASE + slot as u64 * 0x8000;
+    let ring = pointers + 0x4000;
+    c::u64_at(record, 0, pointers);
+    c::u64_at(record, 8, ring);
+    c::u32_at(record, 0x1c, 0);
+    Ok([pointers, ring])
+}
+
+pub(crate) fn transport_pointers() -> [u8; 0x80] {
+    let mut body = [0; 0x80];
+    c::u32_at(&mut body, 0x50, u32::MAX);
+    c::u32_at(&mut body, 0x60, 0x500);
+    body
+}
 
 /// The two ordinary queue owners constructed by the shim's force_fresh path
 /// after rendering. This is a distinct lifetime from the retained startup

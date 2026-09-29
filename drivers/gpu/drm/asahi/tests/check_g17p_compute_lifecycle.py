@@ -61,6 +61,35 @@ emit('post-render:second-descriptor',c.build_compute_descriptor(regs,a['schedule
 emit('post-render:second-optional',c.build_compute_optional(a['context_low'],a['context_high'],grid_index=a['grid'],submission_ordinal=a['optional_submission'],shared_control=a['shared_support'],channel_control=a['channel_control'],uuid=a['uuid'],field_46=a['optional_field_46'],field_1e=2,field_32=a['optional_field_32'],field_56=a['optional_field_56'],field_5e=2,first_submit=True,item_index=0))
 step=(a['descriptor']-ns['DESCRIPTOR'])//0x20
 emit('post-render:second-context',c.build_compute_queue_context_item(a['descriptor'],a['queue'],a['grid'],flags_200=a['qctx_flags'],word_220=a['qctx_word_220'],word_330=0,word_338=a['qctx_word_338'],word_350=0x000110038001a002+step,word_358=0x000020038001a03b+step,word_378=0x003fffffffffffff,item_index=0))
+# Execute the actual transport switch over synthetic owned RAM. Only physical
+# allocation is replaced; queue decoding, mutation and retirement stay source.
+from types import SimpleNamespace as NS
+gs=importlib.util.spec_from_file_location('g17p',args.m1n1/'proxyclient/m1n1/agx/g17p.py')
+g17p=importlib.util.module_from_spec(gs);gs.loader.exec_module(g17p)
+tns=dict(struct=struct,g17p=g17p)
+for filename, name in [('g17p_backend.py','G17PQueue'),('g17p_compute_transport.py','G17PComputeTransportPool')]:
+    tree=ast.parse((args.m1n1/'proxyclient/m1n1/agx'/filename).read_text())
+    nodes=[n for n in tree.body if isinstance(n,ast.ClassDef) and n.name==name]
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),filename,'exec'),tns)
+tns.update(PAGE=0x4000,ITEM_BYTES=0x2870,POOL_BASE=0xfffffc20cf000000,POOL_SLOTS=2)
+for case in range(8):
+    old=(0xfffffc200165a870+case*0x4000,0xfffffc20c08aa870+case*0x4000)
+    done=384+case*3
+    record=bytearray((i*17+case*13)&255 for i in range(0xc0))
+    struct.pack_into('<2Q',record,0,*old);struct.pack_into('<I',record,0x1c,done)
+    pointers=bytearray(0x80)
+    for off in (0,0x30,0x40):struct.pack_into('<I',pointers,off,done)
+    ram={0xfffffc20c0000300:bytes(record),old[0]:bytes(pointers)}
+    backend=NS(_read_dva=lambda at,size:ram[at][:size],
+        _write_dva=lambda at,body:ram.__setitem__(at,bytes(body)),
+        _clean_dva_range=lambda *a:None,u=NS(inst=lambda *a:None),
+        channels=NS(counters=lambda _: [case]*3,by_name=lambda _:None))
+    pool=tns['G17PComputeTransportPool'](backend);pool.history=[None]*(case%2)
+    pool._backing=lambda slot: pool.slots.setdefault(slot,dict(address=tns['POOL_BASE']+slot*0x8000,pa=0x10080000000+slot*0x8000))
+    queue=tns['G17PQueue'](backend._read_dva,0xfffffc20c0000300,4)
+    replacement=pool.switch(queue,128+case)
+    emit(f'transport-{case}:record',ram[queue.address])
+    emit(f'transport-{case}:pointers',ram[replacement.pointers_addr])
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'lifecycle'
     subprocess.run([args.rustc,'--edition=2021',str(Path(__file__).with_name('g17p_compute_lifecycle.rs')),'-o',str(binary)],check=True)

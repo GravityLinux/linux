@@ -69,12 +69,16 @@ Retained direct-compute metadata (source-only, no device access):
 python3 drivers/gpu/drm/asahi/tests/check_g17p_compute_lifecycle.py /path/to/m1n1
 ```
 
-The runtime admits 32 total synchronous compute commands. Completed caller
+The direct runtime reserves the source bootstrap's 258 logical command
+placements. It retains the queue identity while switching pointer/item backing
+at ordinals 128 and 256, using a two-slot pool with ownership/readback and
+inactive-storage integrity checks. Descriptor/context/scheduler storage follows
+the source's 240/256/36-record reuse rules. Completed caller
 bindings can be replaced transactionally, including a handoff between logical
 VMs/files over the retained shared root in native slots 2/3. The source-profile test covers later wrap
 metadata too; it does not claim that runtime wrap/handoff is implemented. The
 native `g17p-drm-compute` test changes its input arrays and poisons its output on
-each submission, checks all 2048 floats and every tail guard, then verifies that
+each submission, checks all 16512 floats and every tail guard, then verifies that
 admission exhaustion returns EOPNOTSUPP without touching the output. The `--rebind` option replaces the output GEM at the same DVA after every
 completed dispatch and retains/checks all older CPU images and guards.
 `g17p-drm-compute-vm` alternates two independent DRM files with colliding DVAs,
@@ -96,7 +100,7 @@ On the target:
 
 ```sh
 g17p-drm-compute --sync --timestamps
-# On a separate fresh boot (the retained transport admits 32 commands total):
+# On a separate fresh boot:
 g17p-drm-batch
 ```
 
@@ -116,13 +120,20 @@ The batch test uses four submissions of eight independently owned graphs,
 checks all 2048 expected floats, each output guard, timestamp pairs and one
 completion-fence pair per batch. Invalid last-command flags/barriers and a
 batch exceeding remaining capacity must leave every output/fence unchanged.
-It includes the sync dependency checks and timestamp object rebind.
+It includes the sync dependency checks and timestamp object rebind. Its final
+rejection checks use malformed commands/barriers; the old 32-command transport
+limit is gone. The 258-command compute test checks a three-command batch when
+only two reserved command placements remain, then executes those two commands
+and verifies refusal of further publication.
 The host VM harness also checks exact timestamp alias backing/attributes,
 collision rejection and aperture/alignment boundaries.
 
 These native compute tests have passed on T8140, including retained-memory
-audits after file close. Finite compute transport handoff, simultaneous native
-contexts and asynchronous frontend/backend behavior remain unfinished.
+audits after file close. The 258-command run passes both transport handoffs, descriptor/context/channel
+wrap, all 516 timestamps, 258 binary/timeline fences, input dependency errors
+and waits, exact results and post-close retained-memory audit. Extending beyond
+the source bootstrap storage window, simultaneous native contexts and
+asynchronous frontend/backend behavior remain unfinished.
 
 The synchronous render path accepts render-only batches on one retained owner.
 `g17p-drm-render` performs 32 pressure renders, replacing eight guarded output
@@ -166,3 +177,12 @@ confirms retained outputs, separate roots, both compute queues retired, render
 queues retired, three render and two compute report records, exact credits,
 and six online CPUs. This qualifies the transition; it does not complete the
 synchronous source port or asynchronous plan stages.
+
+The current direct-compute transport run passes 16533676 native checks and
+6234 memory UAPI checks on T8140. Its audit retains the original transport at
+384/384/384, pool slot zero at 384/384/384, and pool slot one at 6/6/6;
+CL2 wraps to 2/2/2 with report credits 2/2. The 240 descriptor slots contain
+the correct most-recent logical ordinals and timestamp destinations. Private
+robustness pages now live in the reserved VM aperture for ordinary compute as
+well as the render-first path. Reuse of both pool slots is implemented from the source ownership protocol;
+this hardware run exercises two handoffs.

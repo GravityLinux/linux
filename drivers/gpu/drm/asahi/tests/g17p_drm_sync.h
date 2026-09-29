@@ -198,14 +198,14 @@ static void sync_after(int fd, struct sync_test *t, unsigned n)
 	CHECK(stamp > t->last_stamp);
 	t->last_stamp = stamp;
 }
-static inline void sync_finish(int fd, struct sync_test *t)
+static inline void sync_finish(int fd, struct sync_test *t, unsigned count)
 {
 	CHECK(sync_stamp(fd, t->binary) == t->last_stamp);
-	CHECK(sync_point(fd, t->timeline) == 32);
+	CHECK(sync_point(fd, t->timeline) == count);
 	uint32_t handles[] = { t->input, t->seed, t->binary, t->timeline };
 	for (unsigned i = 0; i < 4; i++) {
 		struct drm_syncobj_destroy d = { .handle = handles[i] };
 		OK(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d);
 	}
-	printf("G17P_SYNC_COMPLETION_PASS 32 binary and timeline fences, imported wait, same-file progress, rejected work preserves fences\n");
+	printf("G17P_SYNC_COMPLETION_PASS %u binary and timeline fences, imported wait, same-file progress, rejected work preserves fences\n", count);
 }
