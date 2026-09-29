@@ -198,7 +198,7 @@ static void sync_after(int fd, struct sync_test *t, unsigned n)
 	CHECK(stamp > t->last_stamp);
 	t->last_stamp = stamp;
 }
-static void sync_finish(int fd, struct sync_test *t)
+static inline void sync_finish(int fd, struct sync_test *t)
 {
 	CHECK(sync_stamp(fd, t->binary) == t->last_stamp);
 	CHECK(sync_point(fd, t->timeline) == 32);
