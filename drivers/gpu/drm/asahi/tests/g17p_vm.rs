@@ -250,9 +250,31 @@ fn main() {
         let va = image.graph.addresses[index];
         for offset in (0..object.size).step_by(0x4000) {
             let pte = memory.walk(high_root, va + offset as u64);
-            assert_eq!(
-                &memory.pages[&(pte & MASK)],
-                &image.buffers[index][offset..offset + 0x4000]
+            let mut expected = image.buffers[index][offset..offset + 0x4000].to_vec();
+            // Cold opening records are installed after the initdata image.
+            // Their constructors are independently compared with Python by
+            // check_g17p_opening.py; check their final physical placement here.
+            let page = va + offset as u64;
+            for (address, body) in [
+                (0xfffffc20015e0000, g17p_opening::resource_record().to_vec()),
+                (
+                    0xfffffc20c07d0000,
+                    g17p_opening::current_jobs(false).to_vec(),
+                ),
+                (
+                    0xfffffc20c07f8000,
+                    g17p_opening::current_jobs(true).to_vec(),
+                ),
+                (0xfffffc20015e8000, g17p_opening::dispatch_record().to_vec()),
+            ] {
+                if address >= page && address < page + 0x4000 {
+                    let at = (address - page) as usize;
+                    expected[at..at + body.len()].copy_from_slice(&body);
+                }
+            }
+            assert!(
+                memory.pages[&(pte & MASK)].as_slice() == expected,
+                "initdata object {index} page {page:x} differs after cold opening overlay"
             );
         }
     }
@@ -349,5 +371,30 @@ fn main() {
     assert!(vm
         .alias_firmware(&mut memory, address, 0x7000900000, 0x9000)
         .is_err());
-    println!("PASS: {checked} firmware/alias/MMIO leaves, all object bytes, private roots, context tags, L2 collision rejection, runtime extension/alias preservation");
+    // External timestamp pages keep exact caller backing and Shared/AP=1
+    // attributes. Neither collisions nor aperture/alignment errors replace it.
+    let stamp = g17p_vm::TIMESTAMP_BASE;
+    let stamp_pa = memory.allocate(0x4000).unwrap();
+    vm.timestamp_page(&mut memory, stamp, stamp_pa).unwrap();
+    assert_eq!(memory.walk(high_root, stamp), stamp_pa | 0x00c000000000044b);
+    vm.timestamp_page(&mut memory, stamp, stamp_pa).unwrap();
+    assert_eq!(
+        vm.timestamp_page(&mut memory, stamp, stamp_pa + 0x4000),
+        Err(17)
+    );
+    for va in [stamp - 0x4000, stamp + 1, stamp + g17p_vm::TIMESTAMP_SIZE] {
+        assert_eq!(vm.timestamp_page(&mut memory, va, stamp_pa), Err(22));
+    }
+    assert_eq!(
+        vm.timestamp_page(&mut memory, stamp + 0x4000, stamp_pa + 1),
+        Err(22)
+    );
+    assert_eq!(memory.walk(high_root, stamp), stamp_pa | 0x00c000000000044b);
+    vm.timestamp_page(
+        &mut memory,
+        stamp + g17p_vm::TIMESTAMP_SIZE - 0x4000,
+        stamp_pa,
+    )
+    .unwrap();
+    println!("PASS: {checked} firmware/alias/MMIO leaves, all object bytes, private roots, context tags, L2 collision rejection, runtime extension/alias preservation, timestamp aliases/attributes/bounds");
 }

@@ -38,7 +38,7 @@ address-only import from `g17p_source_topology.py`. Linux validates the full
 reservation list before any future physical placement or firmware publication.
 
 The VM harness runs the actual kernel constructor against bounded synthetic
-RAM. It checks 962 firmware, context-0 alias and MMIO leaf translations, every
+RAM. It checks 3203 firmware, context-0 alias and MMIO leaf translations, every
 initdata byte after physical placement, both distinct private firmware roots,
 and all three context tags. A pre-existing shared-L2 mapping must fail before
 context publication. It does not simulate firmware execution or cache coherence.
@@ -49,10 +49,54 @@ Retained direct-compute metadata (source-only, no device access):
 python3 drivers/gpu/drm/asahi/tests/check_g17p_compute_lifecycle.py /path/to/m1n1
 ```
 
-The runtime currently admits 32 synchronous compute submissions with unchanged
+The runtime currently admits 32 total synchronous compute commands with unchanged
 bindings in the first submitting VM. The source-profile test covers later wrap
 metadata too; it does not claim that runtime wrap/handoff is implemented. The
 native `g17p-drm-compute` test changes its input arrays and poisons its output on
 each submission, checks all 2048 floats and every tail guard, then verifies that
 admission exhaustion returns EOPNOTSUPP without touching the output. Changed VMs
 or bindings are explicitly rejected until VM handoff is connected.
+
+Native integration tests run from a RAM initramfs on the explicitly selected
+development target. Generate the caller workload headers from pure Python
+constructors (no proxy imports or captured firmware objects):
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/make_g17p_compute_workload.py /path/to/m1n1 /tmp/g17p_drm_workload.h
+python3 drivers/gpu/drm/asahi/tests/make_g17p_compute_workload.py /path/to/m1n1 /tmp/g17p_drm_batch_workload.h --batch-count 32
+```
+
+Cross-compile `g17p_drm_compute.c` and `g17p_drm_batch.c` with the installed
+kernel UAPI headers, `-I/tmp`, `-O2 -Wall -Wextra -Werror -static`. The tests
+share the memory helpers and optional sync/timestamp checks in this directory.
+On the target:
+
+```sh
+g17p-drm-compute --sync --timestamps
+# On a separate fresh boot (the retained transport admits 32 commands total):
+g17p-drm-batch
+```
+
+`--sync` requires CONFIG_SW_SYNC and debugfs solely to create imported external
+dependency fences. It checks malformed/missing/failed binary and timeline
+inputs, timeout/interruption, same-file progress while waiting, output fence
+waits/exports/query and preservation after rejection. Compute remains on the
+real GPU. Without `--sync`, the compute test needs no software timeline device.
+
+`--timestamps` checks ordered start/end pairs in the middle page of a caller
+GEM BO, offset/alignment validation, live object unbind/rebind, all earlier
+pairs and every surrounding guard byte. Timestamp aliases retain backing
+until firmware shutdown; address recycling is pending, and the retained
+64 MiB aperture returns ENOSPC on exhaustion.
+
+The batch test uses four submissions of eight independently owned graphs,
+checks all 2048 expected floats, each output guard, timestamp pairs and one
+completion-fence pair per batch. Invalid last-command flags/barriers and a
+batch exceeding remaining capacity must leave every output/fence unchanged.
+It includes the sync dependency checks and timestamp object rebind.
+The host VM harness also checks exact timestamp alias backing/attributes,
+collision rejection and aperture/alignment boundaries.
+
+These native tests have passed on T8140, including retained-memory audits
+after file close. Render, runtime slot reuse/VM handoff and asynchronous
+frontend/backend behavior remain outside this implementation stage.

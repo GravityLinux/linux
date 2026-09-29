@@ -13,6 +13,8 @@ use kernel::{device, prelude::*};
 const PAGE: u64 = 0x4000;
 const ADDRESS: u64 = 0x0000_ffff_ffff_c000;
 const SECONDARY: u64 = 0x40000;
+pub(crate) const TIMESTAMP_BASE: u64 = 0xfffffc2181400000;
+pub(crate) const TIMESTAMP_SIZE: u64 = 0x4000000;
 
 pub(crate) struct Vm {
     roots: [u64; 3],
@@ -316,9 +318,7 @@ impl Vm {
     /// The timestamp registry retains the caller's pinned backing before
     /// installing this alias, including on a partial failure.
     pub(crate) fn timestamp_page(&mut self, memory: &mut Memory, va: u64, pa: u64) -> Result {
-        if !(super::g17p_timestamp::BASE..super::g17p_timestamp::BASE + super::g17p_timestamp::SIZE)
-            .contains(&va)
-        {
+        if !(TIMESTAMP_BASE..TIMESTAMP_BASE + TIMESTAMP_SIZE).contains(&va) {
             return Err(EINVAL);
         }
         // Source iomap_at_root defaults: OS=1, UXN=1, AF=1, AP=1,
