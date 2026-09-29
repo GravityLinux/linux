@@ -122,7 +122,8 @@ pub(crate) fn build(
         (p.fragment_status, PAGE as u64),
         (p.tilemap, 0x24000),
         (p.tpc, PAGE as u64),
-        (0x1000190000, PAGE as u64),
+        (0x1000080000, PAGE as u64),
+        (0x1000190000, 4 * PAGE as u64),
         (p.aux_fb, PAGE as u64),
         (0x7000000000, 0x10000),
         (0x7000208000, PAGE as u64),
@@ -143,13 +144,7 @@ pub(crate) fn build(
             if overlap(&client, va, PAGE as u64) {
                 continue;
             }
-            let pa = if va == p.ta_status {
-                vm.physical(memory, 2, STATUS[0])?
-            } else if va == p.fragment_status {
-                vm.physical(memory, 2, STATUS[1])?
-            } else {
-                vm.physical(memory, 1, va)?
-            };
+            let pa = vm.physical(memory, 1, va)?;
             client.root.prepare(va, PAGE as u64)?;
             client.root.map_owned_page(va, pa, flags)?;
         }
@@ -211,6 +206,19 @@ pub(crate) fn build(
     )
     .map_err(|_| EINVAL)?;
     vm.write(memory, 1, 0x1000190000, &page)?;
+    // apply_render_firmware_aliases(prefer_low=True): four index pages plus
+    // the two status records and pool-B handoff. Growth uses the full index.
+    for (low, high) in [
+        (p.ta_status, STATUS[0]),
+        (0x1000080000, LEAVES[3]),
+        (0x1000190000, LEAVES[0]),
+        (0x1000194000, LEAVES[0] + 0x4000),
+        (0x1000198000, LEAVES[0] + 0x8000),
+        (0x100019c000, LEAVES[0] + 0xc000),
+        (p.fragment_status, STATUS[1]),
+    ] {
+        vm.render_firmware_alias(memory, low, high)?;
+    }
     graph::record_array_a(&mut page[..graph::POOL_A_SIZE], LEAVES[2] + 4, 0).map_err(|_| EINVAL)?;
     write(memory, POOLS[0], &page[..graph::POOL_A_SIZE])?;
     page.fill(0);
