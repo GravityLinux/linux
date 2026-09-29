@@ -4,11 +4,13 @@
 //! Aliases and backing stay owned until both firmware instances stop. This
 //! deliberately does not recycle addresses while firmware could retain them.
 
-use super::{g17p_drm::Object, g17p_memory::Memory, g17p_vm::Vm};
+use super::{
+    g17p_drm::Object,
+    g17p_memory::Memory,
+    g17p_vm::{Vm, TIMESTAMP_BASE as BASE, TIMESTAMP_SIZE as SIZE},
+};
 use kernel::{drm::gem::BaseObject, prelude::*, sync::aref::ARef};
 
-pub(crate) const BASE: u64 = 0xfffffc2181400000;
-pub(crate) const SIZE: u64 = 0x4000000;
 const PAGE: u64 = 0x4000;
 
 struct Alias {
