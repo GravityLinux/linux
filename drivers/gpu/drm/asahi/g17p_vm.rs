@@ -289,6 +289,72 @@ impl Vm {
         Ok(())
     }
 
+    pub(crate) fn flush_tables(&self, memory: &Memory) -> Result {
+        for &table in &self.tables {
+            memory.clean(table, PAGE as usize)?;
+        }
+        super::g17p_memory::sync();
+        Ok(())
+    }
+
+    /// Extend driver-owned firmware storage before first-work publication.
+    pub(crate) fn ensure_firmware(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result {
+        let first = va & !(PAGE - 1);
+        let end = va
+            .checked_add(size as u64)
+            .and_then(|v| v.checked_add(PAGE - 1))
+            .ok_or(EINVAL)?
+            & !(PAGE - 1);
+        for at in (first..end).step_by(PAGE as usize) {
+            if self.lookup(memory, 2, at)?.is_some() {
+                continue;
+            }
+            let pa = memory.allocate(PAGE as usize)?;
+            memory.clean(pa, PAGE as usize)?;
+            let flags = if (0xfffffc20c0000000..0xfffffc20d0000000).contains(&at) {
+                0x00c0000000000443
+            } else {
+                0x00c000000000044b
+            };
+            self.span(memory, 2, at, pa, PAGE as usize, flags)?;
+        }
+        Ok(())
+    }
+
+    /// Explicit first-work replacement of the source-owned context-0 alias.
+    /// This is never used for caller mappings or after a firmware publication.
+    pub(crate) fn alias_firmware(
+        &mut self,
+        memory: &mut Memory,
+        high: u64,
+        low: u64,
+        size: usize,
+    ) -> Result {
+        if (high ^ low) & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        self.ensure_firmware(memory, high, size)?;
+        let first = high & !(PAGE - 1);
+        let end = high
+            .checked_add(size as u64)
+            .and_then(|v| v.checked_add(PAGE - 1))
+            .ok_or(EINVAL)?
+            & !(PAGE - 1);
+        for at in (first..end).step_by(PAGE as usize) {
+            let pa = self.physical(memory, 2, at)?;
+            self.span_inner(
+                memory,
+                0,
+                (low & !(PAGE - 1)) + at - first,
+                pa,
+                PAGE as usize,
+                0x0080000000000c8b,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
     fn backing(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result<u64> {
         if va & (PAGE - 1) != 0 || size == 0 || size % PAGE as usize != 0 {
             return Err(EINVAL);
@@ -384,6 +450,18 @@ impl Vm {
         size: usize,
         flags: u64,
     ) -> Result {
+        self.span_inner(memory, group, va, pa, size, flags, false)
+    }
+    fn span_inner(
+        &mut self,
+        memory: &mut Memory,
+        group: usize,
+        va: u64,
+        pa: u64,
+        size: usize,
+        flags: u64,
+        replace: bool,
+    ) -> Result {
         if size == 0
             || size % PAGE as usize != 0
             || pa & !ADDRESS != 0
@@ -421,7 +499,7 @@ impl Vm {
             let at = table + indices[2] as u64 * 8;
             let expected = (pa + offset as u64) | flags;
             let prior = memory.read64(at)?;
-            if prior & 1 != 0 && prior != expected {
+            if !replace && prior & 1 != 0 && prior != expected {
                 return Err(EEXIST);
             }
             memory.write64(at, expected)?;

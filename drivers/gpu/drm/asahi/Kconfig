@@ -6,10 +6,13 @@ config DRM_ASAHI_NEO
 	depends on ARM64 && ARCH_APPLE && PAGE_SIZE_16KB
 	depends on PM
 	select RUST_DRM_GEM_SHMEM_HELPER
+	select RUST_APPLE_RTKIT
+	select APPLE_MAILBOX
 	help
 	  Experimental Rust driver for the T8140 (A18 Pro / G17P) GPU in
 	  the MacBook Neo. Supports firmware startup and Asahi DRM memory
-	  management. GPU submissions and rendering are not connected yet.
+	  management and first synchronous compute submission. Rendering and
+	  asynchronous scheduling are still under development.
 
 config DRM_ASAHI_M4
 	tristate "Apple M4 GPU driver"

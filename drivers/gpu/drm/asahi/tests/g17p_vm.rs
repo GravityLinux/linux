@@ -79,6 +79,7 @@ mod g17p_image {
     }
 }
 mod g17p_memory {
+    pub fn sync() {}
     use super::*;
     use prelude::*;
     use std::collections::BTreeMap;
@@ -192,7 +193,7 @@ fn main() {
     ));
     assert_eq!(memory.read64(platform.regions[0].base).unwrap(), 0);
     memory.write64(g17p_topology::SHARED_L2, 0).unwrap();
-    let _vm = g17p_vm::Vm::build(&device::Device, &mut memory, &platform, &image).unwrap();
+    let mut vm = g17p_vm::Vm::build(&device::Device, &mut memory, &platform, &image).unwrap();
     // Keep the independent initdata byte check, allowing only the intentional
     // opening control ring/counter writes to the original generated image.
     for (slot, channels) in image.graph.channels.iter().enumerate() {
@@ -323,5 +324,27 @@ fn main() {
             assert!(memory.pages[&rp].iter().all(|b| *b == 0));
         }
     }
-    println!("PASS: {checked} firmware/alias/MMIO leaves, all object bytes, private roots, context tags, L2 collision rejection");
+    // Runtime extension must preserve existing backing/content, including an
+    // unaligned request spanning multiple pages. First-work aliases replace
+    // only the explicitly requested context-0 pages.
+    let address = 0xfffffc20c1f00010;
+    vm.ensure_firmware(&mut memory, address, 0x9000).unwrap();
+    let pa = vm.physical(&memory, 2, address).unwrap();
+    vm.write(&mut memory, 2, address, &[0x55, 0x66, 0x77])
+        .unwrap();
+    vm.ensure_firmware(&mut memory, address, 0x9000).unwrap();
+    assert_eq!(vm.physical(&memory, 2, address).unwrap(), pa);
+    assert_eq!(&memory.pages[&(pa & MASK)][0x10..0x13], &[0x55, 0x66, 0x77]);
+    vm.alias_firmware(&mut memory, address, 0x7000900010, 0x9000)
+        .unwrap();
+    for offset in (0..0xc000).step_by(0x4000) {
+        let high = memory.walk(high_root, (address & !0x3fff) + offset);
+        let low = memory.walk(low_root, 0x7000900000 + offset);
+        assert_eq!(high & !MASK, 0x00c0000000000443);
+        assert_eq!(low, (high & MASK) | 0x0080000000000c8b);
+    }
+    assert!(vm
+        .alias_firmware(&mut memory, address, 0x7000900000, 0x9000)
+        .is_err());
+    println!("PASS: {checked} firmware/alias/MMIO leaves, all object bytes, private roots, context tags, L2 collision rejection, runtime extension/alias preservation");
 }

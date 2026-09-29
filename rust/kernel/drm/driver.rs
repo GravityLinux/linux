@@ -113,6 +113,14 @@ pub trait Driver {
     /// Context data associated with the DRM driver
     type Data: Sync + Send;
 
+    /// Drop initialized driver data when the last DRM reference is released.
+    ///
+    /// Opt in for drivers that always initialize `Data` through `Device::new`.
+    /// The default preserves the older Asahi driver's temporary uninitialized
+    /// allocation workaround; that driver must finish its lifetime conversion
+    /// before this can become the default for all drivers.
+    const DROP_DATA: bool = false;
+
     /// The type used to manage memory for this driver.
     type Object: AllocImpl;
 

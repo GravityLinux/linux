@@ -189,9 +189,9 @@ int main(int argc, char **argv)
 	OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw);
 	struct drm_syncobj_destroy sd = { .handle = sync_handle };
 	OK(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &sd);
-	/* This milestone must fail submission explicitly. No fabricated completion. */
+	/* An empty submission must never fabricate a completion. */
 	struct drm_asahi_submit submit = {0};
-	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
+	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
 	if (argc > 2) {
 		printf("G17P_UAT_AUDIT_READY vm=%u vm2=%u; press Enter to finish\n", vm, vm2);
 		CHECK(getchar() != EOF);
@@ -216,6 +216,6 @@ int main(int argc, char **argv)
 	CHECK(a[0] == 0xa18 && a[PAGE / 8] == 0x8140);
 	CHECK(munmap(a, 2 * PAGE) == 0);
 	CHECK(close(fd) == 0);
-	printf("G17P_DRM_MEMORY_PASS checks=%u; native memory UAPI only; GPU submit unsupported\n", checks);
+	printf("G17P_DRM_MEMORY_PASS checks=%u; native memory UAPI; empty submit rejected\n", checks);
 	return 0;
 }

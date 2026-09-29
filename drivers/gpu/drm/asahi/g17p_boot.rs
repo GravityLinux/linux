@@ -5,11 +5,13 @@
 //! separate: successful RTKit boot is not proof that GPU work can execute.
 
 use super::{
+    g17p_compute_runtime as compute,
     g17p_image::Image,
     g17p_layout as layout,
     g17p_memory::{self, Memory},
     g17p_opening as opening,
     g17p_platform::Platform,
+    g17p_queue as queue,
     g17p_vm::Vm,
 };
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,14 +133,40 @@ struct Peer {
     started: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Prepared,
+    Starting,
+    Running,
+    Failed,
+}
+
 pub(crate) struct Session {
+    phase: Phase,
+    ttbs: u64,
+    compute: Option<compute::Submission>,
     peers: KVec<Peer>,
     memory: Option<Memory>,
     vm: Option<Vm>,
 }
 
+struct Report {
+    host: u32,
+    firmware: u32,
+    records: KVec<[u8; 0x48]>,
+}
+impl Report {
+    fn new() -> Self {
+        Self {
+            host: 0,
+            firmware: 0,
+            records: KVec::new(),
+        }
+    }
+}
+
 impl Session {
-    pub(crate) fn new(
+    pub(crate) fn prepare(
         pdev: &platform::Device<Core>,
         platform: &Platform,
         sgx: &Devres<IoMem<0x4000000>>,
@@ -146,6 +174,9 @@ impl Session {
     ) -> Result<Self> {
         let dev = pdev.as_ref();
         let mut session = Self {
+            phase: Phase::Prepared,
+            ttbs: platform.regions[0].base,
+            compute: None,
             peers: KVec::new(),
             memory: Some(Memory::new(dev, platform)?),
             vm: None,
@@ -266,8 +297,199 @@ impl Session {
             );
         }
         session.vm = Some(Vm::build(dev, memory, platform, image)?);
+        Ok(session)
+    }
+
+    /// Stage all first-work objects before exposing either root to firmware.
+    /// Preparation failure leaves the session unpublished and cannot trigger
+    /// a GPU access to a partially constructed graph.
+    pub(crate) fn stage<T>(
+        &mut self,
+        prepare: impl FnOnce(&mut Memory, &mut Vm) -> Result<T>,
+    ) -> Result<T> {
+        if self.phase != Phase::Prepared {
+            return Err(EBUSY);
+        }
+        prepare(
+            self.memory.as_mut().ok_or(EINVAL)?,
+            self.vm.as_mut().ok_or(EINVAL)?,
+        )
+    }
+
+    pub(crate) fn require_first_work(&self) -> Result {
+        if self.phase == Phase::Failed {
+            return Err(EIO);
+        }
+        if self.phase != Phase::Prepared || self.compute.is_some() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn submit_compute(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        client: compute::Client,
+        parameters: &compute::Parameters,
+    ) -> Result {
+        self.require_first_work()?;
+        let ttbs = self.ttbs;
+        let work =
+            self.stage(|memory, vm| compute::build(memory, vm, image, ttbs, client, parameters))?;
+        // Ownership precedes the first mailbox publication. Even an initdata
+        // timeout or firmware error keeps every reachable client page pinned.
+        self.compute = Some(work);
+        let result = self.run_first_compute(dev, image);
+        if result.is_err() {
+            self.phase = Phase::Failed;
+        }
+        result
+    }
+
+    fn report_snapshot(&self, image: &Image) -> Result<[Report; 2]> {
+        let memory = self.memory.as_ref().ok_or(EINVAL)?;
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        let mut reports = [Report::new(), Report::new()];
+        for (report, channels) in reports.iter_mut().zip(image.graph.channels.iter()) {
+            let channel = channels[13];
+            if channel.states[1].checked_add(256 * 0x48) != Some(channel.ring) {
+                return Err(EINVAL);
+            }
+            for counter in [0, 2] {
+                let pa = vm.physical(memory, 2, channel.states[counter])?;
+                let host = memory.read_firmware32(pa)?;
+                let firmware = memory.read_firmware32(pa + 0x20)?;
+                if host >= 256 || firmware >= 256 {
+                    return Err(EIO);
+                }
+                if counter == 0 {
+                    report.host = host;
+                    report.firmware = firmware;
+                }
+            }
+            for offset in 0..report.firmware.wrapping_sub(report.host) & 255 {
+                let slot = (report.host + offset) & 255;
+                let mut body = [0u8; 0x48];
+                for index in 0..9 {
+                    let pa = vm.physical(
+                        memory,
+                        2,
+                        channel.states[1] + slot as u64 * 0x48 + index * 8,
+                    )?;
+                    memory.invalidate(pa, 8)?;
+                    body[index as usize * 8..index as usize * 8 + 8]
+                        .copy_from_slice(&memory.read64(pa)?.to_le_bytes());
+                }
+                report.records.push(body, GFP_KERNEL)?;
+            }
+        }
+        Ok(reports)
+    }
+
+    fn run_first_compute(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        self.start(dev, image)?;
+        let startup = self.report_snapshot(image)?;
+        let work = self.compute.as_ref().ok_or(EINVAL)?;
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        let (address, value) = work.publication.deferred_outer.ok_or(EINVAL)?;
+        vm.write(memory, 2, address, &value.to_le_bytes())?;
         g17p_memory::sync();
-        for (peer, root) in session.peers.iter_mut().zip(image.graph.roots()) {
+        self.peers[0]
+            .rtkit
+            .as_mut()
+            .ok_or(EINVAL)?
+            .as_mut()
+            .send_message(0x21, 0x0083000a00000000)?;
+        dev_info!(
+            dev,
+            "G17P: first caller compute published on CL2, client root {:#x}\n",
+            work.client.root.root()
+        );
+        let mut last = [0u32; 6];
+        for _ in 0..200 {
+            if self
+                .peers
+                .iter()
+                .any(|p| p.data.crashed.load(Ordering::Acquire))
+            {
+                return Err(EIO);
+            }
+            let work = self.compute.as_ref().ok_or(EINVAL)?;
+            let memory = self.memory.as_ref().ok_or(EINVAL)?;
+            for (index, offset) in [0, 0x20, 0x40].into_iter().enumerate() {
+                last[index] = memory.read_firmware32(vm.physical(
+                    memory,
+                    2,
+                    compute::POINTERS + offset,
+                )?)?;
+            }
+            for (index, address) in work.channel.states.into_iter().enumerate() {
+                last[index + 3] = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+            }
+            let counters = queue::Counters::new([last[3], last[4], last[5]]).map_err(|_| EIO)?;
+            if work.publication.completed(last[0], counters) {
+                let after = self.report_snapshot(image)?;
+                for (peer, (report, before)) in after.iter().zip(startup.iter()).enumerate() {
+                    for (index, body) in report.records.iter().enumerate() {
+                        let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
+                        let startup_receipt = index == 0
+                            && before.host == 0
+                            && report.host == 0
+                            && before.firmware == 1
+                            && before.records.len() == 1
+                            && before.records[0] == *body
+                            && body[..12] == [13, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+                        if opcode != 1 && !startup_receipt {
+                            dev_err!(
+                                dev,
+                                "G17P: unhandled compute report peer {} slot {} opcode {}\n",
+                                peer,
+                                (report.host + index as u32) & 255,
+                                opcode
+                            );
+                            return Err(EIO);
+                        }
+                    }
+                }
+                work.client.cache(true)?;
+                dev_info!(
+                    dev,
+                    "G17P: caller compute retired: queue {:?}, channel {:?}; reports validated\n",
+                    &last[..3],
+                    &last[3..]
+                );
+                return Ok(());
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+        }
+        dev_err!(
+            dev,
+            "G17P: caller compute timeout: queue {:?}, channel {:?}; retaining all GPU memory\n",
+            &last[..3],
+            &last[3..]
+        );
+        Err(ETIMEDOUT)
+    }
+
+    pub(crate) fn start(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        if self.phase != Phase::Prepared {
+            return Err(EBUSY);
+        }
+        self.phase = Phase::Starting;
+        let result = self.start_inner(dev, image);
+        self.phase = if result.is_ok() {
+            Phase::Running
+        } else {
+            Phase::Failed
+        };
+        result
+    }
+
+    fn start_inner(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        g17p_memory::sync();
+        for (peer, root) in self.peers.iter_mut().zip(image.graph.roots()) {
             let rtkit = peer.rtkit.as_mut().ok_or(EINVAL)?;
             rtkit.as_mut().start_endpoint(0x20)?;
             rtkit.as_mut().start_endpoint(0x21)?;
@@ -281,25 +503,25 @@ impl Session {
             rtkit.as_mut().send_message(0x20, message)?;
         }
         for _ in 0..500 {
-            if session
+            if self
                 .peers
                 .iter()
                 .any(|p| p.data.crashed.load(Ordering::Acquire))
             {
                 return Err(EIO);
             }
-            if session
+            if self
                 .peers
                 .iter()
                 .all(|p| p.data.acknowledged.load(Ordering::Acquire))
             {
                 dev_info!(dev, "G17P: both firmware instances acknowledged Rust initdata; no workload submitted\n");
-                session.start_control(dev, image)?;
-                return Ok(session);
+                self.start_control(dev, image)?;
+                return Ok(());
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
         }
-        for peer in &session.peers {
+        for peer in &self.peers {
             dev_err!(
                 dev,
                 "G17P: {} initdata timeout: acknowledged={} last={:#018x}\n",
@@ -308,7 +530,7 @@ impl Session {
                 peer.data.last_message.load(Ordering::Acquire)
             );
         }
-        return Err(ETIMEDOUT);
+        Err(ETIMEDOUT)
     }
 
     fn start_control(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
@@ -365,7 +587,7 @@ impl Session {
         }
         dev_info!(
             dev,
-            "G17P: control start 0x89/0x84 sent with empty work rings; no GPU workload submitted\n"
+            "G17P: control start 0x89/0x84 complete; CL2 outer producer withheld\n"
         );
         Ok(())
     }
@@ -394,6 +616,7 @@ impl Drop for Session {
             // Firmware may still reference these pages. The reservation is
             // permanent; keep the runtime owner too as it gains owned tables.
             core::mem::forget(self.memory.take());
+            core::mem::forget(self.compute.take());
         }
     }
 }

@@ -16,6 +16,7 @@ mod g17p_boot;
 mod g17p_compute;
 #[allow(dead_code)]
 mod g17p_compute_memory;
+mod g17p_compute_runtime;
 mod g17p_drm;
 mod g17p_image;
 mod g17p_initgraph;
@@ -39,9 +40,17 @@ const ID_CLUSTERS: usize = 0xd0401c;
 struct NeoGpu {
     _sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
     _platform: g17p_platform::Platform,
-    _image: g17p_image::Image,
-    _session: g17p_boot::Session,
+    runtime: g17p_drm::RuntimeRef,
     _drm: kernel::sync::aref::ARef<kernel::drm::Device<g17p_drm::Driver>>,
+}
+
+impl Drop for NeoGpu {
+    fn drop(&mut self) {
+        // Serialize with ioctls and stop firmware while devres still owns the
+        // mailbox/MMIO resources. Existing DRM files subsequently see ENODEV.
+        let runtime = self.runtime.lock().take();
+        drop(runtime);
+    }
 }
 
 kernel::of_device_table!(
@@ -80,7 +89,7 @@ impl platform::Driver for NeoGpu {
         };
         let platform = g17p_platform::Platform::new(pdev.as_ref())?;
         let image = g17p_image::Image::new(pdev.as_ref(), &platform)?;
-        let session = g17p_boot::Session::new(pdev, &platform, &sgx, &image)?;
+        let session = g17p_boot::Session::prepare(pdev, &platform, &sgx, &image)?;
         use kernel::dma::Device as _;
         // SAFETY: UAT consumes 42-bit DMA addresses, as validated by this driver.
         unsafe {
@@ -92,12 +101,22 @@ impl platform::Driver for NeoGpu {
             .map(|state| state.frequency_a_mhz.max(state.frequency_b_mhz))
             .max()
             .ok_or(EINVAL)?;
-        let drm = g17p_drm::register(pdev.as_ref(), version, counts, mask, max_mhz)?;
+        let runtime = kernel::sync::Arc::pin_init(
+            kernel::new_mutex!(Some(g17p_drm::Runtime { session, image })),
+            GFP_KERNEL,
+        )?;
+        let drm = g17p_drm::register(
+            pdev.as_ref(),
+            version,
+            counts,
+            mask,
+            max_mhz,
+            runtime.clone(),
+        )?;
         Ok(Self {
             _sgx: sgx,
             _platform: platform,
-            _image: image,
-            _session: session,
+            runtime,
             _drm: drm,
         })
     }

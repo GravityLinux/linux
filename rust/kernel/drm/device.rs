@@ -210,13 +210,14 @@ impl<T: drm::Driver> Device<T> {
         // SAFETY: `ptr` is a valid pointer to a `struct drm_device` and embedded in `Self`.
         let this = unsafe { Self::from_drm_device(ptr) };
 
-        // SAFETY:
-        // - When `release` runs it is guaranteed that there is no further access to `this`.
-        // - `this` is valid for dropping.
-        // unsafe { core::ptr::drop_in_place(this) };
-        // HACK: data might be uninitialized so leak the DRM device instead. The expected number
-        //       of times the asahi device gets released is once at poweroff or reboot.
-        let _ = core::mem::ManuallyDrop::new(this);
+        if T::DROP_DATA {
+            // SAFETY: This vtable is installed only after successful pinned
+            // initialization. Opted-in drivers retain initialized Data until
+            // the final device reference is released. DRM frees the containing
+            // allocation after this callback; drop only the Rust payload here.
+            unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*this).data)) };
+        }
+        // Legacy Asahi opts out while it uses an uninitialized Data placeholder.
     }
 }
 
