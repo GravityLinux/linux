@@ -157,8 +157,10 @@ int main(void)
 		OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait);
 		OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
 	}
-	/* Finite storage admission must reject the next command atomically. */
-	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
+	/* Invalid work after reuse must preserve all completed data. */
+	cmd->flags |= 1U << 31;
+	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
+	cmd->flags = flags;
 	check_images(outputs);
 	CHECK(memcmp(history, timestamps + PAGE + 64, sizeof(history)) == 0);
 	for (unsigned target = 0; target < 8; target++) {

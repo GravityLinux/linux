@@ -35,8 +35,8 @@ fn main() {
     assert!(life::index_registration(0, 32).is_err());
     assert!(life::index_registration(0x1000190001, 32).is_err());
     assert!(life::index_registration(0x2000000000, 32).is_err());
-    for case in 0..64u64 {
-        let item = life::Item::new((case % 31 + 1) as u32).unwrap();
+    for case in 0..256u64 {
+        let item = life::Item::new((case % 127 + 1) as u32).unwrap();
         let p = Parameters {
             width: 128 + case,
             height: 128,

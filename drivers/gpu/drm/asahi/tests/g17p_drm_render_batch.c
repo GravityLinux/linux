@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Sixteen two-command synchronous batches with independent caller resources. */
+/* Sixty-four two-command synchronous batches with independent caller resources. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"
 #undef main
@@ -63,11 +63,11 @@ int main(void)
 		.cmdbuf_size = sizeof(render_command) * 2, .syncs = (uintptr_t)syncs, .out_sync_count = 2 };
 	struct drm_syncobj_array reset = { .handles = (uintptr_t)&binary.handle, .count_handles = 1 };
 	struct drm_syncobj_wait wait = { .handles = (uintptr_t)&binary.handle, .count_handles = 1, .timeout_nsec = 0 };
-	uint64_t point = 0, history[32][4] = {{0}};
+	uint64_t point = 0, history[128][4] = {{0}};
 	struct drm_syncobj_timeline_wait twait = { .handles = (uintptr_t)&timeline.handle,
 		.points = (uintptr_t)&point, .count_handles = 1, .timeout_nsec = 0 };
-	printf("G17P_NATIVE_RENDER_BATCH_BEGIN 16 batches; triangles=%u,%u; 16 distinct images per batch\n", RENDER_TRIANGLES, RENDER_SECOND_TRIANGLES);
-	for (unsigned batch = 0; batch < 16; batch++) {
+	printf("G17P_NATIVE_RENDER_BATCH_BEGIN 64 batches; triangles=%u,%u; 16 distinct images per batch\n", RENDER_TRIANGLES, RENDER_SECOND_TRIANGLES);
+	for (unsigned batch = 0; batch < 64; batch++) {
 		for (unsigned target = 0; target < 16; target++) memset(images[target], 0xa5, RENDER_OUTPUT_SIZE);
 		memset(timestamps + PAGE + 64 + batch * 64, 0, 64);
 		for (unsigned i = 0; i < 2; i++) {
@@ -85,7 +85,7 @@ int main(void)
 			images_check(images, 0);
 			for (unsigned j = 0; j < 64; j++) CHECK(timestamps[PAGE + 64 + j] == 0);
 		}
-		if (batch == 15) {
+		if (batch == 63) {
 			memcpy(buffer.bytes + sizeof(render_command) * 2, buffer.bytes, sizeof(render_command));
 			submit.cmdbuf_size += sizeof(render_command);
 			BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
@@ -122,6 +122,6 @@ int main(void)
 	CHECK(memcmp(history, timestamps + PAGE + 64, sizeof(history)) == 0);
 	for (unsigned target = 0; target < 16; target++) CHECK(munmap(images[target], RENDER_OUTPUT_SIZE) == 0);
 	CHECK(munmap(timestamps, PAGE * 3) == 0); CHECK(close(fd) == 0);
-	printf("G17P_NATIVE_RENDER_BATCH_PASS 16 batches / 32 renders, distinct full images per command, 128 timestamps, barriers and batch fences; checks=%u\n", checks);
+	printf("G17P_NATIVE_RENDER_BATCH_PASS 64 batches / 128 renders, distinct full images per command, 512 timestamps, barriers and batch fences; checks=%u\n", checks);
 	return 0;
 }
