@@ -234,6 +234,18 @@ impl Vm {
         }
         vm.write(memory, 2, opening::SUPPORT, &opening::support())?;
         vm.write(memory, 2, opening::STATE, &2u32.to_le_bytes())?;
+        // The Python compute bootstrap keeps these cold render-owner records
+        // even while both render queues are empty. Omitting them permits the
+        // first CL command but later CL work retires without command status.
+        vm.write(memory, 0, 0x7001838000, &opening::resource_record())?;
+        vm.write(memory, 0, 0x7001840000, &opening::dispatch_record())?;
+        vm.write(memory, 2, 0xfffffc20015e8000, &opening::dispatch_record())?;
+        for (index, address) in [0xfffffc20c07d0000, 0xfffffc20c07f8000]
+            .into_iter()
+            .enumerate()
+        {
+            vm.write(memory, 2, address, &opening::current_jobs(index == 1))?;
+        }
         // Stage both control rings before publishing initdata, with the same
         // already-consumed prefix as the current partial Python entrypoint.
         for (slot, channels) in image.graph.channels.iter().enumerate() {
