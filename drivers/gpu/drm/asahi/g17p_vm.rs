@@ -401,6 +401,26 @@ impl Vm {
         self.span_inner(memory, 2, va, pa, PAGE as usize, flags, true)
     }
 
+    /// First-partial synchronization/index alias, with the retained render
+    /// page canonical. Later source writes and GPU writes share this backing.
+    pub(crate) fn render_firmware_alias(
+        &mut self,
+        memory: &mut Memory,
+        low: u64,
+        high: u64,
+    ) -> Result {
+        if (low | high) & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let pa = self.physical(memory, 1, low)?;
+        let flags = if high >= 0xfffffc20c0000000 {
+            0x00c0000000000443
+        } else {
+            0x00c000000000044b
+        };
+        self.span_inner(memory, 2, high, pa, PAGE as usize, flags, true)
+    }
+
     fn backing(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result<u64> {
         if va & (PAGE - 1) != 0 || size == 0 || size % PAGE as usize != 0 {
             return Err(EINVAL);
