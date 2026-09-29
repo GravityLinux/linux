@@ -497,7 +497,14 @@ impl Session {
             }
             let work = self.compute.as_ref().ok_or(EINVAL)?;
             let memory = self.memory.as_ref().ok_or(EINVAL)?;
-            for (index, offset) in [0, 0x20, 0x40].into_iter().enumerate() {
+            for (index, offset) in [
+                queue::POINTER_DONE,
+                queue::POINTER_READ,
+                queue::POINTER_WRITE,
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 last[index] = memory.read_firmware32(vm.physical(
                     memory,
                     2,
