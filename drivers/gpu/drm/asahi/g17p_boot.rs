@@ -5,8 +5,10 @@
 //! separate: successful RTKit boot is not proof that GPU work can execute.
 
 use super::{
+    g17p_image::Image,
     g17p_memory::{self, Memory},
     g17p_platform::Platform,
+    g17p_vm::Vm,
 };
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
@@ -28,6 +30,7 @@ struct Data {
     firmware_region: &'static CStr,
     crashed: AtomicBool,
     last_message: AtomicU64,
+    acknowledged: AtomicBool,
 }
 
 struct CrashBuffer {
@@ -91,6 +94,9 @@ impl rtkit::Operations for Operations {
         message: u64,
     ) {
         data.last_message.store(message, Ordering::Release);
+        if endpoint == 0x20 && message >> 48 == 0x09 {
+            data.acknowledged.store(true, Ordering::Release);
+        }
         dev_info!(
             data.dev.as_ref(),
             "G17P: {} endpoint {:#x} message {:#018x}\n",
@@ -117,6 +123,7 @@ struct Peer {
 pub(crate) struct Session {
     peers: KVec<Peer>,
     memory: Option<Memory>,
+    vm: Option<Vm>,
 }
 
 impl Session {
@@ -124,11 +131,13 @@ impl Session {
         pdev: &platform::Device<Core>,
         platform: &Platform,
         sgx: &Devres<IoMem<0x4000000>>,
+        image: &Image,
     ) -> Result<Self> {
         let dev = pdev.as_ref();
         let mut session = Self {
             peers: KVec::new(),
             memory: Some(Memory::new(dev, platform)?),
+            vm: None,
         };
         session.peers.reserve(2, GFP_KERNEL)?;
         for (name, registers, firmware_region) in [
@@ -166,6 +175,7 @@ impl Session {
                     firmware_region,
                     crashed: AtomicBool::new(false),
                     last_message: AtomicU64::new(0),
+                    acknowledged: AtomicBool::new(false),
                 },
                 GFP_KERNEL,
             )?;
@@ -243,11 +253,49 @@ impl Session {
                 memory.read64(root + 16)?
             );
         }
-        dev_info!(
-            dev,
-            "G17P: both firmware instances booted; initdata roots not published yet\n"
-        );
-        Ok(session)
+        session.vm = Some(Vm::build(dev, memory, platform, image)?);
+        g17p_memory::sync();
+        for (peer, root) in session.peers.iter_mut().zip(image.graph.roots()) {
+            let rtkit = peer.rtkit.as_mut().ok_or(EINVAL)?;
+            rtkit.as_mut().start_endpoint(0x20)?;
+            rtkit.as_mut().start_endpoint(0x21)?;
+            let message = (0x81u64 << 48) | (root & ((1 << 44) - 1));
+            dev_info!(
+                dev,
+                "G17P: publishing {} initdata {:#018x}\n",
+                peer.data.name,
+                message
+            );
+            rtkit.as_mut().send_message(0x20, message)?;
+        }
+        for _ in 0..500 {
+            if session
+                .peers
+                .iter()
+                .any(|p| p.data.crashed.load(Ordering::Acquire))
+            {
+                return Err(EIO);
+            }
+            if session
+                .peers
+                .iter()
+                .all(|p| p.data.acknowledged.load(Ordering::Acquire))
+            {
+                dev_info!(dev, "G17P: both firmware instances acknowledged Rust initdata; no workload submitted\n");
+                return Ok(session);
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+        }
+        for peer in &session.peers {
+            dev_err!(
+                dev,
+                "G17P: {} initdata timeout: acknowledged={} last={:#018x}\n",
+                peer.data.name,
+                peer.data.acknowledged.load(Ordering::Acquire),
+                peer.data.last_message.load(Ordering::Acquire)
+            );
+        }
+        return Err(ETIMEDOUT);
     }
 }
 

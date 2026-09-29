@@ -4,7 +4,24 @@
 //! Does not treat firmware physical addresses as kernel direct-map pointers.
 
 use super::{g17p_platform::Platform, g17p_topology};
-use kernel::{c_str, device, io::mem, io::resource::Resource, prelude::*};
+use kernel::{bindings, c_str, device, io::mem, io::resource::Resource, page, prelude::*};
+
+const PAGE: usize = 0x4000;
+
+struct Allocation {
+    page: *mut bindings::page,
+    base: u64,
+    size: usize,
+    order: u32,
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // SAFETY: This owner retains the original allocation and its order.
+        // Session only drops memory after the firmware has stopped.
+        unsafe { bindings::__free_pages(self.page, self.order) };
+    }
+}
 
 struct Mapping {
     base: u64,
@@ -13,6 +30,7 @@ struct Mapping {
 
 pub(crate) struct Memory {
     mappings: KVec<Mapping>,
+    allocations: KVec<Allocation>,
 }
 
 // SAFETY: These mappings are not thread-local. Only this owner accesses them;
@@ -24,6 +42,7 @@ impl Memory {
         let node = dev.of_node().ok_or(ENODEV)?;
         let mut memory = Self {
             mappings: KVec::new(),
+            allocations: KVec::new(),
         };
         for (index, name) in [
             c_str!("ttbs"),
@@ -64,8 +83,27 @@ impl Memory {
         Ok(())
     }
 
-    fn pointer(&self, address: u64, size: usize) -> Result<*mut u8> {
+    /// Access is scoped to a mapping, including on kernels with local mappings.
+    /// No pointer from the callback may be retained after it returns.
+    fn access<T>(&self, address: u64, size: usize, f: impl FnOnce(*mut u8) -> T) -> Result<T> {
         let end = address.checked_add(size as u64).ok_or(EINVAL)?;
+        if size == 0 || (address as usize & (PAGE - 1)) + size > PAGE {
+            return Err(EINVAL);
+        }
+        if self
+            .allocations
+            .iter()
+            .any(|a| address >= a.base && end <= a.base + a.size as u64)
+        {
+            let base = address & !(PAGE as u64 - 1);
+            // SAFETY: The allocation above owns this System RAM page for the
+            // entire callback, and no pointer or reference escapes access.
+            let page = unsafe { page::Page::borrow_phys_unchecked(&base) };
+            return Ok(page.with_page_mapped(|p| {
+                // SAFETY: The checked access fits this one mapped page.
+                f(unsafe { p.add((address - base) as usize) })
+            }));
+        }
         let mapping = self
             .mappings
             .iter()
@@ -74,7 +112,37 @@ impl Memory {
             })
             .ok_or(EINVAL)?;
         // SAFETY: The range above is entirely within this live mapping.
-        Ok(unsafe { mapping.memory.ptr().add((address - mapping.base) as usize) })
+        Ok(f(unsafe {
+            mapping.memory.ptr().add((address - mapping.base) as usize)
+        }))
+    }
+
+    pub(crate) fn allocate(&mut self, size: usize) -> Result<u64> {
+        if page::PAGE_SIZE != PAGE || size == 0 || size % PAGE != 0 {
+            return Err(EINVAL);
+        }
+        let pages = (size / PAGE).checked_next_power_of_two().ok_or(EINVAL)?;
+        let order = pages.trailing_zeros();
+        self.allocations.reserve(1, GFP_KERNEL)?;
+        // SAFETY: Standard allocator call; the resulting owner frees exactly
+        // this order. All pages are cleared before any firmware publication.
+        let ptr = unsafe { bindings::alloc_pages(bindings::GFP_KERNEL, order) };
+        if ptr.is_null() {
+            return Err(ENOMEM);
+        }
+        // SAFETY: Successful alloc_pages returned a live page descriptor.
+        let base = unsafe { bindings::page_to_phys(ptr) };
+        self.allocations.push(
+            Allocation {
+                page: ptr,
+                base,
+                size: pages * PAGE,
+                order,
+            },
+            GFP_KERNEL,
+        )?;
+        self.zero(base, pages * PAGE)?;
+        Ok(base)
     }
 
     pub(crate) fn read64(&self, address: u64) -> Result<u64> {
@@ -83,9 +151,9 @@ impl Memory {
         }
         // SAFETY: The checked address names aligned ordinary RAM. Volatile
         // access avoids assuming the firmware leaves the value unchanged.
-        Ok(u64::from_le(unsafe {
-            self.pointer(address, 8)?.cast::<u64>().read_volatile()
-        }))
+        self.access(address, 8, |p| {
+            u64::from_le(unsafe { p.cast::<u64>().read_volatile() })
+        })
     }
 
     pub(crate) fn write64(&mut self, address: u64, value: u64) -> Result {
@@ -94,12 +162,9 @@ impl Memory {
         }
         // SAFETY: Bounds/alignment checked. Only host-owned protocol fields
         // and unpublished tables are written through this interface.
-        unsafe {
-            self.pointer(address, 8)?
-                .cast::<u64>()
-                .write_volatile(value.to_le())
-        };
-        Ok(())
+        self.access(address, 8, |p| unsafe {
+            p.cast::<u64>().write_volatile(value.to_le())
+        })
     }
 
     pub(crate) fn write32(&mut self, address: u64, value: u32) -> Result {
@@ -107,31 +172,53 @@ impl Memory {
             return Err(EINVAL);
         }
         // SAFETY: Same ownership and range checks as write64.
-        unsafe {
-            self.pointer(address, 4)?
-                .cast::<u32>()
-                .write_volatile(value.to_le())
-        };
-        Ok(())
+        self.access(address, 4, |p| unsafe {
+            p.cast::<u32>().write_volatile(value.to_le())
+        })
     }
 
     pub(crate) fn write8(&mut self, address: u64, value: u8) -> Result {
         // SAFETY: Checked one-byte host-owned field in ordinary RAM.
-        unsafe { self.pointer(address, 1)?.write_volatile(value) };
-        Ok(())
+        self.access(address, 1, |p| unsafe { p.write_volatile(value) })
     }
 
     pub(crate) fn zero(&mut self, address: u64, size: usize) -> Result {
         // SAFETY: The caller exclusively owns the unpublished range. Bounds
         // are checked against the reservation before any writes take place.
-        unsafe { self.pointer(address, size)?.write_bytes(0, size) };
+        self.chunks(address, size, |p, _, count| unsafe {
+            p.write_bytes(0, count)
+        })?;
         Ok(())
     }
 
+    fn chunks(
+        &self,
+        address: u64,
+        size: usize,
+        mut f: impl FnMut(*mut u8, usize, usize),
+    ) -> Result {
+        address.checked_add(size as u64).ok_or(EINVAL)?;
+        let mut offset = 0;
+        while offset < size {
+            let pa = address + offset as u64;
+            let count = (size - offset).min(PAGE - (pa as usize & (PAGE - 1)));
+            self.access(pa, count, |p| f(p, offset, count))?;
+            offset += count;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write(&mut self, address: u64, bytes: &[u8]) -> Result {
+        self.chunks(address, bytes.len(), |p, offset, count| {
+            // SAFETY: Checked mapped destination and disjoint source slice.
+            unsafe { p.copy_from_nonoverlapping(bytes.as_ptr().add(offset), count) };
+        })
+    }
+
     pub(crate) fn clean(&self, address: u64, size: usize) -> Result {
-        let pointer = self.pointer(address, size)?;
+        self.chunks(address, size, |pointer, _, count| {
         let start = (pointer as usize) & !63;
-        let end = (pointer as usize).checked_add(size).ok_or(EINVAL)?;
+        let end = pointer as usize + count;
         for address in (start..end).step_by(64) {
             // SAFETY: The live RAM mappings are page aligned, so rounding
             // down to a cache line remains within the same mapped page.
@@ -139,6 +226,7 @@ impl Memory {
                 core::arch::asm!("dc cvac, {address}", address = in(reg) address, options(nostack, preserves_flags))
             };
         }
+        })?;
         sync();
         Ok(())
     }

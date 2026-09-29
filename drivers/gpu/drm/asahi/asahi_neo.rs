@@ -17,6 +17,7 @@ mod g17p_layout;
 mod g17p_memory;
 mod g17p_platform;
 mod g17p_topology;
+mod g17p_vm;
 
 const SGX_SIZE: usize = 0x4000000;
 const ID_VERSION: usize = 0xd04000;
@@ -70,7 +71,7 @@ impl platform::Driver for NeoGpu {
         }
         let platform = g17p_platform::Platform::new(pdev.as_ref())?;
         let image = g17p_image::Image::new(pdev.as_ref(), &platform)?;
-        let session = g17p_boot::Session::new(pdev, &platform, &sgx)?;
+        let session = g17p_boot::Session::new(pdev, &platform, &sgx, &image)?;
         Ok(Self {
             _sgx: sgx,
             _platform: platform,

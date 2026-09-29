@@ -10,6 +10,8 @@ python3 drivers/gpu/drm/asahi/tests/import_g17p_layout.py /path/to/m1n1 --check
 python3 drivers/gpu/drm/asahi/tests/import_g17p_topology.py /path/to/m1n1 --check
 python3 drivers/gpu/drm/asahi/tests/check_g17p_abi.py /path/to/m1n1
 python3 drivers/gpu/drm/asahi/tests/check_g17p_initgraph.py /path/to/m1n1
+rustc --edition=2021 drivers/gpu/drm/asahi/tests/g17p_vm.rs -o /tmp/g17p-vm-test
+/tmp/g17p-vm-test
 ```
 
 The ABI check compares 452 whole objects with `g17p_initdata.py`, including
@@ -34,3 +36,9 @@ reserves the union of prescribed RAM leaf/table pages, including the second
 firmware root, while excluding MMIO and the ADT-owned L2 page. This is an
 address-only import from `g17p_source_topology.py`. Linux validates the full
 reservation list before any future physical placement or firmware publication.
+
+The VM harness runs the actual kernel constructor against bounded synthetic
+RAM. It checks 962 firmware, context-0 alias and MMIO leaf translations, every
+initdata byte after physical placement, both distinct private firmware roots,
+and all three context tags. A pre-existing shared-L2 mapping must fail before
+context publication. It does not simulate firmware execution or cache coherence.

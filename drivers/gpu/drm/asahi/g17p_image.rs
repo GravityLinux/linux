@@ -21,8 +21,8 @@ impl graph::Storage for Buffers {
 }
 
 pub(crate) struct Image {
-    _buffers: Buffers,
-    _graph: graph::Graph,
+    buffers: Buffers,
+    pub(crate) graph: graph::Graph,
 }
 
 impl Image {
@@ -45,9 +45,14 @@ impl Image {
         dev_info!(dev,
             "G17P: built {} unpublished initdata objects ({} bytes), roots {:#x}/{:#x}, {} channels per instance\n",
             graph::OBJECTS, bytes, graph.roots()[0], graph.roots()[1], g17p_abi::CHANNELS);
-        Ok(Self {
-            _buffers: buffers,
-            _graph: graph,
-        })
+        Ok(Self { buffers, graph })
+    }
+
+    pub(crate) fn object(&self, index: usize) -> Result<&[u8]> {
+        self.buffers
+            .0
+            .get(index)
+            .map(|v| v.as_slice())
+            .ok_or(EINVAL)
     }
 }
