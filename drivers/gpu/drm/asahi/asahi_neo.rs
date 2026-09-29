@@ -11,6 +11,11 @@ use kernel::{
 
 mod g17p_abi;
 mod g17p_boot;
+// Current source serializers, connected as the submission port is completed.
+#[allow(dead_code)]
+mod g17p_compute;
+#[allow(dead_code)]
+mod g17p_compute_memory;
 mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
