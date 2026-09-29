@@ -1114,15 +1114,15 @@ impl File {
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
         if parameters.iter().any(|p| matches!(p, Command::Render(_))) {
-            // The retained pair supports bounded synchronous appends. Reject mixed or
-            // multi-render batches before any prefix can become visible.
-            if parameters.len() != 1 {
+            // Admit the entire synchronous render batch before publishing a
+            // prefix. Each command completes before the next one's barriers.
+            if parameters.iter().any(|p| !matches!(p, Command::Render(_))) {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            if runtime.session.render_remaining()? == 0 {
+            if parameters.len() > runtime.session.render_remaining()? as usize {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            let replacement = if let Some(client) = runtime.session.render_client()? {
+            let mut replacement = if let Some(client) = runtime.session.render_client()? {
                 if client.owner != (inner.id, vm.id) {
                     return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
                 }
@@ -1139,21 +1139,23 @@ impl File {
             } else {
                 None
             };
-            let Command::Render(render) = &parameters[0] else {
-                return Err(EINVAL);
-            };
-            if runtime.session.render_client()?.is_some() {
-                runtime.session.submit_next_render(
-                    dev.as_ref(),
-                    &runtime.image,
-                    replacement,
-                    render,
-                )?;
-            } else {
-                let client = vm.snapshot((inner.id, vm.id), true)?;
-                runtime
-                    .session
-                    .submit_render(dev.as_ref(), &runtime.image, client, render)?;
+            for command in &parameters {
+                let Command::Render(render) = command else {
+                    return Err(EINVAL);
+                };
+                if runtime.session.render_client()?.is_some() {
+                    runtime.session.submit_next_render(
+                        dev.as_ref(),
+                        &runtime.image,
+                        replacement.take(),
+                        render,
+                    )?;
+                } else {
+                    let client = vm.snapshot((inner.id, vm.id), true)?;
+                    runtime
+                        .session
+                        .submit_render(dev.as_ref(), &runtime.image, client, render)?;
+                }
             }
             sync.complete();
             return Ok(0);
