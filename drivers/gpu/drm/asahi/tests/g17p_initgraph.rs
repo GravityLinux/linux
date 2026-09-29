@@ -7,6 +7,8 @@ mod g17p_abi;
 mod g17p_initgraph;
 #[path = "../g17p_layout.rs"]
 mod g17p_layout;
+#[path = "../g17p_queue.rs"]
+mod g17p_queue;
 
 use g17p_initgraph::{Storage, OBJECT_LAYOUT};
 use std::{env, fs, path::Path};
@@ -38,6 +40,13 @@ fn main() {
         performance.freq_a[10] += case as u32;
         performance.core_voltage[3] += case as u32;
         let graph = g17p_initgraph::build(&mut image, base, &performance).unwrap();
+        let compute = graph.channels[0][g17p_queue::COMPUTE_CHANNEL];
+        assert_eq!(compute.ring, base + 0xc07a1dc0);
+        assert_eq!(
+            compute.states,
+            [base + 0x20240, base + 0x20250, base + 0x20260]
+        );
+        assert_eq!(g17p_queue::COMPUTE_DOORBELL, 0x0083000a00000000);
         let mut manifest = String::new();
         for (index, object) in OBJECT_LAYOUT.iter().enumerate() {
             let address = graph.addresses[index];

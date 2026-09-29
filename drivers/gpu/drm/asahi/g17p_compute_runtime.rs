@@ -328,7 +328,7 @@ pub(crate) fn build(
     write(memory, DESCRIPTOR, &page)?;
     page.fill(0);
     write(memory, EVENT, &page[..0x400])?;
-    let channel = image.graph.channels[0][10];
+    let channel = image.graph.channels[0][q::COMPUTE_CHANNEL];
     if channel.ring != 0xfffffc20c07a1dc0 {
         return Err(EINVAL);
     }
