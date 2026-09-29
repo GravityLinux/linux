@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Native Asahi UAPI, GEM ownership and unpublished client address spaces.
-//! Submission is connected only after the first-work graph is ready; until
-//! then SUBMIT fails explicitly, never reporting successful GPU execution.
+//! Native Asahi memory UAPI and synchronous first-compute bring-up.
+//! Published mappings and GEM references survive ioctl/file teardown until
+//! firmware is stopped. Unimplemented submission features fail explicitly.
 
-use super::{g17p_compute::USC_EXEC_BASE, g17p_user_vm::UserVm};
+use super::{
+    g17p_boot::Session, g17p_compute::USC_EXEC_BASE, g17p_image::Image, g17p_user_vm::UserVm,
+};
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use kernel::{
     bindings, c_str, device, drm,
@@ -14,7 +16,7 @@ use kernel::{
     },
     new_mutex,
     prelude::*,
-    sync::{aref::ARef, Mutex},
+    sync::{aref::ARef, Arc, Mutex},
     uaccess::{UserPtr, UserSlice},
     uapi,
 };
@@ -32,15 +34,23 @@ const SINGLE: u32 = uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE;
 
 type Device = drm::Device<Driver>;
 type DrmFile = drm::File<File>;
-type Object = shmem::Object<Bo>;
+pub(crate) type Object = shmem::Object<Bo>;
+pub(crate) struct Runtime {
+    pub(crate) session: Session,
+    pub(crate) image: Image,
+}
+pub(crate) type RuntimeRef = Arc<Mutex<Option<Runtime>>>;
+
 pub(crate) struct Driver;
 #[pin_data]
 pub(crate) struct Data {
     params: uapi::drm_asahi_params_global,
+    runtime: RuntimeRef,
 }
 #[vtable]
 impl drm::driver::Driver for Driver {
     type Data = Data;
+    const DROP_DATA: bool = true;
     type File = File;
     type Object = Object;
     const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
@@ -75,6 +85,7 @@ pub(crate) fn register(
     counts: u32,
     core_mask: u32,
     max_mhz: u32,
+    runtime: RuntimeRef,
 ) -> Result<ARef<Device>> {
     let dies = (counts >> 16) & 15;
     let clusters = ((counts >> 8) & 255) * dies;
@@ -112,11 +123,11 @@ pub(crate) fn register(
         max_attachments: 16,
         command_timestamp_frequency_hz: 1_000_000_000,
     };
-    let drm = Device::new(dev, try_pin_init!(Data { params }))?;
+    let drm = Device::new(dev, try_pin_init!(Data { params, runtime }))?;
     drm::driver::Registration::new_foreign_owned(&drm, dev, 0)?;
     dev_info!(
         dev,
-        "G17P: Asahi DRM/GEM registered: core mask {:#x}; submission not connected yet\n",
+        "G17P: Asahi DRM/GEM registered: core mask {:#x}; first-work initialization deferred\n",
         core_mask
     );
     Ok(drm)
@@ -217,6 +228,63 @@ impl Vm {
             return Err(EINVAL);
         }
         Ok(end)
+    }
+    fn cover(&self, start: u64, size: u64, flags: u32) -> Result {
+        let end = start.checked_add(size).ok_or(EINVAL)?;
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let binding = self
+                .bindings
+                .iter()
+                .find(|b| b.start <= cursor && cursor < b.end() && b.flags & flags == flags)
+                .ok_or(EINVAL)?;
+            cursor = end.min(binding.end());
+        }
+        Ok(())
+    }
+    fn snapshot(&self) -> Result<super::g17p_compute_runtime::Client> {
+        let mut root = UserVm::new()?;
+        let mut buffers = KVec::new();
+        for binding in &self.bindings {
+            buffers.push(binding.bo.clone(), GFP_KERNEL)?;
+            root.prepare(binding.start, binding.size)?;
+            let mut pages = KVec::new();
+            let extent = if binding.flags & SINGLE != 0 {
+                PAGE
+            } else {
+                binding.size
+            };
+            pages.reserve((extent / PAGE) as usize, GFP_KERNEL)?;
+            let mut cursor = 0;
+            for entry in binding.bo.sg_table()?.iter() {
+                let pa = entry.dma_address();
+                let length = entry.dma_len() as u64;
+                if (pa | length) & (PAGE - 1) != 0 {
+                    return Err(EINVAL);
+                }
+                for offset in (0..length).step_by(PAGE as usize) {
+                    if cursor >= binding.offset && cursor < binding.offset + extent {
+                        pages.push(pa + offset, GFP_KERNEL)?;
+                    }
+                    cursor += PAGE;
+                }
+            }
+            if pages.len() as u64 != extent / PAGE {
+                return Err(EIO);
+            }
+            for index in 0..binding.size / PAGE {
+                let pa = pages[if binding.flags & SINGLE != 0 {
+                    0
+                } else {
+                    index as usize
+                }];
+                root.map_page(binding.start + index * PAGE, pa, binding.flags & WRITE != 0)?;
+            }
+        }
+        Ok(super::g17p_compute_runtime::Client { root, buffers })
     }
     fn unbind(&mut self, start: u64, end: u64) -> Result {
         let mut next = KVec::with_capacity(
@@ -668,7 +736,120 @@ impl File {
         state.queues.swap_remove(index);
         Ok(0)
     }
-    fn submit(_dev: &Device, _data: &uapi::drm_asahi_submit, _file: &DrmFile) -> Result<u32> {
-        Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
+    fn submit(dev: &Device, data: &uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+        use super::g17p_compute_runtime as compute;
+        if data.flags != 0 || data.pad != 0 || data.cmdbuf_size == 0 {
+            return Err(EINVAL);
+        }
+        if data.in_sync_count != 0 || data.out_sync_count != 0 {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
+        let mut bytes = KVVec::new();
+        UserSlice::new(
+            UserPtr::from_addr(data.cmdbuf as usize),
+            data.cmdbuf_size as usize,
+        )
+        .reader()
+        .read_all(&mut bytes, GFP_KERNEL)?;
+        let inner = file.inner();
+        let state = inner.state.lock();
+        let queue = state
+            .queues
+            .iter()
+            .find(|q| q.id == data.queue_id)
+            .ok_or(ENOENT)?;
+        let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
+        let mut offset = 0;
+        let mut command = None;
+        while offset < bytes.len() {
+            let header = bytes.get(offset..offset + 8).ok_or(EINVAL)?;
+            let kind = u16::from_le_bytes(header[0..2].try_into().unwrap());
+            let size = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
+            let barriers = [
+                u16::from_le_bytes(header[4..6].try_into().unwrap()),
+                u16::from_le_bytes(header[6..8].try_into().unwrap()),
+            ];
+            offset += 8;
+            let payload = bytes.get(offset..offset + size).ok_or(EINVAL)?;
+            offset += size;
+            if kind == 4 {
+                if barriers != [u16::MAX; 2] || size % 24 != 0 || size / 24 > 16 {
+                    return Err(EINVAL);
+                }
+                for row in payload.chunks_exact(24) {
+                    let address = u64::from_le_bytes(row[0..8].try_into().unwrap());
+                    let extent = u64::from_le_bytes(row[8..16].try_into().unwrap());
+                    if row[16..].iter().any(|v| *v != 0) {
+                        return Err(EINVAL);
+                    }
+                    vm.cover(address, extent, WRITE)?;
+                }
+                continue;
+            }
+            if kind != 1 || command.is_some() {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+            if barriers.iter().any(|b| *b != 0 && *b != u16::MAX) {
+                return Err(EINVAL);
+            }
+            if payload
+                .get(64..)
+                .unwrap_or_default()
+                .iter()
+                .any(|b| *b != 0)
+            {
+                return Err(E2BIG);
+            }
+            let mut body = [0u8; 64];
+            let size = size.min(64);
+            body[..size].copy_from_slice(&payload[..size]);
+            // SAFETY: Every integer bit pattern is valid; UAPI size is checked.
+            const {
+                assert!(core::mem::size_of::<uapi::drm_asahi_cmd_compute>() == 64);
+            }
+            let cmd = unsafe {
+                core::ptr::read_unaligned(body.as_ptr().cast::<uapi::drm_asahi_cmd_compute>())
+            };
+            if cmd.flags != 0
+                || cmd.helper.binary != 0
+                || cmd.helper.cfg != 0
+                || cmd.helper.data != 0
+            {
+                return Err(EINVAL);
+            }
+            if cmd.ts.start.handle != 0 || cmd.ts.end.handle != 0 {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+            let base = cmd.cdm_ctrl_stream_base;
+            let end = cmd.cdm_ctrl_stream_end;
+            if (base | end) & 3 != 0
+                || end <= base
+                || cmd.sampler_count > 1024
+                || (cmd.sampler_heap == 0) != (cmd.sampler_count == 0)
+                || cmd.sampler_heap & 7 != 0
+            {
+                return Err(EINVAL);
+            }
+            vm.cover(base, end - base, READ)?;
+            if cmd.sampler_count != 0 {
+                vm.cover(cmd.sampler_heap, cmd.sampler_count as u64 * 8, READ)?;
+            }
+            command = Some(compute::Parameters {
+                preempt: vm.kernel_start,
+                cdm: base,
+                end,
+                sampler: cmd.sampler_heap,
+                sampler_count: cmd.sampler_count,
+            });
+        }
+        let parameters = command.ok_or(EINVAL)?;
+        let mut runtime = dev.runtime.lock();
+        let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
+        runtime.session.require_first_work()?;
+        let client = vm.snapshot()?;
+        runtime
+            .session
+            .submit_compute(dev.as_ref(), &runtime.image, client, &parameters)?;
+        Ok(0)
     }
 }
