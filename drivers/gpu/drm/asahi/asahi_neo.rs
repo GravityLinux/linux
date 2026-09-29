@@ -2,17 +2,19 @@
 
 //! Initial T8140 / G17P GPU identification support.
 //!
-//! Validates boot resources and constructs the unpublished firmware graph.
-//! Firmware startup and DRM registration will follow in the synchronous port.
+//! Validates boot resources, constructs the unpublished firmware graph and
+//! boots both RTKit instances. DRM registration follows in the synchronous port.
 
 use kernel::{
     c_str, device::Core, devres::Devres, io::mem::IoMem, io::Io, of, platform, prelude::*,
 };
 
 mod g17p_abi;
+mod g17p_boot;
 mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
+mod g17p_memory;
 mod g17p_platform;
 mod g17p_topology;
 
@@ -26,6 +28,7 @@ struct NeoGpu {
     _sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
     _platform: g17p_platform::Platform,
     _image: g17p_image::Image,
+    _session: g17p_boot::Session,
 }
 
 kernel::of_device_table!(
@@ -62,15 +65,17 @@ impl platform::Driver for NeoGpu {
             );
             dev_info!(
                 pdev.as_ref(),
-                "Identification only; firmware and DRM initialization are not implemented\n"
+                "GPU identification complete; DRM registration is not implemented yet\n"
             );
         }
         let platform = g17p_platform::Platform::new(pdev.as_ref())?;
         let image = g17p_image::Image::new(pdev.as_ref(), &platform)?;
+        let session = g17p_boot::Session::new(pdev, &platform, &sgx)?;
         Ok(Self {
             _sgx: sgx,
             _platform: platform,
             _image: image,
+            _session: session,
         })
     }
 }
@@ -79,6 +84,6 @@ kernel::module_platform_driver! {
     type: NeoGpu,
     name: "asahi_neo",
     authors: ["Asahi Linux Contributors"],
-    description: "Apple A18 Pro GPU identification driver",
+    description: "Apple A18 Pro GPU driver",
     license: "Dual MIT/GPL",
 }
