@@ -30,6 +30,7 @@ mod g17p_user_vm;
 // Core queue port is exercised by source differential tests until submit is wired.
 #[allow(dead_code)]
 mod g17p_queue;
+mod g17p_sync;
 mod g17p_topology;
 mod g17p_vm;
 
