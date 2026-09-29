@@ -117,10 +117,14 @@ static void sync_setup(int fd, struct sync_test *t, struct drm_asahi_submit *sub
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, ENOENT);
 	sync_empty(fd, t);
 	/* A timeline chain's own status hides its contained fence's error. */
+	t->sw = sync_import_pending(fd, t->input);
 	uint32_t failed_timeline = sync_new(fd, 0);
 	struct drm_syncobj_transfer transfer = { .src_handle = t->input,
 		.dst_handle = failed_timeline, .dst_point = 5 };
 	OK(fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &transfer);
+	/* Transfer merges an already-signaled fence into a successful stub,
+	 * so inject the error only after the pending fence is transferred. */
+	CHECK(close(t->sw) == 0);
 	t->entries[0] = (struct drm_asahi_sync){ .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
 		.handle = failed_timeline, .timeline_value = 5 };
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, ENOENT);
