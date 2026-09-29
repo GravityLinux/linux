@@ -135,7 +135,7 @@ and waits, exact results and post-close retained-memory audit. Extending beyond
 the source bootstrap storage window, simultaneous native contexts and
 asynchronous frontend/backend behavior remain unfinished.
 
-The synchronous render path accepts render-only batches on one retained owner.
+The synchronous render path accepts render-only and mixed batches on one retained owner.
 `g17p-drm-render` performs 32 pressure renders, replacing eight guarded output
 GEMs at the same DVAs on each draw and preserving every earlier image.
 `g17p-drm-render-batch` tests the current 64-command owner limit using 32 pairs
@@ -151,7 +151,7 @@ validated reports and a new terminal since that publication. Completed linked
 scheduler heads are quiesced before return/rebind. The source's 128-job test
 used two physical pairs (64 each); do not equate its harness limit with a
 qualified 128-job lifetime for this sole pair. Further reuse, a second render
-owner, mixed command batches and general source parity remain unfinished. The 64-job
+owner, native dependency waves and general source parity remain unfinished. The 64-job
 retirement/boundary run passes on T8140 with 512 full-image comparisons,
 256 timestamps, 64 new terminals, exact credits, an empty scheduler head
 and a post-close retained-memory audit. Raw evidence is recorded in the
@@ -166,8 +166,9 @@ compute terminals do not satisfy a render terminal baseline. Returning to
 render preserves its existing queue lifetime. Compute-first startup now owns
 a dormant render graph with both producers withheld. Its first render adopts
 that graph, installs caller mappings with break-before-make, replaces the
-placeholder descriptors, and preserves compute roots and history. Mixed
-command buffers within one ioctl are still pending.
+placeholder descriptors, and preserves compute roots and history. Alternating mixed
+command buffers now use this ordinary synchronous path. Prepublished native
+dependency waves and consecutive-compute publication waves still need porting.
 
 Generate `g17p_drm_mixed_workload.h` with the compute generator's
 `--batch-count 2 --mixed`, and `g17p_drm_render_workload.h` with the render
@@ -202,5 +203,35 @@ retains the same logical VM/file across the engine transitions.
 The same #68 kernel also passes the full 258-command direct-compute regression
 with the dormant graph withheld: 16533676 native checks, 6234 memory checks,
 both transport switches, all timestamp/fence checks, and the post-close audit
-of all retained ring and descriptor placements. This closes neither general
-mixed batches nor remaining synchronous source behavior.
+of all retained ring and descriptor placements. This does not complete the remaining synchronous source behavior.
+
+For mixed buffers within one ioctl, generate the render header with
+`--triangles 131072 --batch-pair` as `g17p_drm_render_batch_workload.h`, retain
+the mixed compute header above, and compile `g17p_drm_mixed_batch.c` with the
+same UAPI headers/options. On separate fresh boots run:
+
+```
+g17p-drm-mixed-batch
+g17p-drm-mixed-batch --compute-first
+```
+
+Kernel #69 passes R/C/R/C (3245407 checks) and two consecutive C/R/C/R
+buffers (4326776 checks). Every command has a separate output: each render
+checks eight complete images, and each compute checks all 64 floats plus its
+tail. The two render programs use 131072 and 65536 triangles. The timestamp
+oracle checks order within and across buffers, all old values and guard bytes;
+binary/timeline fences cover each aggregate ioctl.
+
+Trailing invalid flags, future barriers, missing timestamp handles and a valid
+VM binding overlapping render-private storage all reject before any prefix.
+The render-first case also rejects a third compute against the prospective
+two-command post-render capacity before constructing either engine. Rejections
+preserve all outputs, timestamps and aggregate fences, including on the live
+compute-first runtime. Both runs subsequently pass 6234 memory UAPI checks.
+
+Post-close audits check all final images/results, retained roots and shared
+caller pages, retired inner cursors, all timestamp guards, and complete report
+sequences/credits (5/5 for render-first, 9/9 for compute-first). Six CPU contexts
+are collected. These are ordinary synchronous alternating-engine buffers;
+prepublished native dependency waves and consecutive-compute waves remain
+separate unfinished source paths.
