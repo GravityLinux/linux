@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Synchronous R/C/R/C/R on one logical VM, with independent caller programs. */
+/* Synchronous R/C/R/C/R or C/R/C/R, one VM and independent caller programs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"
 #undef main
@@ -36,9 +36,12 @@ static void compute_check(unsigned char **outputs, unsigned completed)
 		}
 	}
 }
-int main(void)
+int main(int argc, char **argv)
 {
 	setbuf(stdout, NULL);
+	int compute_first = argc == 2 && !strcmp(argv[1], "--compute-first");
+	CHECK(argc == 1 || compute_first);
+	unsigned steps = compute_first ? 4 : 5;
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); CHECK(fd >= 0);
 	uint32_t vm = vm_new(fd);
 	struct drm_asahi_queue_create q = { .vm_id = vm, .usc_exec_base = EXEC };
@@ -66,7 +69,7 @@ int main(void)
 		else CHECK(munmap(map, w->size) == 0);
 		bind(fd, vm, bo, w->address, w->size, 0, DRM_ASAHI_BIND_READ | (w->writable ? DRM_ASAHI_BIND_WRITE : 0), 0);
 	}
-	for (unsigned j = 0; j < 8; j++) CHECK(images[j] != NULL);
+	for (unsigned j = 0; j < 8; j++) { CHECK(images[j] != NULL); memset(images[j], 0xa5, RENDER_OUTPUT_SIZE); }
 	CHECK(outputs[0] && outputs[1]);
 	uint32_t ts_bo = bo_new(fd, PAGE * 3, DRM_ASAHI_GEM_WRITEBACK, 0);
 	unsigned char *timestamps = bo_map(fd, ts_bo, PAGE * 3); memset(timestamps, 0xa5, PAGE * 3);
@@ -93,9 +96,9 @@ int main(void)
 		.points = (uintptr_t)&point, .count_handles = 1, .timeout_nsec = 0 };
 	unsigned char saved[5][32] = {{0}};
 	uint64_t last = 0;
-	puts("G17P_NATIVE_MIXED_BEGIN R/C/R/C/R, shared VM and fixed USC, disjoint caller graphs");
-	for (unsigned step = 0; step < 5; step++) {
-		int is_compute = step & 1;
+	printf("G17P_NATIVE_MIXED_BEGIN %s, shared VM and fixed USC, disjoint caller graphs\n", compute_first ? "C/R/C/R" : "R/C/R/C/R");
+	for (unsigned step = 0; step < steps; step++) {
+		int is_compute = (step & 1) ^ compute_first;
 		unsigned count = is_compute ? 2 : 4;
 		struct drm_asahi_timestamp *refs[4];
 		if (is_compute) {
@@ -126,16 +129,16 @@ int main(void)
 		for (unsigned byte = 0; byte < PAGE * 3; byte++) {
 			unsigned char want = 0xa5;
 			for (unsigned old = 0; old <= step; old++) {
-				unsigned start = PAGE + 64 + old * 64, length = old & 1 ? 16 : 32;
+				unsigned start = PAGE + 64 + old * 64, length = ((old & 1) ^ compute_first) ? 16 : 32;
 				if (byte >= start && byte < start + length) want = saved[old][byte - start];
 			}
 			CHECK(timestamps[byte] == want);
 		}
-		render_check(images, 1); compute_check(outputs, (step + 1) / 2);
+		render_check(images, !compute_first || step > 0); compute_check(outputs, (step + 1 + compute_first) / 2);
 		OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait); OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
 		printf("MIXED_OUTPUT_PASS step=%u start=%" PRIu64 " end=%" PRIu64 "\n", step, stamps[0], last);
 	}
 	CHECK(close(fd) == 0);
-	printf("G17P_NATIVE_MIXED_PASS 3 renders, 2 independent compute results, 16 timestamps, 5 binary/timeline fences; checks=%u\n", checks);
+	printf("G17P_NATIVE_MIXED_PASS %u renders, 2 independent compute results, %u timestamps, %u binary/timeline fences; checks=%u\n", compute_first ? 2 : 3, compute_first ? 12 : 16, steps, checks);
 	return 0;
 }

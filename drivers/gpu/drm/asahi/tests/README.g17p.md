@@ -163,8 +163,11 @@ owners. It allocates fresh compute status storage and keeps private robustness
 state in the reserved VM aperture, preserving caller program pages. One shared
 report reader routes non-render masks to the active compute command once;
 compute terminals do not satisfy a render terminal baseline. Returning to
-render preserves its existing queue lifetime. Compute-first rendering and
-mixed command buffers are still pending.
+render preserves its existing queue lifetime. Compute-first startup now owns
+a dormant render graph with both producers withheld. Its first render adopts
+that graph, installs caller mappings with break-before-make, replaces the
+placeholder descriptors, and preserves compute roots and history. Mixed
+command buffers within one ioctl are still pending.
 
 Generate `g17p_drm_mixed_workload.h` with the compute generator's
 `--batch-count 2 --mixed`, and `g17p_drm_render_workload.h` with the render
@@ -186,3 +189,18 @@ the correct most-recent logical ordinals and timestamp destinations. Private
 robustness pages now live in the reserved VM aperture for ordinary compute as
 well as the render-first path. Reuse of both pool slots is implemented from the source ownership protocol;
 this hardware run exercises two handoffs.
+
+Run `g17p-drm-mixed --compute-first` on a fresh boot for C/R/C/R. Kernel #68
+passes 3474569 native checks: two pressure renders, two independent add3
+outputs, 12 guarded timestamp values and four binary/timeline fence pairs.
+The post-close audit checks shared caller physical pages across the distinct
+retained roots, both engines' 6/6/6 inner cursors, the unused compute owner's
+zero cursors, report order (compute, growth, render, compute, render) and exact
+5/5 credits. All six CPU contexts are collected and Linux resumes. This path
+retains the same logical VM/file across the engine transitions.
+
+The same #68 kernel also passes the full 258-command direct-compute regression
+with the dormant graph withheld: 16533676 native checks, 6234 memory checks,
+both transport switches, all timestamp/fence checks, and the post-close audit
+of all retained ring and descriptor placements. This closes neither general
+mixed batches nor remaining synchronous source behavior.

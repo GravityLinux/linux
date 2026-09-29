@@ -51,6 +51,7 @@ pub(crate) struct Submission {
     pub(crate) ordinal: u32,
     deferred: [KVec<Deferred>; 2],
     empty_high: [u64; 2],
+    adopted: bool,
 }
 
 /// quiesce_submission(semantic_complete=True), for the sole synchronous owner.
@@ -155,6 +156,62 @@ pub(crate) fn validate_client(client: &Client, p: &Parameters) -> Result {
         if overlap(client, va, PAGE as u64) {
             return Err(EINVAL);
         }
+    }
+    Ok(())
+}
+
+// Shared first-generation constructor: a dormant owner has no workload;
+// adoption replaces this body with the actual caller before its first producer.
+fn first_descriptor(index: usize, p: &Parameters, page: &mut [u8]) -> Result {
+    let kind = if index == 0 {
+        Kind::Tiling
+    } else {
+        Kind::Fragment
+    };
+    let mut registers = KVec::new();
+    if index == 0 {
+        registers.extend_from_slice(&r::tiling_registers(p).map_err(|_| EINVAL)?, GFP_KERNEL)?;
+    } else {
+        registers.extend_from_slice(&r::fragment_registers(p).map_err(|_| EINVAL)?, GFP_KERNEL)?;
+    }
+    for (n, v) in &mut registers {
+        *v = match (index, *n) {
+            (0, 0xa5a1) => 0xe900400020,
+            (1, 0xa5a9) => 0xed00400020,
+            (0, 0x1ca10 | 0x14a1 | 0xa349) => 0xc4010000e8,
+            (1, 0x160e0 | 0x1499 | 0xa341) => 0xc4010000e7,
+            _ => *v,
+        };
+    }
+    r::Descriptor {
+        kind,
+        index: 0,
+        sequence: if index == 0 { 1 } else { 0 },
+        ordinal: 0,
+        context: 1,
+        queue_pair: 0,
+        pool_bases: POOLS,
+        record_indices: [0, 0],
+        shared: SHARED,
+        low_alias: None,
+        status_base: Some(STATUS[index]),
+        grid: None,
+        write_tail: true,
+        write_lifecycle: true,
+        write_item: true,
+        write_structural: true,
+        pointer_overrides: &[(if index == 0 { 0x934 } else { 0x21ce }, opening::SUPPORT)],
+        item_overrides: &[],
+    }
+    .build(page, &registers, Some(p))
+    .map_err(|_| EINVAL)?;
+    let extra: &[(usize, u8)] = if index == 0 {
+        &[(0x789, 8), (0x93e, 0xd0), (0x93f, 0x91)]
+    } else {
+        &[(0x215c, 0), (0x21d8, 0x10), (0x21d9, 0xa2), (0x222d, 0)]
+    };
+    for &(at, v) in extra {
+        page[at] = v;
     }
     Ok(())
 }
@@ -315,53 +372,7 @@ pub(crate) fn build(
         } else {
             Kind::Fragment
         };
-        let mut registers = KVec::new();
-        if index == 0 {
-            registers
-                .extend_from_slice(&r::tiling_registers(p).map_err(|_| EINVAL)?, GFP_KERNEL)?;
-        } else {
-            registers
-                .extend_from_slice(&r::fragment_registers(p).map_err(|_| EINVAL)?, GFP_KERNEL)?;
-        }
-        for (n, v) in &mut registers {
-            *v = match (index, *n) {
-                (0, 0xa5a1) => 0xe900400020,
-                (1, 0xa5a9) => 0xed00400020,
-                (0, 0x1ca10 | 0x14a1 | 0xa349) => 0xc4010000e8,
-                (1, 0x160e0 | 0x1499 | 0xa341) => 0xc4010000e7,
-                _ => *v,
-            };
-        }
-        r::Descriptor {
-            kind,
-            index: 0,
-            sequence: if index == 0 { 1 } else { 0 },
-            ordinal: 0,
-            context: 1,
-            queue_pair: 0,
-            pool_bases: POOLS,
-            record_indices: [0, 0],
-            shared: SHARED,
-            low_alias: None,
-            status_base: Some(STATUS[index]),
-            grid: None,
-            write_tail: true,
-            write_lifecycle: true,
-            write_item: true,
-            write_structural: true,
-            pointer_overrides: &[(if index == 0 { 0x934 } else { 0x21ce }, opening::SUPPORT)],
-            item_overrides: &[],
-        }
-        .build(&mut page[..kind.size()], &registers, Some(p))
-        .map_err(|_| EINVAL)?;
-        let extra: &[(usize, u8)] = if index == 0 {
-            &[(0x789, 8), (0x93e, 0xd0), (0x93f, 0x91)]
-        } else {
-            &[(0x215c, 0), (0x21d8, 0x10), (0x21d9, 0xa2), (0x222d, 0)]
-        };
-        for &(at, v) in extra {
-            page[at] = v;
-        }
+        first_descriptor(index, p, &mut page[..kind.size()])?;
         write(memory, DESCRIPTORS[index], &page[..kind.size()])?;
         graph::Optional {
             kind,
@@ -543,6 +554,7 @@ pub(crate) fn build(
         ],
         growth: None,
         ordinal: 0,
+        adopted: false,
     })
 }
 
@@ -560,6 +572,11 @@ fn tlbi() {
 }
 impl Submission {
     pub(crate) fn after_control(&self, memory: &mut Memory, vm: &Vm, ttbs: u64) -> Result {
+        if self.adopted {
+            // The dormant startup already installed these roots and operands.
+            // In particular, slots 2/3 now belong to the live compute owner.
+            return Ok(());
+        }
         for (slot, pa) in self.empty_high.into_iter().enumerate() {
             memory.write64(ttbs + slot as u64 * 16 + 8, ((slot as u64) << 48) | pa | 1)?;
         }
@@ -567,6 +584,9 @@ impl Submission {
         memory.write64(ttbs + 2 * 16 + 8, 0)?;
         memory.clean(ttbs, 64 * 16)?;
         tlbi();
+        self.initialize_operands(memory, vm)
+    }
+    pub(crate) fn initialize_operands(&self, memory: &mut Memory, vm: &Vm) -> Result {
         // Render-root directory is distinct from the same DVAs in context 0.
         let size = graph::operand_directory_size(28).map_err(|_| EINVAL)?;
         let mut body = KVVec::with_capacity(size, GFP_KERNEL)?;
@@ -575,6 +595,79 @@ impl Submission {
         vm.write(memory, 1, 0x7000000000, &body)?;
         graph::operand_table(&mut body[..PAGE], 0x7000220000, 28).map_err(|_| EINVAL)?;
         vm.write(memory, 1, 0x7000208000, &body[..PAGE])?;
+        Ok(())
+    }
+    /// _prepare_render_after_compute: adopt the retained graph. Neither its
+    /// pools nor compute history is reset, and every producer remains hidden
+    /// until the complete caller body and root have been installed.
+    pub(crate) fn adopt(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        client: Client,
+        p: &Parameters,
+    ) -> Result {
+        validate_client(&client, p)?;
+        if self.adopted || self.ordinal != 0 || self.growth.is_some() {
+            return Err(EINVAL);
+        }
+        for index in 0..2 {
+            for at in [q::POINTER_DONE, q::POINTER_READ, q::POINTER_WRITE] {
+                if memory.read_firmware32(vm.physical(memory, 2, POINTERS[index] + at)?)? != 0 {
+                    return Err(EBUSY);
+                }
+            }
+            for at in self.channels[index].states {
+                if memory.read_firmware32(vm.physical(memory, 2, at)?)? != 0 {
+                    return Err(EBUSY);
+                }
+            }
+        }
+        let mut body = KVVec::with_capacity(r::FRAGMENT_SIZE, GFP_KERNEL)?;
+        body.resize(r::FRAGMENT_SIZE, 0, GFP_KERNEL)?;
+        // The source startup's blank render extent is replaceable by caller
+        // mappings, except the private ranges rejected by validate_client.
+        // Preserve the retained root and perform break-before-make before
+        // adopting any caller references. Blank backing stays Memory-owned.
+        let mut changes = KVec::new();
+        for &(base, size, _, _) in &client.bindings {
+            let va = if base < 0x1000000000 {
+                base + 0x1000000000
+            } else {
+                base
+            };
+            for offset in (0..size).step_by(PAGE) {
+                let address = va + offset;
+                let old = self.client.root.pte(address)?;
+                let new = client.root.pte(address)?;
+                if new == 0 {
+                    return Err(EIO);
+                }
+                changes.push((address, old, new), GFP_KERNEL)?;
+            }
+        }
+        client.cache(false)?;
+        self.client.root.rebind(&changes, &[1])?;
+        self.client.buffers = client.buffers;
+        self.client.bindings = client.bindings;
+        self.client.owner = client.owner;
+        for (index, kind) in [Kind::Tiling, Kind::Fragment].into_iter().enumerate() {
+            first_descriptor(index, p, &mut body[..kind.size()])?;
+            vm.write(memory, 2, DESCRIPTORS[index], &body[..kind.size()])?;
+            // UUID belongs to the retained queue, as in the source adoption.
+            vm.write(memory, 2, QUEUES[index] + 0x48, &0x15u32.to_le_bytes())?;
+        }
+        for address in FW_TIMESTAMPS {
+            vm.write(memory, 2, address, &[0; 8])?;
+        }
+        self.timestamps = [
+            p.ta_user_timestamp_start,
+            p.ta_user_timestamp_end,
+            p.fragment_user_timestamp_start,
+            p.fragment_user_timestamp_end,
+        ];
+        self.adopted = true;
+        g17p_memory::sync();
         Ok(())
     }
     pub(crate) fn restore(&self, memory: &mut Memory, vm: &Vm, index: usize) -> Result {

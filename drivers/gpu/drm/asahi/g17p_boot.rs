@@ -146,6 +146,7 @@ pub(crate) struct Session {
     ttbs: u64,
     compute: Option<compute::Submission>,
     render: Option<render::Submission>,
+    dormant_render: Option<render::Submission>,
     timestamps: Option<super::g17p_timestamp::Registry>,
     peers: KVec<Peer>,
     memory: Option<Memory>,
@@ -182,6 +183,7 @@ impl Session {
             ttbs: platform.regions[0].base,
             compute: None,
             render: None,
+            dormant_render: None,
             timestamps: Some(super::g17p_timestamp::Registry::new()),
             peers: KVec::new(),
             memory: Some(Memory::new(dev, platform)?),
@@ -476,6 +478,32 @@ impl Session {
             self.require_first_work()?;
         }
         let ttbs = self.ttbs;
+        if !after_render && self.dormant_render.is_none() {
+            // Source compute-first partial startup owns an empty render graph.
+            // Construct it before firmware can cache a queue identity. There
+            // are no caller programs or resources and no render publication.
+            let client = compute::Client {
+                root: super::g17p_user_vm::UserVm::new()?,
+                buffers: KVec::new(),
+                bindings: KVec::new(),
+                owner: client.owner,
+            };
+            let p = super::g17p_render::Parameters {
+                width: 1,
+                height: 1,
+                // Empty source-owned address, replaced before publication.
+                encoder: 0x1000000000,
+                ..render::first_parameters()
+            };
+            self.dormant_render = Some(render::build(
+                self.memory.as_mut().ok_or(EINVAL)?,
+                self.vm.as_mut().ok_or(EINVAL)?,
+                image,
+                ttbs,
+                client,
+                &p,
+            )?);
+        }
         let built = compute::build(
             self.memory.as_mut().ok_or(EINVAL)?,
             self.vm.as_mut().ok_or(EINVAL)?,
@@ -508,9 +536,6 @@ impl Session {
     pub(crate) fn render_client(&self) -> Result<Option<&compute::Client>> {
         if self.phase == Phase::Failed {
             return Err(EIO);
-        }
-        if self.compute.is_some() && self.render.is_none() {
-            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         }
         Ok(self.render.as_ref().map(|work| &work.client))
     }
@@ -639,17 +664,42 @@ impl Session {
         client: compute::Client,
         parameters: &super::g17p_render::Parameters,
     ) -> Result {
-        self.require_first_work()?;
-        let ttbs = self.ttbs;
-        let work = self
-            .stage(|memory, vm| render::build(memory, vm, image, ttbs, client, parameters))
-            .inspect_err(|error| {
-                dev_err!(
-                    dev,
-                    "G17P: first render graph preparation failed: {:?}\n",
-                    error
-                );
-            })?;
+        let work = if let Some(compute) = self.compute.as_ref() {
+            if self.phase != Phase::Running || compute.client.owner != client.owner {
+                return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+            }
+            compute::idle(
+                self.memory.as_ref().ok_or(EINVAL)?,
+                self.vm.as_ref().ok_or(EINVAL)?,
+                compute,
+            )?;
+            // Keep ownership in Session throughout live adoption, including
+            // errors after the retained root has acquired new caller mappings.
+            let work = self.dormant_render.as_mut().ok_or(EIO)?;
+            let result = work.adopt(
+                self.memory.as_mut().ok_or(EINVAL)?,
+                self.vm.as_ref().ok_or(EINVAL)?,
+                client,
+                parameters,
+            );
+            if let Err(error) = result {
+                self.phase = Phase::Failed;
+                return Err(error);
+            }
+            dev_info!(dev, "G17P: adopted dormant render owner after compute\n");
+            self.dormant_render.take().ok_or(EIO)?
+        } else {
+            self.require_first_work()?;
+            let ttbs = self.ttbs;
+            self.stage(|memory, vm| render::build(memory, vm, image, ttbs, client, parameters))
+                .inspect_err(|error| {
+                    dev_err!(
+                        dev,
+                        "G17P: first render graph preparation failed: {:?}\n",
+                        error
+                    );
+                })?
+        };
         self.render = Some(work);
         let result = self.run_render(dev, image);
         if result.is_err() {
@@ -944,6 +994,12 @@ impl Session {
             .cache(timestamps, false)?;
         if self.phase == Phase::Prepared {
             self.start(dev, image)?;
+            if let Some(work) = self.dormant_render.as_ref() {
+                work.initialize_operands(
+                    self.memory.as_mut().ok_or(EINVAL)?,
+                    self.vm.as_ref().ok_or(EINVAL)?,
+                )?;
+            }
         } else if self.phase != Phase::Running {
             return Err(EIO);
         }
@@ -1241,6 +1297,7 @@ impl Drop for Session {
             core::mem::forget(self.memory.take());
             core::mem::forget(self.compute.take());
             core::mem::forget(self.render.take());
+            core::mem::forget(self.dormant_render.take());
             core::mem::forget(self.timestamps.take());
         }
     }
