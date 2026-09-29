@@ -179,7 +179,7 @@ pub(crate) fn build(
     // The submission builder allocates these leaves explicitly; the static
     // firmware extent does not contain every page (notably PrimaryIndex).
     for address in LEAVES {
-        vm.ensure_firmware(memory, address, PAGE)?;
+        vm.submission_leaf(memory, address)?;
     }
     vm.alias_firmware(memory, DESCRIPTORS[0], 0x7000000000, PAGE)?;
     vm.alias_firmware(memory, DESCRIPTORS[1], 0x7000098000, PAGE)?;

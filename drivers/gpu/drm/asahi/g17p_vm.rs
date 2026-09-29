@@ -384,6 +384,23 @@ impl Vm {
         Ok(())
     }
 
+    /// Reclassify a source-owned submission leaf before first publication.
+    /// The initial extent may describe an older read-only status alias at
+    /// this DVA; the new leaf is firmware-writable, as in alloc_at().
+    pub(crate) fn submission_leaf(&mut self, memory: &mut Memory, va: u64) -> Result {
+        if va & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        self.ensure_firmware(memory, va, PAGE as usize)?;
+        let pa = self.physical(memory, 2, va)?;
+        let flags = if (0xfffffc20c0000000..0xfffffc20d0000000).contains(&va) {
+            0x00c0000000000443
+        } else {
+            0x00c000000000044b
+        };
+        self.span_inner(memory, 2, va, pa, PAGE as usize, flags, true)
+    }
+
     fn backing(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result<u64> {
         if va & (PAGE - 1) != 0 || size == 0 || size % PAGE as usize != 0 {
             return Err(EINVAL);
