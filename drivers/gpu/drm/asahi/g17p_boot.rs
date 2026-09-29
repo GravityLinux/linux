@@ -465,8 +465,8 @@ impl Session {
         Ok(self
             .render
             .as_ref()
-            .map_or(super::g17p_render_lifecycle::SUBMISSIONS, |work| {
-                super::g17p_render_lifecycle::SUBMISSIONS - work.ordinal - 1
+            .map_or(super::g17p_render_lifecycle::OWNER_SUBMISSIONS, |work| {
+                super::g17p_render_lifecycle::OWNER_SUBMISSIONS - work.ordinal - 1
             }))
     }
     pub(crate) fn submit_next_render(
@@ -489,6 +489,9 @@ impl Session {
             dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
         }
         let ordinal = self.render.as_ref().ok_or(EINVAL)?.ordinal + 1;
+        if ordinal >= super::g17p_render_lifecycle::OWNER_SUBMISSIONS {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         let result = (|| {
             self.announce_render(dev, image, ordinal)?;
             let work = self.render.as_mut().ok_or(EINVAL)?;
