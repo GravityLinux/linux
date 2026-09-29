@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Retained pair-zero append lifecycle from G17PShimBackend's source path.
-//! The first append needs no runtime 0x2e announcement. Later generations
-//! remain gated until that distinct control lifecycle is ported.
+//! Each later generation owns a sequenced control tick, new records and
+//! an independently retired tilemap block. Ring recycling is still bounded.
 
 use super::{
     g17p_compute::{self as c, Error, Result},
@@ -10,7 +10,7 @@ use super::{
     g17p_render::{self as r, Kind, Parameters},
     g17p_render_graph as graph,
 };
-pub(crate) const SUBMISSIONS: u32 = 2;
+pub(crate) const SUBMISSIONS: u32 = 32;
 pub(crate) const DESCRIPTORS: [u64; 2] = [0xfffffc20c0018000, 0xfffffc20c00b0000];
 pub(crate) const QUEUES: [u64; 2] = [0xfffffc20c0000000, 0xfffffc20c00000c0];
 pub(crate) const POINTERS: [u64; 2] = [0xfffffc2000010000, 0xfffffc2000012870];
@@ -167,4 +167,23 @@ impl Item {
         }
         .build(out)
     }
+}
+
+/// announce_runtime_tick(): context zero, no fields inferred from prior work.
+pub(crate) fn control_tick(ordinal: u32) -> Result<[u8; 0x40]> {
+    if ordinal < 2 || ordinal >= SUBMISSIONS {
+        return Err(Error::Invalid);
+    }
+    let mut body = [0; 0x40];
+    c::u32_at(&mut body, 0, 0x2e);
+    c::u32_at(&mut body, 4, ordinal - 1);
+    Ok(body)
+}
+/// G17P_RUNTIME_NATIVE_SHARED_PRESTATE, before ticks for ordinal >= 3.
+pub(crate) fn control_prestate() -> [u8; 16] {
+    let mut body = [0; 16];
+    for (i, value) in [0x1a0, 0x1ea0, 0, 0x1d00].into_iter().enumerate() {
+        c::u32_at(&mut body, i * 4, value);
+    }
+    body
 }

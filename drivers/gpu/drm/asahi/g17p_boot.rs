@@ -457,18 +457,91 @@ impl Session {
         if self.phase != Phase::Running {
             return Err(EIO);
         }
-        let work = self.render.as_mut().ok_or(EINVAL)?;
-        let result = render::stage_next(
-            self.memory.as_mut().ok_or(EINVAL)?,
-            self.vm.as_ref().ok_or(EINVAL)?,
-            work,
-            p,
-        )
-        .and_then(|()| self.run_render(dev, image));
+        let ordinal = self.render.as_ref().ok_or(EINVAL)?.ordinal + 1;
+        let result = (|| {
+            self.announce_render(dev, image, ordinal)?;
+            let work = self.render.as_mut().ok_or(EINVAL)?;
+            render::stage_next(
+                self.memory.as_mut().ok_or(EINVAL)?,
+                self.vm.as_ref().ok_or(EINVAL)?,
+                work,
+                p,
+            )
+            .and_then(|()| self.run_render(dev, image))
+        })();
         if result.is_err() {
             self.phase = Phase::Failed;
         }
         result
+    }
+
+    fn announce_render(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        ordinal: u32,
+    ) -> Result {
+        use super::g17p_render_lifecycle as life;
+        if ordinal < 2 {
+            return Ok(());
+        }
+        let body = life::control_tick(ordinal).map_err(|_| EINVAL)?;
+        let channel = image.graph.channels[0][12];
+        let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        let mut before = [0; 3];
+        for (value, at) in before.iter_mut().zip(channel.states) {
+            *value = memory.read_firmware32(vm.physical(memory, 2, at)?)?;
+        }
+        if before[2] >= 255 || before[0] != before[2] || before[1] != before[2] {
+            return Err(EBUSY);
+        }
+        if ordinal >= 3 {
+            vm.write(
+                memory,
+                2,
+                super::g17p_opening::SUPPORT + 0x20,
+                &life::control_prestate(),
+            )?;
+        }
+        vm.write(memory, 2, channel.ring + before[2] as u64 * 0x40, &body)?;
+        g17p_memory::sync();
+        let target = before[2] + 1;
+        vm.write(memory, 2, channel.states[2], &target.to_le_bytes())?;
+        g17p_memory::sync();
+        for _ in 0..100 {
+            if self
+                .peers
+                .iter()
+                .any(|p| p.data.crashed.load(Ordering::Acquire))
+            {
+                return Err(EIO);
+            }
+            self.peers[0]
+                .rtkit
+                .as_mut()
+                .ok_or(EINVAL)?
+                .as_mut()
+                .send_message(0x21, 0x0084000000000011)?;
+            let consumer = memory.read_firmware32(vm.physical(memory, 2, channel.states[0])?)?;
+            if consumer >= target {
+                dev_info!(
+                    dev,
+                    "G17P: render {} control tick {} consumed at slot {}\n",
+                    ordinal,
+                    ordinal - 1,
+                    before[2]
+                );
+                return Ok(());
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+        }
+        dev_err!(
+            dev,
+            "G17P: render {} control tick not consumed; retaining graph\n",
+            ordinal
+        );
+        Err(ETIMEDOUT)
     }
 
     pub(crate) fn submit_render(
