@@ -17,6 +17,9 @@ mod g17p_layout;
 mod g17p_memory;
 mod g17p_opening;
 mod g17p_platform;
+// Core queue port is exercised by source differential tests until submit is wired.
+#[allow(dead_code)]
+mod g17p_queue;
 mod g17p_topology;
 mod g17p_vm;
 
