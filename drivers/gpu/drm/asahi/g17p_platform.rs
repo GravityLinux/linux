@@ -6,6 +6,7 @@
 //! Its resource references and explicitly authored properties use DT endianness.
 //! Validate this boundary before allocating UAT tables or starting either ASC.
 
+use super::g17p_topology;
 use kernel::{c_str, device, of, prelude::*};
 
 const PAGE: u64 = 0x4000;
@@ -33,6 +34,47 @@ pub(crate) struct Platform {
     pub(crate) private_vm: [u64; 2],
     pub(crate) performance: [PerfState; STATES],
     pub(crate) period_ms: u32,
+}
+
+fn source_memory(node: &of::Node, regions: &[Region; 6]) -> Result {
+    if regions[2].base != g17p_topology::SHARED_L2 || regions[2].size != PAGE {
+        return Err(EINVAL);
+    }
+    let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
+    if names.as_slice()
+        != b"ttbs\0pagetables\0l2\0handoff\0firmware\0firmware-secondary\0source-graph\0"
+    {
+        return Err(EINVAL);
+    }
+    let source = node
+        .parse_phandle(c_str!("memory-region"), 6)
+        .ok_or(ENODEV)?;
+    let compatible: KVec<u8> = source.get_property(c_str!("compatible"))?;
+    let status: KVec<u8> = source.get_property(c_str!("status"))?;
+    let nomap: KVec<u8> = source.get_property(c_str!("no-map"))?;
+    let range: KVec<u64> = source.get_property(c_str!("reg"))?;
+    if compatible.as_slice() != b"apple,neo-gpu-source-memory\0"
+        || status.as_slice() != b"okay\0"
+        || !nomap.is_empty()
+        || range.len() != g17p_topology::RESERVATIONS.len() * 2
+    {
+        return Err(EINVAL);
+    }
+    for (pair, (base, size)) in range
+        .chunks_exact(2)
+        .zip(g17p_topology::RESERVATIONS.iter())
+    {
+        if pair != [*base, *size] {
+            return Err(EINVAL);
+        }
+        let end = base.checked_add(*size).ok_or(EINVAL)?;
+        for region in regions {
+            if *base < region.base + region.size && region.base < end {
+                return Err(EINVAL);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn adt_u32(node: &of::Node, name: &CStr) -> Result<u32> {
@@ -222,6 +264,21 @@ impl Platform {
             regions[index] = Region { base, size };
             dev_info!(dev, "G17P: {} {:#x}+{:#x}\n", name, base, size);
         }
+        source_memory(&node, &regions).inspect_err(|_| {
+            dev_err!(
+                dev,
+                "G17P: source topology memory reservation is missing or invalid\n"
+            );
+        })?;
+        dev_info!(
+            dev,
+            "G17P: source topology has {} reserved RAM ranges ({} bytes)\n",
+            g17p_topology::RESERVATIONS.len(),
+            g17p_topology::RESERVATIONS
+                .iter()
+                .map(|(_, size)| size)
+                .sum::<u64>()
+        );
         let performance = performance(&node)?;
         let period_ms = adt_u32(&node, c_str!("apple,sgx-gpu-power-sample-period"))?;
         if period_ms == 0 || period_ms.checked_mul(24_000).is_none() {

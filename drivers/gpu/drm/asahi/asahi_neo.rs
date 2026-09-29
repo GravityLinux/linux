@@ -14,6 +14,7 @@ mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
 mod g17p_platform;
+mod g17p_topology;
 
 const SGX_SIZE: usize = 0x4000000;
 const ID_VERSION: usize = 0xd04000;

@@ -7,6 +7,7 @@ From the Linux checkout, with Python 3 and `rustc` on `PATH`:
 ```sh
 python3 drivers/gpu/drm/asahi/tests/import_g17p_constants.py /path/to/m1n1 --check
 python3 drivers/gpu/drm/asahi/tests/import_g17p_layout.py /path/to/m1n1 --check
+python3 drivers/gpu/drm/asahi/tests/import_g17p_topology.py /path/to/m1n1 --check
 python3 drivers/gpu/drm/asahi/tests/check_g17p_abi.py /path/to/m1n1
 python3 drivers/gpu/drm/asahi/tests/check_g17p_initgraph.py /path/to/m1n1
 ```
@@ -27,3 +28,9 @@ The import tools copy named source constants from `g17p_initdata.py` and
 
 These checks prove serialization parity. They do not prove firmware startup,
 GPU execution, rendered output, or the later asynchronous stages.
+
+The topology import also generates the T8140 source-memory DT include. It
+reserves the union of prescribed RAM leaf/table pages, including the second
+firmware root, while excluding MMIO and the ADT-owned L2 page. This is an
+address-only import from `g17p_source_topology.py`. Linux validates the full
+reservation list before any future physical placement or firmware publication.
