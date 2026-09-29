@@ -51,7 +51,7 @@ int main(int argc, char **argv)
 	float *a = bo_map(fd, input_a, PAGE), *b = bo_map(fd, input_b, PAGE);
 	uint32_t output = bo_new(fd, PAGE, DRM_ASAHI_GEM_WRITEBACK, 0);
 	float *result = bo_map(fd, output, PAGE);
-	float *retired[31] = {0};
+	float *retired[257] = {0};
 	memset(result, 0xa5, PAGE);
 	bind(fd, vm, output, COMPUTE_OUTPUT, PAGE, 0, RW, 0);
 	struct {
@@ -76,7 +76,7 @@ int main(int argc, char **argv)
 		vm, q.queue_id, COMPUTE_CDM, COMPUTE_OUTPUT);
 	if (use_timestamps) timestamp_setup(fd, &timestamps, &commands.compute, &submit);
 	if (use_sync) sync_setup(fd, &sync, &submit);
-	for (unsigned n = 0; n < 32; n++) {
+	for (unsigned n = 0; n < 258; n++) {
 		if (use_rebind && n) {
 			retired[n - 1] = result;
 			bind(fd, vm, 0, COMPUTE_OUTPUT, PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0);
@@ -94,6 +94,16 @@ int main(int argc, char **argv)
 		memset(result, 0xa5, PAGE);
 		if (use_timestamps) timestamp_before(fd, &timestamps, &commands.compute, n);
 		if (use_sync) sync_before(fd, &sync, n, vm, (const unsigned char *)result);
+		if (n == 256) {
+			unsigned char stream[sizeof(commands) * 3];
+			for (unsigned j = 0; j < 3; j++) memcpy(stream + j * sizeof(commands), &commands, sizeof(commands));
+			struct drm_asahi_submit rejected = submit;
+			rejected.cmdbuf = (uintptr_t)stream; rejected.cmdbuf_size = sizeof(stream);
+			BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &rejected, EOPNOTSUPP);
+			for (unsigned j = 0; j < PAGE; j++) CHECK(((unsigned char *)result)[j] == 0xa5);
+			if (use_timestamps) timestamp_check(&timestamps, n);
+			puts("COMPUTE_CAPACITY_BATCH_REJECTED before either remaining publication");
+		}
 		errno = 0;
 		int rc = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit);
 		int saved_errno = errno;
@@ -119,25 +129,24 @@ int main(int argc, char **argv)
 		}
 	}
 	/* This admission stage must refuse exhaustion before publishing work. */
-	if (use_rebind) for (unsigned i = 0; i < 64; i++) a[i] = -10000.0f;
-	else memset(result, 0xa5, PAGE);
-	if (use_sync) sync.entries[3].timeline_value = 33;
+	for (unsigned i = 0; i < 64; i++) a[i] = -10000.0f;
+	if (use_sync) sync.entries[3].timeline_value = 259;
 	CHECK(ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit) == -1 && errno == EOPNOTSUPP);
-	if (use_sync) sync_finish(fd, &sync);
-	if (use_timestamps) timestamp_finish(fd, &timestamps);
-	if (use_rebind) for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + 31 * 100.25f + i);
-	for (unsigned i = use_rebind ? 256 : 0; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
+	if (use_sync) sync_finish(fd, &sync, 258);
+	if (use_timestamps) timestamp_finish(fd, &timestamps, 258);
+	for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + 257 * 100.25f + i);
+	for (unsigned i = 256; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
 	CHECK(munmap(a, PAGE) == 0);
 	CHECK(munmap(b, PAGE) == 0);
 	if (use_rebind) {
 		CHECK(munmap(retired[0], PAGE) == 0);
-		for (unsigned generation = 1; generation < 32; generation++) {
-			unsigned char *image = (void *)(generation == 31 ? result : retired[generation]);
+		for (unsigned generation = 1; generation < 258; generation++) {
+			unsigned char *image = (void *)(generation == 257 ? result : retired[generation]);
 			CHECK(munmap(image - PAGE, PAGE * 3) == 0);
 		}
-		printf("COMPUTE_REBIND_PASS 32 independent outputs, every older image and allocation guard preserved\n");
+		printf("COMPUTE_REBIND_PASS 258 independent outputs, every older image and allocation guard preserved\n");
 	} else CHECK(munmap(result, PAGE) == 0);
 	CHECK(close(fd) == 0);
-	printf("G17P_NATIVE_COMPUTE_PASS 32 distinct submissions, exact 2048 floats and intact tails; checks=%u\n", checks);
+	printf("G17P_NATIVE_COMPUTE_PASS 258 distinct submissions, exact 16512 floats and intact tails; checks=%u\n", checks);
 	return 0;
 }

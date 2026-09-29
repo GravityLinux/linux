@@ -138,6 +138,8 @@ pub(crate) struct Submission {
     pub(crate) timestamps: [u64; 2],
     pub(crate) after_render: bool,
     pub(crate) pointers: u64,
+    ring: u64,
+    transport: TransportPool,
     robustness: u64,
 }
 impl Submission {
@@ -149,8 +151,107 @@ impl Submission {
         }
     }
 }
-// Admission is bounded until transport handoff and context reuse are wired.
-pub(crate) const SUBMISSIONS: u32 = 32;
+// The source direct bootstrap reserves 258 logical command placements while
+// recycling its 240 descriptors, 256 context records and 36 scheduler records.
+pub(crate) const SUBMISSIONS: u32 = 258;
+
+struct TransportSlot {
+    physical: u64,
+    retired: Option<KVVec<u8>>,
+}
+struct TransportPool {
+    slots: [Option<TransportSlot>; 2],
+    switches: u32,
+}
+
+fn read_owned(memory: &Memory, vm: &Vm, address: u64, body: &mut [u8]) -> Result {
+    if address & 7 != 0 || body.len() % 8 != 0 {
+        return Err(EINVAL);
+    }
+    for (i, bytes) in body.chunks_exact_mut(8).enumerate() {
+        let pa = vm.physical(memory, 2, address + i as u64 * 8)?;
+        memory.invalidate(pa, 8)?;
+        bytes.copy_from_slice(&memory.read64(pa)?.to_le_bytes());
+    }
+    Ok(())
+}
+
+impl TransportPool {
+    fn switch(
+        &mut self,
+        memory: &mut Memory,
+        vm: &mut Vm,
+        pointers: u64,
+        ring: u64,
+        done: u32,
+    ) -> Result<[u64; 2]> {
+        let mut record = [0; 0xc0];
+        read_owned(memory, vm, QUEUE, &mut record)?;
+        let slot = self.switches as usize % 2;
+        let next = lifecycle::transport_record(&mut record, [pointers, ring], done, slot as u32)
+            .map_err(|_| EIO)?;
+        // Preserve snapshots on the heap, never on the small kernel stack.
+        let mut snapshot = KVVec::with_capacity(0x80 + 0x2870, GFP_KERNEL)?;
+        snapshot.resize(0x80 + 0x2870, 0, GFP_KERNEL)?;
+        for (index, owned) in self.slots.iter_mut().enumerate() {
+            let Some(owned) = owned else {
+                continue;
+            };
+            let base = lifecycle::TRANSPORT_BASE + index as u64 * 0x8000;
+            for offset in [0, PAGE as u64] {
+                if vm.physical(memory, 2, base + offset)? != owned.physical + offset {
+                    return Err(EIO);
+                }
+            }
+            if let Some(retired) = &owned.retired {
+                if base != pointers {
+                    read_owned(memory, vm, base, &mut snapshot[..0x80])?;
+                    read_owned(memory, vm, base + PAGE as u64, &mut snapshot[0x80..])?;
+                    if snapshot.as_slice() != retired.as_slice() {
+                        return Err(EIO);
+                    }
+                }
+            }
+        }
+        for (index, owned) in self.slots.iter_mut().enumerate() {
+            if lifecycle::TRANSPORT_BASE + index as u64 * 0x8000 == pointers {
+                let owned = owned.as_mut().ok_or(EIO)?;
+                read_owned(memory, vm, pointers, &mut snapshot[..0x80])?;
+                read_owned(memory, vm, ring, &mut snapshot[0x80..])?;
+                owned.retired = Some(snapshot);
+                break;
+            }
+        }
+        if self.slots[slot].is_none() {
+            let physical = vm.transport_backing(memory, next[0])?;
+            self.slots[slot] = Some(TransportSlot {
+                physical,
+                retired: None,
+            });
+        }
+        vm.write(memory, 2, next[0], &lifecycle::transport_pointers())?;
+        // Memory owns both contiguous pages, so zero only the ring payload.
+        let physical = self.slots[slot].as_ref().ok_or(EIO)?.physical;
+        memory.zero(physical + PAGE as u64, 0x2870)?;
+        memory.clean(physical + PAGE as u64, 0x2870)?;
+        super::g17p_memory::sync();
+        vm.write(memory, 2, QUEUE, &record)?;
+        super::g17p_memory::sync();
+        let mut after = [0; 0xc0];
+        read_owned(memory, vm, QUEUE, &mut after)?;
+        if after[..16] != record[..16] {
+            return Err(EIO);
+        }
+        for (offset, expected) in [(0, 0), (0x30, 0), (0x40, 0), (0x50, u32::MAX)] {
+            if memory.read_firmware32(vm.physical(memory, 2, next[0] + offset)?)? != expected {
+                return Err(EIO);
+            }
+        }
+        self.slots[slot].as_mut().ok_or(EIO)?.retired = None;
+        self.switches = self.switches.checked_add(1).ok_or(EOVERFLOW)?;
+        Ok(next)
+    }
+}
 struct Writer<'a> {
     memory: &'a mut Memory,
     vm: &'a Vm,
@@ -206,14 +307,10 @@ pub(crate) fn build(
     // aperture before caller BOs replace the old native DVAs. The kernel's
     // preemption slots occupy its first 0x84000 bytes, so use the next MiB.
     // This is driver state, not a change to the fixed USC execution base.
-    let robustness = if after_render {
-        parameters.preempt + 0x100000
-    } else {
-        ROBUSTNESS
-    };
+    let robustness = parameters.preempt + 0x100000;
     for offset in [0, 0x8000] {
         let pa = client_storage(memory, &mut client.root, robustness + offset, PAGE)?;
-        if after_render && client.root.pte(ROBUSTNESS + offset)? == 0 {
+        if client.root.pte(ROBUSTNESS + offset)? == 0 {
             client.root.prepare(ROBUSTNESS + offset, PAGE as u64)?;
             client.root.map_page(ROBUSTNESS + offset, pa, true)?;
         }
@@ -440,7 +537,7 @@ pub(crate) fn build(
         }
         .build(),
     )?;
-    let cold_registers;
+    let mut cold_registers;
     let mut warm_registers;
     let registers: &[c::Register] = if after_render {
         warm_registers =
@@ -455,6 +552,11 @@ pub(crate) fn build(
     } else {
         cold_registers =
             lifecycle::opening_program(parameters.preempt, parameters.cdm).map_err(|_| EINVAL)?;
+        for (number, value) in &mut cold_registers {
+            if *number == 0x14070 {
+                *value = robustness | 1;
+            }
+        }
         &cold_registers
     };
     c::Descriptor {
@@ -559,6 +661,11 @@ pub(crate) fn build(
         after_render,
         pointers: POINTERS,
         robustness,
+        ring: RING,
+        transport: TransportPool {
+            slots: [None, None],
+            switches: 0,
+        },
     })
 }
 
@@ -588,7 +695,7 @@ pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Co
 
 pub(crate) fn stage_next(
     memory: &mut Memory,
-    vm: &Vm,
+    vm: &mut Vm,
     work: &mut Submission,
     parameters: &Parameters,
 ) -> Result {
@@ -597,9 +704,17 @@ pub(crate) fn stage_next(
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
     let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
-    let (counters, write_index) = idle(memory, vm, work)?;
+    let (counters, mut write_index) = idle(memory, vm, work)?;
     if work.after_render {
         return stage_after_render(memory, vm, work, parameters, counters);
+    }
+    if ordinal % lifecycle::TRANSPORT_INTERVAL == 0 {
+        let next = work
+            .transport
+            .switch(memory, vm, work.pointers, work.ring, write_index)?;
+        work.pointers = next[0];
+        work.ring = next[1];
+        write_index = 0;
     }
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
@@ -641,9 +756,14 @@ pub(crate) fn stage_next(
     for address in spec.status {
         write(memory, address, &[0; 8])?;
     }
-    let registers = spec
+    let mut registers = spec
         .program(parameters.preempt, parameters.cdm, ordinal % 2)
         .map_err(|_| EINVAL)?;
+    for (number, value) in &mut registers {
+        if *number == 0x14070 {
+            *value = (work.robustness + (ordinal % 2) as u64 * 0x8000) | 1;
+        }
+    }
     spec.descriptor_body(
         &mut page,
         &registers,
@@ -661,8 +781,8 @@ pub(crate) fn stage_next(
     work.client.cache(false)?;
     let publication = q::Stage {
         queue: QUEUE,
-        pointers: POINTERS,
-        item_ring: RING,
+        pointers: work.pointers,
+        item_ring: work.ring,
         item_capacity: 0x2870 / 8,
         write_index,
         channel_ring: work.channel.ring,
@@ -673,7 +793,7 @@ pub(crate) fn stage_next(
         group: ordinal + 1,
         grid: 4,
         kind: q::Kind::Compute,
-        first: false,
+        first: write_index == 0,
         in_place: false,
         announce: false,
         defer_inner: true,
@@ -825,6 +945,7 @@ fn stage_after_render(
     work.ordinal = 1;
     work.publication = publication;
     work.pointers = pointers;
+    work.ring = ring;
     work.status = status;
     work.timestamps = parameters.timestamps;
     Ok(())

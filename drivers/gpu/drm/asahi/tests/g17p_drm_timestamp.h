@@ -3,7 +3,7 @@
 struct timestamp_test {
 	uint32_t bo, object;
 	unsigned char *map;
-	uint64_t saved[32][2];
+	uint64_t saved[258][2];
 };
 static void timestamp_bind(int fd, struct timestamp_test *t)
 {
@@ -67,11 +67,11 @@ static inline void timestamp_after(struct timestamp_test *t, unsigned n)
 	if (n) CHECK(start >= t->saved[n - 1][1]);
 	timestamp_check(t, n + 1);
 }
-static void timestamp_finish(int fd, struct timestamp_test *t)
+static void timestamp_finish(int fd, struct timestamp_test *t, unsigned count)
 {
-	timestamp_check(t, 32);
+	timestamp_check(t, count);
 	timestamp_unbind(fd, t);
 	CHECK(munmap(t->map, 3 * PAGE) == 0);
 	bo_close(fd, t->bo);
-	printf("G17P_TIMESTAMP_PASS 32 ordered start/end pairs, live object rebind, offset and guard bytes intact\n");
+	printf("G17P_TIMESTAMP_PASS %u ordered start/end pairs, live object rebind, offset and guard bytes intact\n", count);
 }

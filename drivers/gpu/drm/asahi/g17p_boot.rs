@@ -420,13 +420,23 @@ impl Session {
                 );
             }
         }
-        let result = compute::stage_next(
+        let old_pointers = work.pointers;
+        let staged = compute::stage_next(
             self.memory.as_mut().ok_or(EINVAL)?,
-            self.vm.as_ref().ok_or(EINVAL)?,
+            self.vm.as_mut().ok_or(EINVAL)?,
             work,
             parameters,
-        )
-        .and_then(|()| self.run_compute(dev, image));
+        );
+        if staged.is_ok() && old_pointers != work.pointers {
+            dev_info!(
+                dev,
+                "G17P: retained compute transport handoff at ordinal {}: {:#x} -> {:#x}\n",
+                work.ordinal,
+                old_pointers,
+                work.pointers
+            );
+        }
+        let result = staged.and_then(|()| self.run_compute(dev, image));
         if result.is_err() {
             self.phase = Phase::Failed;
         }

@@ -86,6 +86,29 @@ fn main() {
     let mut ctx = [0; 0x200];
     lifecycle::after_render_second_context(&mut ctx).unwrap();
     emit(&ctx);
+    for case in 0..8u32 {
+        let old = [
+            0xfffffc200165a870 + case as u64 * 0x4000,
+            0xfffffc20c08aa870 + case as u64 * 0x4000,
+        ];
+        let done = 384 + case * 3;
+        let mut record = core::array::from_fn(|i| (i as u32 * 17 + case * 13) as u8);
+        record[..8].copy_from_slice(&old[0].to_le_bytes());
+        record[8..16].copy_from_slice(&old[1].to_le_bytes());
+        record[0x1c..0x20].copy_from_slice(&done.to_le_bytes());
+        for (wrong, bad_done, slot) in [
+            ([old[0] + 8, old[1]], done, 0),
+            (old, done + 1, 0),
+            (old, done, 2),
+        ] {
+            let mut rejected = record;
+            assert!(lifecycle::transport_record(&mut rejected, wrong, bad_done, slot).is_err());
+            assert_eq!(rejected, record);
+        }
+        lifecycle::transport_record(&mut record, old, done, case % 2).unwrap();
+        emit(&record);
+        emit(&lifecycle::transport_pointers());
+    }
     for invalid in [0, 0xffffff, u32::MAX] {
         assert!(lifecycle::Retained::new(invalid).is_err());
     }

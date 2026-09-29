@@ -81,10 +81,10 @@ int main(void)
 			timestamp_before(fd, &timestamps, &commands[j].compute, batch * 8 + j);
 		if (batch == 3) {
 			struct command too_many[9];
-			memcpy(too_many, commands, sizeof(commands)); too_many[8] = commands[0];
+			memcpy(too_many, commands, sizeof(commands)); too_many[8] = commands[0]; too_many[8].header.cdm_barrier = 9;
 			struct drm_asahi_submit rejected = submit;
 			rejected.cmdbuf = (uintptr_t)too_many; rejected.cmdbuf_size = sizeof(too_many);
-			BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &rejected, EOPNOTSUPP);
+			BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &rejected, EINVAL);
 			outputs_check(output, 24);
 			CHECK(sync_stamp(fd, sync.binary) == sync.last_stamp);
 			CHECK(sync_point(fd, sync.timeline) == 3);
@@ -105,11 +105,12 @@ int main(void)
 		printf("BATCH %u PASS 8 unique outputs; completion fence after all timestamps\n", batch);
 	}
 	sync.entries[3].timeline_value = 5;
-	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
+	commands[7].compute.flags = 1;
+	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
 	CHECK(sync_stamp(fd, sync.binary) == sync.last_stamp);
 	CHECK(sync_point(fd, sync.timeline) == 4);
 	outputs_check(output, 32);
-	timestamp_finish(fd, &timestamps);
+	timestamp_finish(fd, &timestamps, 32);
 	for (unsigned j = 0; j < 32; j++) CHECK(munmap(output[j], PAGE) == 0);
 	CHECK(close(fd) == 0);
 	printf("G17P_NATIVE_BATCH_PASS 4 batches, 32 independent outputs / 2048 floats, command barriers, timestamps and batch fences; checks=%u\n", checks);
