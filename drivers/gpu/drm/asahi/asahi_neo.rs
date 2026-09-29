@@ -21,6 +21,16 @@ mod g17p_compute_memory;
 mod g17p_compute_runtime;
 #[allow(dead_code)]
 mod g17p_dependency;
+#[allow(dead_code)]
+mod g17p_dependency_vm;
+#[allow(dead_code)]
+mod g17p_dependency_runtime;
+#[allow(dead_code)]
+mod g17p_dependency_release;
+#[allow(dead_code)]
+mod g17p_dependency_retire;
+#[allow(dead_code)]
+mod g17p_dependency_control;
 mod g17p_drm;
 mod g17p_growth;
 mod g17p_growth_runtime;

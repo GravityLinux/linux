@@ -33,11 +33,89 @@ pub(crate) struct Memory {
     allocations: KVec<Allocation>,
 }
 
+/// A checked aligned word in RAM retained by this Memory owner. The immutable
+/// borrow prevents allocations or mappings changing during a publication pass.
+pub(crate) struct Word64<'a> {
+    backing: WordBacking,
+    _owner: core::marker::PhantomData<&'a Memory>,
+}
+enum WordBacking {
+    Allocated(u64),
+    Reserved(*mut u64),
+}
+impl Word64<'_> {
+    /// No allocation, address lookup, or fallible operation after the first
+    /// page-table break. Only checked, host-owned PTE words use this API.
+    pub(crate) fn store(&self, value: u64) {
+        let write = |p: *mut u64| {
+            sync();
+            // SAFETY: Constructor checked alignment, bounds and RAM ownership.
+            // These table lines contain cleaned host-owned entries; preserve
+            // adjacent entries before updating and publishing this one word.
+            unsafe {
+                core::arch::asm!("dc ivac, {p}", p=in(reg)p, options(nostack,preserves_flags));
+            }
+            sync();
+            // SAFETY: The borrowed owner retains the checked writable word.
+            unsafe {
+                p.write_volatile(value.to_le());
+                core::arch::asm!("dc cvac, {p}", p=in(reg)p, options(nostack,preserves_flags));
+            }
+            sync();
+        };
+        match self.backing {
+            WordBacking::Allocated(address) => {
+                let base = address & !(PAGE as u64 - 1);
+                // SAFETY: word64 verified this page is in a retained allocation.
+                let page = unsafe { page::Page::borrow_phys_unchecked(&base) };
+                page.with_page_mapped(|p| {
+                    // SAFETY: Checked aligned word lies wholly in this page.
+                    write(unsafe { p.add((address - base) as usize).cast::<u64>() });
+                });
+            }
+            WordBacking::Reserved(pointer) => write(pointer),
+        }
+    }
+}
+
 // SAFETY: These mappings are not thread-local. Only this owner accesses them;
 // writes require exclusive access. No reference into shared firmware RAM escapes.
 unsafe impl Send for Memory {}
 
 impl Memory {
+    pub(crate) fn word64(&self, address: u64) -> Result<Word64<'_>> {
+        if address & 7 != 0 {
+            return Err(EINVAL);
+        }
+        let end = address.checked_add(8).ok_or(EINVAL)?;
+        let backing = if self
+            .allocations
+            .iter()
+            .any(|a| address >= a.base && end <= a.base + a.size as u64)
+        {
+            WordBacking::Allocated(address)
+        } else {
+            let mapping = self
+                .mappings
+                .iter()
+                .find(|m| address >= m.base && end <= m.base + m.memory.size() as u64)
+                .ok_or(EINVAL)?;
+            // SAFETY: Checked ordinary reserved RAM mapping remains live for
+            // the full immutable owner borrow carried by the returned word.
+            WordBacking::Reserved(unsafe {
+                mapping
+                    .memory
+                    .ptr()
+                    .add((address - mapping.base) as usize)
+                    .cast::<u64>()
+            })
+        };
+        Ok(Word64 {
+            backing,
+            _owner: core::marker::PhantomData,
+        })
+    }
+
     pub(crate) fn new(dev: &device::Device, platform: &Platform) -> Result<Self> {
         let node = dev.of_node().ok_or(ENODEV)?;
         let mut memory = Self {

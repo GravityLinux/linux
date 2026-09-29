@@ -429,7 +429,7 @@ pub(crate) fn render_context(out: &mut [u8], kind: Kind, opening_completion: u32
         partial_opening: false,
         dependency_grid: Some(LAYOUTS[i + 1].grid),
         points: Some(if i == 0 { &tiling } else { &fragment }),
-        event_slot: None,
+        event_slot: Some(1),
         completion: None,
     }
     .build(out)

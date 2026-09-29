@@ -287,6 +287,107 @@ impl Vm {
         Ok((self.lookup(memory, group, va - offset)?.ok_or(EINVAL)? & ADDRESS) + offset)
     }
 
+    /// Live source-owned leaf, including its attributes. Never substitute a
+    /// bootstrap placement table for this lookup after a mapping transition.
+    pub(crate) fn pte(&self, memory: &Memory, group: usize, va: u64) -> Result<u64> {
+        Ok(self.lookup(memory, group, va)?.unwrap_or(0))
+    }
+
+    /// Quiescent replacements of already-present source-owned leaves. Validate
+    /// every old PTE and prepare every RAM word before breaking any mapping.
+    /// Old physical allocations remain owned by Memory until firmware stops.
+    pub(crate) fn rebind_pages(
+        &self,
+        memory: &Memory,
+        changes: &[(usize, u64, u64, u64)],
+    ) -> Result {
+        let mut stores = KVec::new();
+        for (i, &(group, va, old, new)) in changes.iter().enumerate() {
+            if changes[..i].iter().any(|r| r.0 == group && r.1 == va)
+                || old & 3 != 3
+                || new & 3 != 3
+                || [old, new].into_iter().any(|pte| {
+                    pte & ADDRESS == 0
+                        || pte & ADDRESS >= 1 << 42
+                        || pte & !(ADDRESS | 0x00c0000000000fff) != 0
+                })
+                || self.lookup(memory, group, va)? != Some(old)
+            {
+                return Err(EINVAL);
+            }
+            // Replacements name retained RAM owners, never device mappings.
+            memory.word64(old & ADDRESS)?;
+            memory.word64(new & ADDRESS)?;
+            let indices = Self::indices(group, va)?;
+            let mut table = self.roots[group];
+            for index in indices[..2].iter().copied() {
+                if !self.tables.contains(&table) {
+                    return Err(EINVAL);
+                }
+                let pte = memory.read64(table + index as u64 * 8)?;
+                if pte & 3 != 3 {
+                    return Err(EINVAL);
+                }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) {
+                return Err(EINVAL);
+            }
+            if old != new {
+                stores.push(
+                    (memory.word64(table + indices[2] as u64 * 8)?, new),
+                    GFP_KERNEL,
+                )?;
+            }
+        }
+        // All remaining operations are infallible. No page-table walker can
+        // observe a valid-to-valid replacement with stale physical backing.
+        for (word, _) in &stores {
+            word.store(0);
+        }
+        Self::invalidate_gpu();
+        for (word, new) in &stores {
+            word.store(*new);
+        }
+        Self::invalidate_gpu();
+        Ok(())
+    }
+
+    /// Native scheduler generations keep their ABI DVAs and PTE attributes,
+    /// but must not reuse the bootstrap's physical scheduler/completion pages.
+    pub(crate) fn freshen_firmware(&self, memory: &mut Memory, pages: &[u64]) -> Result {
+        let mut changes = KVec::new();
+        // Resolve the complete owned mapping set before allocating new owners.
+        for (i, &va) in pages.iter().enumerate() {
+            if pages[..i].contains(&va) {
+                return Err(EINVAL);
+            }
+            let old = self.lookup(memory, 2, va)?.ok_or(EINVAL)?;
+            changes.push((2, va, old, 0), GFP_KERNEL)?;
+        }
+        for row in &mut changes {
+            let pa = memory.allocate(PAGE as usize)?;
+            memory.clean(pa, PAGE as usize)?;
+            row.3 = pa | (row.2 & !ADDRESS);
+        }
+        self.rebind_pages(memory, &changes)
+    }
+
+    fn invalidate_gpu() {
+        super::g17p_memory::sync();
+        // SAFETY: Called under exclusive runtime access, after checked,
+        // quiescent UAT replacements. Global invalidation includes aliases in
+        // contexts zero through three and the source-owned roots/aliases.
+        unsafe {
+            core::arch::asm!(
+                ".inst 0xd508811f",
+                "dsb sy",
+                "isb",
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
     /// Driver-owned RAM fields only. Each page is separately translated and
     /// bounded by Memory, then cleaned before a mailbox can expose the write.
     pub(crate) fn write(&self, memory: &mut Memory, group: usize, va: u64, bytes: &[u8]) -> Result {
