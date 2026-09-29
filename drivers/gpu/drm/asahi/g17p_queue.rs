@@ -4,6 +4,11 @@
 //! G17PSubmitter.stage. Caller owns storage, cache maintenance and notification.
 //! Deferred outer producers stay invisible until the startup/runtime boundary.
 
+// CL_2 is entry 8 in the TA/3D/CL channel table. Its mailbox selector is
+// separately encoded as 0x0a; it is not an index into that table.
+pub(crate) const COMPUTE_CHANNEL: usize = 8;
+pub(crate) const COMPUTE_DOORBELL: u64 = 0x0083000a00000000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
     Invalid,

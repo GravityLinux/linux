@@ -335,8 +335,15 @@ impl Session {
     ) -> Result {
         self.require_first_work()?;
         let ttbs = self.ttbs;
-        let work =
-            self.stage(|memory, vm| compute::build(memory, vm, image, ttbs, client, parameters))?;
+        let work = self
+            .stage(|memory, vm| compute::build(memory, vm, image, ttbs, client, parameters))
+            .inspect_err(|error| {
+                dev_err!(
+                    dev,
+                    "G17P: first compute graph preparation failed: {:?}\n",
+                    error
+                );
+            })?;
         // Ownership precedes the first mailbox publication. Even an initdata
         // timeout or firmware error keeps every reachable client page pinned.
         self.compute = Some(work);
@@ -401,7 +408,7 @@ impl Session {
             .as_mut()
             .ok_or(EINVAL)?
             .as_mut()
-            .send_message(0x21, 0x0083000a00000000)?;
+            .send_message(0x21, queue::COMPUTE_DOORBELL)?;
         dev_info!(
             dev,
             "G17P: first caller compute published on CL2, client root {:#x}\n",
