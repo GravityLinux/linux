@@ -136,6 +136,18 @@ pub(crate) struct Submission {
     pub(crate) preempt: u64,
     pub(crate) status: [u64; 2],
     pub(crate) timestamps: [u64; 2],
+    pub(crate) after_render: bool,
+    pub(crate) pointers: u64,
+    robustness: u64,
+}
+impl Submission {
+    pub(crate) fn capacity(&self) -> u32 {
+        if self.after_render {
+            2
+        } else {
+            SUBMISSIONS
+        }
+    }
 }
 // Admission is bounded until transport handoff and context reuse are wired.
 pub(crate) const SUBMISSIONS: u32 = 32;
@@ -171,7 +183,14 @@ pub(crate) fn build(
     ttbs: u64,
     mut client: Client,
     parameters: &Parameters,
+    after_render: bool,
 ) -> Result<Submission> {
+    let status = if after_render {
+        let base = vm.fresh_firmware_page(memory, lifecycle::AFTER_RENDER_STATUS)?;
+        [base, base + 8]
+    } else {
+        STATUS
+    };
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     let lists = client_storage(memory, &mut client.root, 0x7000000000, 0x200000)?;
@@ -183,8 +202,22 @@ pub(crate) fn build(
     for i in 0..42 {
         client_storage(memory, &mut client.root, OPERANDS + i * 0x108000, 0x100000)?;
     }
-    client_storage(memory, &mut client.root, ROBUSTNESS, PAGE)?;
-    client_storage(memory, &mut client.root, ROBUSTNESS + 0x8000, PAGE)?;
+    // _ensure_compute_robustness retains private state in the VM's reserved
+    // aperture before caller BOs replace the old native DVAs. The kernel's
+    // preemption slots occupy its first 0x84000 bytes, so use the next MiB.
+    // This is driver state, not a change to the fixed USC execution base.
+    let robustness = if after_render {
+        parameters.preempt + 0x100000
+    } else {
+        ROBUSTNESS
+    };
+    for offset in [0, 0x8000] {
+        let pa = client_storage(memory, &mut client.root, robustness + offset, PAGE)?;
+        if after_render && client.root.pte(ROBUSTNESS + offset)? == 0 {
+            client.root.prepare(ROBUSTNESS + offset, PAGE as u64)?;
+            client.root.map_page(ROBUSTNESS + offset, pa, true)?;
+        }
+    }
     client_storage(memory, &mut client.root, parameters.preempt, 0xc000)?;
     client_storage(
         memory,
@@ -223,8 +256,7 @@ pub(crate) fn build(
         (CTX_HIGH, 8 * PAGE),
         (0xfffffc20001c8008, 8),
         (0xfffffc20c07c0008, 8),
-        (STATUS[0], 8),
-        (STATUS[1], 8),
+        (status[0], 0x20),
     ] {
         vm.ensure_firmware(memory, va, size)?;
     }
@@ -232,7 +264,7 @@ pub(crate) fn build(
     vm.alias_firmware(memory, CTX_HIGH, CTX_LOW, 8 * PAGE)?;
     // Reserve the retained-lifetime storage before initdata publication. This
     // preserves all page-table and alias placement while firmware is running.
-    for ordinal in 1..SUBMISSIONS {
+    for ordinal in 1..if after_render { 2 } else { SUBMISSIONS } {
         let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
         vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
         for (address, size) in [
@@ -242,8 +274,22 @@ pub(crate) fn build(
             (spec.event, 0x40),
             (spec.dispatch[0], 8),
             (spec.dispatch[1], 8),
-            (spec.status[0], 8),
-            (spec.status[1], 8),
+            (
+                if after_render {
+                    status[0] + 0x10
+                } else {
+                    spec.status[0]
+                },
+                8,
+            ),
+            (
+                if after_render {
+                    status[1] + 0x10
+                } else {
+                    spec.status[1]
+                },
+                8,
+            ),
             (lifecycle::SUPPORT, PAGE),
             (lifecycle::SUPPORT_STATE, PAGE),
             (lifecycle::ZERO, PAGE),
@@ -254,6 +300,17 @@ pub(crate) fn build(
     let write = |memory: &mut Memory, va, bytes: &[u8]| vm.write(memory, 2, va, bytes);
     let mut dispatch = [0u8; 0x20];
     abi::compute_dispatch(&mut dispatch).map_err(|_| EINVAL)?;
+    if after_render {
+        // Graphics startup omits this record. Never overwrite live allocator
+        // history or the adjacent render record on a force_fresh transition.
+        for offset in (0..0x20).step_by(8) {
+            let pa = vm.physical(memory, 2, 0xfffffc20015e8020 + offset)?;
+            memory.invalidate(pa, 8)?;
+            if memory.read64(pa)? != 0 {
+                return Err(EIO);
+            }
+        }
+    }
     write(memory, 0xfffffc20015e8020, &dispatch)?;
     for offset in [0, 0x18, 0x30, 0x48] {
         let address = JOB_LIST - 0x18 + offset;
@@ -272,7 +329,7 @@ pub(crate) fn build(
     for i in 0..36 {
         c::u64_at(&mut page, i * 0x100, SHARED_STATE + i as u64 * 4);
     }
-    for index in 0..3 {
+    for index in 0..if after_render { 2 } else { 3 } {
         page[(index + 1) * 0x100..(index + 2) * 0x100].copy_from_slice(
             &c::Scheduler {
                 slot: SHARED_STATE + 4 + index as u64 * 4,
@@ -287,7 +344,7 @@ pub(crate) fn build(
     }
     write(memory, SCHEDULERS, &page)?;
     page.fill(0);
-    for index in 1..4 {
+    for index in 1..if after_render { 3 } else { 4 } {
         c::u32_at(&mut page, index * 4, 1);
     }
     write(memory, SHARED_STATE, &page)?;
@@ -313,7 +370,7 @@ pub(crate) fn build(
     write(memory, SUPPORT_STATE, &page)?;
     page.fill(0);
     write(memory, ZERO, &page)?;
-    for address in [0xfffffc20001c8008, 0xfffffc20c07c0008, STATUS[0], STATUS[1]] {
+    for address in [0xfffffc20001c8008, 0xfffffc20c07c0008, status[0], status[1]] {
         write(memory, address, &[0; 8])?;
     }
     page.fill(0);
@@ -383,8 +440,23 @@ pub(crate) fn build(
         }
         .build(),
     )?;
-    let registers =
-        lifecycle::opening_program(parameters.preempt, parameters.cdm).map_err(|_| EINVAL)?;
+    let cold_registers;
+    let mut warm_registers;
+    let registers: &[c::Register] = if after_render {
+        warm_registers =
+            lifecycle::after_render_opening_program(parameters.preempt, parameters.cdm)
+                .map_err(|_| EINVAL)?;
+        for (number, value) in &mut warm_registers {
+            if *number == 0x14070 {
+                *value = robustness | 1;
+            }
+        }
+        &warm_registers
+    } else {
+        cold_registers =
+            lifecycle::opening_program(parameters.preempt, parameters.cdm).map_err(|_| EINVAL)?;
+        &cold_registers
+    };
     c::Descriptor {
         scheduler: SCHEDULER,
         low_alias: DESCRIPTOR_LOW,
@@ -393,7 +465,7 @@ pub(crate) fn build(
         context: 2,
         grid: 4,
         dispatch: [0xfffffc20001c8008, 0xfffffc20c07c0008],
-        status: STATUS,
+        status,
         timestamps: parameters.timestamps,
         shared_control: SUPPORT,
         zero_page: ZERO,
@@ -406,15 +478,22 @@ pub(crate) fn build(
         sampler_array: parameters.sampler,
         sampler_count: parameters.sampler_count,
     }
-    .build(&mut page, &registers)
+    .build(&mut page, registers)
     .map_err(|_| EINVAL)?;
     write(memory, DESCRIPTOR, &page)?;
     page.fill(0);
     write(memory, EVENT, &page[..0x400])?;
-    prepare_cold_queues(memory, vm, &mut page)?;
+    prepare_cold_queues(memory, vm, &mut page, if after_render { 2 } else { 3 })?;
     let channel = image.graph.channels[0][q::COMPUTE_CHANNEL];
     if channel.ring != 0xfffffc20c07a1dc0 {
         return Err(EINVAL);
+    }
+    let mut counts = [0; 3];
+    for (value, address) in counts.iter_mut().zip(channel.states) {
+        *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+    }
+    if counts[0] != counts[1] || counts[1] != counts[2] {
+        return Err(EBUSY);
     }
     let publication = q::Stage {
         queue: QUEUE,
@@ -424,8 +503,8 @@ pub(crate) fn build(
         write_index: 0,
         channel_ring: channel.ring,
         channel_producer: channel.states[2],
-        counters: q::Counters::new([0; 3]).map_err(|_| EINVAL)?,
-        slot: Some(0),
+        counters: q::Counters::new(counts).map_err(|_| EINVAL)?,
+        slot: if after_render { None } else { Some(0) },
         items: &[DESCRIPTOR, OPTIONAL, EVENT],
         group: 1,
         grid: 4,
@@ -448,7 +527,7 @@ pub(crate) fn build(
     vm.flush_tables(memory)?;
     // Exact first-work client context table: independent empty upper roots.
     // Install only after the graph and all caller references are owned.
-    for context in 0..3 {
+    for context in if after_render { 2 } else { 0 }..3 {
         let high = memory.allocate(PAGE)?;
         memory.clean(high, PAGE)?;
         memory.write64(ttbs + context * 16 + 8, (context << 48) | high | 1)?;
@@ -475,8 +554,11 @@ pub(crate) fn build(
         channel,
         ordinal: 0,
         preempt: parameters.preempt,
-        status: STATUS,
+        status,
         timestamps: parameters.timestamps,
+        after_render,
+        pointers: POINTERS,
+        robustness,
     })
 }
 
@@ -488,7 +570,7 @@ pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Co
         *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
     }
     let counters = q::Counters::new(values).map_err(|_| EIO)?;
-    let done = memory.read_firmware32(vm.physical(memory, 2, POINTERS)?)?;
+    let done = memory.read_firmware32(vm.physical(memory, 2, work.pointers)?)?;
     if done != work.publication.write_after
         || values[0] != values[1]
         || values[1] != values[2]
@@ -497,7 +579,7 @@ pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Co
         return Err(EBUSY);
     }
     for offset in [0x30, 0x40] {
-        if memory.read_firmware32(vm.physical(memory, 2, POINTERS + offset)?)? != done {
+        if memory.read_firmware32(vm.physical(memory, 2, work.pointers + offset)?)? != done {
             return Err(EBUSY);
         }
     }
@@ -511,11 +593,14 @@ pub(crate) fn stage_next(
     parameters: &Parameters,
 ) -> Result {
     let ordinal = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-    if ordinal >= SUBMISSIONS || parameters.preempt != work.preempt {
+    if ordinal >= work.capacity() || parameters.preempt != work.preempt {
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
     let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
     let (counters, write_index) = idle(memory, vm, work)?;
+    if work.after_render {
+        return stage_after_render(memory, vm, work, parameters, counters);
+    }
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     let write = |memory: &mut Memory, address, bytes: &[u8]| vm.write(memory, 2, address, bytes);
@@ -609,10 +694,146 @@ pub(crate) fn stage_next(
     Ok(())
 }
 
+/// Ordinary post-render command one starts the second native queue. Preserve
+/// the first queue's history; do not append it to the cold retained transport.
+fn stage_after_render(
+    memory: &mut Memory,
+    vm: &Vm,
+    work: &mut Submission,
+    parameters: &Parameters,
+    counters: q::Counters,
+) -> Result {
+    use lifecycle::{
+        AFTER_RENDER_CONTEXT as context, AFTER_RENDER_EVENT as event,
+        AFTER_RENDER_OPTIONAL as optional, AFTER_RENDER_POINTERS as pointers,
+        AFTER_RENDER_QUEUE as queue, AFTER_RENDER_RING as ring,
+    };
+    for offset in [0, 0x30, 0x40] {
+        if memory.read_firmware32(vm.physical(memory, 2, pointers + offset)?)? != 0 {
+            return Err(EBUSY);
+        }
+    }
+    let spec = lifecycle::Retained::new(1).map_err(|_| EINVAL)?;
+    let status = [work.status[0] + 0x10, work.status[1] + 0x10];
+    let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+    page.resize(PAGE, 0, GFP_KERNEL)?;
+    let write = |memory: &mut Memory, address, bytes: &[u8]| vm.write(memory, 2, address, bytes);
+    write(memory, spec.scheduler, &spec.scheduler_body())?;
+    write(memory, spec.scheduler_slot, &1u32.to_le_bytes())?;
+    cm::Support {
+        compact: None,
+        header: 3,
+        word_08: 0,
+        word_10: 2,
+        resource_class: 0x15,
+        word_20: None,
+        word_28: None,
+        client_state: OPERAND_TABLE,
+        firmware_state: lifecycle::SUPPORT_STATE,
+        cursor: 0xa8,
+        field_54: 1,
+        field_5c: 1,
+        final_kind: 2,
+    }
+    .build(&mut page)
+    .map_err(|_| EINVAL)?;
+    write(memory, lifecycle::SUPPORT, &page)?;
+    page.fill(0);
+    write(memory, lifecycle::ZERO, &page)?;
+    write(memory, 0xfffffc20c07b80c0, &lifecycle::channel_control())?;
+    write(memory, JOB_LIST + 0x30, &q::job_list(JOB_LIST + 0x30))?;
+    write(memory, lifecycle::SUPPORT_STATE, &2u32.to_le_bytes())?;
+    for address in [0xfffffc20001c8014, 0xfffffc20c07c0014] {
+        write(memory, address, &[0; 4])?;
+    }
+    for address in status {
+        write(memory, address, &[0; 8])?;
+    }
+    let mut registers = spec
+        .program(parameters.preempt, parameters.cdm, 1)
+        .map_err(|_| EINVAL)?;
+    for (number, value) in &mut registers {
+        if *number == 0x14070 {
+            *value = (work.robustness + 0x8000) | 1;
+        }
+    }
+    lifecycle::after_render_second_descriptor(
+        &mut page,
+        &registers,
+        parameters.end,
+        parameters.sampler,
+        parameters.sampler_count,
+        parameters.timestamps,
+        status,
+    )
+    .map_err(|_| EINVAL)?;
+    write(memory, spec.descriptor, &page[..0x1000])?;
+    write(memory, optional, &lifecycle::after_render_second_optional())?;
+    page.fill(0);
+    lifecycle::after_render_second_context(&mut page[0x200..0x400]).map_err(|_| EINVAL)?;
+    write(memory, context, &page)?;
+    write(memory, event, &[0; 0x40])?;
+    write(
+        memory,
+        queue,
+        &q::Record {
+            pointers,
+            ring,
+            job_list: JOB_LIST + 0x30,
+            context: 0xfffffc20c07b80c0,
+            uuid: 0x159,
+            priority: 2,
+            prio5: 2,
+            unk_2c: 2,
+            unk_38: 0,
+            unk_30: None,
+            unk_94: 0,
+            sentinel_size: 2,
+        }
+        .build()
+        .map_err(|_| EINVAL)?,
+    )?;
+    work.client.cache(false)?;
+    let publication = q::Stage {
+        queue,
+        pointers,
+        item_ring: ring,
+        item_capacity: 0x2870 / 8,
+        write_index: 0,
+        channel_ring: work.channel.ring,
+        channel_producer: work.channel.states[2],
+        counters,
+        slot: None,
+        items: &[spec.descriptor, optional, event],
+        group: 2,
+        grid: 5,
+        kind: q::Kind::Compute,
+        first: true,
+        in_place: false,
+        announce: false,
+        defer_inner: true,
+        defer_outer: true,
+        event_subtype: None,
+        event_counter: None,
+        event_counter_low: 2,
+    }
+    .publish(&mut Writer { memory, vm })
+    .map_err(|error| match error {
+        q::StageError::Access(e) => e,
+        q::StageError::Protocol(_) => EINVAL,
+    })?;
+    work.ordinal = 1;
+    work.publication = publication;
+    work.pointers = pointers;
+    work.status = status;
+    work.timestamps = parameters.timestamps;
+    Ok(())
+}
+
 /// The retained source bootstrap constructs all three queue owners before
 /// initdata, even though only queue zero has its first descriptor published.
-fn prepare_cold_queues(memory: &mut Memory, vm: &mut Vm, page: &mut [u8]) -> Result {
-    for slot in 1u64..3 {
+fn prepare_cold_queues(memory: &mut Memory, vm: &mut Vm, page: &mut [u8], count: u64) -> Result {
+    for slot in 1u64..count {
         let (
             queue,
             pointers,

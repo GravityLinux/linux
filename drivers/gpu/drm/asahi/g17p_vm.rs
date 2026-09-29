@@ -351,7 +351,7 @@ impl Vm {
     }
 
     /// Explicit first-work replacement of the source-owned context-0 alias.
-    /// This is never used for caller mappings or after a firmware publication.
+    /// Also used for a new, quiescent compute owner after render completion.
     pub(crate) fn alias_firmware(
         &mut self,
         memory: &mut Memory,
@@ -382,6 +382,19 @@ impl Vm {
             )?;
         }
         Ok(())
+    }
+
+    /// Fresh command-status storage, matching the shim's post-render scan.
+    pub(crate) fn fresh_firmware_page(&mut self, memory: &mut Memory, first: u64) -> Result<u64> {
+        if first & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let mut address = first;
+        while self.lookup(memory, 2, address)?.is_some() {
+            address = address.checked_add(PAGE).ok_or(ENOMEM)?;
+        }
+        self.ensure_firmware(memory, address, PAGE as usize)?;
+        Ok(address)
     }
 
     /// Reclassify a source-owned submission leaf before first publication.

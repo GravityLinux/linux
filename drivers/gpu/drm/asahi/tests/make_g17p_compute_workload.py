@@ -18,6 +18,7 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("m1n1", type=Path)
 p.add_argument("output", type=Path)
 p.add_argument("--batch-count", type=int, default=0)
+p.add_argument("--mixed", action="store_true", help="source mixed caller: disjoint add3 image and graphs 8/9")
 args = p.parse_args()
 experiments = args.m1n1 / "proxyclient/experiments"
 package = types.ModuleType("workload_reference")
@@ -52,7 +53,16 @@ if args.batch_count:
                    "build_add3_code_image": code.build_add3_code_image,
                    "build_add3_preamble": scope["build_add3_preamble"]}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "source-owned-batch-workloads", "exec"), batch_scope)
-    mapping, batch = batch_scope["build_workloads"](args.batch_count)
+    mapping, batch = batch_scope["build_workloads"](args.batch_count, first_graph=8 if args.mixed else 0)
+    if args.mixed:
+        mixed_tree = ast.parse((experiments / "agx_g17p_modern_mixed_batch.py").read_text())
+        nodes = [n for n in mixed_tree.body if isinstance(n, ast.FunctionDef) and n.name == "relocate_compute_launch"]
+        mixed_scope = {"struct": struct, "COMPUTE_CODE_SHIFT": 0x10000}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "source-owned-mixed-launch", "exec"), mixed_scope)
+        mapping[usc + 0x10000] = mapping.pop(usc)
+        for job in batch:
+            body, writable = mapping[job["shader"]]
+            mapping[job["shader"]] = (mixed_scope["relocate_compute_launch"](body), writable)
     bodies = [(f"batch_{i}", address, body, (len(body)+0x3fff)&~0x3fff, writable)
               for i,(address,(body,writable)) in enumerate(mapping.items())]
 text = ["/* Generated from source-owned add3 constructors; caller workload only. */",

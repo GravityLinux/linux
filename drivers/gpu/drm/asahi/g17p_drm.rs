@@ -1160,6 +1160,7 @@ impl File {
             sync.complete();
             return Ok(0);
         }
+        runtime.session.require_compute_owner((inner.id, vm.id))?;
         let mut replacement = if let Some(client) = runtime.session.compute_client()? {
             if client.owner != (inner.id, vm.id)
                 || client.bindings.len() != vm.bindings.len()

@@ -60,6 +60,32 @@ fn main() {
             emit(&lifecycle::channel_control());
         }
     }
+    for (number, value) in
+        lifecycle::after_render_opening_program(0x30000000000, 0x10000600000).unwrap()
+    {
+        emit(&number.to_le_bytes());
+        emit(&value.to_le_bytes());
+    }
+    let regs = lifecycle::Retained::new(1)
+        .unwrap()
+        .program(0x30000000000, 0x10000600000, 1)
+        .unwrap();
+    let mut page = [0; 0x4000];
+    lifecycle::after_render_second_descriptor(
+        &mut page,
+        &regs,
+        0x10000600030,
+        0,
+        0,
+        [0xfffffc2181400010, 0xfffffc2181400018],
+        [0xfffffc2001a00010, 0xfffffc2001a00018],
+    )
+    .unwrap();
+    emit(&page);
+    emit(&lifecycle::after_render_second_optional());
+    let mut ctx = [0; 0x200];
+    lifecycle::after_render_second_context(&mut ctx).unwrap();
+    emit(&ctx);
     for invalid in [0, 0xffffff, u32::MAX] {
         assert!(lifecycle::Retained::new(invalid).is_err());
     }

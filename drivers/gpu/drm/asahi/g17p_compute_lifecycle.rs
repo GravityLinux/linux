@@ -12,6 +12,109 @@ pub(crate) const SUPPORT: u64 = 0xfffffc20c08d0000;
 pub(crate) const SUPPORT_STATE: u64 = 0xfffffc2001688000;
 pub(crate) const ZERO: u64 = 0xfffffc2001698000;
 
+/// The two ordinary queue owners constructed by the shim's force_fresh path
+/// after rendering. This is a distinct lifetime from the retained startup
+/// transport above; ordinal one starts queue/grid five at inner index zero.
+pub(crate) const AFTER_RENDER_STATUS: u64 = 0xfffffc2001a00000;
+pub(crate) const AFTER_RENDER_QUEUE: u64 = 0xfffffc20c00003c0;
+pub(crate) const AFTER_RENDER_POINTERS: u64 = 0xfffffc200166d0e0;
+pub(crate) const AFTER_RENDER_RING: u64 = 0xfffffc20c08b50e0;
+pub(crate) const AFTER_RENDER_CONTEXT: u64 = 0xfffffc20002a0000;
+pub(crate) const AFTER_RENDER_OPTIONAL: u64 = 0xfffffc20c0603e40;
+pub(crate) const AFTER_RENDER_EVENT: u64 = 0xfffffc20c05e96c0;
+
+pub(crate) fn after_render_opening_program(preempt: u64, cdm: u64) -> Result<[c::Register; 40]> {
+    c::Program {
+        preempt,
+        cdm,
+        identity: 0x010001d7020001dc,
+        context: 2,
+        ordinal: 0,
+        robustness: 0x1000018000,
+        operand_state: 0x7000220000,
+        usc_exec_base: c::USC_EXEC_BASE,
+        helper_binary: 0,
+        helper_data: 0,
+        helper_cfg: 0,
+        execution_gate: 1,
+    }
+    .build()
+}
+
+pub(crate) fn after_render_second_descriptor(
+    out: &mut [u8],
+    registers: &[c::Register],
+    end: u64,
+    sampler: u64,
+    sampler_count: u32,
+    timestamps: [u64; 2],
+    status: [u64; 2],
+) -> Result {
+    let spec = Retained::new(1)?;
+    c::Descriptor {
+        scheduler: spec.scheduler,
+        low_alias: spec.descriptor_low,
+        cdm_terminator: end.checked_sub(4).ok_or(Error::Invalid)?,
+        sequence: 1,
+        context: 3,
+        grid: 5,
+        dispatch: [0xfffffc20001c8014, 0xfffffc20c07c0014],
+        status,
+        timestamps,
+        shared_control: SUPPORT,
+        zero_page: ZERO,
+        support_control: 0xe0a00001,
+        support_flags: 0,
+        ordinal: 1,
+        queue_submission: 2,
+        queue_ordinal: 0,
+        submission_index: 2,
+        sampler_array: sampler,
+        sampler_count,
+    }
+    .build(out, registers)
+}
+
+pub(crate) fn after_render_second_optional() -> [u8; 0xc0] {
+    c::Optional {
+        context_low: 0x7000500000,
+        context_high: AFTER_RENDER_CONTEXT,
+        grid: 5,
+        ordinal: 0x29,
+        shared_control: SUPPORT,
+        channel_control: 0xfffffc20c07b80c0,
+        uuid: 0x159,
+        field_46: 0,
+        field_1e: 2,
+        field_32: 3,
+        field_56: 2,
+        field_5e: 2,
+        first: true,
+        item_index: 0,
+    }
+    .build()
+}
+
+pub(crate) fn after_render_second_context(out: &mut [u8]) -> Result {
+    c::Context {
+        descriptor: DESCRIPTOR_BASE + 0x1040,
+        queue: AFTER_RENDER_QUEUE,
+        grid: 5,
+        flags: 0x1000000000000000,
+        word_220: 0xffff080200000001,
+        word_330: 0,
+        word_338: 8,
+        word_350: 0x000110038001a084,
+        word_358: 0x000020038001a0bd,
+        word_378: 0x003fffffffffffff,
+        item_index: 0,
+        points: None,
+        event_slot: None,
+        completion: None,
+    }
+    .build(out)
+}
+
 /// Cold source startup uses the compact 36-register program. The four UAPI
 /// USC/helper registers belong to the subsequent caller submission profile.
 pub(crate) fn opening_program(preempt: u64, cdm: u64) -> Result<[c::Register; 36]> {

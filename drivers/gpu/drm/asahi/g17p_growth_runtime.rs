@@ -34,6 +34,8 @@ pub(crate) struct Service {
     refused: bool,
     limited: bool,
     terminals: u32,
+    compute_terminals: u32,
+    compute_owner: Option<u32>,
     fragment: u64,
 }
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
@@ -71,6 +73,19 @@ impl Service {
     pub(crate) fn terminals(&self) -> u32 {
         self.terminals
     }
+    pub(crate) fn compute_terminals(&self) -> u32 {
+        self.compute_terminals
+    }
+    pub(crate) fn begin_compute(&mut self, ordinal: u32) -> Result {
+        if self.compute_owner.is_some() {
+            return Err(EBUSY);
+        }
+        self.compute_owner = Some(ordinal);
+        Ok(())
+    }
+    pub(crate) fn finish_compute(&mut self) {
+        self.compute_owner = None;
+    }
     pub(crate) fn new(
         memory: &Memory,
         vm: &Vm,
@@ -100,6 +115,8 @@ impl Service {
             refused: false,
             limited: false,
             terminals: 0,
+            compute_terminals: 0,
+            compute_owner: None,
             fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
         })
     }
@@ -169,6 +186,7 @@ impl Service {
         vm: &Vm,
         root: &mut UserVm,
         ttbs: u64,
+        compute_ordinal: Option<u32>,
     ) -> Result<Action> {
         let tail = word(memory, vm, self.report.states[0] + 0x20)?;
         if tail >= 256 {
@@ -187,6 +205,11 @@ impl Service {
         let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
         let next = (self.cursor + 1) & 255;
         let owner = g::Owner { vm: 1, pool: 0 };
+        if compute_ordinal.is_some() && opcode != 1 {
+            // No live render can request growth here. Retain unexpected
+            // evidence without allocating, replying, or advancing credits.
+            return Err(EIO);
+        }
         if opcode == 7 {
             if !self.refused
                 || self.limited
@@ -213,6 +236,21 @@ impl Service {
             return Err(EIO);
         }
         if opcode == 1 {
+            // The same physical report ring serves both engines. A CL2
+            // terminal belongs only to the active synchronous compute owner;
+            // it cannot satisfy the render pair's terminal baseline.
+            let subtype = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            if subtype != 3 && body[8..16] == [0; 8] {
+                // render_startup.completion_handler routes every non-render
+                // mask to the oldest active CL owner, exactly once.
+                if compute_ordinal.is_none() || self.compute_owner != compute_ordinal {
+                    return Err(EIO);
+                }
+                self.compute_owner = None;
+                self.compute_terminals = self.compute_terminals.checked_add(1).ok_or(EIO)?;
+                self.consume(memory, vm, next)?;
+                return Ok(Action::Consumed);
+            }
             if body[4..16] != [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
                 return Err(EIO);
             }

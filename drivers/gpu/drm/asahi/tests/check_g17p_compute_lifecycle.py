@@ -52,6 +52,15 @@ for n in (1,2,3,4,34,35,36,127,128,239,240,255,256,383,384,1024):
         step=(descriptor-ns['DESCRIPTOR'])//0x20
         emit(f'{n}/{slot}:context',c.build_compute_queue_context_item(descriptor,transport['queue'],transport['grid'],flags_200=persistent['qctx_flags'],word_220=persistent['qctx_word_220'],word_330=0,word_338=persistent['qctx_word_338'],word_350=0x000110038001a002+step,word_358=0x000020038001a03b+step,word_378=0x003fffffffffffff,item_index=n))
         emit(f'{n}/{slot}:control',ns['_build_channel_control'](1))
+# Ordinary post-render startup has UAPI registers and a distinct second queue.
+regs=c.apply_compute_uapi_registers(ns['_registers_for_workload'](0),preempt_base=0x30000000000,cdm_base=0x10000600000,usc_exec_base=0x10000000000,helper_binary=0,helper_data=0,helper_cfg=0)
+emit('post-render:opening-program',b''.join(struct.pack('<IQ',*r) for r in regs))
+a=ns['_work_addresses'](1)
+regs=c.apply_compute_uapi_registers(ns['_registers_for_workload'](1,command_slot=1),preempt_base=0x30000078000,cdm_base=0x10000600000,usc_exec_base=0x10000000000,helper_binary=0,helper_data=0,helper_cfg=0)
+emit('post-render:second-descriptor',c.build_compute_descriptor(regs,a['scheduler'],a['descriptor_low'],0x1000060002c,submit_sequence=1,context_id=a['context_id'],grid_index=a['grid'],dispatch_a=a['dispatch_a'],dispatch_b=a['dispatch_b'],status_a=0xfffffc2001a00010,status_b=0xfffffc2001a00018,user_timestamp_start=0xfffffc2181400010,user_timestamp_end=0xfffffc2181400018,zero_page=a['zero_page'],shared_control=a['shared_support'],protection_index=1,support_control=0xe0a00001,support_flags=0,work_ordinal=1,queue_submission=2,queue_ordinal=0,submission_index=2,sampler_array=0,sampler_count=0))
+emit('post-render:second-optional',c.build_compute_optional(a['context_low'],a['context_high'],grid_index=a['grid'],submission_ordinal=a['optional_submission'],shared_control=a['shared_support'],channel_control=a['channel_control'],uuid=a['uuid'],field_46=a['optional_field_46'],field_1e=2,field_32=a['optional_field_32'],field_56=a['optional_field_56'],field_5e=2,first_submit=True,item_index=0))
+step=(a['descriptor']-ns['DESCRIPTOR'])//0x20
+emit('post-render:second-context',c.build_compute_queue_context_item(a['descriptor'],a['queue'],a['grid'],flags_200=a['qctx_flags'],word_220=a['qctx_word_220'],word_330=0,word_338=a['qctx_word_338'],word_350=0x000110038001a002+step,word_358=0x000020038001a03b+step,word_378=0x003fffffffffffff,item_index=0))
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'lifecycle'
     subprocess.run([args.rustc,'--edition=2021',str(Path(__file__).with_name('g17p_compute_lifecycle.rs')),'-o',str(binary)],check=True)
