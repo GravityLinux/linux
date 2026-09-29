@@ -11,7 +11,7 @@
 #include <dt-bindings/phy/phy.h>
 #include <dt-bindings/pinctrl/apple.h>
 #include <dt-bindings/spmi/spmi.h>
-
+#include "t8140-neo-gpu-memory.dtsi"
 
 / {
 	compatible = "apple,t8140", "apple,arm-platform";
@@ -168,9 +168,10 @@
 			mboxes = <&agx_mbox>, <&agx1_mbox>;
 			mbox-names = "primary", "secondary";
 			memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_l2>,
-					<&uat_handoff>, <&gpu_firmware>, <&gpu_firmware_secondary>;
+					<&uat_handoff>, <&gpu_firmware>, <&gpu_firmware_secondary>,
+					<&neo_source_memory>;
 			memory-region-names = "ttbs", "pagetables", "l2", "handoff",
-					      "firmware", "firmware-secondary";
+					      "firmware", "firmware-secondary", "source-graph";
 		};
 
 		agx_mbox: mailbox@482608000 {

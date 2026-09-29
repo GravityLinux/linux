@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// Generated from g17p_source_topology.py by tests/import_g17p_topology.py.
+// Address-only source topology. No table or firmware page bodies.
+
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		neo_source_memory: gpu-source-memory@10021598000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			/* Excludes MMIO and the existing ADT L2 reservation. */
+			reg = <0x100 0x21598000 0 0x4000>,
+			      <0x100 0x215d8000 0 0x4000>,
+			      <0x100 0x2d3d4000 0 0x4000>,
+			      <0x100 0x34a00000 0 0x158000>,
+			      <0x100 0x34b5c000 0 0x24000>,
+			      <0x100 0x34bcc000 0 0x4000>,
+			      <0x100 0x34c3c000 0 0x4000>,
+			      <0x100 0x34e00000 0 0x340000>,
+			      <0x100 0x35144000 0 0x4000>,
+			      <0x100 0x351a0000 0 0x14000>,
+			      <0x100 0x351c0000 0 0x8000>,
+			      <0x100 0x351d0000 0 0x430000>,
+			      <0x100 0x359e0000 0 0x20000>,
+			      <0x100 0x5439c000 0 0x4c000>,
+			      <0x100 0x543f0000 0 0x8000>,
+			      <0x100 0x54438000 0 0x28000>,
+			      <0x100 0x57b90000 0 0x8000>,
+			      <0x100 0x57ba0000 0 0x4000>,
+			      <0x100 0x594e8000 0 0x4000>,
+			      <0x100 0x594f0000 0 0x8000>,
+			      <0x100 0x59530000 0 0x4000>,
+			      <0x100 0x5a184000 0 0xc000>,
+			      <0x100 0x5bb44000 0 0x8000>,
+			      <0x100 0x5c0b8000 0 0x18000>;
+		};
+	};
+};
