@@ -59,8 +59,8 @@ pub fn tests(){
  changes.push((0x2100004000,0,0x15000000000|(FLAGS & !(1<<54))));
  let mut refusals=0;let mut successes=0;
  for budget in 0..300 {
-  let mut vm=base.clone();reset();BUDGET.with(|b|b.set(Some(budget)));let r=vm.rebind(&changes,1);BUDGET.with(|b|b.set(None));
-  if r==Err(ENOMEM){refusals+=1;unchanged(&vm,&before);vm.rebind(&changes,1).unwrap();}else{r.unwrap();successes+=1;}
+  let mut vm=base.clone();reset();BUDGET.with(|b|b.set(Some(budget)));let r=vm.rebind(&changes,&[1]);BUDGET.with(|b|b.set(None));
+  if r==Err(ENOMEM){refusals+=1;unchanged(&vm,&before);vm.rebind(&changes,&[1]).unwrap();}else{r.unwrap();successes+=1;}
   for &(va,_,new)in &changes{assert_eq!(vm.pte(va).unwrap(),new);}
   assert_eq!(vm.pte(initial[2].0).unwrap(),initial[2].1|FLAGS,"private growth leaf changed");
   let log=trace();let flushes:Vec<_>=log.iter().enumerate().filter(|(_,v)|v.0==0).collect();assert_eq!(flushes.len(),2);assert_eq!(flushes[1].0,log.len()-1);
@@ -71,11 +71,13 @@ pub fn tests(){
  }
  assert!(refusals>100&&successes>0);
  for last in [(initial[2].0,0,0x16000000000|FLAGS),(changes[0].0,changes[0].1,0),(1<<42,0,FLAGS),(0x3200000001,0,FLAGS),(0x3200000000,0,1),(0x3200000000,0,FLAGS),(0x3200000000,0,(1<<63)|FLAGS)]{
-  let mut vm=base.clone();reset();let mut bad=changes.clone();bad.push(last);assert_eq!(vm.rebind(&bad,1),Err(EINVAL));unchanged(&vm,&before);
+  let mut vm=base.clone();reset();let mut bad=changes.clone();bad.push(last);assert_eq!(vm.rebind(&bad,&[1]),Err(EINVAL));unchanged(&vm,&before);
  }
- for ctx in [0,64,u16::MAX]{let mut vm=base.clone();reset();assert_eq!(vm.rebind(&changes,ctx),Err(EINVAL));unchanged(&vm,&before);}
- let mut vm=base.clone();reset();vm.rebind(&[(initial[0].0,initial[0].1|FLAGS,initial[0].1|FLAGS)],1).unwrap();assert_eq!(trace(),vec![(0,1,0),(0,1,0)]);
- println!("PASS: actual UserVm::rebind/pte; {} allocation refusals with unchanged live tables and successful retry; {} successful replacement/removal/addition plans; private growth preservation, break-before-make, child-first links, 10 invalid plans, unchanged-leaf preservation",refusals,successes);
+ for ctx in [0,64,u16::MAX]{let mut vm=base.clone();reset();assert_eq!(vm.rebind(&changes,&[ctx]),Err(EINVAL));unchanged(&vm,&before);}
+ for contexts in [&[][..], &[2,2][..], &[1,0][..]] {let mut vm=base.clone();reset();assert_eq!(vm.rebind(&changes,contexts),Err(EINVAL));unchanged(&vm,&before);}
+ let mut vm=base.clone();reset();vm.rebind(&changes,&[2,3]).unwrap();let log=trace();let flushes:Vec<_>=log.iter().enumerate().filter(|(_,v)|v.0==0).map(|(i,v)|(i,v.1)).collect();assert_eq!(flushes,vec![(2,2),(3,3),(log.len()-2,2),(log.len()-1,3)]);for &(va,_,new)in &changes{assert_eq!(vm.pte(va).unwrap(),new);}
+ let mut vm=base.clone();reset();vm.rebind(&[(initial[0].0,initial[0].1|FLAGS,initial[0].1|FLAGS)],&[1]).unwrap();assert_eq!(trace(),vec![(0,1,0),(0,1,0)]);
+ println!("PASS: actual UserVm::rebind/pte; {} allocation refusals with unchanged live tables and successful retry; {} successful replacement/removal/addition plans; private growth preservation, break-before-make, child-first links, 13 invalid plans, both compute ASIDs flushed before make/release, unchanged-leaf preservation",refusals,successes);
 }
 }
 fn main(){candidate::tests();}

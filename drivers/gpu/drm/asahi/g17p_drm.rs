@@ -1160,20 +1160,23 @@ impl File {
             sync.complete();
             return Ok(0);
         }
-        if let Some(client) = runtime.session.compute_client()? {
-            // This admission step supports the retained address space. A
-            // changed binding set or another VM needs the later VM-handoff
-            // path, and must never silently execute using old translations.
-            if client.owner != (inner.id, vm.id)
-                || client.bindings.len() != vm.bindings.len()
+        let mut replacement = if let Some(client) = runtime.session.compute_client()? {
+            if client.owner != (inner.id, vm.id) {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+            if client.bindings.len() != vm.bindings.len()
                 || !vm.bindings.iter().enumerate().all(|(i, b)| {
                     client.bindings[i] == (b.start, b.size, b.offset, b.flags)
                         && core::ptr::eq(&*client.buffers[i], &*b.bo)
                 })
             {
-                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+                Some(vm.snapshot((inner.id, vm.id), false)?)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         // Admit the complete batch before its first publication. In
         // particular, exhaustion may never execute an accepted prefix.
         if parameters.len() > runtime.session.compute_remaining()? {
@@ -1184,9 +1187,12 @@ impl File {
                 return Err(EINVAL);
             };
             if runtime.session.compute_client()?.is_some() {
-                runtime
-                    .session
-                    .submit_next_compute(dev.as_ref(), &runtime.image, parameters)?;
+                runtime.session.submit_next_compute(
+                    dev.as_ref(),
+                    &runtime.image,
+                    replacement.take(),
+                    parameters,
+                )?;
             } else {
                 let client = vm.snapshot((inner.id, vm.id), false)?;
                 runtime
