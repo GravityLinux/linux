@@ -26,6 +26,7 @@ module=ast.Module(body=[node for node in tree.body if any(nodes[name] is node fo
 exec(compile(module,'source-only-native-add3','exec'),ns)
 expected=[]
 def emit(name,body):expected.append((name,body))
+emit('opening-program',b''.join(struct.pack('<IQ',*r) for r in ns['_registers_for_workload'](0,resource_base=0x30000000000,cdm_base=0x10000600000)))
 for n in (1,2,3,4,34,35,36,127,128,239,240,255,256,383,384,1024):
     for slot in (0,1,2):
         base=ns['_work_addresses'](n)

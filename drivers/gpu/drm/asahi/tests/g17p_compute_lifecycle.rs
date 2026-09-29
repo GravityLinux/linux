@@ -9,6 +9,10 @@ fn emit(body: &[u8]) {
     std::io::stdout().write_all(body).unwrap();
 }
 fn main() {
+    for (number, value) in lifecycle::opening_program(0x30000000000, 0x10000600000).unwrap() {
+        emit(&number.to_le_bytes());
+        emit(&value.to_le_bytes());
+    }
     for n in [
         1, 2, 3, 4, 34, 35, 36, 127, 128, 239, 240, 255, 256, 383, 384, 1024,
     ] {

@@ -12,6 +12,29 @@ pub(crate) const SUPPORT: u64 = 0xfffffc20c08d0000;
 pub(crate) const SUPPORT_STATE: u64 = 0xfffffc2001688000;
 pub(crate) const ZERO: u64 = 0xfffffc2001698000;
 
+/// Cold source startup uses the compact 36-register program. The four UAPI
+/// USC/helper registers belong to the subsequent caller submission profile.
+pub(crate) fn opening_program(preempt: u64, cdm: u64) -> Result<[c::Register; 36]> {
+    let program = c::Program {
+        preempt,
+        cdm,
+        identity: 0x010001d7020001dc,
+        context: 2,
+        ordinal: 0,
+        robustness: 0x1000018000,
+        operand_state: 0x7000220000,
+        usc_exec_base: c::USC_EXEC_BASE,
+        helper_binary: 0,
+        helper_data: 0,
+        helper_cfg: 0,
+        execution_gate: 1,
+    }
+    .build()?;
+    Ok(core::array::from_fn(|index| {
+        program[if index < 6 { index } else { index + 4 }]
+    }))
+}
+
 pub(crate) struct Retained {
     pub(crate) ordinal: u32,
     pub(crate) descriptor: u64,
