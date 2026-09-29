@@ -83,7 +83,9 @@ int main(void)
 	cmd->ts_vtx.start.offset = 1; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); cmd->ts_vtx.start.offset = 64;
 	cmd->ts_vtx.start.handle = UINT32_MAX; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, ENOENT); cmd->ts_vtx.start.handle = object.object_handle;
 	memcpy(buffer.bytes + sizeof(render_command), buffer.bytes, sizeof(render_command));
-	submit.cmdbuf_size *= 2; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP); submit.cmdbuf_size /= 2;
+	struct drm_asahi_cmd_render *last = (void *)(buffer.bytes + sizeof(buffer.bytes) - sizeof(*last));
+	last->flags |= 1U << 31;
+	submit.cmdbuf_size *= 2; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); submit.cmdbuf_size /= 2;
 	const unsigned draws = 32;
 	uint64_t history[32][4] = {{0}};
 	struct drm_syncobj_array reset = { .handles = (uintptr_t)&binary.handle, .count_handles = 1 };
