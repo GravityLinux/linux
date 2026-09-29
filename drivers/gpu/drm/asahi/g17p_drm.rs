@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Native Asahi memory UAPI and synchronous first-compute bring-up.
+//! Native Asahi memory UAPI and synchronous compute submissions.
 //! Published mappings and GEM references survive ioctl/file teardown until
 //! firmware is stopped. Unimplemented submission features fail explicitly.
 
@@ -746,29 +746,11 @@ impl File {
         state.queues.swap_remove(index);
         Ok(0)
     }
-    fn submit(dev: &Device, data: &uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+    fn compute_parameters(
+        vm: &Vm,
+        bytes: &[u8],
+    ) -> Result<super::g17p_compute_runtime::Parameters> {
         use super::g17p_compute_runtime as compute;
-        if data.flags != 0 || data.pad != 0 || data.cmdbuf_size == 0 {
-            return Err(EINVAL);
-        }
-        if data.in_sync_count != 0 || data.out_sync_count != 0 {
-            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
-        }
-        let mut bytes = KVVec::new();
-        UserSlice::new(
-            UserPtr::from_addr(data.cmdbuf as usize),
-            data.cmdbuf_size as usize,
-        )
-        .reader()
-        .read_all(&mut bytes, GFP_KERNEL)?;
-        let inner = file.inner();
-        let state = inner.state.lock();
-        let queue = state
-            .queues
-            .iter()
-            .find(|q| q.id == data.queue_id)
-            .ok_or(ENOENT)?;
-        let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
         let mut offset = 0;
         let mut command = None;
         while offset < bytes.len() {
@@ -852,7 +834,46 @@ impl File {
                 sampler_count: cmd.sampler_count,
             });
         }
-        let parameters = command.ok_or(EINVAL)?;
+        command.ok_or(EINVAL)
+    }
+    fn submit(dev: &Device, data: &uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+        if data.flags != 0
+            || data.pad != 0
+            || data.cmdbuf_size == 0
+            || data.cmdbuf_size > 1024 * 1024
+        {
+            return Err(EINVAL);
+        }
+        let sync = super::g17p_sync::Plan::read(file, data)?;
+        let mut bytes = KVVec::new();
+        UserSlice::new(
+            UserPtr::from_addr(data.cmdbuf.try_into()?),
+            data.cmdbuf_size as usize,
+        )
+        .reader()
+        .read_all(&mut bytes, GFP_KERNEL)?;
+        let inner = file.inner();
+        {
+            let state = inner.state.lock();
+            let queue = state
+                .queues
+                .iter()
+                .find(|q| q.id == data.queue_id)
+                .ok_or(ENOENT)?;
+            let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
+            Self::compute_parameters(vm, &bytes)?;
+        }
+        // No file/runtime lock across waits. A concurrent producer may need
+        // this very file. Revalidate mappings after the wait before staging.
+        sync.wait_inputs()?;
+        let state = inner.state.lock();
+        let queue = state
+            .queues
+            .iter()
+            .find(|q| q.id == data.queue_id)
+            .ok_or(ENOENT)?;
+        let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
+        let parameters = Self::compute_parameters(vm, &bytes)?;
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
         if let Some(client) = runtime.session.compute_client()? {
@@ -877,6 +898,7 @@ impl File {
                 .session
                 .submit_compute(dev.as_ref(), &runtime.image, client, &parameters)?;
         }
+        sync.complete();
         Ok(0)
     }
 }
