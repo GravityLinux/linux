@@ -154,6 +154,7 @@ struct Report {
     host: u32,
     firmware: u32,
     records: KVec<[u8; 0x48]>,
+    peer_credits: [u32; 2],
 }
 impl Report {
     fn new() -> Self {
@@ -161,6 +162,7 @@ impl Report {
             host: 0,
             firmware: 0,
             records: KVec::new(),
+            peer_credits: [0; 2],
         }
     }
 }
@@ -326,6 +328,42 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn compute_client(&self) -> Result<Option<&compute::Client>> {
+        if self.phase == Phase::Failed {
+            return Err(EIO);
+        }
+        if self.phase != Phase::Prepared && self.phase != Phase::Running {
+            return Err(EBUSY);
+        }
+        Ok(self.compute.as_ref().map(|work| &work.client))
+    }
+
+    pub(crate) fn submit_next_compute(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        parameters: &compute::Parameters,
+    ) -> Result {
+        if self.phase != Phase::Running {
+            return Err(EIO);
+        }
+        let work = self.compute.as_mut().ok_or(EINVAL)?;
+        if work.ordinal + 1 >= compute::SUBMISSIONS || work.preempt != parameters.preempt {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        let result = compute::stage_next(
+            self.memory.as_mut().ok_or(EINVAL)?,
+            self.vm.as_ref().ok_or(EINVAL)?,
+            work,
+            parameters,
+        )
+        .and_then(|()| self.run_compute(dev, image));
+        if result.is_err() {
+            self.phase = Phase::Failed;
+        }
+        result
+    }
+
     pub(crate) fn submit_compute(
         &mut self,
         dev: &kernel::device::Device,
@@ -347,7 +385,7 @@ impl Session {
         // Ownership precedes the first mailbox publication. Even an initdata
         // timeout or firmware error keeps every reachable client page pinned.
         self.compute = Some(work);
-        let result = self.run_first_compute(dev, image);
+        let result = self.run_compute(dev, image);
         if result.is_err() {
             self.phase = Phase::Failed;
         }
@@ -370,6 +408,7 @@ impl Session {
                 if host >= 256 || firmware >= 256 {
                     return Err(EIO);
                 }
+                report.peer_credits[counter / 2] = firmware;
                 if counter == 0 {
                     report.host = host;
                     report.firmware = firmware;
@@ -394,12 +433,43 @@ impl Session {
         Ok(reports)
     }
 
-    fn run_first_compute(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
-        self.start(dev, image)?;
+    fn acknowledge_reports(&mut self, image: &Image, reports: &[Report; 2]) -> Result {
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        for (peer, channels) in image.graph.channels.iter().enumerate() {
+            for index in [13, 14] {
+                for state in [0, 2] {
+                    let address = channels[index].states[state];
+                    if address == 0 {
+                        continue;
+                    }
+                    // Channel 13 returns only the copied, validated credits.
+                    // Channel 14 is source telemetry credit bookkeeping.
+                    let value = if index == 13 {
+                        reports[peer].peer_credits[state / 2]
+                    } else {
+                        memory.read_firmware32(vm.physical(memory, 2, address)? + 0x20)?
+                    };
+                    vm.write(memory, 2, address, &value.to_le_bytes())?;
+                }
+            }
+        }
+        g17p_memory::sync();
+        Ok(())
+    }
+
+    fn run_compute(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        if self.phase == Phase::Prepared {
+            self.start(dev, image)?;
+        }
         let startup = self.report_snapshot(image)?;
         let work = self.compute.as_ref().ok_or(EINVAL)?;
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
         let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        if let Some((address, value)) = work.publication.deferred_inner {
+            vm.write(memory, 2, address, &value.to_le_bytes())?;
+            g17p_memory::sync();
+        }
         let (address, value) = work.publication.deferred_outer.ok_or(EINVAL)?;
         vm.write(memory, 2, address, &value.to_le_bytes())?;
         g17p_memory::sync();
@@ -411,7 +481,8 @@ impl Session {
             .send_message(0x21, queue::COMPUTE_DOORBELL)?;
         dev_info!(
             dev,
-            "G17P: first caller compute published on CL2, client root {:#x}\n",
+            "G17P: caller compute {} published on CL2, client root {:#x}\n",
+            work.ordinal,
             work.client.root.root()
         );
         let mut last = [0u32; 6];
@@ -467,6 +538,7 @@ impl Session {
                     &last[..3],
                     &last[3..]
                 );
+                self.acknowledge_reports(image, &after)?;
                 return Ok(());
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));

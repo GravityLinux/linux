@@ -245,11 +245,16 @@ impl Vm {
         }
         Ok(())
     }
-    fn snapshot(&self) -> Result<super::g17p_compute_runtime::Client> {
+    fn snapshot(&self, owner: (u64, u32)) -> Result<super::g17p_compute_runtime::Client> {
         let mut root = UserVm::new()?;
         let mut buffers = KVec::new();
+        let mut bindings = KVec::new();
         for binding in &self.bindings {
             buffers.push(binding.bo.clone(), GFP_KERNEL)?;
+            bindings.push(
+                (binding.start, binding.size, binding.offset, binding.flags),
+                GFP_KERNEL,
+            )?;
             root.prepare(binding.start, binding.size)?;
             let mut pages = KVec::new();
             let extent = if binding.flags & SINGLE != 0 {
@@ -284,7 +289,12 @@ impl Vm {
                 root.map_page(binding.start + index * PAGE, pa, binding.flags & WRITE != 0)?;
             }
         }
-        Ok(super::g17p_compute_runtime::Client { root, buffers })
+        Ok(super::g17p_compute_runtime::Client {
+            root,
+            buffers,
+            bindings,
+            owner,
+        })
     }
     fn unbind(&mut self, start: u64, end: u64) -> Result {
         let mut next = KVec::with_capacity(
@@ -845,11 +855,28 @@ impl File {
         let parameters = command.ok_or(EINVAL)?;
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
-        runtime.session.require_first_work()?;
-        let client = vm.snapshot()?;
-        runtime
-            .session
-            .submit_compute(dev.as_ref(), &runtime.image, client, &parameters)?;
+        if let Some(client) = runtime.session.compute_client()? {
+            // This admission step supports the retained address space. A
+            // changed binding set or another VM needs the later VM-handoff
+            // path, and must never silently execute using old translations.
+            if client.owner != (inner.id, vm.id)
+                || client.bindings.len() != vm.bindings.len()
+                || !vm.bindings.iter().enumerate().all(|(i, b)| {
+                    client.bindings[i] == (b.start, b.size, b.offset, b.flags)
+                        && core::ptr::eq(&*client.buffers[i], &*b.bo)
+                })
+            {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+            runtime
+                .session
+                .submit_next_compute(dev.as_ref(), &runtime.image, &parameters)?;
+        } else {
+            let client = vm.snapshot((inner.id, vm.id))?;
+            runtime
+                .session
+                .submit_compute(dev.as_ref(), &runtime.image, client, &parameters)?;
+        }
         Ok(0)
     }
 }

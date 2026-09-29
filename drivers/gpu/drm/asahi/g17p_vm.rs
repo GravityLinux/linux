@@ -282,6 +282,10 @@ impl Vm {
             let at = va + offset as u64;
             let size = (bytes.len() - offset).min((PAGE - (at & (PAGE - 1))) as usize);
             let pa = self.physical(memory, group, at)?;
+            // Every earlier host store through this API was cleaned. Preserve
+            // adjacent firmware-owned bytes when a partial cache line is now
+            // updated, particularly split counters and scheduler slots.
+            memory.invalidate(pa, size)?;
             memory.write(pa, &bytes[offset..offset + size])?;
             memory.clean(pa, size)?;
             offset += size;

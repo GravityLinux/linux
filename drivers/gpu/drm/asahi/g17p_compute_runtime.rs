@@ -4,8 +4,9 @@
 //! field values follow native_add3's direct queue zero, without its workload.
 
 use super::{
-    g17p_abi as abi, g17p_compute as c, g17p_compute_memory as cm, g17p_drm::Object,
-    g17p_image::Image, g17p_memory::Memory, g17p_queue as q, g17p_user_vm::UserVm, g17p_vm::Vm,
+    g17p_abi as abi, g17p_compute as c, g17p_compute_lifecycle as lifecycle,
+    g17p_compute_memory as cm, g17p_drm::Object, g17p_image::Image, g17p_memory::Memory,
+    g17p_queue as q, g17p_user_vm::UserVm, g17p_vm::Vm,
 };
 use kernel::{drm::gem::BaseObject, prelude::*, sync::aref::ARef};
 
@@ -36,6 +37,8 @@ pub(crate) const STATUS: [u64; 2] = [0xfffffc2000024c68, 0xfffffc2000024c70];
 pub(crate) struct Client {
     pub(crate) root: UserVm,
     pub(crate) buffers: KVec<ARef<Object>>,
+    pub(crate) bindings: KVec<(u64, u64, u64, u32)>,
+    pub(crate) owner: (u64, u32),
 }
 impl Client {
     pub(crate) fn cache(&self, invalidate: bool) -> Result {
@@ -73,7 +76,11 @@ pub(crate) struct Submission {
     pub(crate) client: Client,
     pub(crate) publication: q::Publication,
     pub(crate) channel: abi::Channel,
+    pub(crate) ordinal: u32,
+    pub(crate) preempt: u64,
 }
+// Admission is bounded until transport handoff and context reuse are wired.
+pub(crate) const SUBMISSIONS: u32 = 32;
 struct Writer<'a> {
     memory: &'a mut Memory,
     vm: &'a Vm,
@@ -158,6 +165,27 @@ pub(crate) fn build(
     }
     vm.alias_firmware(memory, DESCRIPTOR, DESCRIPTOR_LOW, PAGE)?;
     vm.alias_firmware(memory, CTX_HIGH, CTX_LOW, 8 * PAGE)?;
+    // Reserve the retained-lifetime storage before initdata publication. This
+    // preserves all page-table and alias placement while firmware is running.
+    for ordinal in 1..SUBMISSIONS {
+        let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
+        vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
+        for (address, size) in [
+            (spec.scheduler, 0x100),
+            (spec.scheduler_slot, 4),
+            (spec.optional, 0xc0),
+            (spec.event, 0x40),
+            (spec.dispatch[0], 8),
+            (spec.dispatch[1], 8),
+            (spec.status[0], 8),
+            (spec.status[1], 8),
+            (lifecycle::SUPPORT, PAGE),
+            (lifecycle::SUPPORT_STATE, PAGE),
+            (lifecycle::ZERO, PAGE),
+        ] {
+            vm.ensure_firmware(memory, address, size)?;
+        }
+    }
     let write = |memory: &mut Memory, va, bytes: &[u8]| vm.write(memory, 2, va, bytes);
     let mut dispatch = [0u8; 0x20];
     abi::compute_dispatch(&mut dispatch).map_err(|_| EINVAL)?;
@@ -364,12 +392,13 @@ pub(crate) fn build(
     vm.flush_tables(memory)?;
     // Exact first-work client context table: independent empty upper roots.
     // Install only after the graph and all caller references are owned.
-    for context in 0..3 {
+    for context in 0..4 {
         let high = memory.allocate(PAGE)?;
         memory.clean(high, PAGE)?;
         memory.write64(ttbs + context * 16 + 8, (context << 48) | high | 1)?;
     }
     memory.write64(ttbs + 2 * 16, (2 << 48) | client.root.root() | 1)?;
+    memory.write64(ttbs + 3 * 16, (3 << 48) | client.root.root() | 1)?;
     memory.clean(ttbs, 64 * 16)?;
     super::g17p_memory::sync();
     // SAFETY: Invalidate GPU ASID translations after publishing owned roots.
@@ -385,5 +414,123 @@ pub(crate) fn build(
         client,
         publication,
         channel,
+        ordinal: 0,
+        preempt: parameters.preempt,
     })
+}
+
+/// Prepare one later item on the completed retained transport. No producer
+/// becomes visible until the session validates and explicitly publishes it.
+pub(crate) fn stage_next(
+    memory: &mut Memory,
+    vm: &Vm,
+    work: &mut Submission,
+    parameters: &Parameters,
+) -> Result {
+    let ordinal = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+    if ordinal >= SUBMISSIONS || parameters.preempt != work.preempt {
+        return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+    }
+    let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
+    let mut counters = [0; 3];
+    for (index, address) in work.channel.states.iter().enumerate() {
+        counters[index] = memory.read_firmware32(vm.physical(memory, 2, *address)?)?;
+    }
+    let counters = q::Counters::new(counters).map_err(|_| EIO)?;
+    let done = memory.read_firmware32(vm.physical(memory, 2, POINTERS)?)?;
+    if !work.publication.completed(done, counters) {
+        return Err(EBUSY);
+    }
+    let write_index = memory.read_firmware32(vm.physical(memory, 2, POINTERS + 0x40)?)?;
+    if write_index != work.publication.write_after {
+        return Err(EIO);
+    }
+    let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+    page.resize(PAGE, 0, GFP_KERNEL)?;
+    let write = |memory: &mut Memory, address, bytes: &[u8]| vm.write(memory, 2, address, bytes);
+    write(memory, spec.scheduler, &spec.scheduler_body())?;
+    write(memory, spec.scheduler_slot, &1u32.to_le_bytes())?;
+    if ordinal == 1 {
+        cm::Support {
+            compact: None,
+            header: 3,
+            word_08: 0,
+            word_10: 2,
+            resource_class: 0x15,
+            word_20: None,
+            word_28: None,
+            client_state: OPERAND_TABLE,
+            firmware_state: lifecycle::SUPPORT_STATE,
+            cursor: 0xa8,
+            field_54: 1,
+            field_5c: 1,
+            final_kind: 2,
+        }
+        .build(&mut page)
+        .map_err(|_| EINVAL)?;
+        write(memory, lifecycle::SUPPORT, &page)?;
+        page.fill(0);
+        write(memory, lifecycle::ZERO, &page)?;
+        write(memory, CONTROL, &lifecycle::channel_control())?;
+        write(memory, JOB_LIST, &q::job_list(JOB_LIST))?;
+    }
+    write(
+        memory,
+        lifecycle::SUPPORT_STATE,
+        &(ordinal + 1).to_le_bytes(),
+    )?;
+    for address in spec.dispatch {
+        write(memory, address, &[0; 4])?;
+    }
+    for address in spec.status {
+        write(memory, address, &[0; 8])?;
+    }
+    let registers = spec
+        .program(parameters.preempt, parameters.cdm, 0)
+        .map_err(|_| EINVAL)?;
+    spec.descriptor_body(
+        &mut page,
+        &registers,
+        parameters.end,
+        parameters.sampler,
+        parameters.sampler_count,
+    )
+    .map_err(|_| EINVAL)?;
+    write(memory, spec.descriptor, &page[..0x1000])?;
+    write(memory, spec.optional, &spec.optional_body())?;
+    spec.context_body(&mut page[..0x200]).map_err(|_| EINVAL)?;
+    write(memory, spec.context_record, &page[..0x200])?;
+    write(memory, spec.event, &[0; 0x40])?;
+    work.client.cache(false)?;
+    let publication = q::Stage {
+        queue: QUEUE,
+        pointers: POINTERS,
+        item_ring: RING,
+        item_capacity: 0x2870 / 8,
+        write_index,
+        channel_ring: work.channel.ring,
+        channel_producer: work.channel.states[2],
+        counters,
+        slot: None,
+        items: &[spec.descriptor, spec.optional, spec.event],
+        group: ordinal + 1,
+        grid: 4,
+        kind: q::Kind::Compute,
+        first: false,
+        in_place: false,
+        announce: false,
+        defer_inner: true,
+        defer_outer: true,
+        event_subtype: None,
+        event_counter: None,
+        event_counter_low: 2,
+    }
+    .publish(&mut Writer { memory, vm })
+    .map_err(|error| match error {
+        q::StageError::Access(e) => e,
+        q::StageError::Protocol(_) => EINVAL,
+    })?;
+    work.ordinal = ordinal;
+    work.publication = publication;
+    Ok(())
 }

@@ -135,6 +135,9 @@ mod g17p_memory {
         pub fn clean(&self, _: u64, _: usize) -> Result {
             Ok(())
         }
+        pub fn invalidate(&self, _: u64, _: usize) -> Result {
+            Ok(())
+        }
         pub fn walk(&self, root: u64, va: u64) -> u64 {
             let l2 = self.read64(root + ((va >> 36) & 63) * 8).unwrap();
             assert_eq!(l2 & 3, 3);

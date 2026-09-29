@@ -42,3 +42,17 @@ RAM. It checks 962 firmware, context-0 alias and MMIO leaf translations, every
 initdata byte after physical placement, both distinct private firmware roots,
 and all three context tags. A pre-existing shared-L2 mapping must fail before
 context publication. It does not simulate firmware execution or cache coherence.
+
+Retained direct-compute metadata (source-only, no device access):
+
+```
+python3 drivers/gpu/drm/asahi/tests/check_g17p_compute_lifecycle.py /path/to/m1n1
+```
+
+The runtime currently admits 32 synchronous compute submissions with unchanged
+bindings in the first submitting VM. The source-profile test covers later wrap
+metadata too; it does not claim that runtime wrap/handoff is implemented. The
+native `g17p-drm-compute` test changes its input arrays and poisons its output on
+each submission, checks all 2048 floats and every tail guard, then verifies that
+admission exhaustion returns EOPNOTSUPP without touching the output. Changed VMs
+or bindings are explicitly rejected until VM handoff is connected.
