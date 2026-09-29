@@ -19,6 +19,7 @@ fn hash(h: &mut u64, value: u8) {
     *h = (*h ^ value as u64).wrapping_mul(0x100000001b3);
 }
 fn main() {
+    println!("compute-mailbox {COMPUTE_DOORBELL:x}");
     for case in 0u32..192 {
         let kind = match case % 3 {
             0 => Kind::Tiling,
