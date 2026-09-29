@@ -90,3 +90,59 @@ pub(crate) fn status_config(fwctl: u64) -> [(usize, u64); 5] {
         (0x48e8, fwctl + 0x40),
     ]
 }
+
+/// The compute-capable partial startup retains the empty render owner's
+/// resource/dispatch headers. They are still needed by later CL work.
+pub(crate) fn resource_record() -> [u8; 8] {
+    let mut out = [0; 8];
+    out[..4].copy_from_slice(&0x19000u32.to_le_bytes());
+    out[4..].copy_from_slice(&0x20u32.to_le_bytes());
+    out
+}
+
+pub(crate) fn dispatch_record() -> [u8; 0x20] {
+    let mut out = [0; 0x20];
+    for (offset, value) in [
+        (0, 0xe0000000u32),
+        (4, 0x08000000),
+        (12, 0x3800),
+        (16, 0x1c00),
+    ] {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Source cold-start current-job records. The secondary profile installs only
+/// headers and pointers; its second qword is firmware-owned and starts zero.
+pub(crate) fn current_jobs(secondary: bool) -> [u8; 0x80] {
+    let mut out = [0; 0x80];
+    for (index, (header, second, descriptor, queue)) in [
+        (
+            0x0001000000000013u64,
+            0x20u64,
+            0xfffffc20c0018000u64,
+            0xfffffc20c0000000u64,
+        ),
+        (
+            0x0101000000000223,
+            0x82,
+            0xfffffc20c00b0000,
+            0xfffffc20c00000c0,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let base = index * 0x40;
+        for (offset, value) in [
+            (0, header),
+            (8, if secondary { 0 } else { second }),
+            (0x30, descriptor),
+            (0x38, queue),
+        ] {
+            out[base + offset..base + offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    out
+}

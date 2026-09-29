@@ -24,9 +24,11 @@ root = args.m1n1 / 'proxyclient'
 source = root / 'experiments/agx_g17p_boot.py'
 parsed = ast.parse(source.read_text())
 consts = set('INITIAL_QUEUE_CONTEXT_PAGES CONTEXT NATIVE_FIRMWARE_SLOT NATIVE_FIRMWARE_CONTEXT NATIVE_RENDER_SLOT NATIVE_RENDER_CONTEXT CONTEXT_QUEUE_WORDS CONTEXT_QUEUE_ADDRESSES PARTIAL_OPENING_SHARED_CONTROL_ADDRESS PARTIAL_OPENING_SHARED_CONTROL_INNER_ADDRESS CHANNEL_CONTROL_ADDRESS CHANNEL_CONTROL_STRIDE CHANNEL_CONTROL_RECORDS CHANNEL_CONTROL_ITEM_RECORD CHANNEL_CONTROL_WORDS CONTROL_OPERAND_TABLE_VA COMPUTE_BINDING_OPERAND_TABLE_VA COMPUTE_CLASS2_SUPPORT_TABLE_VA CONTROL_OPERAND_ENTRIES CONTROL_OPERAND_ENTRIES_RUNTIME PARTIAL_CONTROL_OPERAND_ENTRIES CONTROL_OPERAND_BUFFER_BASE CONTROL_OPERAND_BUFFER_STRIDE CONTROL_OPERAND_BUFFER_SIZE PARTIAL_SHARED_CONTROL_COUNT_AFTER PARTIAL_SHARED_CONTROL_COUNT_BEFORE'.split())
-functions = set('stage_device_control prepare_final_26_6_opening_control build_context_queue_state bind_contexts'.split())
+consts.update('PER_SUBMISSION_RECORD_VA PARTIAL_SECONDARY_SUBMISSION_RECORD_VA PER_SUBMISSION_RECORD_STRIDE PER_SUBMISSION_RECORD_HEADERS PER_SUBMISSION_DESCRIPTOR_AT PER_SUBMISSION_QUEUE_AT DISPATCH_RECORD_VA PARTIAL_DISPATCH_RECORD_FIELDS PARTIAL_INITIAL_RESOURCE_RECORD_FIELDS'.split())
+functions = set('build_per_submission_records build_dispatch_record stage_device_control prepare_final_26_6_opening_control build_context_queue_state bind_contexts'.split())
 env = dict(PARTIAL_OPENING_GRAPH=True, PAGE=0x4000, struct=struct,
-    os=NS(getenv=lambda key: '1' if key in ('G17P_PARTIAL_OPENING_GRAPH', 'G17P_FINAL_26_6_CONTROL_LIFECYCLE', 'G17P_SOURCE_PRESENT_PRIMARY_CONTROL_DONE') else None),
+    legacy_aug5_topology=lambda:False,
+    os=NS(getenv=lambda key,default=None: 'header-pointers' if key=='G17P_PARTIAL_SECONDARY_RECORD_FIELDS' else '1' if key in ('G17P_PARTIAL_OPENING_GRAPH', 'G17P_FINAL_26_6_CONTROL_LIFECYCLE', 'G17P_SOURCE_PRESENT_PRIMARY_CONTROL_DONE') else None),
     LOW_ALIAS_FLAGS={}, NORMAL_OBJECT_FLAGS={}, RENDER_SNAPSHOT_ROOT=2,
     MemoryAttr=NS(Shared=2))
 selected = []
@@ -66,6 +68,7 @@ class Ram:
         for offset, byte in enumerate(data):
             at = address + offset
             self.pages[at & -0x4000][at & 0x3fff] = byte
+    def readmem(self, address, size): return bytes(self.pages[(address+i)&-0x4000][(address+i)&0x3fff] for i in range(size))
     def write32(self, at, value): self.writemem(at, struct.pack('<I', value))
     def write64(self, at, value): self.writemem(at, struct.pack('<Q', value))
     def memset32(self, at, value, size):
@@ -108,6 +111,20 @@ with contextlib.redirect_stdout(io.StringIO()):
     expected['support'] = ram.body(0xfffffc20c0828000)[:0x70]
     assert ram.body(env['PARTIAL_OPENING_SHARED_CONTROL_INNER_ADDRESS'])[:4] == struct.pack('<I', 2)
 
+# Execute the full current-job/dispatch cold constructors against owned mock
+# pages. This catches omitted source work outside the initdata serializers.
+for va in (0x7001838000,0x7001840000,0xfffffc20015e8000,0xfffffc20c07d0000,0xfffffc20c07f8000):
+    ram.alloc_at(va,0x4000,'cold')
+env['leaf_output']=lambda uat,slot,va:ram.physical(va)
+with contextlib.redirect_stdout(io.StringIO()):
+    env['build_dispatch_record'](ram)
+    env['build_per_submission_records'](ram,ram,[('tiling',0xfffffc20c0018000,0xfffffc20c0000000),('fragment',0xfffffc20c00b0000,0xfffffc20c00000c0)])
+expected['resource']=ram.body(0x7001838000)[:8]
+expected['dispatch']=ram.body(0x7001840000)[:0x20]
+assert ram.body(0xfffffc20015e8000)[:0x20]==expected['dispatch']
+for index,va in enumerate((0xfffffc20c07d0000,0xfffffc20c07f8000)):
+    expected['jobs'+str(index)]=ram.body(va)[:0x80]
+
 # Run the current render entrypoint's post-ACK status writes too.
 status_ast = ast.parse((root / 'm1n1/agx/g17p_render_startup.py').read_text())
 status_ns = dict(struct=struct)
@@ -145,6 +162,8 @@ fn main() {
  for i in 0..2 { let mut page=vec![0; 0x4000]; page[..0x380].copy_from_slice(&opening::context(i).unwrap()); emit(&format!("context{i}"), &page); emit(&format!("message{i}"), &opening::message(i==1)); }
  let mut page=vec![0;0x4000]; page[..0x40].copy_from_slice(&opening::channel_control()); emit("channel", &page);
  emit("support", &opening::support());
+ emit("resource", &opening::resource_record()); emit("dispatch", &opening::dispatch_record());
+ for i in 0..2 { emit(&format!("jobs{i}"), &opening::current_jobs(i==1)); }
  let mut status=vec![0;0x10000]; for (offset,value) in opening::status_config(0xfffffc20001c0000) { status[offset..offset+8].copy_from_slice(&value.to_le_bytes()); } emit("status", &status);
 }
 '''.replace('MODULE',str(module))
