@@ -11,7 +11,7 @@ use super::{
     g17p_memory::{self, Memory},
     g17p_opening as opening,
     g17p_platform::Platform,
-    g17p_queue as queue,
+    g17p_queue as queue, g17p_render_runtime as render,
     g17p_vm::Vm,
 };
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -145,6 +145,7 @@ pub(crate) struct Session {
     phase: Phase,
     ttbs: u64,
     compute: Option<compute::Submission>,
+    render: Option<render::Submission>,
     timestamps: Option<super::g17p_timestamp::Registry>,
     peers: KVec<Peer>,
     memory: Option<Memory>,
@@ -180,6 +181,7 @@ impl Session {
             phase: Phase::Prepared,
             ttbs: platform.regions[0].base,
             compute: None,
+            render: None,
             timestamps: Some(super::g17p_timestamp::Registry::new()),
             peers: KVec::new(),
             memory: Some(Memory::new(dev, platform)?),
@@ -324,7 +326,7 @@ impl Session {
         if self.phase == Phase::Failed {
             return Err(EIO);
         }
-        if self.phase != Phase::Prepared || self.compute.is_some() {
+        if self.phase != Phase::Prepared || self.compute.is_some() || self.render.is_some() {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
         }
         Ok(())
@@ -352,6 +354,9 @@ impl Session {
     }
 
     pub(crate) fn compute_client(&self) -> Result<Option<&compute::Client>> {
+        if self.render.is_some() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         if self.phase == Phase::Failed {
             return Err(EIO);
         }
@@ -423,6 +428,136 @@ impl Session {
             self.phase = Phase::Failed;
         }
         result
+    }
+
+    pub(crate) fn submit_render(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        client: compute::Client,
+        parameters: &super::g17p_render::Parameters,
+    ) -> Result {
+        self.require_first_work()?;
+        let ttbs = self.ttbs;
+        let work =
+            self.stage(|memory, vm| render::build(memory, vm, image, ttbs, client, parameters))?;
+        self.render = Some(work);
+        let result = self.run_render(dev, image);
+        if result.is_err() {
+            self.phase = Phase::Failed;
+        }
+        result
+    }
+
+    fn run_render(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        let stamps = self.render.as_ref().ok_or(EINVAL)?.timestamps;
+        for pair in stamps.chunks_exact(2) {
+            self.timestamps
+                .as_ref()
+                .ok_or(EINVAL)?
+                .cache([pair[0], pair[1]], false)?;
+        }
+        self.start(dev, image)?;
+        let startup = self.report_snapshot(image)?;
+        {
+            let work = self.render.as_ref().ok_or(EINVAL)?;
+            let vm = self.vm.as_ref().ok_or(EINVAL)?;
+            let memory = self.memory.as_mut().ok_or(EINVAL)?;
+            work.after_control(memory, vm, self.ttbs)?;
+            work.restore(memory, vm, 1)?;
+            work.restore(memory, vm, 0)?;
+        }
+        self.peers[0]
+            .rtkit
+            .as_mut()
+            .ok_or(EINVAL)?
+            .as_mut()
+            .send_message(0x21, 0x0083000000000008)?;
+        dev_info!(
+            dev,
+            "G17P: caller render published on TA2/3D2, client root {:#x}\n",
+            self.render.as_ref().ok_or(EINVAL)?.client.root.root()
+        );
+        let mut last = [[0u32; 6]; 2];
+        let mut command_status = 0;
+        for _ in 0..500 {
+            if self
+                .peers
+                .iter()
+                .any(|p| p.data.crashed.load(Ordering::Acquire))
+            {
+                return Err(EIO);
+            }
+            let work = self.render.as_ref().ok_or(EINVAL)?;
+            let memory = self.memory.as_ref().ok_or(EINVAL)?;
+            let vm = self.vm.as_ref().ok_or(EINVAL)?;
+            let mut done = true;
+            for stage in 0..2 {
+                for (i, offset) in [
+                    queue::POINTER_DONE,
+                    queue::POINTER_READ,
+                    queue::POINTER_WRITE,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    last[stage][i] = memory.read_firmware32(vm.physical(
+                        memory,
+                        2,
+                        render::POINTERS[stage] + offset,
+                    )?)?;
+                }
+                for (i, address) in work.channels[stage].states.into_iter().enumerate() {
+                    last[stage][i + 3] =
+                        memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+                }
+                let counters =
+                    queue::Counters::new([last[stage][3], last[stage][4], last[stage][5]])
+                        .map_err(|_| EIO)?;
+                done &= work.publications[stage].completed(last[stage][0], counters);
+            }
+            let after = self.report_snapshot(image)?;
+            for (peer, (report, before)) in after.iter().zip(startup.iter()).enumerate() {
+                for (index, body) in report.records.iter().enumerate() {
+                    let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
+                    let receipt = index == 0
+                        && before.host == 0
+                        && report.host == 0
+                        && before.firmware == 1
+                        && before.records.len() == 1
+                        && before.records[0] == *body
+                        && body[..12] == [13, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+                    if opcode != 1 && !receipt {
+                        dev_err!(dev,"G17P: unhandled render report peer {} slot {} opcode {}; retaining graph\n",peer,(report.host+index as u32)&255,opcode);
+                        return Err(EIO);
+                    }
+                }
+            }
+            let pa = vm.physical(memory, 2, 0xfffffc2000024c70)?;
+            memory.invalidate(pa, 8)?;
+            command_status = memory.read64(pa)?;
+            if done && command_status != 0 {
+                work.client.cache(true)?;
+                for pair in stamps.chunks_exact(2) {
+                    self.timestamps
+                        .as_ref()
+                        .ok_or(EINVAL)?
+                        .cache([pair[0], pair[1]], true)?;
+                }
+                dev_info!(dev,"G17P: caller render complete: TA {:?}, 3D {:?}, status {:#x}; reports validated\n",last[0],last[1],command_status);
+                self.acknowledge_reports(image, &after)?;
+                return Ok(());
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+        }
+        dev_err!(
+            dev,
+            "G17P: caller render timeout: TA {:?}, 3D {:?}, status {:#x}; retaining graph\n",
+            last[0],
+            last[1],
+            command_status
+        );
+        Err(ETIMEDOUT)
     }
 
     fn report_snapshot(&self, image: &Image) -> Result<[Report; 2]> {
@@ -756,6 +891,7 @@ impl Drop for Session {
             // permanent; keep the runtime owner too as it gains owned tables.
             core::mem::forget(self.memory.take());
             core::mem::forget(self.compute.take());
+            core::mem::forget(self.render.take());
             core::mem::forget(self.timestamps.take());
         }
     }
