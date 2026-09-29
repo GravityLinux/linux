@@ -15,6 +15,7 @@ mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
 mod g17p_memory;
+mod g17p_opening;
 mod g17p_platform;
 mod g17p_topology;
 mod g17p_vm;

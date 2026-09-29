@@ -50,6 +50,7 @@ for group, name in enumerate(("context0", "render_low", "firmware_high")):
 rust += ["];", ""]
 for name, runs in (("FIRMWARE_RUNS", src.ROOT_RUNS[1]),
                    ("CONTEXT0_RUNS", src.ROOT_RUNS[0]),
+                   ("RENDER_RUNS", src._PARTIAL_RENDER_RUNS),
                    ("CONTEXT0_PEERS", src.CONTEXT0_FIRMWARE_PEER_RUNS)):
     rust += ["#[rustfmt::skip]", f"pub(crate) const {name}: &[(u64, usize, u64)] = &["]
     rust += [f"    ({first:#x}, {count}, {value:#x})," for first, count, value in runs]
