@@ -48,9 +48,8 @@ shared/optional records and operand directories. Its 512 queue-context cases
 cover ordinary, partial-opening, dependency and extended-context forms,
 explicit points/completion values, locator relocation and retained bytes on
 slot reuse. Event initialization is limited to the host's 64-byte record;
-adjacent bytes remain intact. These render constructors compile into the
-driver, but runtime render publication and rendered-output validation remain
-pending; the checks do not imply hardware render support.
+adjacent bytes remain intact. These constructors are used by the synchronous render runtime. Native output
+checks are separate from the serialization tests below.
 
 The topology import also generates the T8140 source-memory DT include. It
 reserves the union of prescribed RAM leaf/table pages, including the second
@@ -70,13 +69,16 @@ Retained direct-compute metadata (source-only, no device access):
 python3 drivers/gpu/drm/asahi/tests/check_g17p_compute_lifecycle.py /path/to/m1n1
 ```
 
-The runtime currently admits 32 total synchronous compute commands with unchanged
-bindings in the first submitting VM. The source-profile test covers later wrap
+The runtime admits 32 total synchronous compute commands. Completed caller
+bindings can be replaced transactionally, including a handoff between logical
+VMs/files over the retained shared root in native slots 2/3. The source-profile test covers later wrap
 metadata too; it does not claim that runtime wrap/handoff is implemented. The
 native `g17p-drm-compute` test changes its input arrays and poisons its output on
 each submission, checks all 2048 floats and every tail guard, then verifies that
-admission exhaustion returns EOPNOTSUPP without touching the output. Changed VMs
-or bindings are explicitly rejected until VM handoff is connected.
+admission exhaustion returns EOPNOTSUPP without touching the output. The `--rebind` option replaces the output GEM at the same DVA after every
+completed dispatch and retains/checks all older CPU images and guards.
+`g17p-drm-compute-vm` alternates two independent DRM files with colliding DVAs,
+separate timestamp/fence ownership and distinct noncolliding sentinels.
 
 Native integration tests run from a RAM initramfs on the explicitly selected
 development target. Generate the caller workload headers from pure Python
@@ -118,6 +120,28 @@ It includes the sync dependency checks and timestamp object rebind.
 The host VM harness also checks exact timestamp alias backing/attributes,
 collision rejection and aperture/alignment boundaries.
 
-These native tests have passed on T8140, including retained-memory audits
-after file close. Render, runtime slot reuse/VM handoff and asynchronous
-frontend/backend behavior remain outside this implementation stage.
+These native compute tests have passed on T8140, including retained-memory
+audits after file close. Finite compute transport handoff, simultaneous native
+contexts and asynchronous frontend/backend behavior remain unfinished.
+
+The synchronous render path accepts render-only batches on one retained owner.
+`g17p-drm-render` performs 32 pressure renders, replacing eight guarded output
+GEMs at the same DVAs on each draw and preserving every earlier image.
+`g17p-drm-render-batch` tests the current 64-command owner limit using 32 pairs
+of independent 131072/65536-triangle workloads, each with eight exact full-image
+oracles. It checks 256 timestamps, barriers, binary/timeline output fences and
+whole-batch refusal before capacity is exceeded. Generate its header with
+`make_g17p_render_workload.py --batch-pair`; use `--help` for the explicit
+caller resource bundle and triangle-count arguments. The generator uses the
+identified own compiler/resource inputs, never firmware object templates.
+
+Render completion requires both retired queues, both changed status records,
+validated reports and a new terminal since that publication. Completed linked
+scheduler heads are quiesced before return/rebind. The source's 128-job test
+used two physical pairs (64 each); do not equate its harness limit with a
+qualified 128-job lifetime for this sole pair. Further reuse, a second render
+owner, mixed engines and general source parity remain unfinished. The 64-job
+retirement/boundary run passes on T8140 with 512 full-image comparisons,
+256 timestamps, 64 new terminals, exact credits, an empty scheduler head
+and a post-close retained-memory audit. Raw evidence is recorded in the
+local m1n1 EXPERIMENT_LOG.md. These results do not complete source parity.
