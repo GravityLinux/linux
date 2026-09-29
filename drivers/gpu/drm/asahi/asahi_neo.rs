@@ -31,6 +31,7 @@ mod g17p_user_vm;
 #[allow(dead_code)]
 mod g17p_queue;
 mod g17p_sync;
+mod g17p_timestamp;
 mod g17p_topology;
 mod g17p_vm;
 

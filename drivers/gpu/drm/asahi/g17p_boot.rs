@@ -145,6 +145,7 @@ pub(crate) struct Session {
     phase: Phase,
     ttbs: u64,
     compute: Option<compute::Submission>,
+    timestamps: Option<super::g17p_timestamp::Registry>,
     peers: KVec<Peer>,
     memory: Option<Memory>,
     vm: Option<Vm>,
@@ -179,6 +180,7 @@ impl Session {
             phase: Phase::Prepared,
             ttbs: platform.regions[0].base,
             compute: None,
+            timestamps: Some(super::g17p_timestamp::Registry::new()),
             peers: KVec::new(),
             memory: Some(Memory::new(dev, platform)?),
             vm: None,
@@ -328,6 +330,27 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn bind_timestamp(
+        &mut self,
+        bo: ARef<super::g17p_drm::Object>,
+        offset: u64,
+        size: u64,
+    ) -> Result<u64> {
+        if self.phase == Phase::Failed {
+            return Err(EIO);
+        }
+        if self.phase != Phase::Prepared && self.phase != Phase::Running {
+            return Err(EBUSY);
+        }
+        self.timestamps.as_mut().ok_or(EINVAL)?.bind(
+            self.memory.as_mut().ok_or(EINVAL)?,
+            self.vm.as_mut().ok_or(EINVAL)?,
+            bo,
+            offset,
+            size,
+        )
+    }
+
     pub(crate) fn compute_client(&self) -> Result<Option<&compute::Client>> {
         if self.phase == Phase::Failed {
             return Err(EIO);
@@ -459,6 +482,11 @@ impl Session {
     }
 
     fn run_compute(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
+        let timestamps = self.compute.as_ref().ok_or(EINVAL)?.timestamps;
+        self.timestamps
+            .as_ref()
+            .ok_or(EINVAL)?
+            .cache(timestamps, false)?;
         if self.phase == Phase::Prepared {
             self.start(dev, image)?;
         }
@@ -550,6 +578,10 @@ impl Session {
                     continue;
                 }
                 work.client.cache(true)?;
+                self.timestamps
+                    .as_ref()
+                    .ok_or(EINVAL)?
+                    .cache(timestamps, true)?;
                 dev_info!(
                     dev,
                     "G17P: caller compute complete: queue {:?}, channel {:?}, status {:#x}; reports validated\n",
@@ -714,6 +746,7 @@ impl Drop for Session {
             // permanent; keep the runtime owner too as it gains owned tables.
             core::mem::forget(self.memory.take());
             core::mem::forget(self.compute.take());
+            core::mem::forget(self.timestamps.take());
         }
     }
 }

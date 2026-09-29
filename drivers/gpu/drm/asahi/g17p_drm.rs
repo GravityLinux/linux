@@ -325,6 +325,7 @@ struct Queue {
 }
 struct Timestamp {
     id: u32,
+    address: u64,
     bo: ARef<Object>,
     offset: u64,
     size: u64,
@@ -648,7 +649,7 @@ impl File {
         Ok(0)
     }
     fn gem_bind_object(
-        _dev: &Device,
+        dev: &Device,
         data: &mut uapi::drm_asahi_gem_bind_object,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -684,9 +685,16 @@ impl File {
         }
         let id = state.next_object;
         let next = id.checked_add(1).ok_or(EOVERFLOW)?;
+        state.objects.reserve(1, GFP_KERNEL)?;
+        let mut runtime = dev.runtime.lock();
+        let address = Option::as_mut(&mut *runtime)
+            .ok_or(ENODEV)?
+            .session
+            .bind_timestamp(bo.clone(), data.offset, data.range)?;
         state.objects.push(
             Timestamp {
                 id,
+                address,
                 bo,
                 offset: data.offset,
                 size: data.range,
@@ -748,6 +756,7 @@ impl File {
     }
     fn compute_parameters(
         vm: &Vm,
+        objects: &[Timestamp],
         bytes: &[u8],
     ) -> Result<super::g17p_compute_runtime::Parameters> {
         use super::g17p_compute_runtime as compute;
@@ -809,9 +818,18 @@ impl File {
             {
                 return Err(EINVAL);
             }
-            if cmd.ts.start.handle != 0 || cmd.ts.end.handle != 0 {
-                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
-            }
+            let resolve = |ts: &uapi::drm_asahi_timestamp| -> Result<u64> {
+                if ts.handle == 0 {
+                    return if ts.offset == 0 { Ok(0) } else { Err(EINVAL) };
+                }
+                let object = objects.iter().find(|o| o.id == ts.handle).ok_or(ENOENT)?;
+                let offset = ts.offset as u64;
+                if offset & 7 != 0 || offset.checked_add(8).ok_or(EINVAL)? > object.size {
+                    return Err(EINVAL);
+                }
+                Ok(object.address + offset)
+            };
+            let timestamps = [resolve(&cmd.ts.start)?, resolve(&cmd.ts.end)?];
             let base = cmd.cdm_ctrl_stream_base;
             let end = cmd.cdm_ctrl_stream_end;
             if (base | end) & 3 != 0
@@ -832,6 +850,7 @@ impl File {
                 end,
                 sampler: cmd.sampler_heap,
                 sampler_count: cmd.sampler_count,
+                timestamps,
             });
         }
         command.ok_or(EINVAL)
@@ -861,7 +880,7 @@ impl File {
                 .find(|q| q.id == data.queue_id)
                 .ok_or(ENOENT)?;
             let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
-            Self::compute_parameters(vm, &bytes)?;
+            Self::compute_parameters(vm, &state.objects, &bytes)?;
         }
         // No file/runtime lock across waits. A concurrent producer may need
         // this very file. Revalidate mappings after the wait before staging.
@@ -873,7 +892,7 @@ impl File {
             .find(|q| q.id == data.queue_id)
             .ok_or(ENOENT)?;
         let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
-        let parameters = Self::compute_parameters(vm, &bytes)?;
+        let parameters = Self::compute_parameters(vm, &state.objects, &bytes)?;
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
         if let Some(client) = runtime.session.compute_client()? {

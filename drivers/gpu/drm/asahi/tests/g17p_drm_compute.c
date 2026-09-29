@@ -6,6 +6,7 @@
 #undef main
 #include "g17p_drm_workload.h"
 #include "g17p_drm_sync.h"
+#include "g17p_drm_timestamp.h"
 
 static uint32_t workload_bind(int fd, uint32_t vm, uint64_t address,
 			  const void *data, size_t size, int writable)
@@ -21,9 +22,14 @@ static uint32_t workload_bind(int fd, uint32_t vm, uint64_t address,
 
 int main(int argc, char **argv)
 {
-	int use_sync = argc == 2 && !strcmp(argv[1], "--sync");
-	CHECK(argc == 1 || use_sync);
+	int use_sync = 0, use_timestamps = 0;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--sync")) use_sync = 1;
+		else if (!strcmp(argv[i], "--timestamps")) use_timestamps = 1;
+		else CHECK(0);
+	}
 	struct sync_test sync = {0};
+	struct timestamp_test timestamps = {0};
 	setbuf(stdout, NULL);
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
 	CHECK(fd >= 0);
@@ -66,6 +72,7 @@ int main(int argc, char **argv)
 		.cmdbuf = (uintptr_t)&commands, .cmdbuf_size = sizeof(commands) };
 	printf("G17P_NATIVE_COMPUTE_BEGIN vm=%u queue=%u CDM=%llx output=%llx\n",
 		vm, q.queue_id, COMPUTE_CDM, COMPUTE_OUTPUT);
+	if (use_timestamps) timestamp_setup(fd, &timestamps, &commands.compute, &submit);
 	if (use_sync) sync_setup(fd, &sync, &submit);
 	for (unsigned n = 0; n < 32; n++) {
 		for (unsigned i = 0; i < 64; i++) {
@@ -73,6 +80,7 @@ int main(int argc, char **argv)
 			b[i] = 0.5f + n * 0.25f;
 		}
 		memset(result, 0xa5, PAGE);
+		if (use_timestamps) timestamp_before(fd, &timestamps, &commands.compute, n);
 		if (use_sync) sync_before(fd, &sync, n, vm, (const unsigned char *)result);
 		errno = 0;
 		int rc = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit);
@@ -81,6 +89,7 @@ int main(int argc, char **argv)
 			saved_errno, result[0], result[1], result[2], result[3]);
 		CHECK(rc == 0);
 		if (use_sync) sync_after(fd, &sync, n);
+		if (use_timestamps) timestamp_after(&timestamps, n);
 		for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + n * 100.25f + i);
 		for (unsigned i = 256; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
 	}
@@ -89,6 +98,7 @@ int main(int argc, char **argv)
 	if (use_sync) sync.entries[3].timeline_value = 33;
 	CHECK(ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit) == -1 && errno == EOPNOTSUPP);
 	if (use_sync) sync_finish(fd, &sync);
+	if (use_timestamps) timestamp_finish(fd, &timestamps);
 	for (unsigned i = 0; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
 	CHECK(munmap(a, PAGE) == 0);
 	CHECK(munmap(b, PAGE) == 0);
