@@ -160,7 +160,13 @@ pub(crate) fn build(
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     r::aux_fb(&mut page).map_err(|_| EINVAL)?;
-    vm.write(memory, 1, p.aux_fb, &page)?;
+    // install_caller() adds this source-built page outside RENDER_RUNS.
+    // Retain its backing in Memory and publish it only in this render root.
+    let auxiliary = memory.allocate(PAGE)?;
+    memory.write(auxiliary, &page)?;
+    memory.clean(auxiliary, PAGE)?;
+    client.root.prepare(p.aux_fb, PAGE as u64)?;
+    client.root.map_page(p.aux_fb, auxiliary, true)?;
 
     for (address, size) in [
         (POOLS[0] - 0x100, PAGE),
