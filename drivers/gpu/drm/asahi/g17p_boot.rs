@@ -452,10 +452,20 @@ impl Session {
         &mut self,
         dev: &kernel::device::Device,
         image: &Image,
+        replacement: Option<compute::Client>,
         p: &super::g17p_render::Parameters,
     ) -> Result {
         if self.phase != Phase::Running {
             return Err(EIO);
+        }
+        if let Some(client) = replacement {
+            render::validate_client(&client, p)?;
+            self.render
+                .as_mut()
+                .ok_or(EINVAL)?
+                .client
+                .rebind_render(client)?;
+            dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
         }
         let ordinal = self.render.as_ref().ok_or(EINVAL)?.ordinal + 1;
         let result = (|| {

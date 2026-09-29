@@ -41,6 +41,59 @@ pub(crate) struct Client {
     pub(crate) owner: (u64, u32),
 }
 impl Client {
+    /// Update only the caller-owned part of the quiescent retained root. Both
+    /// generations of GEM references remain pinned until the final TLBI.
+    pub(crate) fn rebind_render(&mut self, next: Self) -> Result {
+        if self.owner != next.owner {
+            return Err(EINVAL);
+        }
+        let address = |base: u64| {
+            if base < 0x1000000000 {
+                base + 0x1000000000
+            } else {
+                base
+            }
+        };
+        let mut changes: KVec<(u64, u64, u64)> = KVec::new();
+        for &(base, size, _, _) in &self.bindings {
+            for offset in (0..size).step_by(PAGE) {
+                let va = address(base) + offset;
+                let old = self.root.pte(va)?;
+                if old == 0 {
+                    return Err(EIO);
+                }
+                changes.push((va, old, 0), GFP_KERNEL)?;
+            }
+        }
+        for &(base, size, _, _) in &next.bindings {
+            for offset in (0..size).step_by(PAGE) {
+                let va = address(base) + offset;
+                let new = next.root.pte(va)?;
+                if new == 0 {
+                    return Err(EIO);
+                }
+                if let Some(row) = changes.iter_mut().find(|r| r.0 == va) {
+                    if row.2 != 0 {
+                        return Err(EINVAL);
+                    }
+                    row.2 = new;
+                } else {
+                    // Never replace a private/growth leaf on an addition.
+                    if self.root.pte(va)? != 0 {
+                        return Err(EBUSY);
+                    }
+                    changes.push((va, 0, new), GFP_KERNEL)?;
+                }
+            }
+        }
+        next.cache(false)?;
+        self.root.rebind(&changes, 1)?;
+        // rebind cannot fail after its first live store. Its final ASID flush
+        // precedes release of old BOs; the root and all private state survive.
+        self.buffers = next.buffers;
+        self.bindings = next.bindings;
+        Ok(())
+    }
     pub(crate) fn cache(&self, invalidate: bool) -> Result {
         for bo in &self.buffers {
             let map = bo.vmap::<u8>()?;

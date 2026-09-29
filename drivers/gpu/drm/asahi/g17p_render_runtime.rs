@@ -92,14 +92,7 @@ fn overlap(client: &Client, address: u64, size: u64) -> bool {
     })
 }
 
-pub(crate) fn build(
-    memory: &mut Memory,
-    vm: &mut Vm,
-    image: &Image,
-    ttbs: u64,
-    mut client: Client,
-    p: &Parameters,
-) -> Result<Submission> {
+pub(crate) fn validate_client(client: &Client, p: &Parameters) -> Result {
     p.validate().map_err(|_| EINVAL)?;
     // These writable/private pages cannot be handed over to caller bindings.
     for (va, len) in [
@@ -126,10 +119,27 @@ pub(crate) fn build(
             super::g17p_growth::GROWTH_END - super::g17p_growth::GROWTH_BASE,
         ),
     ] {
-        if overlap(&client, va, len) {
+        if overlap(client, va, len) {
             return Err(EINVAL);
         }
     }
+    for va in opening::EXTRA_RENDER {
+        if overlap(client, va, PAGE as u64) {
+            return Err(EINVAL);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn build(
+    memory: &mut Memory,
+    vm: &mut Vm,
+    image: &Image,
+    ttbs: u64,
+    mut client: Client,
+    p: &Parameters,
+) -> Result<Submission> {
+    validate_client(&client, p)?;
     // Borrow only the already-owned, zero/source-built private render shape.
     // Caller pages keep their own GEM backing, permissions and physical owner.
     for &(first, count, flags) in topology::RENDER_RUNS {
