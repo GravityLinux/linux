@@ -30,6 +30,11 @@ mod g17p_user_vm;
 // Core queue port is exercised by source differential tests until submit is wired.
 #[allow(dead_code)]
 mod g17p_queue;
+// Render serializers are checked against the shim before runtime integration.
+#[allow(dead_code)]
+mod g17p_render;
+#[allow(dead_code)]
+mod g17p_render_graph;
 mod g17p_sync;
 mod g17p_timestamp;
 mod g17p_topology;
