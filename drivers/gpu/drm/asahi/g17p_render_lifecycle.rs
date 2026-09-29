@@ -10,7 +10,7 @@ use super::{
     g17p_render::{self as r, Kind, Parameters},
     g17p_render_graph as graph,
 };
-pub(crate) const SUBMISSIONS: u32 = 32;
+pub(crate) const SUBMISSIONS: u32 = 128;
 pub(crate) const DESCRIPTORS: [u64; 2] = [0xfffffc20c0018000, 0xfffffc20c00b0000];
 pub(crate) const QUEUES: [u64; 2] = [0xfffffc20c0000000, 0xfffffc20c00000c0];
 pub(crate) const POINTERS: [u64; 2] = [0xfffffc2000010000, 0xfffffc2000012870];

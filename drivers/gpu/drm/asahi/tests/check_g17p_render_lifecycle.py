@@ -19,7 +19,7 @@ source=ast.parse((args.m1n1/'proxyclient/experiments/agx_g17p_boot.py').read_tex
 tick=next(n for n in ast.walk(source) if isinstance(n,ast.FunctionDef) and n.name=='announce_runtime_tick')
 clock_scope=dict(struct=struct,g17p=types.SimpleNamespace(CONTROL_MESSAGE_SIZE=64),instances=[None],ascs=[None],runtime_control_sequence=[0],announce_control_entry=lambda a,b,body,label:dict(consumed=True,body=body))
 exec(compile(ast.Module(body=[tick],type_ignores=[]),'<source tick>','exec'),clock_scope)
-for ordinal in range(2,32):expected.append((f'tick:{ordinal}',clock_scope['announce_runtime_tick'](ordinal-1)['body']))
+for ordinal in range(2,128):expected.append((f'tick:{ordinal}',clock_scope['announce_runtime_tick'](ordinal-1)['body']))
 prestate=next(n for n in ast.walk(source) if isinstance(n,ast.FunctionDef) and n.name=='announce_runtime_submission')
 values=next(n.value for n in ast.walk(prestate) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='values' for t in n.targets))
 expected.append(('prestate',struct.pack('<4I',*ast.literal_eval(values))))
@@ -34,8 +34,8 @@ for count in (32,72,112,0,1312,0xffffffff):
  fake=types.SimpleNamespace(initdata_addr=0x2000,_read_dva=read,_write_dva=lambda at,b:writes.append((at,b)))
  reg_scope['_publish_partial_index_owner'](fake,0x100)
  expected.append((f'index-refresh:{count}',bytes([bool(writes)])+(writes[0][1] if writes else b'')))
-for case in range(64):
- ordinal=case%31+1
+for case in range(256):
+ ordinal=case%127+1
  values={f.name:0 for f in dataclasses.fields(r.G17PRenderParameters) if f.default is dataclasses.MISSING}
  values.update(width=128+case,height=128,context_base=0x1000000000,tilemap=0x10001b0000,heapmeta=0x10001b1000,tpc=0x10001d8000,
   deflake_1=0x10000682a0,deflake_2=0x1000068020,deflake_3=0x1000068000,ta_status=0x1000078000,fragment_status=0x10001a8000,aux_fb=0x10000300000,
@@ -77,4 +77,4 @@ for name,body in expected:
   raise AssertionError((name,diffs[:20],len(got),len(body)))
  offset+=len(body)
 assert offset==len(actual)
-print(f'PASS: {len(expected)} complete retained-render append objects, {offset} bytes; 64 caller variations, real Python tilemap advancement and queue dependencies; generation bounds')
+print(f'PASS: {len(expected)} complete retained-render append objects, {offset} bytes; 256 caller variations, real Python tilemap advancement and queue dependencies; generation bounds')
