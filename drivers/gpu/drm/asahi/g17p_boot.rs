@@ -380,6 +380,7 @@ impl Session {
         &mut self,
         dev: &kernel::device::Device,
         image: &Image,
+        replacement: Option<compute::Client>,
         parameters: &compute::Parameters,
     ) -> Result {
         if self.phase != Phase::Running {
@@ -388,6 +389,12 @@ impl Session {
         let work = self.compute.as_mut().ok_or(EINVAL)?;
         if work.ordinal + 1 >= compute::SUBMISSIONS || work.preempt != parameters.preempt {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        if let Some(client) = replacement {
+            // The source's compute mirror uses this same low root in native
+            // slots 2/3. Flush both ASIDs before releasing the old GEMs.
+            work.client.rebind(client, false)?;
+            dev_info!(dev, "G17P: retained compute caller mappings refreshed\n");
         }
         let result = compute::stage_next(
             self.memory.as_mut().ok_or(EINVAL)?,
@@ -464,7 +471,7 @@ impl Session {
                 .as_mut()
                 .ok_or(EINVAL)?
                 .client
-                .rebind_render(client)?;
+                .rebind(client, true)?;
             dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
         }
         let ordinal = self.render.as_ref().ok_or(EINVAL)?.ordinal + 1;

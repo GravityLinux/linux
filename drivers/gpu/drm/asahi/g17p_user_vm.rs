@@ -102,7 +102,7 @@ impl UserVm {
     fn invalidate(context: u16) {
         super::g17p_memory::sync();
         // SAFETY: Called under the runtime lock with the source's quiescent
-        // render context. T8140 implements FEAT_TLBIOS.
+        // execution context. T8140 implements FEAT_TLBIOS.
         unsafe {
             core::arch::asm!(
                 ".inst 0xd5088140", // TLBI ASIDE1OS, X0
@@ -117,8 +117,12 @@ impl UserVm {
     /// Each change names its expected old leaf (zero for an addition). Allocate
     /// and validate the complete plan before breaking any live mapping. Failed
     /// preparation leaves active tables intact, including all parent entries.
-    pub(crate) fn rebind(&mut self, changes: &[(u64, u64, u64)], context: u16) -> Result {
-        if context == 0 || context >= 64 {
+    pub(crate) fn rebind(&mut self, changes: &[(u64, u64, u64)], contexts: &[u16]) -> Result {
+        if contexts.is_empty()
+            || contexts.iter().enumerate().any(|(i, &context)| {
+                context == 0 || context >= 64 || contexts[..i].contains(&context)
+            })
+        {
             return Err(EINVAL);
         }
         let mut writes: KVec<(usize, u64, usize, u64)> = KVec::new();
@@ -176,14 +180,18 @@ impl UserVm {
                 Self::store(page, index, 0);
             }
         }
-        Self::invalidate(context);
+        for &context in contexts {
+            Self::invalidate(context);
+        }
         for depth in [2, 1, 0] {
             for &(_, page, index, _, new) in stores.iter().filter(|r| r.0 == depth) {
                 Self::store(page, index, new);
             }
             super::g17p_memory::sync();
         }
-        Self::invalidate(context);
+        for &context in contexts {
+            Self::invalidate(context);
+        }
         Ok(())
     }
     fn leaf(&mut self, va: u64, create: bool) -> Result<Option<(u64, usize)>> {

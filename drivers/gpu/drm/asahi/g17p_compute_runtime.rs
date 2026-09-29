@@ -43,12 +43,12 @@ pub(crate) struct Client {
 impl Client {
     /// Update only the caller-owned part of the quiescent retained root. Both
     /// generations of GEM references remain pinned until the final TLBI.
-    pub(crate) fn rebind_render(&mut self, next: Self) -> Result {
+    pub(crate) fn rebind(&mut self, next: Self, render: bool) -> Result {
         if self.owner != next.owner {
             return Err(EINVAL);
         }
         let address = |base: u64| {
-            if base < 0x1000000000 {
+            if render && base < 0x1000000000 {
                 base + 0x1000000000
             } else {
                 base
@@ -87,7 +87,8 @@ impl Client {
             }
         }
         next.cache(false)?;
-        self.root.rebind(&changes, 1)?;
+        self.root
+            .rebind(&changes, if render { &[1] } else { &[2, 3] })?;
         // rebind cannot fail after its first live store. Its final ASID flush
         // precedes release of old BOs; the root and all private state survive.
         self.buffers = next.buffers;

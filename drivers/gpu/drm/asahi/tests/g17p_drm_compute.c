@@ -22,10 +22,11 @@ static uint32_t workload_bind(int fd, uint32_t vm, uint64_t address,
 
 int main(int argc, char **argv)
 {
-	int use_sync = 0, use_timestamps = 0;
+	int use_sync = 0, use_timestamps = 0, use_rebind = 0;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--sync")) use_sync = 1;
 		else if (!strcmp(argv[i], "--timestamps")) use_timestamps = 1;
+		else if (!strcmp(argv[i], "--rebind")) use_rebind = 1;
 		else CHECK(0);
 	}
 	struct sync_test sync = {0};
@@ -50,6 +51,7 @@ int main(int argc, char **argv)
 	float *a = bo_map(fd, input_a, PAGE), *b = bo_map(fd, input_b, PAGE);
 	uint32_t output = bo_new(fd, PAGE, DRM_ASAHI_GEM_WRITEBACK, 0);
 	float *result = bo_map(fd, output, PAGE);
+	float *retired[31] = {0};
 	memset(result, 0xa5, PAGE);
 	bind(fd, vm, output, COMPUTE_OUTPUT, PAGE, 0, RW, 0);
 	struct {
@@ -75,6 +77,16 @@ int main(int argc, char **argv)
 	if (use_timestamps) timestamp_setup(fd, &timestamps, &commands.compute, &submit);
 	if (use_sync) sync_setup(fd, &sync, &submit);
 	for (unsigned n = 0; n < 32; n++) {
+		if (use_rebind && n) {
+			retired[n - 1] = result;
+			bind(fd, vm, 0, COMPUTE_OUTPUT, PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0);
+			bo_close(fd, output);
+			output = bo_new(fd, PAGE * 3, DRM_ASAHI_GEM_WRITEBACK, 0);
+			unsigned char *allocation = bo_map(fd, output, PAGE * 3);
+			memset(allocation, 0x5a, PAGE * 3);
+			result = (void *)(allocation + PAGE);
+			bind(fd, vm, output, COMPUTE_OUTPUT, PAGE, PAGE, RW, 0);
+		}
 		for (unsigned i = 0; i < 64; i++) {
 			a[i] = 1000.0f + n * 100.0f + i;
 			b[i] = 0.5f + n * 0.25f;
@@ -92,17 +104,39 @@ int main(int argc, char **argv)
 		if (use_timestamps) timestamp_after(&timestamps, n);
 		for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + n * 100.25f + i);
 		for (unsigned i = 256; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
+		if (use_rebind) {
+			for (unsigned old = 0; old < n; old++) {
+				for (unsigned i = 0; i < 64; i++) CHECK(retired[old][i] == 1000.5f + old * 100.25f + i);
+				for (unsigned i = 256; i < PAGE; i++) CHECK(((unsigned char *)retired[old])[i] == 0xa5);
+			}
+			for (unsigned generation = 1; generation <= n; generation++) {
+				unsigned char *image = (void *)(generation == n ? result : retired[generation]);
+				for (unsigned i = 0; i < PAGE; i++) {
+					CHECK(image[(int)i - (int)PAGE] == 0x5a);
+					CHECK(image[PAGE + i] == 0x5a);
+				}
+			}
+		}
 	}
 	/* This admission stage must refuse exhaustion before publishing work. */
-	memset(result, 0xa5, PAGE);
+	if (use_rebind) for (unsigned i = 0; i < 64; i++) a[i] = -10000.0f;
+	else memset(result, 0xa5, PAGE);
 	if (use_sync) sync.entries[3].timeline_value = 33;
 	CHECK(ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit) == -1 && errno == EOPNOTSUPP);
 	if (use_sync) sync_finish(fd, &sync);
 	if (use_timestamps) timestamp_finish(fd, &timestamps);
-	for (unsigned i = 0; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
+	if (use_rebind) for (unsigned i = 0; i < 64; i++) CHECK(result[i] == 1000.5f + 31 * 100.25f + i);
+	for (unsigned i = use_rebind ? 256 : 0; i < PAGE; i++) CHECK(((unsigned char *)result)[i] == 0xa5);
 	CHECK(munmap(a, PAGE) == 0);
 	CHECK(munmap(b, PAGE) == 0);
-	CHECK(munmap(result, PAGE) == 0);
+	if (use_rebind) {
+		CHECK(munmap(retired[0], PAGE) == 0);
+		for (unsigned generation = 1; generation < 32; generation++) {
+			unsigned char *image = (void *)(generation == 31 ? result : retired[generation]);
+			CHECK(munmap(image - PAGE, PAGE * 3) == 0);
+		}
+		printf("COMPUTE_REBIND_PASS 32 independent outputs, every older image and allocation guard preserved\n");
+	} else CHECK(munmap(result, PAGE) == 0);
 	CHECK(close(fd) == 0);
 	printf("G17P_NATIVE_COMPUTE_PASS 32 distinct submissions, exact 2048 floats and intact tails; checks=%u\n", checks);
 	return 0;
