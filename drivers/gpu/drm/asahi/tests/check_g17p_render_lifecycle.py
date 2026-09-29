@@ -23,6 +23,17 @@ for ordinal in range(2,32):expected.append((f'tick:{ordinal}',clock_scope['annou
 prestate=next(n for n in ast.walk(source) if isinstance(n,ast.FunctionDef) and n.name=='announce_runtime_submission')
 values=next(n.value for n in ast.walk(prestate) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='values' for t in n.targets))
 expected.append(('prestate',struct.pack('<4I',*ast.literal_eval(values))))
+registration=next(n for n in node.body if isinstance(n,ast.FunctionDef) and n.name=='_publish_partial_index_owner')
+reg_scope=dict(struct=struct,__package__=package.__name__)
+exec(compile(ast.Module(body=[registration],type_ignores=[]),'<source registration refresh>','exec'),reg_scope)
+for count in (32,72,112,0,1312,0xffffffff):
+ writes=[];body=bytearray(0x40);struct.pack_into('<Q',body,0x28,0x1000190000);struct.pack_into('<I',body,0x34,count)
+ def read(at,size):
+  if at==0x100:return bytes(body)
+  return struct.pack('<Q',0x1000 if at==0x2018 else 0x4000)
+ fake=types.SimpleNamespace(initdata_addr=0x2000,_read_dva=read,_write_dva=lambda at,b:writes.append((at,b)))
+ reg_scope['_publish_partial_index_owner'](fake,0x100)
+ expected.append((f'index-refresh:{count}',bytes([bool(writes)])+(writes[0][1] if writes else b'')))
 for case in range(64):
  ordinal=case%31+1
  values={f.name:0 for f in dataclasses.fields(r.G17PRenderParameters) if f.default is dataclasses.MISSING}

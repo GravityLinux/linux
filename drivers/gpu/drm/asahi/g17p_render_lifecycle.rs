@@ -187,3 +187,18 @@ pub(crate) fn control_prestate() -> [u8; 16] {
     }
     body
 }
+
+/// _publish_partial_index_owner leaves firmware's grown registration intact.
+/// Only the original eight-group partial layout has a host refresh rule.
+pub(crate) fn index_registration(low: u64, count: u32) -> Result<Option<[u8; 8]>> {
+    if count != 32 {
+        return Ok(None);
+    }
+    if !(0x1000000000..0x2000000000).contains(&low) || low & 15 != 0 {
+        return Err(Error::Invalid);
+    }
+    let mut body = [0; 8];
+    c::u32_at(&mut body, 0, ((low - 0x1000000000) >> 4) as u32);
+    c::u32_at(&mut body, 4, count);
+    Ok(Some(body))
+}

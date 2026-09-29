@@ -696,7 +696,12 @@ pub(crate) fn stage_next(
     write(memory, SHARED[0] + 0x0c, &u32::MAX.to_le_bytes())?;
     write(memory, SHARED[0] + 0x0c, &0u32.to_le_bytes())?;
     write(memory, SHARED[0], &item.ordinal.to_le_bytes())?;
-    write(memory, 0xfffffc20015e0000, &opening::resource_record())?;
+    let count = memory.read_firmware32(vm.physical(memory, 2, SHARED[0] + 0x34)?)?;
+    let pa = vm.physical(memory, 2, SHARED[0] + 0x28)?;
+    memory.invalidate(pa, 8)?;
+    if let Some(body) = life::index_registration(memory.read64(pa)?, count).map_err(|_| EIO)? {
+        write(memory, 0xfffffc20015e0000, &body)?;
+    }
     g17p_memory::sync();
     for index in 0..2 {
         let kind = if index == 0 {
