@@ -376,10 +376,10 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn compute_remaining(&self) -> Result<usize> {
+    pub(crate) fn compute_remaining(&self, render_first: bool) -> Result<usize> {
         self.compute_client()?;
         Ok(self.compute.as_ref().map_or(
-            if self.render.is_some() {
+            if self.render.is_some() || render_first {
                 2
             } else {
                 compute::SUBMISSIONS as usize

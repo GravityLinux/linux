@@ -245,6 +245,25 @@ impl Vm {
         }
         Ok(())
     }
+    fn refresh_for(
+        &self,
+        owner: (u64, u32),
+        render: bool,
+        current: Option<&super::g17p_compute_runtime::Client>,
+    ) -> Result<Option<super::g17p_compute_runtime::Client>> {
+        if current.is_some_and(|client| {
+            client.owner == owner
+                && client.bindings.len() == self.bindings.len()
+                && self.bindings.iter().enumerate().all(|(i, b)| {
+                    client.bindings[i] == (b.start, b.size, b.offset, b.flags)
+                        && core::ptr::eq(&*client.buffers[i], &*b.bo)
+                })
+        }) {
+            Ok(None)
+        } else {
+            Ok(Some(self.snapshot(owner, render)?))
+        }
+    }
     fn snapshot(
         &self,
         owner: (u64, u32),
@@ -1113,90 +1132,103 @@ impl File {
         let parameters = Self::parameters(vm, &state.objects, &bytes)?;
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
-        if parameters.iter().any(|p| matches!(p, Command::Render(_))) {
-            // Admit the entire synchronous render batch before publishing a
-            // prefix. Each command completes before the next one's barriers.
-            if parameters.iter().any(|p| !matches!(p, Command::Render(_))) {
+        let owner = (inner.id, vm.id);
+        let render_count = parameters
+            .iter()
+            .filter(|p| matches!(p, Command::Render(_)))
+            .count();
+        let compute_count = parameters.len() - render_count;
+        let render_first = matches!(parameters.first(), Some(Command::Render(_)));
+        // Validate the entire command buffer against its prospective engine
+        // lifetimes before publishing any prefix. A cold render-first buffer
+        // creates the post-render compute owner even when none exists yet.
+        if render_count != 0 {
+            if render_count > runtime.session.render_remaining()? as usize {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            if parameters.len() > runtime.session.render_remaining()? as usize {
-                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
-            }
-            let mut replacement = if let Some(client) = runtime.session.render_client()? {
-                if client.owner != (inner.id, vm.id) {
-                    return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
-                }
-                if client.bindings.len() != vm.bindings.len()
-                    || !vm.bindings.iter().enumerate().all(|(i, b)| {
-                        client.bindings[i] == (b.start, b.size, b.offset, b.flags)
-                            && core::ptr::eq(&*client.buffers[i], &*b.bo)
-                    })
-                {
-                    Some(vm.snapshot((inner.id, vm.id), true)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            for command in &parameters {
-                let Command::Render(render) = command else {
-                    return Err(EINVAL);
-                };
-                if runtime.session.render_client()?.is_some() {
-                    runtime.session.submit_next_render(
-                        dev.as_ref(),
-                        &runtime.image,
-                        replacement.take(),
-                        render,
-                    )?;
-                } else {
-                    let client = vm.snapshot((inner.id, vm.id), true)?;
-                    runtime
+            if runtime
+                .session
+                .render_client()?
+                .is_some_and(|c| c.owner != owner)
+                || (render_first
+                    && runtime
                         .session
-                        .submit_render(dev.as_ref(), &runtime.image, client, render)?;
-                }
-            }
-            sync.complete();
-            return Ok(0);
-        }
-        runtime.session.require_compute_owner((inner.id, vm.id))?;
-        let mut replacement = if let Some(client) = runtime.session.compute_client()? {
-            if client.owner != (inner.id, vm.id)
-                || client.bindings.len() != vm.bindings.len()
-                || !vm.bindings.iter().enumerate().all(|(i, b)| {
-                    client.bindings[i] == (b.start, b.size, b.offset, b.flags)
-                        && core::ptr::eq(&*client.buffers[i], &*b.bo)
-                })
+                        .compute_client()?
+                        .is_some_and(|c| c.owner != owner))
             {
-                Some(vm.snapshot((inner.id, vm.id), false)?)
-            } else {
-                None
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
+        }
+        if compute_count != 0 {
+            runtime.session.require_compute_owner(owner)?;
+            if compute_count > runtime.session.compute_remaining(render_first)? {
+                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+            }
+        }
+        // Pin both caller views before the first command, including when the
+        // second engine is new. An invalid render-private mapping must not
+        // permit a preceding compute to execute first.
+        let mut render_client = if render_count != 0 {
+            vm.refresh_for(owner, true, runtime.session.render_client()?)?
         } else {
             None
         };
-        // Admit the complete batch before its first publication. In
-        // particular, exhaustion may never execute an accepted prefix.
-        if parameters.len() > runtime.session.compute_remaining()? {
-            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        let mut compute_client = if compute_count != 0 {
+            vm.refresh_for(owner, false, runtime.session.compute_client()?)?
+        } else {
+            None
+        };
+        if render_count != 0 {
+            let client = render_client
+                .as_ref()
+                .or(runtime.session.render_client()?)
+                .ok_or(EIO)?;
+            for command in &parameters {
+                if let Command::Render(p) = command {
+                    super::g17p_render_runtime::validate_client(client, p)?;
+                }
+            }
         }
+        // The ordinary source path completes each alternating engine before
+        // advancing to the next. The ioctl's aggregate fence is installed
+        // only when every command has completed; barriers were checked against
+        // the preceding per-engine counts when decoding the whole buffer.
         for command in &parameters {
-            let Command::Compute(parameters) = command else {
-                return Err(EINVAL);
-            };
-            if runtime.session.compute_client()?.is_some() {
-                runtime.session.submit_next_compute(
-                    dev.as_ref(),
-                    &runtime.image,
-                    replacement.take(),
-                    parameters,
-                )?;
-            } else {
-                let client = vm.snapshot((inner.id, vm.id), false)?;
-                runtime
-                    .session
-                    .submit_compute(dev.as_ref(), &runtime.image, client, parameters)?;
+            match command {
+                Command::Render(p) => {
+                    if runtime.session.render_client()?.is_some() {
+                        runtime.session.submit_next_render(
+                            dev.as_ref(),
+                            &runtime.image,
+                            render_client.take(),
+                            p,
+                        )?;
+                    } else {
+                        runtime.session.submit_render(
+                            dev.as_ref(),
+                            &runtime.image,
+                            render_client.take().ok_or(EIO)?,
+                            p,
+                        )?;
+                    }
+                }
+                Command::Compute(p) => {
+                    if runtime.session.compute_client()?.is_some() {
+                        runtime.session.submit_next_compute(
+                            dev.as_ref(),
+                            &runtime.image,
+                            compute_client.take(),
+                            p,
+                        )?;
+                    } else {
+                        runtime.session.submit_compute(
+                            dev.as_ref(),
+                            &runtime.image,
+                            compute_client.take().ok_or(EIO)?,
+                            p,
+                        )?;
+                    }
+                }
             }
         }
         sync.complete();
