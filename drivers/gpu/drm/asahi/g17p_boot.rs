@@ -790,6 +790,13 @@ impl Session {
                     .ok_or(EINVAL)?
                     .as_mut()
                     .send_message(0x21, 0x0084000000000011)?;
+                if render::quiesce(
+                    self.memory.as_mut().ok_or(EINVAL)?,
+                    self.vm.as_ref().ok_or(EINVAL)?,
+                    self.render.as_ref().ok_or(EINVAL)?,
+                )? {
+                    dev_info!(dev, "G17P: completed render scheduler list quiesced\n");
+                }
                 return Ok(());
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));

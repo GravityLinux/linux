@@ -52,6 +52,34 @@ pub(crate) struct Submission {
     deferred: [KVec<Deferred>; 2],
     empty_high: [u64; 2],
 }
+
+/// quiesce_submission(semantic_complete=True), for the sole synchronous owner.
+/// Call only after its queues, statuses and new terminal have all completed.
+pub(crate) fn quiesce(memory: &mut Memory, vm: &Vm, work: &Submission) -> Result<bool> {
+    for stage in 0..2 {
+        let target = work.publications[stage].write_after;
+        for offset in [q::POINTER_DONE, q::POINTER_READ, q::POINTER_WRITE] {
+            if memory.read_firmware32(vm.physical(memory, 2, POINTERS[stage] + offset)?)? != target
+            {
+                return Err(EBUSY);
+            }
+        }
+    }
+    let tail = vm.physical(memory, 2, JOB_LIST + 8)?;
+    memory.invalidate(tail, 8)?;
+    if memory.read64(tail)? == JOB_LIST {
+        return Ok(false);
+    }
+    // Both halves name this one retained head. Never clear pool records or
+    // neighboring list nodes; Python resets only the 0x18-byte list header.
+    vm.write(memory, 2, JOB_LIST, &q::job_list(JOB_LIST))?;
+    g17p_memory::sync();
+    memory.invalidate(tail, 8)?;
+    if memory.read64(tail)? != JOB_LIST {
+        return Err(EIO);
+    }
+    Ok(true)
+}
 struct Writer<'a> {
     memory: &'a mut Memory,
     vm: &'a Vm,
