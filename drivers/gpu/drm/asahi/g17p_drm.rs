@@ -1122,24 +1122,33 @@ impl File {
             if runtime.session.render_remaining()? == 0 {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
-            if let Some(client) = runtime.session.render_client()? {
-                if client.owner != (inner.id, vm.id)
-                    || client.bindings.len() != vm.bindings.len()
+            let replacement = if let Some(client) = runtime.session.render_client()? {
+                if client.owner != (inner.id, vm.id) {
+                    return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+                }
+                if client.bindings.len() != vm.bindings.len()
                     || !vm.bindings.iter().enumerate().all(|(i, b)| {
                         client.bindings[i] == (b.start, b.size, b.offset, b.flags)
                             && core::ptr::eq(&*client.buffers[i], &*b.bo)
                     })
                 {
-                    return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+                    Some(vm.snapshot((inner.id, vm.id), true)?)
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
             let Command::Render(render) = &parameters[0] else {
                 return Err(EINVAL);
             };
             if runtime.session.render_client()?.is_some() {
-                runtime
-                    .session
-                    .submit_next_render(dev.as_ref(), &runtime.image, render)?;
+                runtime.session.submit_next_render(
+                    dev.as_ref(),
+                    &runtime.image,
+                    replacement,
+                    render,
+                )?;
             } else {
                 let client = vm.snapshot((inner.id, vm.id), true)?;
                 runtime
