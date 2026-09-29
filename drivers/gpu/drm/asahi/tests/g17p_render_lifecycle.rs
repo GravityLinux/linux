@@ -21,8 +21,12 @@ fn main() {
     assert!(life::Item::new(0).is_err());
     assert!(life::Item::new(life::SUBMISSIONS).is_err());
     assert!(life::Item::new(u32::MAX).is_err());
+    for ordinal in 2..life::SUBMISSIONS {
+        emit(&life::control_tick(ordinal).unwrap());
+    }
+    emit(&life::control_prestate());
     for case in 0..64u64 {
-        let item = life::Item::new(1).unwrap();
+        let item = life::Item::new((case % 31 + 1) as u32).unwrap();
         let p = Parameters {
             width: 128 + case,
             height: 128,

@@ -1114,7 +1114,7 @@ impl File {
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
         if parameters.iter().any(|p| matches!(p, Command::Render(_))) {
-            // The retained pair supports one synchronous append. Reject mixed or
+            // The retained pair supports bounded synchronous appends. Reject mixed or
             // multi-render batches before any prefix can become visible.
             if parameters.len() != 1 {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));

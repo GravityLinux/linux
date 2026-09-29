@@ -620,6 +620,17 @@ pub(crate) fn stage_next(
             objects[index].push(Deferred { address, body }, GFP_KERNEL)?;
         }
     }
+    // _advance_tilemap_block resets a completed allocation only when its
+    // eight-block ring wraps. Keep the persistent directory and TPC intact.
+    if item.ordinal >= 8 {
+        let zeros = [0u8; 0x1200];
+        vm.write(
+            memory,
+            1,
+            p.tilemap + (item.ordinal % 8) as u64 * 0x1200,
+            &zeros,
+        )?;
+    }
     work.client.cache(false)?;
     work.growth
         .as_mut()
