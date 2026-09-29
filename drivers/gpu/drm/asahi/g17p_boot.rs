@@ -467,10 +467,18 @@ impl Session {
         self.start(dev, image)?;
         let startup = self.report_snapshot(image)?;
         {
-            let work = self.render.as_ref().ok_or(EINVAL)?;
+            let work = self.render.as_mut().ok_or(EINVAL)?;
             let vm = self.vm.as_ref().ok_or(EINVAL)?;
             let memory = self.memory.as_mut().ok_or(EINVAL)?;
             work.after_control(memory, vm, self.ttbs)?;
+            work.growth = Some(super::g17p_growth_runtime::Service::new(
+                memory,
+                vm,
+                self.ttbs,
+                work.client.root.root(),
+                image.graph.channels[0][12],
+                image.graph.channels[0][13],
+            )?);
             work.restore(memory, vm, 1)?;
             work.restore(memory, vm, 0)?;
         }
@@ -495,6 +503,50 @@ impl Session {
                 .any(|p| p.data.crashed.load(Ordering::Acquire))
             {
                 return Err(EIO);
+            }
+            // A bounded prefix handles coalesced growth notifications while
+            // retaining the runtime lock and the sole active root owner.
+            for _ in 0..32 {
+                use super::g17p_growth_runtime::Action;
+                let work = self.render.as_mut().ok_or(EINVAL)?;
+                let action = work.growth.as_mut().ok_or(EINVAL)?.step(
+                    self.memory.as_mut().ok_or(EINVAL)?,
+                    self.vm.as_ref().ok_or(EINVAL)?,
+                    &mut work.client.root,
+                    self.ttbs,
+                )?;
+                match action {
+                    Action::Idle => break,
+                    Action::Consumed => (),
+                    Action::Limit => {
+                        dev_err!(
+                            dev,
+                            "G17P: owned render memory limit consumed; retaining graph\n"
+                        );
+                        return Err(ENOMEM);
+                    }
+                    Action::Reply {
+                        counter,
+                        old,
+                        new,
+                        refused,
+                    } => {
+                        self.peers[0]
+                            .rtkit
+                            .as_mut()
+                            .ok_or(EINVAL)?
+                            .as_mut()
+                            .send_message(0x21, 0x0084000000000011)?;
+                        dev_info!(
+                            dev,
+                            "G17P: TVB growth reply {} pool 0 VM 1: {} -> {} blocks, refused={}\n",
+                            counter,
+                            old,
+                            new,
+                            refused
+                        );
+                    }
+                }
             }
             let work = self.render.as_ref().ok_or(EINVAL)?;
             let memory = self.memory.as_ref().ok_or(EINVAL)?;
@@ -535,6 +587,13 @@ impl Session {
             }
             let after = self.report_snapshot(image)?;
             for (peer, (report, before)) in after.iter().zip(startup.iter()).enumerate() {
+                // The growth service is the primary report reader. If a new
+                // record arrived after its drain, service it next iteration;
+                // never ACK it from this completion snapshot.
+                if peer == 0 && report.firmware != work.growth.as_ref().ok_or(EINVAL)?.cursor() {
+                    done = false;
+                    continue;
+                }
                 for (index, body) in report.records.iter().enumerate() {
                     let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
                     let receipt = index == 0

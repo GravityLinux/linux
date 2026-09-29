@@ -15,11 +15,13 @@ mod g17p_boot;
 #[allow(dead_code)]
 mod g17p_compute;
 #[allow(dead_code)]
+mod g17p_compute_lifecycle;
+#[allow(dead_code)]
 mod g17p_compute_memory;
 mod g17p_compute_runtime;
-#[allow(dead_code)]
-mod g17p_compute_lifecycle;
 mod g17p_drm;
+mod g17p_growth;
+mod g17p_growth_runtime;
 mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
