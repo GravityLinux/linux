@@ -37,9 +37,11 @@ pub(crate) struct Service {
     compute_terminals: u32,
     compute_owners: KVec<u32>,
     fragment: u64,
+    fragment_event: u32,
     state: u64,
     list: u64,
     receipt: Option<super::g17p_dependency::Receipt>,
+    dependency: bool,
 }
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
     memory.read_firmware32(vm.physical(memory, 2, va)?)
@@ -112,17 +114,33 @@ impl Service {
         report: Channel,
     ) -> Result<Self> {
         use super::g17p_dependency::LEAVES;
-        Self::new_graph(
+        let mut service = Self::new_graph(
             memory, vm, ttbs, root, command, report, LEAVES[4], LEAVES[1],
-        )
+        )?;
+        service.dependency = true;
+        // The fragment queue moves from grid 1 to grid 2 in the native
+        // four-queue graph. Growth report identity follows the queue grid,
+        // independently of the render context's event_slot (which stays 1).
+        service.fragment_event = super::g17p_dependency::LAYOUTS[2].grid;
+        Ok(service)
     }
     #[allow(dead_code)]
     pub(crate) fn expect_dependency_receipt(&mut self, sequence: u32) -> Result {
+        if !self.dependency {
+            return Err(EINVAL);
+        }
         if self.receipt.as_ref().is_some_and(|r| r.pending()) {
             return Err(EBUSY);
         }
         self.receipt = Some(super::g17p_dependency::Receipt::new(sequence));
         Ok(())
+    }
+    #[allow(dead_code)]
+    pub(crate) fn require_dependency(&self, memory: &Memory, ttbs: u64, root: &UserVm) -> Result {
+        if !self.dependency || root.root() != self.root {
+            return Err(EINVAL);
+        }
+        verify_root(memory, ttbs, self.root)
     }
     fn new_graph(
         memory: &Memory,
@@ -158,9 +176,11 @@ impl Service {
             compute_terminals: 0,
             compute_owners: KVec::with_capacity(36, GFP_KERNEL)?,
             fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
+            fragment_event: 1,
             state,
             list,
             receipt: None,
+            dependency: false,
         })
     }
     fn consume(&mut self, memory: &mut Memory, vm: &Vm, next: u32) -> Result {
@@ -231,6 +251,37 @@ impl Service {
         ttbs: u64,
         compute_ordinal: Option<u32>,
     ) -> Result<Action> {
+        if self.dependency {
+            return Err(EINVAL);
+        }
+        self.step_inner(memory, vm, root, ttbs, compute_ordinal, false)
+    }
+    /// One native report stream has both live CL owners and the render pair.
+    /// Route CL terminals through their owned FIFO, and keep serving render
+    /// growth while CL is pending. The command being waited on is not an
+    /// ownership discriminator for this mixed stream.
+    #[allow(dead_code)]
+    pub(crate) fn step_dependency(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        root: &mut UserVm,
+        ttbs: u64,
+    ) -> Result<Action> {
+        if !self.dependency || self.receipt.is_none() {
+            return Err(EINVAL);
+        }
+        self.step_inner(memory, vm, root, ttbs, None, true)
+    }
+    fn step_inner(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        root: &mut UserVm,
+        ttbs: u64,
+        compute_ordinal: Option<u32>,
+        mixed: bool,
+    ) -> Result<Action> {
         let tail = word(memory, vm, self.report.states[0] + 0x20)?;
         if tail >= 256 {
             return Err(EIO);
@@ -252,7 +303,7 @@ impl Service {
             self.consume(memory, vm, next)?;
             return Ok(Action::Consumed);
         }
-        if compute_ordinal.is_some() && opcode != 1 {
+        if compute_ordinal.is_some() && !mixed && opcode != 1 {
             // No live render can request growth here. Retain unexpected
             // evidence without allocating, replying, or advancing credits.
             return Err(EIO);
@@ -265,7 +316,7 @@ impl Service {
                         &body,
                         &[0xfffffc2000000100, 0xfffffc2000000200],
                         self.fragment,
-                        1,
+                        self.fragment_event,
                     )
                     .is_none()
             {
@@ -290,7 +341,7 @@ impl Service {
             if subtype != 3 && body[8..16] == [0; 8] {
                 // render_startup.completion_handler routes every non-render
                 // mask to the oldest active CL owner, exactly once.
-                if compute_ordinal.is_none() || self.compute_owners.is_empty() {
+                if (!mixed && compute_ordinal.is_none()) || self.compute_owners.is_empty() {
                     return Err(EIO);
                 }
                 self.compute_owners.remove(0).map_err(|_| EIO)?;

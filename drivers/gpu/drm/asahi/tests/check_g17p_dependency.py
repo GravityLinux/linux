@@ -195,6 +195,7 @@ for case in range(16):
         emit(f'{case}:{kind}-context',s.build_queue_context_item(kind,
             (0xfffffc20c0018000,0xfffffc20c00b0000)[i],t[0],pair=0,item_index=0,context_id=1,
             grid_index=t[3],dependency_grid=t[3],
+            context_event_slot=1,
             context_points=((0,case+1),(1,0)) if i==0 else ((1,1),(2,0))))
     parameters={f.name:0 for f in fields(r.G17PRenderParameters) if f.default is MISSING}
     parameters.update(width=(1,32,128,129)[case%4],height=(129,128,32,1)[case%4],
