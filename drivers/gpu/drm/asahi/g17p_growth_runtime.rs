@@ -34,6 +34,7 @@ pub(crate) struct Service {
     refused: bool,
     limited: bool,
     terminals: u32,
+    fragment: u64,
 }
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
     memory.read_firmware32(vm.physical(memory, 2, va)?)
@@ -57,6 +58,13 @@ fn verify_root(memory: &Memory, ttbs: u64, root: u64) -> Result {
     Ok(())
 }
 impl Service {
+    pub(crate) fn bind_work(&mut self, fragment: u64) -> Result {
+        if self.refused || self.limited {
+            return Err(EIO);
+        }
+        self.fragment = fragment;
+        Ok(())
+    }
     pub(crate) fn cursor(&self) -> u32 {
         self.cursor
     }
@@ -89,6 +97,7 @@ impl Service {
             refused: false,
             limited: false,
             terminals: 0,
+            fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
         })
     }
     fn consume(&mut self, memory: &mut Memory, vm: &Vm, next: u32) -> Result {
@@ -181,8 +190,8 @@ impl Service {
                 || owner
                     .limit(
                         &body,
-                        &[0xfffffc2000000100],
-                        super::g17p_render_runtime::DESCRIPTORS[1],
+                        &[0xfffffc2000000100, 0xfffffc2000000200],
+                        self.fragment,
                         1,
                     )
                     .is_none()

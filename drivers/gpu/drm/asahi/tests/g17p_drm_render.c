@@ -103,13 +103,39 @@ int main(void)
 	struct drm_syncobj_timeline_wait twait = { .handles = (uintptr_t)&timeline.handle,
 		.points = (uintptr_t)&point, .count_handles = 1, .timeout_nsec = 0 };
 	OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
-	/* Until repeat publication is ported, refusal must retain successful output. */
+	/* A second draw must overwrite fresh poison, retain the first timestamps,
+	 * and signal a new timeline point. Both draws use the same retained VM. */
+	for (unsigned target = 0; target < 8; target++) memset(outputs[target], 0xa5, RENDER_OUTPUT_SIZE);
+	memset(timestamps + PAGE + 96, 0, 32);
+	for (unsigned i = 0; i < 4; i++) refs[i]->offset = 96 + i * 8;
+	syncs[1].timeline_value = 2;
+	struct drm_syncobj_array reset = { .handles = (uintptr_t)&binary.handle, .count_handles = 1 };
+	OK(fd, DRM_IOCTL_SYNCOBJ_RESET, &reset);
+	check_unpublished(outputs);
+	errno = 0; rc = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit); saved_errno = errno;
+	printf("RENDER APPEND rc=%d errno=%d\n", rc, saved_errno);
+	for (unsigned target = 0; target < 8; target++) {
+		float value; memcpy(&value, outputs[target] + RENDER_PIXEL_0, 4);
+		printf("APPEND OUTPUT %u pixel=%g expected=%g\n", target, value, RENDER_TRIANGLES * ((target + 1)/8.0));
+	}
+	CHECK(rc == 0);
+	uint64_t next_stamps[4]; memcpy(next_stamps, timestamps + PAGE + 96, sizeof(next_stamps));
+	printf("APPEND_TIMESTAMPS TA=%" PRIu64 ",%" PRIu64 " FRAG=%" PRIu64 ",%" PRIu64 "\n", next_stamps[0], next_stamps[1], next_stamps[2], next_stamps[3]);
+	CHECK(next_stamps[0] > stamps[0] && next_stamps[1] > next_stamps[0] && next_stamps[2] > stamps[2] && next_stamps[3] > next_stamps[2]);
+	CHECK(memcmp(stamps, timestamps + PAGE + 64, sizeof(stamps)) == 0);
+	for (unsigned byte = 0; byte < PAGE * 3; byte++)
+		if (byte < PAGE + 64 || byte >= PAGE + 128) CHECK(timestamps[byte] == 0xa5);
+	check_images(outputs);
+	OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait);
+	point = 2; OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
+	/* Later control generations remain unimplemented; refuse before publication. */
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
 	check_images(outputs);
 	CHECK(memcmp(stamps, timestamps + PAGE + 64, sizeof(stamps)) == 0);
+	CHECK(memcmp(next_stamps, timestamps + PAGE + 96, sizeof(next_stamps)) == 0);
 	for (unsigned target = 0; target < 8; target++) CHECK(munmap(outputs[target], RENDER_OUTPUT_SIZE) == 0);
 	CHECK(munmap(timestamps, PAGE * 3) == 0);
 	CHECK(close(fd) == 0);
-	printf("G17P_NATIVE_RENDER_PASS eight exact full 128x128 R32F images, four timestamps and binary/timeline fences; checks=%u\n", checks);
+	printf("G17P_NATIVE_RENDER_PASS two renders, eight exact full 128x128 R32F images per render, eight timestamps and binary/timeline fences; checks=%u\n", checks);
 	return 0;
 }

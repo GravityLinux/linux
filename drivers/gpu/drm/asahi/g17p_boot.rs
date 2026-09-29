@@ -430,6 +430,47 @@ impl Session {
         result
     }
 
+    pub(crate) fn render_client(&self) -> Result<Option<&compute::Client>> {
+        if self.phase == Phase::Failed {
+            return Err(EIO);
+        }
+        if self.compute.is_some() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        Ok(self.render.as_ref().map(|work| &work.client))
+    }
+    pub(crate) fn render_remaining(&self) -> Result<u32> {
+        self.render_client()?;
+        Ok(self
+            .render
+            .as_ref()
+            .map_or(super::g17p_render_lifecycle::SUBMISSIONS, |work| {
+                super::g17p_render_lifecycle::SUBMISSIONS - work.ordinal - 1
+            }))
+    }
+    pub(crate) fn submit_next_render(
+        &mut self,
+        dev: &kernel::device::Device,
+        image: &Image,
+        p: &super::g17p_render::Parameters,
+    ) -> Result {
+        if self.phase != Phase::Running {
+            return Err(EIO);
+        }
+        let work = self.render.as_mut().ok_or(EINVAL)?;
+        let result = render::stage_next(
+            self.memory.as_mut().ok_or(EINVAL)?,
+            self.vm.as_ref().ok_or(EINVAL)?,
+            work,
+            p,
+        )
+        .and_then(|()| self.run_render(dev, image));
+        if result.is_err() {
+            self.phase = Phase::Failed;
+        }
+        result
+    }
+
     pub(crate) fn submit_render(
         &mut self,
         dev: &kernel::device::Device,
@@ -464,21 +505,27 @@ impl Session {
                 .ok_or(EINVAL)?
                 .cache([pair[0], pair[1]], false)?;
         }
-        self.start(dev, image)?;
+        if self.phase == Phase::Prepared {
+            self.start(dev, image)?;
+        } else if self.phase != Phase::Running {
+            return Err(EIO);
+        }
         let startup = self.report_snapshot(image)?;
         {
             let work = self.render.as_mut().ok_or(EINVAL)?;
             let vm = self.vm.as_ref().ok_or(EINVAL)?;
             let memory = self.memory.as_mut().ok_or(EINVAL)?;
-            work.after_control(memory, vm, self.ttbs)?;
-            work.growth = Some(super::g17p_growth_runtime::Service::new(
-                memory,
-                vm,
-                self.ttbs,
-                work.client.root.root(),
-                image.graph.channels[0][12],
-                image.graph.channels[0][13],
-            )?);
+            if work.ordinal == 0 {
+                work.after_control(memory, vm, self.ttbs)?;
+                work.growth = Some(super::g17p_growth_runtime::Service::new(
+                    memory,
+                    vm,
+                    self.ttbs,
+                    work.client.root.root(),
+                    image.graph.channels[0][12],
+                    image.graph.channels[0][13],
+                )?);
+            }
             work.restore(memory, vm, 1)?;
             work.restore(memory, vm, 0)?;
         }
@@ -577,7 +624,11 @@ impl Session {
                 done &= work.publications[stage].completed(last[stage][0], counters);
                 // Match the shim's two independent 0x40-byte status gates.
                 // build() initializes these retained private records to zero.
-                let pa = vm.physical(memory, 2, render::STATUS[stage])?;
+                let pa = vm.physical(
+                    memory,
+                    2,
+                    render::STATUS[stage] + work.ordinal as u64 * 0x40,
+                )?;
                 memory.invalidate(pa, 0x40)?;
                 status_changed[stage] = false;
                 for offset in (0..0x40).step_by(8) {
@@ -622,6 +673,13 @@ impl Session {
                 }
                 dev_info!(dev,"G17P: caller render complete: TA {:?}, 3D {:?}, status {:#x}; reports validated\n",last[0],last[1],command_status);
                 self.acknowledge_reports(image, &after)?;
+                // Same control-done boundary as the source synchronous shim.
+                self.peers[0]
+                    .rtkit
+                    .as_mut()
+                    .ok_or(EINVAL)?
+                    .as_mut()
+                    .send_message(0x21, 0x0084000000000011)?;
                 return Ok(());
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));

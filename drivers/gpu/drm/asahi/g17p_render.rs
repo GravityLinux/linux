@@ -197,7 +197,7 @@ impl Kind {
             Self::Fragment => FRAGMENT_SIZE,
         }
     }
-    fn index(self) -> u32 {
+    pub(crate) fn index(self) -> u32 {
         match self {
             Self::Tiling => 0,
             Self::Fragment => 1,
