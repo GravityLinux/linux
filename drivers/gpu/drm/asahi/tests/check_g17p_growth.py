@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Differential protocol checks against source g17p_growth.py, no hardware."""
 import argparse
+import ast
 import importlib.util
 from pathlib import Path
 import struct
 import subprocess
 import tempfile
+from types import SimpleNamespace
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('m1n1', type=Path)
@@ -87,6 +89,30 @@ for old_count in (0, 8, 18, 328):
             result = b'\0'
         emit(3, old_count, len(new), 0, struct.pack('<%dQ' % (len(old) + len(new)), *old, *new), result)
 
+# Execute the source service's actual environment resolution and validation.
+# Importing its hardware module would hide these pure policy checks behind USB.
+tree = ast.parse((args.m1n1 / 'proxyclient/m1n1/agx/g17p_render_startup.py').read_text())
+cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'G17PFirstRender')
+method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'install_growth_service')
+start = next(i for i, node in enumerate(method.body)
+             if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+             and node.targets[0].id == 'max_blocks')
+policy = compile(ast.Module(body=method.body[start:start + 4], type_ignores=[]), '<source pool policy>', 'exec')
+for global_limit in (0, 7, 8, 18, 2048, 2049):
+    for first in (0, 7, 8, 18, 2048, 0xffffffff):
+        for second in (0, 7, 8, 18, 2048, 0xffffffff):
+            env = {'G17P_TVB_MAX_BLOCKS': str(global_limit)}
+            for owner, value in enumerate((first, second)):
+                if value != 0xffffffff:
+                    env['G17P_TVB_MAX_BLOCKS_POOL%d' % owner] = str(value)
+            scope = {'PAGE': 0x4000, 'os': SimpleNamespace(getenv=lambda key, default: env.get(key, default))}
+            try:
+                exec(policy, scope)
+                result = struct.pack('<B2I', 1, *(scope['pool_limits'][owner] or 2048 for owner in (0, 1)))
+            except ValueError:
+                result = bytes(9)
+            emit(4, global_limit, first, second, b'', result)
+
 candidate = Path(__file__).resolve().parents[1] / 'g17p_growth.rs'
 rust = '''#![allow(dead_code)]
 use std::io::{Read, Write};
@@ -103,6 +129,7 @@ fn main(){
    1=>{let r=owner.limit(body,&[0xfffffc2000000100,0xfffffc2000000120],0xfffffc20c00b0000,1);out.push(u8::from(r.is_some()));out.extend_from_slice(&r.unwrap_or(0).to_le_bytes());},
    2=>out.push(u8::from(g::fatal(body))),
    3=>{let list:Vec<u64>=body.chunks_exact(8).map(|v|u64::from_le_bytes(v.try_into().unwrap())).collect();out.push(u8::from(g::block_list(&list[..vm as usize],&list[vm as usize..])));},
+   4=>{let limits=g::source_pool_limits(vm,[pool,counter]);out.push(u8::from(limits.is_some()));for value in limits.unwrap_or([0;2]){out.extend_from_slice(&value.to_le_bytes());}},
    _=>panic!("bad op")
   }
  }
@@ -117,4 +144,4 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run([args.rustc, '--edition=2021', '-Dwarnings', str(path / 'check.rs'), '-o', str(path / 'check')], check=True)
     actual = subprocess.run([str(path / 'check')], input=inputs, stdout=subprocess.PIPE, check=True).stdout
 assert actual == expected, (len(actual), len(expected), next((i for i, (a, b) in enumerate(zip(actual, expected)) if a != b), None))
-print(f'PASS: {cases} growth identities, replies, limit/fatal reports and retained block lists; {len(expected)} compared bytes, all request/report bit mutations, malformed lengths and 32 bounded allocations')
+print(f'PASS: {cases} growth identities, replies, limit/fatal reports, retained block lists and source per-pool limits; {len(expected)} compared bytes, all request/report bit mutations, malformed lengths and 32 bounded allocations')

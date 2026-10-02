@@ -87,9 +87,6 @@ impl Retirement {
         if self.next == ORDER.len() {
             return Ok(None);
         }
-        if let Some(owner) = self.offered {
-            return Ok(Some(owner));
-        }
         let changed = |i: usize| observations[i].status != self.initial[i];
         let owner = ORDER[self.next];
         let complete = match owner {
@@ -104,6 +101,13 @@ impl Retirement {
             Owner::Opening => self.transport[0] && changed(0),
         };
         if !complete {
+            // _finish_render takes a second status snapshot after its control
+            // pump. A previously offered owner cannot lose that evidence and
+            // still authorize copyback or scheduler cleanup.
+            if self.offered.is_some() {
+                self.fail();
+                return Err(Error::Failed);
+            }
             return Ok(None);
         }
         self.offered = Some(owner);
@@ -111,7 +115,8 @@ impl Retirement {
     }
     /// Commit only after the corresponding synchronous finisher has succeeded.
     /// Closing CL owns compute copyback, render owns its scheduler cleanup and
-    /// render copyback, and opening CL never triggers another compute copyback.
+    /// timestamp copyback. Final render BO copyback follows opening CL; opening
+    /// never triggers another compute BO copyback.
     pub(crate) fn retire(&mut self, owner: Owner) -> core::result::Result<(), Error> {
         if self.failed {
             return Err(Error::Failed);

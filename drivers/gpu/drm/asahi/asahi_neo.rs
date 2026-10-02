@@ -20,25 +20,31 @@ mod g17p_compute_lifecycle;
 mod g17p_compute_memory;
 mod g17p_compute_runtime;
 #[allow(dead_code)]
+mod g17p_context;
+#[allow(dead_code)]
 mod g17p_dependency;
 #[allow(dead_code)]
-mod g17p_dependency_vm;
-#[allow(dead_code)]
-mod g17p_dependency_runtime;
+mod g17p_dependency_control;
 #[allow(dead_code)]
 mod g17p_dependency_release;
 #[allow(dead_code)]
 mod g17p_dependency_retire;
 #[allow(dead_code)]
-mod g17p_dependency_control;
+mod g17p_dependency_runtime;
+#[allow(dead_code)]
+mod g17p_dependency_vm;
 mod g17p_drm;
 mod g17p_growth;
 mod g17p_growth_runtime;
 mod g17p_image;
 mod g17p_initgraph;
 mod g17p_layout;
+#[allow(dead_code)]
+mod g17p_lifecycle;
 mod g17p_memory;
 mod g17p_opening;
+#[allow(dead_code)]
+mod g17p_partial_runtime;
 mod g17p_platform;
 mod g17p_user_vm;
 // Core queue port is exercised by source differential tests until submit is wired.
@@ -51,6 +57,8 @@ mod g17p_render;
 mod g17p_render_graph;
 mod g17p_render_lifecycle;
 mod g17p_render_runtime;
+#[allow(dead_code)]
+mod g17p_resource_record;
 mod g17p_sync;
 mod g17p_timestamp;
 mod g17p_topology;
@@ -127,7 +135,13 @@ impl platform::Driver for NeoGpu {
             .max()
             .ok_or(EINVAL)?;
         let runtime = kernel::sync::Arc::pin_init(
-            kernel::new_mutex!(Some(g17p_drm::Runtime { session, image })),
+            kernel::new_mutex!(Some(g17p_drm::Runtime {
+                session,
+                image,
+                active: 0,
+                exclusive: false,
+                admission_handoff: None
+            })),
             GFP_KERNEL,
         )?;
         let drm = g17p_drm::register(
@@ -153,4 +167,70 @@ kernel::module_platform_driver! {
     authors: ["Asahi Linux Contributors"],
     description: "Apple A18 Pro GPU driver",
     license: "Dual MIT/GPL",
+    params: {
+        submission_log: u32 {
+            default: 1,
+            description: "Successful render/compute submission logs: 0 off for benchmarking, nonzero retains diagnostic evidence",
+        },
+        first_render_fragment_sync_grow: u32 {
+            default: 2,
+            description: "Source first-render fragment sync-grow diagnostic: 0 or 1, 2 retains the caller default",
+        },
+        repeat_fragment_sync_grow: u32 {
+            default: 2,
+            description: "Source repeat fragment sync-grow diagnostic: 0 or 1, 2 retains the caller default",
+        },
+        tvb_max_blocks: u32 {
+            default: 0,
+            description: "Source G17P_TVB_MAX_BLOCKS: zero for the full index capacity, otherwise 8..2048",
+        },
+        tvb_max_blocks_pool0: u32 {
+            default: 0xffffffff,
+            description: "Source pool-zero TVB bound: inherit by default, zero unbounded, otherwise 8..2048",
+        },
+        tvb_max_blocks_pool1: u32 {
+            default: 0xffffffff,
+            description: "Source pool-one TVB bound: inherit by default, zero unbounded, otherwise 8..2048",
+        },
+        owned_render_fault_kind: u32 {
+            default: 0,
+            description: "Source owned render fault diagnostic: 0 off, 1 shader store, 2 command fetch",
+        },
+        owned_render_fault_address: u64 {
+            default: 0,
+            description: "Page-aligned caller render DVA for the one owned fault diagnostic",
+        },
+        owned_render_fault_ordinal: u32 {
+            default: 0,
+            description: "Render ordinal on which to arm the one owned fault diagnostic",
+        },
+        cleanup_diagnostics: u32 {
+            default: 0,
+            description: "Source cleanup relocation diagnostics at VM_DESTROY: bit0 descriptor, bit1 context, bit2 transport, bit3 root",
+        },
+        native_render_vms: u32 {
+            default: 0,
+            description: "Source G17P_NATIVE_RENDER_VMS: retain two standalone render VM roots",
+        },
+        partial_independent_owner: u32 {
+            default: 0,
+            description: "Source G17P_PARTIAL_INDEPENDENT_OWNER: retain two render pools",
+        },
+        alternate_queue_pairs: u32 {
+            default: 0,
+            description: "Source G17P_ALTERNATE_QUEUE_PAIRS: alternate the two render transports",
+        },
+        keep_partial_operand_mappings: u32 {
+            default: 0,
+            description: "Source G17P_PARTIAL_KEEP_OPERAND_MAPPINGS: preserve low render operands",
+        },
+        native_compute_vms: u32 {
+            default: 0,
+            description: "Source G17P_NATIVE_COMPUTE_VMS: retain two standalone compute VM roots",
+        },
+        native_barriers: u32 {
+            default: 0,
+            description: "Source G17P_MODERN_NATIVE_BARRIERS: use native first C/R/C publication",
+        },
+    },
 }

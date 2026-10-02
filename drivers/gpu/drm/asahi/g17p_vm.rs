@@ -40,6 +40,9 @@ fn native(va: u64) -> Option<u64> {
 }
 
 impl Vm {
+    pub(crate) fn firmware_root(&self) -> u64 {
+        self.roots[2]
+    }
     pub(crate) fn build(
         dev: &device::Device,
         memory: &mut Memory,
@@ -292,6 +295,23 @@ impl Vm {
     pub(crate) fn pte(&self, memory: &Memory, group: usize, va: u64) -> Result<u64> {
         Ok(self.lookup(memory, group, va)?.unwrap_or(0))
     }
+    pub(crate) fn leaf_record(&self, memory: &Memory, group: usize, va: u64) -> Result<(u64, u64)> {
+        let indices = Self::indices(group, va)?;
+        let mut table = self.roots[group];
+        for index in indices[..2].iter().copied() {
+            let pte = memory.word64(table + index as u64 * 8)?.load();
+            if pte & 3 != 3 {
+                return Err(EINVAL);
+            }
+            table = pte & ADDRESS;
+        }
+        let address = table + indices[2] as u64 * 8;
+        let pte = memory.word64(address)?.load();
+        if pte & 3 != 3 {
+            return Err(EINVAL);
+        }
+        Ok((address, pte))
+    }
 
     /// Quiescent replacements of already-present source-owned leaves. Validate
     /// every old PTE and prepare every RAM word before breaking any mapping.
@@ -373,7 +393,7 @@ impl Vm {
         self.rebind_pages(memory, &changes)
     }
 
-    fn invalidate_gpu() {
+    pub(crate) fn invalidate_gpu() {
         super::g17p_memory::sync();
         // SAFETY: Called under exclusive runtime access, after checked,
         // quiescent UAT replacements. Global invalidation includes aliases in
@@ -425,6 +445,51 @@ impl Vm {
         // Source iomap_at_root defaults: OS=1, UXN=1, AF=1, AP=1,
         // AttrIndex=Shared (2), VALID/TYPE=1; global mapping.
         self.span(memory, 2, va, pa, PAGE as usize, 0x00c000000000044b)
+    }
+
+    pub(crate) fn unmap_timestamp(&self, memory: &Memory, va: u64, pages: &[u64]) -> Result {
+        let mut words = KVec::with_capacity(pages.len(), GFP_KERNEL)?;
+        if va & (PAGE - 1) != 0
+            || va < TIMESTAMP_BASE
+            || va.checked_add(pages.len() as u64 * PAGE).ok_or(EINVAL)?
+                > TIMESTAMP_BASE + TIMESTAMP_SIZE
+        {
+            return Err(EINVAL);
+        }
+        for (index, &pa) in pages.iter().enumerate() {
+            let at = va + index as u64 * PAGE;
+            if self.lookup(memory, 2, at)? != Some(pa | 0x00c000000000044b) {
+                return Err(EIO);
+            }
+            let indices = Self::indices(2, at)?;
+            let mut table = self.roots[2];
+            for offset in indices[..2].iter().copied() {
+                if !self.tables.contains(&table) {
+                    return Err(EIO);
+                }
+                let pte = memory.read64(table + offset as u64 * 8)?;
+                if pte & 3 != 3 {
+                    return Err(EIO);
+                }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) {
+                return Err(EIO);
+            }
+            let leaf = table + indices[2] as u64 * 8;
+            words.push((leaf, memory.word64(leaf)?), GFP_KERNEL)?;
+        }
+        // All backing and leaf ownership checks precede the first store.
+        for (_, word) in &words {
+            word.store(0);
+        }
+        Self::invalidate_gpu();
+        for (leaf, _) in &words {
+            if memory.read64(*leaf)? != 0 {
+                return Err(EIO);
+            }
+        }
+        Ok(())
     }
 
     /// Extend driver-owned firmware storage before first-work publication.
@@ -501,7 +566,18 @@ impl Vm {
     /// A transport pool allocation belongs to Memory before it becomes
     /// reachable. Existing mappings are never overwritten or adopted.
     pub(crate) fn transport_backing(&mut self, memory: &mut Memory, address: u64) -> Result<u64> {
-        if address & (PAGE - 1) != 0 {
+        self.transport_backing_with_attributes(memory, address, 0x00c0000000000443)
+    }
+
+    /// Relocated firmware objects preserve their Source cache attributes.
+    /// Firmware-only queues use Normal; CPU/GPU shared counters use Shared.
+    /// Moving a shared object to the c0000000 aperture never licenses caching
+    /// its host-updated counts as a firmware-only object.
+    pub(crate) fn transport_backing_with_attributes(
+        &mut self, memory: &mut Memory, address: u64, attributes: u64,
+    ) -> Result<u64> {
+        if !matches!(attributes, 0x00c0000000000443 | 0x00c000000000044b)
+            || address & (PAGE - 1) != 0 {
             return Err(EINVAL);
         }
         for offset in [0, PAGE] {
@@ -517,7 +593,7 @@ impl Vm {
             address,
             pa,
             2 * PAGE as usize,
-            0x00c0000000000443,
+            attributes,
         )?;
         self.flush_tables(memory)?;
         // SAFETY: Publish the owned absent-to-present GPU mappings before

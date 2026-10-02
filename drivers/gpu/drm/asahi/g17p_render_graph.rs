@@ -227,9 +227,7 @@ impl Optional<'_> {
         }
         let phase = match self.context_phase {
             Some(v) => v,
-            None => (self.item as u32 * 256)
-                .try_into()
-                .map_err(|_| Error::Overflow)?,
+            None => (self.item & 0xff) << 8,
         };
         let context = self.context.unwrap_or(self.grid / 2);
         let scheduler = self.scheduler_class.unwrap_or(context);
@@ -259,7 +257,7 @@ impl Optional<'_> {
             }
         }
         for (at, v) in [
-            (0x2a, self.context_index.unwrap_or(self.item)),
+            (0x2a, self.context_index.unwrap_or(self.item & 0xff)),
             (0x2e, phase),
             (0x18, self.grid),
             (0x3e, self.ordinal),

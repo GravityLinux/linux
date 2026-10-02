@@ -41,9 +41,13 @@ static void render_check(unsigned char **images, int complete)
 		}
 	}
 }
-int main(void)
+int main(int argc, char **argv)
 {
 	setbuf(stdout, NULL);
+	int render_only = argc == 2 && !strcmp(argv[1], "--render-only");
+	unsigned compute_count = argc == 3 && !strcmp(argv[1], "--compute-count") ? (unsigned)atoi(argv[2]) : 258;
+	CHECK(argc == 1 || render_only || (argc == 3 && !strcmp(argv[1], "--compute-count") && compute_count > 0 && compute_count <= G17P_TIMESTAMP_CAPACITY));
+	unsigned batches = (compute_count + 55) / 56;
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
 	CHECK(fd >= 0);
 	uint32_t vm = vm_new(fd);
@@ -79,13 +83,14 @@ int main(void)
 
 	struct drm_asahi_submit draw={.queue_id=queue.queue_id,.cmdbuf=(uintptr_t)render_command,.cmdbuf_size=sizeof(render_command)};
 	render_check(images,0); OK(fd,DRM_IOCTL_ASAHI_SUBMIT,&draw);render_check(images,1);
+	if (render_only) goto repeat_render;
 	struct command commands[56];
 	struct timestamp_test timestamps = {0};
 	struct sync_test sync = {0};
 	struct drm_asahi_submit submit = { .queue_id = queue.queue_id, .cmdbuf = (uintptr_t)commands };
-	puts("G17P_NATIVE_RETAINED_WAVE_BEGIN 56/56/56/56/34 commands, 258 unique inputs and status/timestamp pairs");
-	for (unsigned batch = 0; batch < 5; batch++) {
-		unsigned count = batch == 4 ? 34 : 56, first = batch * 56;
+	printf("G17P_NATIVE_RETAINED_WAVE_BEGIN %u commands with unique inputs and status/timestamp pairs\n", compute_count);
+	for (unsigned batch = 0; batch < batches; batch++) {
+		unsigned first = batch * 56, count = compute_count - first > 56 ? 56 : compute_count - first;
 		submit.cmdbuf_size = count * sizeof(commands[0]); memset(commands, 0, sizeof(commands));
 		for (unsigned j = 0; j < count; j++) {
 			const struct batch_workload *w = &batch_workloads[j];
@@ -100,8 +105,8 @@ int main(void)
 			c->compute.cdm_ctrl_stream_base = w->cdm; c->compute.cdm_ctrl_stream_end = w->cdm + w->cdm_size;
 		}
 		if (batch == 0) {
-			commands[55].compute.flags = 1; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); commands[55].compute.flags = 0;
-			commands[55].header.cdm_barrier = 56; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); commands[55].header.cdm_barrier = 55;
+			commands[count-1].compute.flags = 1; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); commands[count-1].compute.flags = 0;
+			commands[count-1].header.cdm_barrier = count; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); commands[count-1].header.cdm_barrier = count-1;
 			outputs_check(output, epochs);
 			timestamp_setup(fd, &timestamps, &commands[0].compute, &submit); sync_setup(fd, &sync, &submit);
 			/* Rebind before assigning any references in this first full buffer. */
@@ -111,8 +116,13 @@ int main(void)
 		for (unsigned j = 0; j < count; j++) if (first + j != 16)
 			timestamp_before(fd, &timestamps, &commands[j].compute, first + j);
 		if (batch == 4) {
+			struct command original_command=commands[34];
 			commands[34] = commands[0]; commands[34].header.cdm_barrier = 34;
-			submit.cmdbuf_size = 35 * sizeof(commands[0]); BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP);
+			/* The source now retains status pages past the old 258-command
+			 * port limit. Reject a genuinely invalid trailing command. */
+			commands[34].compute.flags = 1;
+			submit.cmdbuf_size = 35 * sizeof(commands[0]); BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
+			commands[34]=original_command;
 			submit.cmdbuf_size = count * sizeof(commands[0]); outputs_check(output, epochs);
 			CHECK(sync_point(fd, sync.timeline) == 4); CHECK(sync_stamp(fd, sync.binary) == sync.last_stamp);
 		}
@@ -127,11 +137,15 @@ int main(void)
 		timestamp_check(&timestamps, first + count); outputs_check(output, epochs);render_check(images,1);
 		printf("WAVE_BATCH %u PASS %u outputs, independent statuses/timestamps and aggregate fences\n", batch, count);
 	}
-	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EOPNOTSUPP); outputs_check(output, epochs);
-	timestamp_finish(fd, &timestamps, 258); sync_finish(fd, &sync, 5);
+	unsigned last_count = compute_count - (batches - 1) * 56;
+	commands[last_count-1].header.cdm_barrier = last_count;
+	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); outputs_check(output, epochs);
+	timestamp_finish(fd, &timestamps, compute_count); sync_finish(fd, &sync, batches);
+repeat_render:
 	for(unsigned j=0;j<8;j++)memset(images[j],0xa5,RENDER_OUTPUT_SIZE);
 	render_check(images,0);OK(fd,DRM_IOCTL_ASAHI_SUBMIT,&draw);render_check(images,1);outputs_check(output,epochs);
 	CHECK(close(fd) == 0);
-	printf("G17P_NATIVE_RETAINED_WAVE_PASS 258 commands, 16512 floats and guarded outputs, 516 timestamps, 5 aggregate fences, capacity rejection; checks=%u\n", checks);
+	if (render_only) printf("G17P_RETAINED_RENDER_ONLY_PASS two renders with unchanged allocation inventory; checks=%u\n", checks);
+	else printf("G17P_NATIVE_RETAINED_WAVE_PASS %u commands, %u floats and guarded outputs, %u timestamps, %u aggregate fences, invalid suffix rejection; checks=%u\n", compute_count, compute_count * 64, compute_count * 2, batches, checks);
 	return 0;
 }

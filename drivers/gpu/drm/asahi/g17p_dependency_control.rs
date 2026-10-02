@@ -34,6 +34,7 @@ pub(crate) struct Host<'a, N> {
     notifications: N,
     deferred: Option<(u64, u32)>,
     limit_seen: bool,
+    last_control: Option<release::Control>,
 }
 impl<'a, N: Notifications> Host<'a, N> {
     /// Called after all preparation and the explicit Session root switch. The
@@ -41,6 +42,34 @@ impl<'a, N: Notifications> Host<'a, N> {
     /// Reserve admission for all seven records before the first release kick;
     /// this first native source lifetime uses finite control-ring backing.
     pub(crate) fn new(
+        memory: &'a mut Memory,
+        vm: &'a Vm,
+        root: &'a mut UserVm,
+        service: &'a mut Service,
+        control: Channel,
+        ttbs: u64,
+        notifications: N,
+    ) -> Result<Self> {
+        let host = Self::attach(memory, vm, root, service, control, ttbs, notifications)?;
+        let counters = host.counters()?;
+        if counters.available() < 7 || counters.0[2] > 248 {
+            return Err(EBUSY);
+        }
+        // Validate the complete release train before publishing its prefix.
+        for slot in counters.0[2] as usize..counters.0[2] as usize + 7 {
+            for offset in (0..0x40).step_by(8) {
+                let va = control
+                    .ring
+                    .checked_add((slot * 0x40 + offset) as u64)
+                    .ok_or(EINVAL)?;
+                host.memory.word64(host.vm.physical(host.memory, 2, va)?)?;
+            }
+        }
+        Ok(host)
+    }
+    /// Reattach the owned report/control reader after release. Waiting for an
+    /// existing publication does not reserve another seven control entries.
+    pub(crate) fn attach(
         memory: &'a mut Memory,
         vm: &'a Vm,
         root: &'a mut UserVm,
@@ -60,21 +89,8 @@ impl<'a, N: Notifications> Host<'a, N> {
             notifications,
             deferred: None,
             limit_seen: false,
+            last_control: None,
         };
-        let counters = host.counters()?;
-        if counters.available() < 7 || counters.0[2] > 248 {
-            return Err(EBUSY);
-        }
-        // Bounds/ownership validation, not report consumption or GPU work.
-        for slot in counters.0[2] as usize..counters.0[2] as usize + 7 {
-            for offset in (0..0x40).step_by(8) {
-                let va = control
-                    .ring
-                    .checked_add((slot * 0x40 + offset) as u64)
-                    .ok_or(EINVAL)?;
-                host.memory.word64(host.vm.physical(host.memory, 2, va)?)?;
-            }
-        }
         for va in control.states {
             if va == 0 || va & 3 != 0 {
                 return Err(EINVAL);
@@ -111,8 +127,19 @@ impl<'a, N: Notifications> Host<'a, N> {
         }
         Ok(())
     }
+    pub(crate) fn poll_control(&mut self, control: release::Control) -> Result<bool> {
+        if self.deferred.is_some() || control.producer != self.control.states[2] {
+            return Err(EIO);
+        }
+        self.pump_reports()?;
+        let counters = self.counters()?;
+        Ok((0..2).all(|i| q::reached(control.consumers_before[i], counters.0[i], control.target)))
+    }
     pub(crate) fn limit_seen(&self) -> bool {
         self.limit_seen
+    }
+    pub(crate) fn last_control(&self) -> Option<release::Control> {
+        self.last_control
     }
 }
 impl<N: Notifications> d::ReleaseWriter for Host<'_, N> {
@@ -160,11 +187,13 @@ impl<N: Notifications> release::Target for Host<'_, N> {
             )?;
         }
         g17p_memory::sync();
-        Ok(release::Control {
+        let publication = release::Control {
             producer: self.control.states[2],
             target,
             consumers_before: [counters.0[0], counters.0[1]],
-        })
+        };
+        self.last_control = Some(publication);
+        Ok(publication)
     }
     fn expect_receipt(&mut self, sequence: u32) -> Result {
         self.service.expect_dependency_receipt(sequence)

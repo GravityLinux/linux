@@ -3,6 +3,7 @@
 #define main memory_test_main
 #include "g17p_drm_memory.c"
 #undef main
+#include <linux/sync_file.h>
 #include "g17p_drm_render_batch_workload.h"
 #define workload compute_workload
 #define workloads compute_workloads
@@ -10,9 +11,10 @@
 #undef workloads
 #undef workload
 
-static void render_check(unsigned char **images, int complete)
+static void render_check(unsigned char **images, unsigned completed)
 {
 	for (unsigned target = 0; target < 16; target++) {
+		int complete = target / 8 < completed;
 		float value = (target < 8 ? RENDER_TRIANGLES : RENDER_SECOND_TRIANGLES) * ((target % 8 + 1) / 8.0f);
 		unsigned char expected[4]; memcpy(expected, &value, 4);
 		for (unsigned byte = 0; byte < RENDER_OUTPUT_SIZE; byte++) {
@@ -41,10 +43,12 @@ int main(int argc, char **argv)
 	setbuf(stdout, NULL);
 	int compute_first = argc == 2 && !strcmp(argv[1], "--compute-first");
 	int compute_wave = argc == 2 && !strcmp(argv[1], "--compute-wave");
-	CHECK(argc == 1 || compute_first || compute_wave);
+	int native = argc == 2 && !strcmp(argv[1], "--native");
+	CHECK(argc == 1 || compute_first || compute_wave || native);
+	unsigned steps = native ? 3 : 4;
 	unsigned kinds[4];
-	for (unsigned step = 0; step < 4; step++)
-		kinds[step] = compute_wave ? (step == 1 || step == 2) : ((step & 1) ^ compute_first);
+	for (unsigned step = 0; step < steps; step++)
+		kinds[step] = native ? step != 1 : compute_wave ? (step == 1 || step == 2) : ((step & 1) ^ compute_first);
 
 	int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); CHECK(fd >= 0);
 	uint32_t vm = vm_new(fd);
@@ -87,7 +91,7 @@ int main(int argc, char **argv)
 	uint32_t *flags[4];
 	struct drm_asahi_timestamp *stamps[4][4];
 	unsigned counts[2] = {0}, position = 0;
-	for (unsigned step = 0; step < 4; step++) {
+	for (unsigned step = 0; step < steps; step++) {
 		unsigned kind = kinds[step], n = counts[kind];
 		if (kind) {
 			struct compute_packet packet = { .header = { .cmd_type = DRM_ASAHI_CMD_COMPUTE, .size = sizeof(packet.cmd) },
@@ -125,11 +129,11 @@ int main(int argc, char **argv)
 	unsigned batches = compute_first ? 2 : 1;
 	uint64_t last = 0;
 	printf("G17P_NATIVE_MIXED_BATCH_BEGIN %s, %u batches, every command has distinct outputs\n",
-		compute_first ? "C/R/C/R" : compute_wave ? "R/C/C/R" : "R/C/R/C", batches);
+		native ? "C/R/C" : compute_first ? "C/R/C/R" : compute_wave ? "R/C/C/R" : "R/C/R/C", batches);
 	for (unsigned batch = 0; batch < batches; batch++) {
 		for (unsigned target = 0; target < 16; target++) memset(images[target], 0xa5, RENDER_OUTPUT_SIZE);
 		for (unsigned n = 0; n < 2; n++) memset(outputs[n], 0xa5, PAGE);
-		for (unsigned step = 0; step < 4; step++) {
+		for (unsigned step = 0; step < steps; step++) {
 			unsigned count = kinds[step] ? 2 : 4;
 			for (unsigned i = 0; i < count; i++) {
 				unsigned offset = 64 + (batch * 4 + step) * 64 + i * 8;
@@ -140,10 +144,10 @@ int main(int argc, char **argv)
 		syncs[1].timeline_value = point = batch + 1;
 		OK(fd, DRM_IOCTL_SYNCOBJ_RESET, &reset);
 		/* Every trailing failure must leave all prior commands unpublished. */
-		*flags[3] |= 1U << 31; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); *flags[3] &= ~(1U << 31);
-		uint16_t barrier = headers[3]->vdm_barrier;
-		headers[3]->vdm_barrier = 3; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); headers[3]->vdm_barrier = barrier;
-		stamps[3][0]->handle = 0xdeadbeef; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, ENOENT); stamps[3][0]->handle = object.object_handle;
+		*flags[steps - 1] |= 1U << 31; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); *flags[steps - 1] &= ~(1U << 31);
+		uint16_t barrier = headers[steps - 1]->vdm_barrier;
+		headers[steps - 1]->vdm_barrier = 3; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL); headers[steps - 1]->vdm_barrier = barrier;
+		stamps[steps - 1][0]->handle = 0xdeadbeef; BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, ENOENT); stamps[steps - 1][0]->handle = object.object_handle;
 		/* Valid UAPI mapping, forbidden driver-private overlap: reject even
 		 * when the first command is compute and only a later render uses it. */
 		uint32_t collision = bo_new(fd, PAGE, DRM_ASAHI_GEM_WRITEBACK, 0);
@@ -159,7 +163,7 @@ int main(int argc, char **argv)
 		BAD(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &empty, EINVAL);
 		errno = 0; int result = ioctl(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit), error = errno;
 		printf("MIXED_BATCH %u rc=%d errno=%d\n", batch, result, error); CHECK(result == 0);
-		for (unsigned step = 0; step < 4; step++) {
+		for (unsigned step = 0; step < steps; step++) {
 			unsigned count = kinds[step] ? 2 : 4, offset = PAGE + 64 + (batch * 4 + step) * 64;
 			uint64_t values[4]; memcpy(values, timestamps + offset, count * 8);
 			for (unsigned i = 0; i < count; i += 2) CHECK(values[i] && values[i + 1] > values[i]);
@@ -168,11 +172,18 @@ int main(int argc, char **argv)
 			printf("MIXED_BATCH_COMMAND %u start=%" PRIu64 " end=%" PRIu64 "\n", batch * 4 + step, values[0], last);
 		}
 		CHECK(memcmp(timestamps, expected, sizeof(expected)) == 0);
-		render_check(images, 1); compute_check(outputs, 2);
+		render_check(images, native ? 1 : 2); compute_check(outputs, 2);
 		OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait); OK(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
+		struct drm_syncobj_handle completed = { .handle = binary.handle,
+			.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE };
+		OK(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &completed);
+		struct sync_file_info info = {0};
+		CHECK(ioctl(completed.fd, SYNC_IOC_FILE_INFO, &info) == 0);
+		printf("MIXED_BATCH_FENCE %u status=%d\n", batch, info.status);
+		CHECK(info.status == 1); CHECK(close(completed.fd) == 0);
 	}
 	CHECK(close(fd) == 0);
 	printf("G17P_NATIVE_MIXED_BATCH_PASS %u batches, %u renders / %u compute, every output and timestamp, cross-engine barriers, aggregate fences and rejected suffixes; checks=%u\n",
-		batches, batches * 2, batches * 2, checks);
+		batches, batches * (native ? 1 : 2), batches * 2, checks);
 	return 0;
 }

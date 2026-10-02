@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Native Asahi memory UAPI and synchronous compute submissions.
+//! Native Asahi memory UAPI and queued submissions with owned snapshots.
 //! Published mappings and GEM references survive ioctl/file teardown until
 //! firmware is stopped. Unimplemented submission features fail explicitly.
 
@@ -9,7 +9,9 @@ use super::{
 };
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use kernel::{
-    bindings, c_str, device, drm,
+    bindings, c_str, device,
+    dma_fence::RawDmaFence,
+    drm,
     drm::{
         gem::{self, shmem, BaseObject, DriverObject},
         ioctl,
@@ -36,8 +38,11 @@ type Device = drm::Device<Driver>;
 type DrmFile = drm::File<File>;
 pub(crate) type Object = shmem::Object<Bo>;
 pub(crate) struct Runtime {
-    pub(crate) session: Session,
+    pub(crate) session: KBox<Session>,
     pub(crate) image: Image,
+    pub(crate) active: usize,
+    pub(crate) exclusive: bool,
+    pub(crate) admission_handoff: Option<kernel::dma_fence::Fence>,
 }
 pub(crate) type RuntimeRef = Arc<Mutex<Option<Runtime>>>;
 
@@ -46,6 +51,7 @@ pub(crate) struct Driver;
 pub(crate) struct Data {
     params: uapi::drm_asahi_params_global,
     runtime: RuntimeRef,
+    events: Arc<asynchronous::Events>,
 }
 #[vtable]
 impl drm::driver::Driver for Driver {
@@ -106,7 +112,8 @@ pub(crate) fn register(
     let mut masks = [0u64; uapi::DRM_ASAHI_MAX_CLUSTERS as usize];
     masks[0] = core_mask as u64;
     let params = uapi::drm_asahi_params_global {
-        features: 0,
+        // Exact UAPI FEATURE_FRAGMENT_BARRIER, with conservative special-profile fallback.
+        features: 1 << 1,
         gpu_generation: 17,
         gpu_variant: b'P' as u32,
         gpu_revision: (version >> 8) & 255,
@@ -123,7 +130,15 @@ pub(crate) fn register(
         max_attachments: 16,
         command_timestamp_frequency_hz: 1_000_000_000,
     };
-    let drm = Device::new(dev, try_pin_init!(Data { params, runtime }))?;
+    let events = runtime.lock().as_ref().ok_or(ENODEV)?.session.events();
+    let drm = Device::new(
+        dev,
+        try_pin_init!(Data {
+            params,
+            runtime,
+            events
+        }),
+    )?;
     drm::driver::Registration::new_foreign_owned(&drm, dev, 0)?;
     dev_info!(
         dev,
@@ -152,13 +167,39 @@ impl DriverObject for Bo {
     fn close(obj: &Object, file: &DrmFile) {
         let inner = file.inner();
         let mut state = inner.state.lock();
+        if inner.pending.load(Ordering::Acquire) != 0 {
+            return;
+        }
         for vm in &mut state.vms {
+            if vm
+                .bindings
+                .iter()
+                .any(|binding| core::ptr::eq(&*binding.bo, obj))
+            {
+                // Invalidate before the first fallible unmap: a partial close
+                // must never retain a template for an older logical generation.
+                vm.invalidate_snapshots();
+            }
             let mut failed = false;
             for binding in &vm.bindings {
-                if core::ptr::eq(&*binding.bo, obj)
-                    && vm.tree.unmap(binding.start, binding.size).is_err()
-                {
-                    failed = true;
+                if core::ptr::eq(&*binding.bo, obj) {
+                    let result = (|| -> Result {
+                        let mut expected = KVec::new();
+                        for address in (binding.start..binding.end()).step_by(PAGE as usize) {
+                            let pte = vm.tree.pte(address)?;
+                            if pte != 0 {
+                                expected.push((address, pte), GFP_KERNEL)?;
+                            }
+                        }
+                        Option::as_mut(&mut *inner.runtime.lock())
+                            .ok_or(ENODEV)?
+                            .session
+                            .unbind_vm((inner.id, vm.id), binding.start, binding.size, &expected)?;
+                        vm.tree.unmap(binding.start, binding.size)
+                    })();
+                    if result.is_err() {
+                        failed = true;
+                    }
                 }
             }
             // A table access error must not drop the last BO reference while
@@ -168,6 +209,13 @@ impl DriverObject for Bo {
                     .retain(|binding| !core::ptr::eq(&*binding.bo, obj));
             } else {
                 pr_err!("G17P: GEM close retained mapping after table error\n");
+            }
+        }
+        for object in &state.objects {
+            if core::ptr::eq(&*object.bo, obj) {
+                if let Some(runtime) = Option::as_mut(&mut *inner.runtime.lock()) {
+                    let _ = runtime.session.unbind_timestamp(object.address);
+                }
             }
         }
         state
@@ -210,13 +258,38 @@ impl Binding {
 }
 struct Vm {
     id: u32,
+    pending: Arc<AtomicU64>,
     kernel_start: u64,
     kernel_end: u64,
     tree: UserVm,
     resv: ARef<Object>,
     bindings: KVec<Binding>,
+    mapping_generation: u64,
+    snapshots: [Option<Arc<admission::Snapshot>>; 2],
 }
 impl Vm {
+    fn invalidate_snapshots(&mut self) {
+        // Clear both views on every logical mapping mutation. Clearing also
+        // prevents an ABA cache hit if this identity counter ever wraps.
+        self.mapping_generation = self.mapping_generation.wrapping_add(1);
+        self.snapshots = [None, None];
+    }
+    fn cached_snapshot(
+        &mut self,
+        owner: (u64, u32),
+        render: bool,
+    ) -> Result<Arc<admission::Snapshot>> {
+        let index = usize::from(render);
+        if let Some(snapshot) = &self.snapshots[index] {
+            if snapshot.matches(owner, self.mapping_generation, render, &self.bindings) {
+                return Ok(snapshot.clone());
+            }
+        }
+        let client = self.snapshot(owner, render)?;
+        let snapshot = admission::Snapshot::new(self.mapping_generation, render, client)?;
+        self.snapshots[index] = Some(snapshot.clone());
+        Ok(snapshot)
+    }
     fn range(&self, start: u64, size: u64) -> Result<u64> {
         let end = start.checked_add(size).ok_or(EINVAL)?;
         if size == 0
@@ -322,6 +395,8 @@ impl Vm {
             buffers,
             bindings,
             owner,
+            cpu_maps: crate::g17p_compute_runtime::CpuMaps::new()?,
+            primer_aliases: None,
         })
     }
     fn unbind(&mut self, start: u64, end: u64) -> Result {
@@ -341,6 +416,7 @@ impl Vm {
                 next.push(binding.part(binding.start, binding.end()), GFP_KERNEL)?;
             }
         }
+        self.invalidate_snapshots();
         self.tree.unmap(start, end - start)?;
         self.bindings = next;
         Ok(())
@@ -351,7 +427,26 @@ enum Command {
     Render(super::g17p_render::Parameters),
 }
 
+#[derive(Clone, Default)]
+struct EngineHistory {
+    render: Option<Arc<super::g17p_boot::RenderReceipt>>,
+    compute: Option<kernel::dma_fence::Fence>,
+}
+#[pin_data]
+struct QueueHistory {
+    #[pin]
+    state: Mutex<EngineHistory>,
+}
+impl QueueHistory {
+    fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(try_pin_init!(Self { state <- new_mutex!(EngineHistory::default()) }), GFP_KERNEL)
+    }
+}
 struct Queue {
+    tail: Option<kernel::dma_fence::Fence>,
+    publication: Option<kernel::dma_fence::Fence>,
+    render_pipeline: bool,
+    history: Arc<QueueHistory>,
     id: u32,
     vm: u32,
     priority: u32,
@@ -371,31 +466,113 @@ struct State {
     next_queue: u32,
     next_object: u32,
 }
-#[pin_data]
-pub(crate) struct File {
+#[pin_data(PinnedDrop)]
+pub(crate) struct FileState {
     id: u64,
-    raw: AtomicPtr<bindings::drm_file>,
+    runtime: RuntimeRef,
+    pending: AtomicU64,
     #[pin]
     state: Mutex<State>,
 }
+#[pin_data]
+pub(crate) struct File {
+    shared: Arc<FileState>,
+    raw: AtomicPtr<bindings::drm_file>,
+}
+impl core::ops::Deref for File {
+    type Target = FileState;
+    fn deref(&self) -> &FileState {
+        &self.shared
+    }
+}
+#[path = "g17p_admission.rs"]
+mod admission;
+#[path = "g17p_async.rs"]
+pub(crate) mod asynchronous;
+
+struct Prepared {
+    owner: (u64, u32),
+    history: Arc<QueueHistory>,
+    // Frozen only after the preceding accepted queue job has published.
+    history_seed: Option<EngineHistory>,
+    vm_pending: Arc<AtomicU64>,
+    parameters: KVec<Command>,
+    // Submit-relative engine milestones, including index zero's preceding
+    // public-queue work. Retain them with the immutable command snapshot.
+    barriers: KVec<[u16; 2]>,
+    render_client: Option<super::g17p_compute_runtime::Client>,
+    compute_client: Option<super::g17p_compute_runtime::Client>,
+    render_snapshot: Option<Arc<admission::Snapshot>>,
+    compute_snapshot: Option<Arc<admission::Snapshot>>,
+    buffers: KVec<ARef<Object>>,
+}
+impl Prepared {
+    fn pipeline_render(&self) -> bool {
+        *crate::module_parameters::native_render_vms.value() == 0
+            && *crate::module_parameters::native_compute_vms.value() == 0
+            && *crate::module_parameters::partial_independent_owner.value() == 1
+            && *crate::module_parameters::alternate_queue_pairs.value() == 1
+            && !self.parameters.is_empty()
+            && self.parameters.iter().all(|p| matches!(p, Command::Render(_)))
+            && self.parameters.iter().zip(self.barriers.iter()).all(|(p, b)| {
+                *b == [u16::MAX; 2] || matches!(p, Command::Render(p) if p.vdm_barrier_fragment)
+            })
+    }
+}
+
+
 static FILE_ID: AtomicU64 = AtomicU64::new(1);
 impl drm::file::DriverFile for File {
     type Driver = Driver;
-    fn open(_dev: &Device) -> Result<Pin<KBox<Self>>> {
+    fn open(dev: &Device) -> Result<Pin<KBox<Self>>> {
         let id = FILE_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_add(1))
             .map_err(|_| EOVERFLOW)?;
+        let shared = Arc::pin_init(
+            try_pin_init!(FileState {
+                id, runtime:dev.runtime.clone(), pending:AtomicU64::new(0),
+                state <- new_mutex!(State {vms:KVec::new(),queues:KVec::new(),
+                    objects:KVec::new(),next_vm:1,next_queue:1,next_object:1})
+            }),
+            GFP_KERNEL,
+        )?;
         KBox::pin_init(
-            try_pin_init!(Self {id,raw:AtomicPtr::new(core::ptr::null_mut()),state<-new_mutex!(State {
-            vms:KVec::new(),queues:KVec::new(),objects:KVec::new(),next_vm:1,next_queue:1,next_object:1})}),
+            try_pin_init!(Self {
+                shared,
+                raw: AtomicPtr::new(core::ptr::null_mut())
+            }),
             GFP_KERNEL,
         )
     }
+
     fn post_open(&self, file: &DrmFile) {
         self.raw.store(file.as_raw(), Ordering::Release);
     }
     fn as_raw(&self) -> *mut bindings::drm_file {
         self.raw.load(Ordering::Acquire)
+    }
+}
+#[pinned_drop]
+impl PinnedDrop for FileState {
+    fn drop(self: Pin<&mut Self>) {
+        let state = self.state.lock();
+        let mut runtime = self.runtime.lock();
+        if let Some(runtime) = Option::as_mut(&mut *runtime) {
+            for object in &state.objects {
+                if runtime.session.unbind_timestamp(object.address).is_err() {
+                    pr_err!("G17P: retaining timestamp alias after file close\n");
+                }
+            }
+            for vm in &state.vms {
+                if runtime
+                    .session
+                    .destroy_vm((self.id, vm.id), &runtime.image)
+                    .is_err()
+                {
+                    pr_err!("G17P: retaining native VM after file close without cleanup receipt\n");
+                }
+            }
+        }
     }
 }
 impl File {
@@ -476,11 +653,14 @@ impl File {
         state.vms.push(
             Vm {
                 id,
+                pending: Arc::new(AtomicU64::new(0), GFP_KERNEL)?,
                 kernel_start: data.kernel_start,
                 kernel_end: data.kernel_end,
                 tree,
                 resv,
                 bindings: KVec::new(),
+                mapping_generation: 0,
+                snapshots: [None, None],
             },
             GFP_KERNEL,
         )?;
@@ -495,7 +675,7 @@ impl File {
         );
         Ok(0)
     }
-    fn vm_destroy(_dev: &Device, data: &uapi::drm_asahi_vm_destroy, file: &DrmFile) -> Result<u32> {
+    fn vm_destroy(dev: &Device, data: &uapi::drm_asahi_vm_destroy, file: &DrmFile) -> Result<u32> {
         if data.pad != 0 {
             return Err(EINVAL);
         }
@@ -506,10 +686,18 @@ impl File {
             .iter()
             .position(|vm| vm.id == data.vm_id)
             .ok_or(ENOENT)?;
+        if state.vms[index].pending.load(Ordering::Acquire) != 0 {
+            return Err(EBUSY);
+        }
         if state.queues.iter().any(|q| q.vm == data.vm_id) || !state.vms[index].bindings.is_empty()
         {
             return Err(EBUSY);
         }
+        let mut runtime = dev.runtime.lock();
+        let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
+        runtime
+            .session
+            .destroy_vm((inner.id, data.vm_id), &runtime.image)?;
         state.vms.swap_remove(index);
         Ok(0)
     }
@@ -571,7 +759,7 @@ impl File {
         data.offset = object.create_mmap_offset()?;
         Ok(0)
     }
-    fn vm_bind(_dev: &Device, data: &uapi::drm_asahi_vm_bind, file: &DrmFile) -> Result<u32> {
+    fn vm_bind(dev: &Device, data: &uapi::drm_asahi_vm_bind, file: &DrmFile) -> Result<u32> {
         let stride = data.stride as usize;
         let op_size = core::mem::size_of::<uapi::drm_asahi_gem_bind_op>();
         if data.pad != 0 || stride < op_size {
@@ -603,8 +791,24 @@ impl File {
                 return Err(EINVAL);
             }
             if op.flags & UNBIND != 0 {
+                if vm.pending.load(Ordering::Acquire) != 0 {
+                    return Err(EBUSY);
+                }
                 if op.flags != UNBIND || op.handle != 0 || op.offset != 0 {
                     return Err(EINVAL);
+                }
+                {
+                    let mut expected = KVec::new();
+                    for address in (op.addr..end).step_by(PAGE as usize) {
+                        let pte = vm.tree.pte(address)?;
+                        if pte != 0 {
+                            expected.push((address, pte), GFP_KERNEL)?;
+                        }
+                    }
+                    Option::as_mut(&mut *dev.runtime.lock())
+                        .ok_or(ENODEV)?
+                        .session
+                        .unbind_vm((inner.id, vm.id), op.addr, op.range, &expected)?;
                 }
                 vm.unbind(op.addr, end)?;
                 continue;
@@ -653,6 +857,7 @@ impl File {
                 return Err(EIO);
             }
             vm.bindings.reserve(1, GFP_KERNEL)?;
+            vm.invalidate_snapshots();
             vm.tree.prepare(op.addr, op.range)?;
             for index in 0..op.range / PAGE {
                 let pa = pages[if op.flags & SINGLE != 0 {
@@ -692,6 +897,9 @@ impl File {
         let inner = file.inner();
         let mut state = inner.state.lock();
         if data.op == uapi::drm_asahi_bind_object_op_DRM_ASAHI_BIND_OBJECT_OP_UNBIND {
+            if inner.pending.load(Ordering::Acquire) != 0 {
+                return Err(EBUSY);
+            }
             if data.flags != 0 || data.handle != 0 || data.offset != 0 || data.range != 0 {
                 return Err(EINVAL);
             }
@@ -700,6 +908,10 @@ impl File {
                 .iter()
                 .position(|o| o.id == data.object_handle)
                 .ok_or(ENOENT)?;
+            Option::as_mut(&mut *dev.runtime.lock())
+                .ok_or(ENODEV)?
+                .session
+                .unbind_timestamp(state.objects[index].address)?;
             state.objects.swap_remove(index);
             return Ok(0);
         }
@@ -759,6 +971,10 @@ impl File {
         let next = id.checked_add(1).ok_or(EOVERFLOW)?;
         state.queues.push(
             Queue {
+                tail: None,
+                publication: None,
+                render_pipeline: false,
+                history: QueueHistory::new()?,
                 id,
                 vm: data.vm_id,
                 priority: data.priority,
@@ -811,7 +1027,7 @@ impl File {
         let cmd = unsafe {
             core::ptr::read_unaligned(body.as_ptr().cast::<uapi::drm_asahi_cmd_render>())
         };
-        if cmd.flags & !(2 | (1 << 18)) != 0
+        if cmd.flags & !(2 | (1 << 3) | (1 << 18)) != 0
             || cmd.vertex_helper.binary != 0
             || cmd.vertex_helper.cfg != 0
             || cmd.vertex_helper.data != 0
@@ -910,6 +1126,7 @@ impl File {
             Ok(object.address + offset)
         };
         let mut p = super::g17p_render_runtime::first_parameters();
+        p.vdm_barrier_fragment = cmd.flags & (1 << 3) != 0;
         p.width = cmd.width_px as u64;
         p.height = cmd.height_px as u64;
         p.layers = cmd.layers as u64;
@@ -966,12 +1183,18 @@ impl File {
         Ok(p)
     }
 
-    fn parameters(vm: &Vm, objects: &[Timestamp], bytes: &[u8]) -> Result<KVec<Command>> {
+    fn parameters(
+        vm: &Vm,
+        objects: &[Timestamp],
+        bytes: &[u8],
+    ) -> Result<(KVec<Command>, KVec<[u16; 2]>)> {
         use super::g17p_compute_runtime as compute;
         let mut offset = 0;
         let mut commands = KVec::new();
+        let mut command_barriers = KVec::new();
         let mut counts = [0usize; 2];
         let mut fragment_count = 0;
+        let mut fragment_attachments = [[0; 2]; 16];
         while offset < bytes.len() {
             let header = bytes.get(offset..offset + 8).ok_or(EINVAL)?;
             let kind = u16::from_le_bytes(header[0..2].try_into().unwrap());
@@ -986,17 +1209,21 @@ impl File {
             if matches!(kind, 2 | 3 | 4) {
                 if kind == 3 {
                     fragment_count = size / 24;
+                    fragment_attachments = [[0; 2]; 16];
                 }
                 if barriers != [u16::MAX; 2] || size % 24 != 0 || size / 24 > 16 {
                     return Err(EINVAL);
                 }
-                for row in payload.chunks_exact(24) {
+                for (index, row) in payload.chunks_exact(24).enumerate() {
                     let address = u64::from_le_bytes(row[0..8].try_into().unwrap());
                     let extent = u64::from_le_bytes(row[8..16].try_into().unwrap());
                     if row[16..].iter().any(|v| *v != 0) {
                         return Err(EINVAL);
                     }
                     vm.cover(address, extent, WRITE)?;
+                    if kind == 3 {
+                        fragment_attachments[index] = [address, extent];
+                    }
                 }
                 continue;
             }
@@ -1011,19 +1238,14 @@ impl File {
             }
             counts[kind as usize] += 1;
             if kind == 0 {
-                commands.push(
-                    Command::Render(Self::render_parameters(
-                        vm,
-                        objects,
-                        payload,
-                        fragment_count,
-                    )?),
-                    GFP_KERNEL,
-                )?;
+                let mut p = Self::render_parameters(vm, objects, payload, fragment_count)?;
+                p.fragment_attachments = fragment_attachments;
+                p.fragment_attachment_count = fragment_count;
+                commands.push(Command::Render(p), GFP_KERNEL)?;
+                command_barriers.push(barriers, GFP_KERNEL)?;
                 continue;
             }
-            // All previous commands finish before the next one starts in
-            // this synchronous port, satisfying each validated barrier.
+            // Attachment updates do not create engine milestones.
             if payload
                 .get(64..)
                 .unwrap_or_default()
@@ -1086,13 +1308,15 @@ impl File {
                 }),
                 GFP_KERNEL,
             )?;
+            command_barriers.push(barriers, GFP_KERNEL)?;
         }
         if commands.is_empty() {
             return Err(EINVAL);
         }
-        Ok(commands)
+        Ok((commands, command_barriers))
     }
     fn submit(dev: &Device, data: &uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+        dev.events.healthy()?;
         if data.flags != 0
             || data.pad != 0
             || data.cmdbuf_size == 0
@@ -1101,6 +1325,7 @@ impl File {
             return Err(EINVAL);
         }
         let sync = super::g17p_sync::Plan::read(file, data)?;
+        sync.input_error()?;
         let mut bytes = KVVec::new();
         UserSlice::new(
             UserPtr::from_addr(data.cmdbuf.try_into()?),
@@ -1109,53 +1334,148 @@ impl File {
         .reader()
         .read_all(&mut bytes, GFP_KERNEL)?;
         let inner = file.inner();
-        {
-            let state = inner.state.lock();
-            let queue = state
-                .queues
-                .iter()
-                .find(|q| q.id == data.queue_id)
-                .ok_or(ENOENT)?;
-            let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
-            Self::parameters(vm, &state.objects, &bytes)?;
-        }
-        // No file/runtime lock across waits. A concurrent producer may need
-        // this very file. Revalidate mappings after the wait before staging.
-        sync.wait_inputs()?;
-        let state = inner.state.lock();
+        let mut state = inner.state.lock();
         let queue = state
             .queues
             .iter()
             .find(|q| q.id == data.queue_id)
             .ok_or(ENOENT)?;
-        let vm = state.vms.iter().find(|v| v.id == queue.vm).ok_or(ENOENT)?;
-        let parameters = Self::parameters(vm, &state.objects, &bytes)?;
-        let mut runtime = dev.runtime.lock();
-        let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
+        let queue_vm = queue.vm;
+        let queue_priority = queue.priority;
+        let previous_completion = queue.tail.clone();
+        let previous_publication = queue.publication.clone();
+        let previous_pipeline = queue.render_pipeline;
+        let history = queue.history.clone();
+        let vm = state.vms.iter().find(|v| v.id == queue_vm).ok_or(ENOENT)?;
+        let (mut parameters, barriers) = Self::parameters(vm, &state.objects, &bytes)?;
+        for command in &mut parameters {
+            if let Command::Render(p) = command {
+                p.firmware_priority = Some(queue_priority);
+            }
+        }
         let owner = (inner.id, vm.id);
+        let vm_pending = vm.pending.clone();
+        let render = parameters.iter().any(|p| matches!(p, Command::Render(_)));
+        let compute = parameters.iter().any(|p| matches!(p, Command::Compute(_)));
+        let vm = state
+            .vms
+            .iter_mut()
+            .find(|v| v.id == queue_vm)
+            .ok_or(ENOENT)?;
+        // Snapshot under the file lock, without the runtime lock or any GPU
+        // wait. Each accepted job owns exactly these mappings and GEMs.
+        let render_snapshot = if render {
+            Some(vm.cached_snapshot(owner, true)?)
+        } else {
+            None
+        };
+        let render_client = render_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.deferred_client())
+            .transpose()?;
+        if let Some(client) = &render_client {
+            for command in &parameters {
+                if let Command::Render(p) = command {
+                    super::g17p_render_runtime::validate_client(client, p)?;
+                }
+            }
+        }
+        let compute_snapshot = if compute || render {
+            Some(vm.cached_snapshot(owner, false)?)
+        } else {
+            None
+        };
+        let compute_client = compute_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.deferred_client())
+            .transpose()?;
+        let mut buffers = KVec::new();
+        for binding in &vm.bindings {
+            buffers.push(binding.bo.clone(), GFP_KERNEL)?;
+        }
+        for object in &state.objects {
+            buffers.push(object.bo.clone(), GFP_KERNEL)?;
+        }
+        let prepared = Prepared {
+            owner,
+            history,
+            history_seed: None,
+            vm_pending,
+            parameters,
+            barriers,
+            render_client,
+            compute_client,
+            render_snapshot,
+            compute_snapshot,
+            buffers,
+        };
+        let pipeline = prepared.pipeline_render();
+        // Ordinary NONE/fragment-barrier pure renders use publication order.
+        // Legacy pre-tiling barriers and mixed/special work keep completion order.
+        let previous = if pipeline && previous_pipeline {
+            previous_publication
+        } else {
+            previous_completion
+        };
+        let fence = sync.fence();
+        // Allocate the work item before publishing any output syncobj. The
+        // previous queue fence preserves per-queue ordering without preventing
+        // another queue from resolving an imported input dependency.
+        let job =
+            asynchronous::Job::new(dev.into(), inner.shared.clone(), prepared, sync, previous)?;
+        let queue = state.queues.iter_mut()
+            .find(|q| q.id == data.queue_id).ok_or(ENOENT)?;
+        queue.tail = Some(fence);
+        queue.publication = Some(job.publication_fence());
+        queue.render_pipeline = pipeline;
+        asynchronous::Job::enqueue(job);
+        Ok(0)
+    }
+
+    fn initialize(
+        dev: &Device,
+        runtime: &mut Runtime,
+        prepared: &mut Prepared,
+        sync: &super::g17p_sync::Plan,
+        joining: bool,
+    ) -> Result {
+        let Prepared {
+            owner,
+            history: _,
+            history_seed: _,
+            vm_pending: _,
+            parameters,
+            barriers: _,
+            render_client,
+            compute_client,
+            render_snapshot,
+            compute_snapshot,
+            buffers,
+        } = prepared;
+        let owner = *owner;
         let render_count = parameters
             .iter()
             .filter(|p| matches!(p, Command::Render(_)))
             .count();
         let compute_count = parameters.len() - render_count;
         let render_first = matches!(parameters.first(), Some(Command::Render(_)));
+        if *crate::module_parameters::native_render_vms.value() == 1
+            && (compute_count != 0
+                || *crate::module_parameters::native_compute_vms.value() == 1
+                || *crate::module_parameters::partial_independent_owner.value() != 1)
+        {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        if *crate::module_parameters::native_compute_vms.value() == 1
+            && (render_count != 0 || runtime.session.render_client()?.is_some())
+        {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
         // Validate the entire command buffer against its prospective engine
         // lifetimes before publishing any prefix. A cold render-first buffer
         // creates the post-render compute owner even when none exists yet.
         if render_count != 0 {
             if render_count > runtime.session.render_remaining()? as usize {
-                return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
-            }
-            if runtime
-                .session
-                .render_client()?
-                .is_some_and(|c| c.owner != owner)
-                || (render_first
-                    && runtime
-                        .session
-                        .compute_client()?
-                        .is_some_and(|c| c.owner != owner))
-            {
                 return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
             }
         }
@@ -1168,13 +1488,61 @@ impl File {
         // Pin both caller views before the first command, including when the
         // second engine is new. An invalid render-private mapping must not
         // permit a preceding compute to execute first.
-        let mut render_client = if render_count != 0 {
-            vm.refresh_for(owner, true, runtime.session.render_client()?)?
-        } else {
-            None
-        };
-        let mut compute_client = if compute_count != 0 {
-            vm.refresh_for(owner, false, runtime.session.compute_client()?)?
+        // Preserve the retained hardware/private root when the admitted
+        // caller mapping snapshot is identical. Caller cache cleaning remains
+        // in the execution path and always happens before publication.
+        let unchanged =
+            |next: &super::g17p_compute_runtime::Client,
+             old: Option<&super::g17p_compute_runtime::Client>| {
+                old.is_some_and(|old| {
+                    old.owner == next.owner
+                        && old.bindings == next.bindings
+                        && old.buffers.len() == next.buffers.len()
+                        && old
+                            .buffers
+                            .iter()
+                            .zip(&next.buffers)
+                            .all(|(a, b)| core::ptr::eq(&**a, &**b))
+                })
+            };
+        if render_client
+            .as_ref()
+            .is_some_and(|next| unchanged(next, runtime.session.render_client().ok().flatten()))
+        {
+            *render_client = None;
+        }
+        if *crate::module_parameters::native_compute_vms.value() != 1
+            && compute_client.as_ref().is_some_and(|next| {
+                unchanged(next, runtime.session.compute_client().ok().flatten())
+            })
+        {
+            *compute_client = None;
+        }
+        // Metadata-only admission clients may be compared and validated above,
+        // but every retained replacement/cold client must own an executable
+        // tree before any private-root or hardware publication operation.
+        if let Some(client) = render_client.as_mut() {
+            render_snapshot
+                .as_ref()
+                .ok_or(EIO)?
+                .materialize(client, true)?;
+        }
+        if let Some(client) = compute_client.as_mut() {
+            compute_snapshot
+                .as_ref()
+                .ok_or(EIO)?
+                .materialize(client, false)?;
+        }
+        // Source activate_execution_context is separate from _ensure_render_vm:
+        // compute-only work selects its logical root without mapping compute
+        // BOs into render-private addresses. Retained direct-compute-only calls
+        // preserve the registered render selection altogether.
+        let execution_owner = if render_count == 0
+            && compute_count != 0
+            && !runtime.session.native_render()
+            && runtime.session.compute_selects_logical_context()
+        {
+            Some(owner)
         } else {
             None
         };
@@ -1183,51 +1551,396 @@ impl File {
                 .as_ref()
                 .or(runtime.session.render_client()?)
                 .ok_or(EIO)?;
-            for command in &parameters {
+            for command in parameters.iter() {
                 if let Command::Render(p) = command {
                     super::g17p_render_runtime::validate_client(client, p)?;
                 }
             }
         }
-        // Stage consecutive compute commands in source publication waves;
-        // render transitions still complete synchronously before advancing.
-        let mut commands = parameters.iter().peekable();
-        while let Some(command) = commands.next() {
+        // Preserve the Python source's opt-in exact C/R/C admission. Pin and
+        // validate both caller views before the private bootstrap or any work
+        // publication; the bootstrap never executes one of these commands.
+        let mut timestamp_addresses = KVec::new();
+        for command in parameters.iter() {
             match command {
-                Command::Render(p) => {
-                    if runtime.session.render_client()?.is_some() {
-                        runtime.session.submit_next_render(
-                            dev.as_ref(),
-                            &runtime.image,
-                            render_client.take(),
-                            p,
-                        )?;
-                    } else {
-                        runtime.session.submit_render(
-                            dev.as_ref(),
-                            &runtime.image,
-                            render_client.take().ok_or(EIO)?,
-                            p,
-                        )?;
+                Command::Compute(p) => {
+                    for address in p.timestamps {
+                        timestamp_addresses.push(address, GFP_KERNEL)?;
                     }
                 }
-                Command::Compute(p) => {
-                    let mut run = KVec::with_capacity(64, GFP_KERNEL)?;
-                    run.push(p, GFP_KERNEL)?;
-                    while let Some(Command::Compute(p)) = commands.peek() {
-                        run.push(p, GFP_KERNEL)?;
-                        commands.next();
+                Command::Render(p) => {
+                    for address in [
+                        p.ta_user_timestamp_start,
+                        p.ta_user_timestamp_end,
+                        p.fragment_user_timestamp_start,
+                        p.fragment_user_timestamp_end,
+                    ] {
+                        timestamp_addresses.push(address, GFP_KERNEL)?;
                     }
-                    runtime.session.submit_computes(
-                        dev.as_ref(),
-                        &runtime.image,
-                        compute_client.take(),
-                        &run,
-                    )?;
                 }
             }
         }
-        sync.complete();
-        Ok(0)
+        // Source adapter destroy_bo closes its host mapping while retaining
+        // the physical allocation. Preserve that lifetime before publication,
+        // including backing which a later file teardown removes from a root.
+        for buffer in buffers.iter() {
+            runtime.session.retain_source_backing(buffer)?;
+        }
+        runtime
+            .session
+            .begin_submission(&sync.fence(), &timestamp_addresses)?;
+        // Source activates once before the command loop, even when every
+        // caller leaf is unchanged. Install render BOs at that point so a
+        // leading compute sees the same prepared logical context.
+        if render_count != 0
+            && *crate::module_parameters::native_render_vms.value() == 0
+            && !runtime.session.native_render()
+            && runtime.session.render_client()?.is_some()
+        {
+            if let Some(client) = render_client.take() {
+                let p = parameters
+                    .iter()
+                    .find_map(|command| match command {
+                        Command::Render(p) => Some(p),
+                        _ => None,
+                    })
+                    .ok_or(EINVAL)?;
+                runtime
+                    .session
+                    .prepare_logical_render_context(dev.as_ref(), client, p)?;
+            } else if !joining {
+                // A joined ticket keeps the installed exact same root. Avoid
+                // a redundant ASID invalidate while firmware is using it.
+                runtime.session.select_logical_execution_context(dev.as_ref(), owner, None)?;
+            }
+        } else if let Some(owner) = execution_owner.filter(|_| !joining) {
+            runtime
+                .session
+                .select_logical_execution_context(dev.as_ref(), owner, None)?;
+        }
+        Ok(())
+    }
+
+    fn dependency_point(receipt: Option<&Arc<super::g17p_boot::RenderReceipt>>,
+                        engine: usize, propagate_error: bool) -> Result<Option<(u8, u32)>> {
+        let Some(receipt) = receipt else { return Ok(None); };
+        let status = unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) };
+        if status < 0 && propagate_error { return Err(Error::from_errno(status)); }
+        // A retired point needs no firmware wait, and its old context may
+        // have been replaced. Never encode a stale completed stamp.
+        if status != 0 { return Ok(None); }
+        let milestone = receipt.milestone(engine).ok_or(EIO)?;
+        Ok(Some((milestone.grid, milestone.value)))
+    }
+
+    fn progress(
+        dev: &Device,
+        prepared: &mut Prepared,
+        sync: &super::g17p_sync::Plan,
+        initialized: &mut bool,
+        cursor: &mut usize,
+        waiting: &mut bool,
+        work_gate: &mut Option<kernel::dma_fence::Fence>,
+        render_receipts: &mut KVec<Arc<super::g17p_boot::RenderReceipt>>,
+        publication: &kernel::dma_fence::Fence,
+    ) -> Result<Option<Option<Error>>> {
+        if prepared.history_seed.is_none() {
+            prepared.history_seed = Some(prepared.history.state.lock().clone());
+        }
+        // Only the ordinary pure-render pipeline encodes live FR dependencies.
+        // Mixed/native/cold jobs retain host completion ordering, which also
+        // satisfies the flag. Their public queue histories still update below.
+        let dependency_result = (|| -> Result<bool> {
+        if prepared.pipeline_render() {
+            // Control may still own the previous accepted receipt. Service it
+            // before resolving a published milestone; never encode a guessed
+            // future stamp or block the only worker that can publish it.
+            if render_receipts.iter().any(|receipt| !receipt.is_published()
+                && unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) } == 0) {
+                let mut held = dev.runtime.lock();
+                let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
+                runtime.session.poll_work(dev.as_ref(), &runtime.image)?;
+                if render_receipts.iter().any(|receipt| !receipt.is_published()
+                    && unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) } == 0) {
+                    return Ok(false);
+                }
+            }
+            let seed = prepared.history_seed.as_ref().ok_or(EIO)?;
+            let barriers = prepared.barriers.get(*cursor).copied();
+            if let (Some(Command::Render(p)), Some(barriers)) = (prepared.parameters.get_mut(*cursor), barriers) {
+                if barriers[1] == 0 {
+                    if let Some(compute) = &seed.compute {
+                        let status = unsafe { bindings::dma_fence_get_status(compute.raw()) };
+                        if status < 0 { return Err(Error::from_errno(status)); }
+                        if status == 0 { return Ok(false); }
+                    }
+                } else if barriers[1] != u16::MAX {
+                    // Pure render contains no Nth compute command (parser checks).
+                    return Err(EINVAL);
+                }
+                let prior = render_receipts.last().or(seed.render.as_ref());
+                p.prior_queue_ta = Self::dependency_point(prior, 0, false)?;
+                let selected = match barriers[0] {
+                    u16::MAX => None,
+                    0 => seed.render.as_ref(),
+                    n => Some(render_receipts.get(n as usize - 1).ok_or(EINVAL)?),
+                };
+                p.vdm_dependency = Self::dependency_point(selected, 1, true)?;
+            }
+        }
+        Ok(true)
+        })();
+        if matches!(dependency_result, Ok(false)) { return Ok(None); }
+        if !*initialized { dependency_result.as_ref().map_err(|error| *error)?; }
+        let dependency_error = dependency_result.err();
+        // Own the immutable seed under a short runtime lock, then perform
+        // allocation and Source command serialization on this worker without
+        // excluding unrelated publication or firmware retirement. Commit
+        // revalidates every item/parameter/root/binding/BO identity.
+        let seed = if dependency_error.is_none() && *initialized && !*waiting {
+            if let Some(Command::Render(p)) = prepared.parameters.get(*cursor) {
+                let held = dev.runtime.lock();
+                let runtime = Option::as_ref(&*held).ok_or(ENODEV)?;
+                runtime.session.render_preparation_seed(p, 1)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let prepared_append = seed.map(super::g17p_render_runtime::PreparationSeed::prepare).transpose()?;
+        let mut held = dev.runtime.lock();
+        let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
+        let fence = sync.fence();
+        if !*initialized {
+            // Only dependency-ready jobs reach admission. The first waiter
+            // requiring an owner/exclusive handoff prevents compatible new
+            // jobs from extending the current owner's wave indefinitely.
+            // Already initialized jobs bypass this gate and finish normally.
+            if runtime.admission_handoff.as_ref().is_some_and(|preferred| {
+                // SAFETY: Runtime owns this completion-fence reference.
+                unsafe { bindings::dma_fence_get_status(preferred.raw()) != 0 }
+            }) {
+                runtime.admission_handoff = None;
+            }
+            if runtime
+                .admission_handoff
+                .as_ref()
+                .is_some_and(|preferred| preferred.raw() != fence.raw())
+            {
+                return Ok(None);
+            }
+            let pipeline = prepared.pipeline_render();
+            let exclusive = (!pipeline && prepared.parameters.iter().any(|p| matches!(p, Command::Render(_))))
+                || *crate::module_parameters::native_compute_vms.value() == 1;
+            let compatible = if pipeline {
+                match prepared.parameters.first() {
+                    Some(Command::Render(p)) => runtime.session.can_join_render(prepared.render_client.as_ref(), p)?,
+                    _ => false,
+                }
+            } else {
+                runtime.session.can_join_compute(prepared.compute_client.as_ref())
+            };
+            let joining = runtime.active != 0;
+            if joining
+                && (runtime.exclusive
+                    || exclusive
+                    || !compatible)
+            {
+                if runtime.admission_handoff.is_none() {
+                    runtime.admission_handoff = Some(fence.clone());
+                }
+                return Ok(None);
+            }
+            if let Err(error) = Self::initialize(dev, runtime, prepared, sync, joining) {
+                runtime.session.notify_failure(error);
+                return Err(error);
+            }
+            // Exact public-fence identity reserves one admission, not every
+            // subsequent job of the same owner. Failure signals that fence;
+            // the next admission pass then discards the stale preference.
+            runtime.admission_handoff = None;
+            if !joining {
+                runtime.exclusive = exclusive;
+            }
+            runtime.active += 1;
+            *initialized = true;
+        }
+        let result = (|| -> Result<bool> {
+            let drained = runtime.session.poll_work(dev.as_ref(), &runtime.image)?;
+            if prepared.pipeline_render()
+                && *cursor == prepared.parameters.len()
+                && !render_receipts.is_empty()
+                && render_receipts.iter().all(|receipt| receipt.is_published())
+            {
+                publication.signal();
+            }
+            if prepared.pipeline_render() {
+                let mut owned_error = None;
+                let mut owned_pending = false;
+                for receipt in render_receipts.iter() {
+                    // SAFETY: The job retains each exact accepted fence Arc.
+                    let status = unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) };
+                    if status < 0 && owned_error.is_none() { owned_error = Some(Error::from_errno(status)); }
+                    owned_pending |= status == 0;
+                }
+                if let Some(error) = owned_error {
+                    // Stop further commands, but already published own tickets
+                    // must retire before the public error fence can signal.
+                    if owned_pending { return Ok(false); }
+                    return Err(error);
+                }
+            }
+            if let Some(error) = dependency_error {
+                if render_receipts.iter().any(|receipt|
+                    unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) } == 0) {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+            if *waiting {
+                let ready = if let Some(gate) = work_gate {
+                    // SAFETY: This job owns its final published work gate.
+                    let status = unsafe { bindings::dma_fence_get_status(gate.raw()) };
+                    if status < 0 {
+                        return Err(Error::from_errno(status));
+                    }
+                    status != 0
+                } else {
+                    drained
+                };
+                if !ready {
+                    return Ok(false);
+                }
+                *waiting = false;
+                *work_gate = None;
+            }
+            if (!prepared.pipeline_render() && runtime.session.submission_error().is_some())
+                || *cursor == prepared.parameters.len()
+            {
+                return Ok(true);
+            }
+            if *cursor == 0
+                && *crate::module_parameters::native_barriers.value() == 1
+                && runtime.session.render_client()?.is_none()
+            {
+                if let [Command::Compute(opening), Command::Render(render), Command::Compute(closing)] =
+                    prepared.parameters.as_slice()
+                {
+                    runtime.session.submit_native_dependency(
+                        dev.as_ref(),
+                        &runtime.image,
+                        prepared.compute_client.take(),
+                        prepared.render_client.take().ok_or(EIO)?,
+                        [opening, closing],
+                        render,
+                    )?;
+                    *cursor = 3;
+                    *waiting = true;
+                    return Ok(false);
+                }
+            }
+            match &prepared.parameters[*cursor] {
+                Command::Render(p) => {
+                    let receipt = if runtime.session.render_client()?.is_some() {
+                        // A finite live-ticket/control conflict is ordinary
+                        // backpressure. It must not fail an accepted buffer or
+                        // discard the client's immutable mapping snapshot.
+                        if !runtime.session.native_render()
+                            && *crate::module_parameters::native_render_vms.value() == 0
+                            && !runtime.session.can_append_render(p)?
+                        {
+                            return Ok(false);
+                        }
+                        let compute_replacement = if runtime.session.native_render() {
+                            prepared.compute_client.take()
+                        } else {
+                            None
+                        };
+                        runtime.session.submit_prepared_render_ticket(
+                            dev.as_ref(),
+                            &runtime.image,
+                            prepared.render_client.take(),
+                            compute_replacement,
+                            p,
+                            prepared_append,
+                        )?
+                    } else {
+                        runtime.session.submit_render_ticket(
+                            dev.as_ref(),
+                            &runtime.image,
+                            prepared.render_client.take().ok_or(EIO)?,
+                            p,
+                        )?
+                    };
+                    *work_gate = Some(receipt.fence.clone());
+                    prepared.history.state.lock().render = Some(receipt.clone());
+                    render_receipts.push(receipt, GFP_KERNEL).expect("reserved render receipt slot");
+                    *cursor += 1;
+                    // NONE explicitly permits the next independent render
+                    // to publish before this render completes. Real caller
+                    // barriers and mixed/special profiles retain their current
+                    // dependency path until their exact histories are wired.
+                    if !runtime.session.native_render()
+                        && *crate::module_parameters::native_render_vms.value() == 0
+                        && matches!(prepared.parameters.get(*cursor), Some(Command::Render(_)))
+                        && (prepared.barriers.get(*cursor) == Some(&[u16::MAX; 2])
+                            || (prepared.pipeline_render() && matches!(prepared.parameters.get(*cursor),
+                                Some(Command::Render(p)) if p.vdm_barrier_fragment)))
+                    {
+                        *waiting = false;
+                        return Ok(false);
+                    }
+                }
+                Command::Compute(_) => {
+                    let mut run = KVec::new();
+                    for command in &prepared.parameters[*cursor..] {
+                        if let Command::Compute(p) = command {
+                            run.push(p, GFP_KERNEL)?;
+                        } else {
+                            break;
+                        }
+                    }
+                    let (published, gate) = runtime.session.submit_computes(
+                        dev.as_ref(),
+                        &runtime.image,
+                        &mut prepared.compute_client,
+                        &run,
+                    )?;
+                    if published == 0 {
+                        return Ok(false);
+                    }
+                    *cursor += published;
+                    // Aggregate completion is a conservative exact CS gate.
+                    // Later pure render waits it before tiling, never on FR.
+                    prepared.history.state.lock().compute = Some(gate.as_ref().unwrap_or(&fence).clone());
+                    *work_gate = gate;
+                }
+            }
+            *waiting = true;
+            Ok(false)
+        })();
+        match result {
+            Ok(false) => Ok(None),
+            result => {
+                let result = result.map(|_| ());
+                if let Err(error) = &result {
+                    runtime.session.notify_failure(*error);
+                }
+                let finished = if prepared.pipeline_render() {
+                    runtime.session.finish_owned_render_submission(result)
+                } else {
+                    runtime.session.finish_submission(result)
+                };
+                if prepared.pipeline_render() {
+                    let failed = match &finished { Ok(error) => error.is_some(), Err(_) => true };
+                    runtime.session.remember_owned_render_completed(fence, failed);
+                } else {
+                    runtime.session.remember_completed(fence);
+                }
+                runtime.active -= 1;
+                finished.map(Some)
+            }
+        }
     }
 }

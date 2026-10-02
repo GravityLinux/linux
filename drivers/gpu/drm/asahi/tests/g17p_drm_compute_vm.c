@@ -3,6 +3,7 @@
 #define main memory_test_main
 #include "g17p_drm_memory.c"
 #undef main
+#include <linux/sync_file.h>
 #include "g17p_drm_workload.h"
 
 struct command {
@@ -16,8 +17,10 @@ struct owner {
 	uint32_t vm, queue, binary, timeline, object;
 	float *a, *b, *output;
 	unsigned char *allocation, *timestamps, *sentinel;
-	uint64_t saved[16][2];
+	uint64_t saved[24][2];
 	int last;
+	struct { uint64_t address, size; } spans[64];
+	unsigned span_count;
 };
 static void *make_buffer(struct owner *owner, uint64_t address, size_t size,
 	const void *data, int writable)
@@ -26,6 +29,8 @@ static void *make_buffer(struct owner *owner, uint64_t address, size_t size,
 	void *map = bo_map(owner->fd, bo, size);
 	if (data) memcpy(map, data, size); else memset(map, 0, size);
 	bind(owner->fd, owner->vm, bo, address, size, 0, DRM_ASAHI_BIND_READ | (writable ? DRM_ASAHI_BIND_WRITE : 0), 0);
+	CHECK(owner->span_count < 64);
+	owner->spans[owner->span_count++] = (typeof(owner->spans[0])){address, size};
 	return map;
 }
 static void create_owner(struct owner *o, unsigned index)
@@ -45,6 +50,8 @@ static void create_owner(struct owner *o, unsigned index)
 	o->allocation = bo_map(o->fd, bo, PAGE * 3); memset(o->allocation, 0x5a, PAGE * 3);
 	o->output = (void *)(o->allocation + PAGE); memset(o->output, 0xa5, PAGE);
 	bind(o->fd, o->vm, bo, COMPUTE_OUTPUT, PAGE, PAGE, RW, 0);
+	CHECK(o->span_count < 64);
+	o->spans[o->span_count++] = (typeof(o->spans[0])){COMPUTE_OUTPUT, PAGE};
 	o->sentinel = make_buffer(o, EXEC + 0x70000000 + index * PAGE, PAGE, NULL, 1);
 	memset(o->sentinel, 0x61 + index, PAGE);
 	uint32_t ts = bo_new(o->fd, PAGE * 3, DRM_ASAHI_GEM_WRITEBACK, 0);
@@ -71,14 +78,31 @@ static void check_owner(struct owner *o, unsigned index)
 	}
 	CHECK(memcmp(o->saved, o->timestamps + PAGE + 64, (o->last + 1) * 16) == 0);
 }
-int main(void)
+int main(int argc, char **argv)
 {
 	setbuf(stdout, NULL);
+	int cleanup = argc == 2 && !strcmp(argv[1], "--cleanup");
+	int relocate = argc == 2 && !strcmp(argv[1], "--relocate");
+	CHECK(argc == 1 || cleanup || relocate);
 	struct owner owners[2] = {{0}};
 	for (unsigned i = 0; i < 2; i++) create_owner(&owners[i], i);
 	uint64_t previous = 0;
-	for (unsigned n = 0; n < 32; n++) {
-		unsigned index = n % 2, generation = n / 2; struct owner *o = &owners[index];
+	unsigned submissions = relocate ? 40 : 32;
+	for (unsigned n = 0; n < submissions; n++) {
+		if (n == 32) {
+			struct owner *retired = &owners[1];
+			struct drm_asahi_queue_destroy qd = { .queue_id = retired->queue };
+			OK(retired->fd, DRM_IOCTL_ASAHI_QUEUE_DESTROY, &qd);
+			for (unsigned i = 0; i < retired->span_count; i++)
+				bind(retired->fd, retired->vm, 0, retired->spans[i].address,
+					retired->spans[i].size, 0, DRM_ASAHI_BIND_UNBIND, 0);
+			vm_destroy(retired->fd, retired->vm, 0);
+			check_owner(&owners[0], 0); check_owner(&owners[1], 1);
+			puts("G17P_COMPUTE_RELOCATION_CLEANUP_PASS logical VM destroyed; both images retained");
+		}
+		unsigned index = n < 32 ? n % 2 : 0;
+		unsigned generation = n < 32 ? n / 2 : n - 16;
+		struct owner *o = &owners[index];
 		for (unsigned i = 0; i < 64; i++) { o->a[i] = 1000.0f + index * 10000.0f + generation * 100.0f + i; o->b[i] = 0.5f + generation * 0.25f; }
 		memset(o->output, 0xa5, PAGE);
 		struct command command = {
@@ -113,6 +137,12 @@ int main(void)
 		uint64_t point = generation + 1;
 		struct drm_syncobj_timeline_wait twait = { .handles = (uintptr_t)&o->timeline, .points = (uintptr_t)&point, .count_handles = 1, .timeout_nsec = 0 };
 		OK(o->fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait); OK(o->fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &twait);
+		struct drm_syncobj_handle exported = { .handle = o->binary,
+			.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE };
+		OK(o->fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &exported);
+		struct sync_file_info info = {0};
+		CHECK(ioctl(exported.fd, SYNC_IOC_FILE_INFO, &info) == 0);
+		CHECK(info.status == 1); CHECK(close(exported.fd) == 0);
 		if (n == 31) {
 			submit.queue_id = owners[0].queue;
 			command.compute.ts.start.handle = command.compute.ts.end.handle = owners[0].object;
@@ -122,12 +152,24 @@ int main(void)
 			BAD(owners[0].fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
 		}
 	}
+	if (cleanup) {
+		struct owner *o = &owners[1];
+		struct drm_asahi_queue_destroy qd = { .queue_id = o->queue };
+		OK(o->fd, DRM_IOCTL_ASAHI_QUEUE_DESTROY, &qd);
+		for (unsigned i = 0; i < o->span_count; i++)
+			bind(o->fd, o->vm, 0, o->spans[i].address, o->spans[i].size, 0,
+				DRM_ASAHI_BIND_UNBIND, 0);
+		vm_destroy(o->fd, o->vm, 0);
+		check_owner(&owners[0], 0); check_owner(&owners[1], 1);
+		printf("G17P_NATIVE_COMPUTE_VM_CLEANUP_PASS slot three destroyed after owned cleanup/maintenance, both owners' output and guard images preserved\n");
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct owner *o = &owners[i]; check_owner(o, i);
 		CHECK(munmap(o->a, PAGE) == 0); CHECK(munmap(o->b, PAGE) == 0);
 		CHECK(munmap(o->allocation, PAGE * 3) == 0); CHECK(munmap(o->sentinel, PAGE) == 0);
 		CHECK(munmap(o->timestamps, PAGE * 3) == 0); CHECK(close(o->fd) == 0);
 	}
-	printf("G17P_NATIVE_COMPUTE_VM_PASS 32 alternating submissions from two files, colliding caller DVAs, exact independent outputs, inactive images/guards/sentinels preserved, timestamps and fences; checks=%u\n", checks);
+	printf("G17P_NATIVE_COMPUTE_VM_PASS %u submissions from two files, colliding caller DVAs, exact independent outputs, inactive images/guards/sentinels preserved, timestamps and fences; checks=%u\n", submissions, checks);
+	if (relocate) puts("G17P_COMPUTE_RELOCATION_PASS eight further submissions after cleanup diagnostics");
 	return 0;
 }

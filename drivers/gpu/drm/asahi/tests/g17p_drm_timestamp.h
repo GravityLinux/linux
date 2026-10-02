@@ -1,15 +1,20 @@
 /* SPDX-License-Identifier: MIT */
 /* Firmware writes into an offset GEM object range, with live object rebind. */
+#ifndef G17P_TIMESTAMP_CAPACITY
+#define G17P_TIMESTAMP_CAPACITY 258
+#endif
+#define G17P_TIMESTAMP_RANGE (((64+G17P_TIMESTAMP_CAPACITY*16+PAGE-1)/PAGE)*PAGE)
+#define G17P_TIMESTAMP_BO_SIZE (G17P_TIMESTAMP_RANGE+2*PAGE)
 struct timestamp_test {
 	uint32_t bo, object;
 	unsigned char *map;
-	uint64_t saved[258][2];
+	uint64_t saved[G17P_TIMESTAMP_CAPACITY][2];
 };
 static void timestamp_bind(int fd, struct timestamp_test *t)
 {
 	struct drm_asahi_gem_bind_object obj = { .op = DRM_ASAHI_BIND_OBJECT_OP_BIND,
 		.flags = DRM_ASAHI_BIND_OBJECT_USAGE_TIMESTAMPS,
-		.handle = t->bo, .offset = PAGE, .range = PAGE };
+		.handle = t->bo, .offset = PAGE, .range = G17P_TIMESTAMP_RANGE };
 	OK(fd, DRM_IOCTL_ASAHI_GEM_BIND_OBJECT, &obj);
 	t->object = obj.object_handle;
 }
@@ -22,21 +27,21 @@ static void timestamp_unbind(int fd, struct timestamp_test *t)
 static void timestamp_setup(int fd, struct timestamp_test *t,
 		struct drm_asahi_cmd_compute *cmd, struct drm_asahi_submit *submit)
 {
-	t->bo = bo_new(fd, PAGE * 3, DRM_ASAHI_GEM_WRITEBACK, 0);
-	t->map = bo_map(fd, t->bo, PAGE * 3);
-	memset(t->map, 0xa5, PAGE * 3);
+	t->bo = bo_new(fd, G17P_TIMESTAMP_BO_SIZE, DRM_ASAHI_GEM_WRITEBACK, 0);
+	t->map = bo_map(fd, t->bo, G17P_TIMESTAMP_BO_SIZE);
+	memset(t->map, 0xa5, G17P_TIMESTAMP_BO_SIZE);
 	timestamp_bind(fd, t);
 	cmd->ts.start.handle = UINT32_MAX;
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, ENOENT);
 	cmd->ts.start.handle = t->object; cmd->ts.start.offset = 1;
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, EINVAL);
-	cmd->ts.start.offset = PAGE;
+	cmd->ts.start.offset = G17P_TIMESTAMP_RANGE;
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, EINVAL);
 	cmd->ts.start.handle = 0; cmd->ts.start.offset = 8;
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, EINVAL);
 	cmd->ts.start.handle = t->object; cmd->ts.start.offset = 64;
 	cmd->ts.end.handle = t->object; cmd->ts.end.offset = 72;
-	for (unsigned i = 0; i < PAGE * 3; i++) CHECK(t->map[i] == 0xa5);
+	for (unsigned i = 0; i < G17P_TIMESTAMP_BO_SIZE; i++) CHECK(t->map[i] == 0xa5);
 }
 static void timestamp_before(int fd, struct timestamp_test *t,
 		struct drm_asahi_cmd_compute *cmd, unsigned n)
@@ -51,7 +56,7 @@ static void timestamp_before(int fd, struct timestamp_test *t,
 }
 static void timestamp_check(struct timestamp_test *t, unsigned count)
 {
-	for (unsigned i = 0; i < PAGE * 3; i++) {
+	for (unsigned i = 0; i < G17P_TIMESTAMP_BO_SIZE; i++) {
 		if (i >= PAGE + 64 && i < PAGE + 64 + count * 16) continue;
 		CHECK(t->map[i] == 0xa5);
 	}
@@ -71,7 +76,7 @@ static void timestamp_finish(int fd, struct timestamp_test *t, unsigned count)
 {
 	timestamp_check(t, count);
 	timestamp_unbind(fd, t);
-	CHECK(munmap(t->map, 3 * PAGE) == 0);
+	CHECK(munmap(t->map, G17P_TIMESTAMP_BO_SIZE) == 0);
 	bo_close(fd, t->bo);
 	printf("G17P_TIMESTAMP_PASS %u ordered start/end pairs, live object rebind, offset and guard bytes intact\n", count);
 }
