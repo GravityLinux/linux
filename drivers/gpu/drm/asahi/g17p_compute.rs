@@ -334,6 +334,28 @@ pub(crate) fn points(out: &mut [u8], engine: u8, event_slot: u8, points: &[(u8, 
     }
     Ok(())
 }
+/// Extend the existing Source same-queue point without changing its
+/// completion, receiver event slot, or firmware-owned context tail.
+pub(crate) fn context_dependencies(out: &mut [u8], dependencies: &[(u8, u32)]) -> Result {
+    if dependencies.is_empty() { return Ok(()); }
+    if out.len() != 0x200 || dependencies.len() > 3 { return Err(Error::Invalid); }
+    let header = qword(out, 0x20);
+    let previous = qword(out, 0x28);
+    let mut merged = [(0u8, 0u32); 4];
+    merged[0] = ((previous >> 40) as u8, previous as u32);
+    let mut count = 1;
+    for &(grid, value) in dependencies {
+        if grid >= 128 || value == 0 || value >= 1 << 30 { return Err(Error::Invalid); }
+        if let Some(existing) = merged[..count].iter_mut().find(|point| point.0 == grid) {
+            existing.1 = existing.1.max(value);
+        } else {
+            merged[count] = (grid, value);
+            count += 1;
+        }
+    }
+    points(&mut out[0x20..0x130], 8, (header >> 32) as u8, &merged[..count])
+}
+
 pub(crate) fn completion_header(header: u64, value: u32) -> Result<u64> {
     if value == 0 || value >= 1 << 30 {
         return Err(Error::Invalid);

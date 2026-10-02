@@ -165,7 +165,15 @@ int main(int argc, char **argv)
     CHECK(async_status(fd,binary[0])==0 && async_status(fd,binary[1])==0);
     async_check(output,4);render_check(images,1);
     uint32_t increment=1;OK(sw,SW_INC,&increment);
-    async_wait(fd,binary[1]);CHECK(async_status(fd,binary[0])==1 && async_status(fd,binary[1])==1);
+    async_wait(fd,binary[1]);
+    /* GPU compute FIFO is ordered; independently completed submit fences
+     * need not be notified in that order by separate completion workers. */
+    int earlier_status=async_status(fd,binary[0]);
+    CHECK((earlier_status==0 || earlier_status==1) && async_status(fd,binary[1])==1);
+    async_check(output,7); /* Keep the GPU ordering oracle before waiting. */
+    printf("G17P_ASYNC_OWN_FENCES earlier_status=%d after later CS completion\n",earlier_status);
+    async_wait(fd,binary[0]);
+    CHECK(async_status(fd,binary[0])==1 && async_status(fd,binary[1])==1);
     async_check(output,7);render_check(images,1);CHECK(close(sw)==0);
     uint64_t point=2;
     struct drm_syncobj_timeline_wait wait={.handles=(uintptr_t)&timeline,.points=(uintptr_t)&point,

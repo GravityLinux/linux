@@ -43,6 +43,7 @@ pub(crate) struct Runtime {
     pub(crate) active: usize,
     pub(crate) exclusive: bool,
     pub(crate) admission_handoff: Option<kernel::dma_fence::Fence>,
+    pub(crate) engine_handoff: [Option<kernel::dma_fence::Fence>;2],
 }
 pub(crate) type RuntimeRef = Arc<Mutex<Option<Runtime>>>;
 
@@ -443,6 +444,7 @@ impl QueueHistory {
     }
 }
 struct Queue {
+    accepted: scheduling::History,
     tail: Option<kernel::dma_fence::Fence>,
     publication: Option<kernel::dma_fence::Fence>,
     render_pipeline: bool,
@@ -487,6 +489,8 @@ impl core::ops::Deref for File {
 }
 #[path = "g17p_admission.rs"]
 mod admission;
+#[path = "g17p_schedule.rs"]
+mod scheduling;
 #[path = "g17p_async.rs"]
 pub(crate) mod asynchronous;
 
@@ -971,6 +975,7 @@ impl File {
         let next = id.checked_add(1).ok_or(EOVERFLOW)?;
         state.queues.push(
             Queue {
+                accepted: [None,None],
                 tail: None,
                 publication: None,
                 render_pipeline: false,
@@ -1346,6 +1351,7 @@ impl File {
         let previous_publication = queue.publication.clone();
         let previous_pipeline = queue.render_pipeline;
         let history = queue.history.clone();
+        let accepted = queue.accepted.clone();
         let vm = state.vms.iter().find(|v| v.id == queue_vm).ok_or(ENOENT)?;
         let (mut parameters, barriers) = Self::parameters(vm, &state.objects, &bytes)?;
         for command in &mut parameters {
@@ -1409,10 +1415,17 @@ impl File {
             compute_snapshot,
             buffers,
         };
+        let schedule = if scheduling::Schedule::enabled() {
+            Some(scheduling::Schedule::new(&prepared.parameters,&prepared.barriers,accepted.clone())?)
+        } else { None };
+        let next_accepted = schedule.as_ref().map(scheduling::Schedule::tail).unwrap_or(accepted);
+        let ordinary = schedule.is_some();
         let pipeline = prepared.pipeline_render();
         // Ordinary NONE/fragment-barrier pure renders use publication order.
         // Legacy pre-tiling barriers and mixed/special work keep completion order.
-        let previous = if pipeline && previous_pipeline {
+        let previous = if ordinary {
+            None
+        } else if pipeline && previous_pipeline {
             previous_publication
         } else {
             previous_completion
@@ -1422,9 +1435,10 @@ impl File {
         // previous queue fence preserves per-queue ordering without preventing
         // another queue from resolving an imported input dependency.
         let job =
-            asynchronous::Job::new(dev.into(), inner.shared.clone(), prepared, sync, previous)?;
+            asynchronous::Job::new(dev.into(), inner.shared.clone(), prepared, sync, previous, schedule)?;
         let queue = state.queues.iter_mut()
             .find(|q| q.id == data.queue_id).ok_or(ENOENT)?;
+        queue.accepted = next_accepted;
         queue.tail = Some(fence);
         queue.publication = Some(job.publication_fence());
         queue.render_pipeline = pipeline;

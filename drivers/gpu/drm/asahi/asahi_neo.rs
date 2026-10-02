@@ -140,6 +140,7 @@ impl platform::Driver for NeoGpu {
                 image,
                 active: 0,
                 exclusive: false,
+                engine_handoff: [None,None],
                 admission_handoff: None
             })),
             GFP_KERNEL,

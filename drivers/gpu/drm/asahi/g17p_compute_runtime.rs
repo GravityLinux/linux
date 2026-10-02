@@ -363,6 +363,8 @@ pub(crate) struct Submission {
 /// Host-only completion/lease record, retained independently of the newest
 /// command. No command may borrow another live command's mutable storage.
 pub(crate) struct Pending {
+    pub(crate) client: ClientLease,
+    pub(crate) milestone: super::g17p_render_runtime::Milestone,
     pub(crate) publication: q::Publication,
     pub(crate) channel: abi::Channel,
     pub(crate) ordinal: u32,
@@ -515,6 +517,12 @@ impl Submission {
     }
     pub(crate) fn pending(&self) -> Result<Pending> {
         Ok(Pending {
+            client: self.client.lease()?,
+            milestone: super::g17p_render_runtime::Milestone {
+                event_slot: if self.ordinal == 0 { 1 } else { 2 },
+                grid: if self.ordinal == 0 { 4 } else if self.after_render { 5 } else { 4 },
+                value: if self.after_render && self.ordinal != 0 { self.ordinal } else { self.ordinal + 1 },
+            },
             publication: self.publication,
             channel: self.channel,
             ordinal: self.ordinal,
@@ -1120,6 +1128,7 @@ pub(crate) fn stage_next(
     work: &mut Submission,
     parameters: &Parameters,
     pending: bool,
+    dependencies: &[(u8, u32)],
 ) -> Result {
     let ordinal = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
     if ordinal >= work.capacity() || parameters.preempt != work.preempt {
@@ -1168,9 +1177,9 @@ pub(crate) fn stage_next(
     }
     if work.after_render {
         return if ordinal == 1 {
-            stage_after_render(memory, vm, work, parameters, counters)
+            stage_after_render(memory, vm, work, parameters, counters, dependencies)
         } else {
-            stage_retained_after_render(memory, vm, work, parameters, counters, write_index)
+            stage_retained_after_render(memory, vm, work, parameters, counters, write_index, dependencies)
         };
     }
     for (address, size) in [
@@ -1256,6 +1265,7 @@ pub(crate) fn stage_next(
     write(memory, spec.descriptor, &page[..0x1000])?;
     write(memory, spec.optional, &spec.optional_body())?;
     spec.context_body(&mut page[..0x200]).map_err(|_| EINVAL)?;
+    c::context_dependencies(&mut page[..0x200], dependencies).map_err(|_| EINVAL)?;
     write_context_item(
         memory,
         vm,
@@ -1308,6 +1318,7 @@ fn stage_after_render(
     work: &mut Submission,
     parameters: &Parameters,
     counters: q::Counters,
+    dependencies: &[(u8, u32)],
 ) -> Result {
     use lifecycle::{
         AFTER_RENDER_CONTEXT as context, AFTER_RENDER_EVENT as event,
@@ -1378,6 +1389,7 @@ fn stage_after_render(
     write(memory, optional, &lifecycle::after_render_second_optional())?;
     page.fill(0);
     lifecycle::after_render_second_context(&mut page[0x200..0x400]).map_err(|_| EINVAL)?;
+    c::context_dependencies(&mut page[0x200..0x400], dependencies).map_err(|_| EINVAL)?;
     write(memory, context, &page)?;
     write(memory, event, &[0; 0x40])?;
     write(
@@ -1447,6 +1459,7 @@ fn stage_retained_after_render(
     parameters: &Parameters,
     counters: q::Counters,
     write_index: u32,
+    dependencies: &[(u8, u32)],
 ) -> Result {
     let ordinal = work.ordinal + 1;
     if ordinal % (PAGE as u32 / 16) == 0 {
@@ -1517,6 +1530,7 @@ fn stage_retained_after_render(
     vm.write(memory, 2, spec.descriptor, &page[..0x1000])?;
     spec.after_render_context(&mut page[..0x200])
         .map_err(|_| EINVAL)?;
+    c::context_dependencies(&mut page[..0x200], dependencies).map_err(|_| EINVAL)?;
     write_context_item(memory, vm, context, &page[..0x200], ordinal - 1 >= 256)?;
     vm.write(memory, 2, event, &[0; 0x40])?;
     vm.flush_tables(memory)?;
