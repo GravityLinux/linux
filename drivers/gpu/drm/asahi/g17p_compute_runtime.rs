@@ -287,12 +287,15 @@ impl Client {
         cache_buffers(&self.buffers, invalidate, retained)
     }
 }
-fn cache_buffers(buffers: &[ARef<Object>], invalidate: bool, retained: &CpuMaps) -> Result {
+fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps) -> Result {
+        // Native caller shmem leaves use AP_GPU/OS1/AttrIndex2, equivalent
+        // to Asahi PROT_GPU_SHARED_* coherent mappings. Keep caller ownership
+        // and vmap validation plus ordering; no per-submit DC sweep is needed.
+        // Firmware/private/table/status/timestamp maintenance uses other paths.
         let mut maps = retained.0.lock();
         for (index, bo) in buffers.iter().enumerate() {
-            // Multiple DVA bindings may alias one GEM. Cache maintenance is
-            // physical, so sweep each owned Object once without changing its
-            // lifetime, covered bytes, direction or the final publication barrier.
+            // Multiple DVA bindings may alias one GEM. Validate each exact
+            // owned Object once; retain lifetime and publication ordering.
             if buffers[..index]
                 .iter()
                 .any(|prior| core::ptr::eq(&**prior, &**bo))
@@ -316,20 +319,9 @@ fn cache_buffers(buffers: &[ARef<Object>], invalidate: bool, retained: &CpuMaps)
             if map.is_iomem() {
                 return Err(EINVAL);
             }
-            for offset in (0..bo.size()).step_by(64) {
-                let pointer = map.ptr_from_index(offset)?;
-                // SAFETY: Complete cache lines of pinned, page-sized GEM RAM.
-                // Invalidation is used only after the caller's writes were
-                // cleaned and hardware completion was observed.
-                unsafe {
-                    if invalidate {
-                        core::arch::asm!("dc ivac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
-                    } else {
-                        // Match Source uploads: CVAC is a no-op on Apple
-                        // Silicon; CIVAC publishes the caller's dirty lines.
-                        core::arch::asm!("dc civac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
-                    }
-                }
+            if bo.size() != 0 {
+                map.ptr_from_index(0)?;
+                map.ptr_from_index(bo.size() - 1)?;
             }
         }
         super::g17p_memory::sync();
