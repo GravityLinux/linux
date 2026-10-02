@@ -29,6 +29,16 @@ impl Snapshot {
         )?)
     }
 
+    pub(super) fn client(&self) -> &Client { &self.client }
+
+    pub(super) fn same_client(&self, old: Option<&Client>) -> bool {
+        old.is_some_and(|old| old.owner == self.client.owner
+            && old.bindings == self.client.bindings
+            && old.buffers.len() == self.client.buffers.len()
+            && old.buffers.iter().zip(&self.client.buffers)
+                .all(|(a,b)| core::ptr::eq(&**a,&**b)))
+    }
+
     pub(super) fn matches(
         &self,
         owner: (u64, u32),

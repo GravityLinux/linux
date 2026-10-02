@@ -1,3 +1,4 @@
+/* Candidate pressure variant: 48 independent ready queues, exact full outputs/guards. */
 /* SPDX-License-Identifier: MIT */
 /* Render, 258 retained computes in five buffers, then render again. */
 #define main memory_test_main
@@ -80,11 +81,10 @@ static void async_compute(int fd,uint32_t queue,unsigned graph,uint32_t input,
     /* The worker must use its copied command stream after ioctl return. */
     memset(&command,0xa5,sizeof(command));memset(syncs,0xa5,sizeof(syncs));
 }
-static void async_check(float **outputs,unsigned complete_mask)
+static void async_check(float **outputs,uint64_t complete_mask)
 {
     for(unsigned graph=0;graph<56;graph++){
-        int complete=!!(complete_mask & (1U << (graph<32?graph:31)));
-        if(graph>=32)complete=0;
+        int complete=!!(complete_mask & (1ULL << graph));
         if(complete)for(unsigned i=0;i<64;i++)
             CHECK(outputs[graph][i]==2000.25f+(graph+8)*129.0f+i);
         for(unsigned i=complete?256:0;i<PAGE;i++)CHECK(((unsigned char *)outputs[graph])[i]==0xa5);
@@ -188,9 +188,9 @@ int main(int argc, char **argv)
     OK(fd,DRM_IOCTL_ASAHI_SUBMIT,&draw);render_check(images,1);async_check(output,7);
     printf("G17P_ASYNC_FRONTEND_PASS pending ioctls returned; same-queue order, independent-queue dependency progress, copied commands, binary/timeline fences, dependency error and recovery; complete images/guards; checks=%u\n",checks);
     if(backend){
-        uint32_t burst_input=sync_new(fd,0),fences[16],timelines[16];
+        uint32_t burst_input=sync_new(fd,0),fences[48],timelines[48];
         int producer=sync_import_pending(fd,burst_input);
-        for(unsigned i=0;i<16;i++){
+        for(unsigned i=0;i<48;i++){
             struct drm_asahi_queue_create q={.vm_id=vm,.usc_exec_base=EXEC};
             OK(fd,DRM_IOCTL_ASAHI_QUEUE_CREATE,&q);
             fences[i]=sync_new(fd,0);timelines[i]=sync_new(fd,0);
@@ -203,7 +203,7 @@ int main(int argc, char **argv)
         struct drm_asahi_gem_bind_op unmap={.addr=batch_workloads[4].output,.range=PAGE,.flags=DRM_ASAHI_BIND_UNBIND};
         struct drm_asahi_vm_bind unbind={.vm_id=vm,.num_binds=1,.stride=sizeof(unmap),.userptr=(uintptr_t)&unmap};
         BAD(fd,DRM_IOCTL_ASAHI_VM_BIND,&unbind,EBUSY);
-        for(unsigned i=4;i<20;i++)bo_close(fd,output_handles[i]);
+        for(unsigned i=4;i<52;i++)bo_close(fd,output_handles[i]);
         struct sigaction action={.sa_handler=interrupt_wait},old_action;
         sigemptyset(&action.sa_mask);CHECK(sigaction(SIGUSR1,&action,&old_action)==0);
         pid_t interrupter=fork();CHECK(interrupter>=0);
@@ -215,18 +215,18 @@ int main(int argc, char **argv)
         CHECK(WIFEXITED(child_status) && WEXITSTATUS(child_status)==0 && wait_interrupted);
         CHECK(sigaction(SIGUSR1,&old_action,NULL)==0);
         usleep(3000000);
-        for(unsigned i=0;i<16;i++)CHECK(async_status(fd,fences[i])==0);
+        for(unsigned i=0;i<48;i++)CHECK(async_status(fd,fences[i])==0);
         async_check(output,7);render_check(images,1);
         uint32_t increase=1;OK(producer,SW_INC,&increase);
-        for(unsigned i=0;i<16;i++){
+        for(unsigned i=0;i<48;i++){
             async_wait(fd,fences[i]);CHECK(async_status(fd,fences[i])==1);
             uint64_t one=1;
             struct drm_syncobj_timeline_wait done={.handles=(uintptr_t)&timelines[i],
                 .points=(uintptr_t)&one,.count_handles=1,.timeout_nsec=now_ns()+15000000000ULL};
             OK(fd,DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,&done);
         }
-        async_check(output,0xffff7);render_check(images,1);CHECK(close(producer)==0);
-        printf("G17P_ASYNC_BACKEND_PASS 16 accepted jobs on destroyed queues, imported input pending beyond two seconds, independent completion and timeline fences, every output/image/guard; checks=%u\n",checks);
+        async_check(output,((1ULL<<52)-1)&~8ULL);render_check(images,1);CHECK(close(producer)==0);
+        printf("G17P_ASYNC_PRESSURE_PASS 48 accepted jobs on destroyed queues, imported input pending beyond two seconds, independent completion and timeline fences, every output/image/guard; checks=%u\n",checks);
     }
     CHECK(close(fd)==0);return 0;
 }

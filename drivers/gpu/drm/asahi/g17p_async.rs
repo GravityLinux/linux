@@ -112,11 +112,24 @@ struct Execution {
     previous: Option<dma_fence::Fence>,
     publication: dma_fence::Fence,
     render_receipts: KVec<Arc<super::super::g17p_boot::RenderReceipt>>,
+    schedule: Option<super::scheduling::Schedule>,
     initialized: bool,
     cursor: usize,
     waiting: bool,
     work_gate: Option<dma_fence::Fence>,
     callbacks: KVec<KBox<FenceWake>>,
+}
+impl Execution {
+    fn progress(&mut self) -> Result<Option<Option<Error>>> {
+        if let Some(schedule) = &mut self.schedule {
+            schedule.progress(&self.dev,&mut self.prepared,&self.sync,
+                &mut self.initialized,&mut self.cursor,&self.publication)
+        } else {
+            File::progress(&self.dev,&mut self.prepared,&self.sync,&mut self.initialized,
+                &mut self.cursor,&mut self.waiting,&mut self.work_gate,
+                &mut self.render_receipts,&self.publication)
+        }
+    }
 }
 impl_has_work! {impl HasWork<Self> for Job {self.work}}
 impl_has_delayed_work! {impl HasDelayedWork<Self,1> for Job {self.timer}}
@@ -127,6 +140,7 @@ impl Job {
         prepared: Prepared,
         sync: super::super::g17p_sync::Plan,
         previous: Option<dma_fence::Fence>,
+        schedule: Option<super::scheduling::Schedule>,
     ) -> Result<Arc<Self>> {
         // Allocate all internal publication/receipt ownership before ioctl
         // commitment. None of these fences changes userspace completion.
@@ -138,7 +152,7 @@ impl Job {
             try_pin_init!(Self {
                 work<-new_work!("asahi_neo_event"),
                 timer<-new_delayed_work!("asahi_neo_watchdog"),
-                execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,
+                execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,schedule,
                     initialized:false,cursor:0,waiting:false,work_gate:None,callbacks:KVec::new()})),
                 committed:AtomicBool::new(false),firmware_waiting:AtomicBool::new(false),events,
             }),
@@ -154,6 +168,11 @@ impl Job {
                     FenceWake::new(fence.clone(), job.events.clone(), identity)?,
                     GFP_KERNEL,
                 )?;
+            }
+            if let Some(schedule) = &e.schedule {
+                for fence in schedule.callback_fences()? {
+                    e.callbacks.push(FenceWake::new(fence,job.events.clone(),identity)?,GFP_KERNEL)?;
+                }
             }
             if let Some(previous) = &e.previous {
                 e.callbacks.push(
@@ -202,17 +221,7 @@ impl Job {
                 if !e.initialized {
                     return Err(error);
                 }
-                return File::progress(
-                    &e.dev,
-                    &mut e.prepared,
-                    &e.sync,
-                    &mut e.initialized,
-                    &mut e.cursor,
-                    &mut e.waiting,
-                    &mut e.work_gate,
-                    &mut e.render_receipts,
-                    &e.publication,
-                );
+                return e.progress();
             }
             if !e.sync.inputs_ready()? {
                 input_blocked = true;
@@ -225,17 +234,7 @@ impl Job {
                     return Ok(None);
                 }
             }
-            File::progress(
-                &e.dev,
-                &mut e.prepared,
-                &e.sync,
-                &mut e.initialized,
-                &mut e.cursor,
-                &mut e.waiting,
-                &mut e.work_gate,
-                &mut e.render_receipts,
-                &e.publication,
-            )
+            e.progress()
         })();
         match result {
             Ok(None) if input_blocked => {
@@ -260,6 +259,9 @@ impl Job {
                     Err(error) => Some(error),
                     _ => unreachable!(),
                 };
+                if let (Some(schedule),Some(error)) = (&execution.schedule,error) {
+                    schedule.fail_unstaged(error);
+                }
                 if let Some(error) = error {
                     kernel::dev_err!(
                         execution.dev.as_ref(),

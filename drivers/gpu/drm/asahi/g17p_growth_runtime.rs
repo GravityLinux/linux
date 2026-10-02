@@ -372,6 +372,7 @@ impl Service {
             Ok(last.max(pool.growth_base.checked_add(size).ok_or(EOVERFLOW)?))
         })
     }
+    pub(crate) fn command_channel(&self) -> Channel { self.command }
     pub(crate) fn cursor(&self) -> u32 {
         self.cursor
     }
@@ -601,6 +602,14 @@ impl Service {
             return Err(EINVAL);
         }
         self.checked_step(memory, vm, root, ttbs, compute_ordinal, false)
+    }
+    /// Ordinary lanes share one report stream. Pool tokens own growth;
+    /// compute terminal ownership follows its admitted publication FIFO.
+    pub(crate) fn step_ordinary(
+        &mut self, memory: &mut Memory, vm: &Vm, root: &mut UserVm, ttbs: u64,
+    ) -> Result<Action> {
+        if self.dependency { return Err(EINVAL); }
+        self.checked_step(memory, vm, root, ttbs, None, true)
     }
     /// One native report stream has both live CL owners and the render pair.
     /// Route CL terminals through their owned FIFO, and keep serving render

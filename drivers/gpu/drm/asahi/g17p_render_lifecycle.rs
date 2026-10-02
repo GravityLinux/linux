@@ -434,6 +434,7 @@ impl Item {
         // A referenced Source milestone names its target grid and counter.
         let external = [
             if kind == Kind::Tiling { p.prior_queue_ta } else { None },
+            if kind == Kind::Tiling { p.cdm_dependency } else { None },
             if (kind == Kind::Fragment) == p.vdm_barrier_fragment {
                 p.vdm_dependency
             } else { None },
