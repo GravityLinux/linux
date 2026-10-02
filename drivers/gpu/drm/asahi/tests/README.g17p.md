@@ -1,4 +1,46 @@
-# G17P synchronous-port checks
+# G17P UAPI integration and source checks
+
+The frontend accepts copied commands and publishes pending output fences before
+returning. Firmware events and DMA-fence callbacks advance the backend; pending
+external inputs have no GPU execution timeout. Jobs retain their file, VM and
+GEM references until completion. Published backing pages remain retained.
+
+The completion bar is hardware integration through the Asahi UAPI; unit or
+source serialization checks are not required. Run consecutively in one driver
+session, using the same complete output/guard/timestamp/fence oracles:
+
+```sh
+g17p-drm-memory && g17p-drm-retained-wave &&
+g17p-drm-render-vm --cleanup && g17p-drm-compute-vm --cleanup &&
+g17p-drm-mixed-vm && g17p-drm-mixed-batch && g17p-drm-memory
+g17p-drm-async --backend && g17p-drm-async --close
+g17p-drm-compute-stress --compute-count 4096
+g17p-drm-render-vm --stress
+```
+
+Build compute-stress from g17p_drm_retained_wave.c with
+`-DG17P_TIMESTAMP_CAPACITY=4096`; this increases the integration fixture's
+caller timestamp storage. The driver uses normal resource leases and retired
+transport rotation. Both compute profiles recycle two finite pointer/item
+backing banks after the preceding wave retires.
+
+`g17p_drm_wait.h` adds explicit output-fence waits to the older integration
+programs. `g17p-drm-async` bypasses that adapter for submission and proves
+unsignaled acceptance, copied commands, same-queue ordering, independent-queue
+progress, binary/timeline completion and dependency error recovery. Its backend
+mode holds 16 accepted jobs beyond two seconds, destroys their queues, closes
+output GEM handles, checks pending VM_UNBIND returns EBUSY, interrupts a UAPI
+wait, then verifies every output and independent completion fence. The close
+mode closes the DRM file before signaling the accepted job's imported input.
+
+Run owned-fault, pool-limit/recovery and native C/R/C cases on separate boots
+with their documented diagnostic parameters below. A fault fence must carry
+its own error; a healthy peer's image is never a substitute for that check.
+
+The remaining sections retain source-port comparisons and earlier hardware
+measurements for reference. Their historical synchronous-stage limits and
+unfinished-stage statements describe those recorded revisions.
+
 
 These host tools compare the Rust source used by the kernel with the current
 m1n1 Python shim. They do not connect to hardware or load captured memory.
@@ -112,9 +154,9 @@ real GPU. Without `--sync`, the compute test needs no software timeline device.
 
 `--timestamps` checks ordered start/end pairs in the middle page of a caller
 GEM BO, offset/alignment validation, live object unbind/rebind, all earlier
-pairs and every surrounding guard byte. Timestamp aliases retain backing
-until firmware shutdown; address recycling is pending, and the retained
-64 MiB aperture returns ENOSPC on exhaustion.
+pairs and every surrounding guard byte. Timestamp aliases retain backing through every recorded fence. Unbound ranges
+become reusable after successful completion; pending or failed owners remain
+retained. The 64 MiB aperture returns ENOSPC on exhaustion.
 
 The batch test uses four submissions of eight independently owned graphs,
 checks all 2048 expected floats, each output guard, timestamp pairs and one
@@ -341,10 +383,17 @@ RAM and compares362 objects /936944bytes, including32 complete CL descriptors,
 registration receipts and rejection cases, and the source-authored host index
 transition. No target, firmware binary or captured page is imported.
 
-These are construction and report-service prerequisites. The native opt-in
-still needs its execution-root join, fresh scheduler backing and deferred
-publication sequence wired into Linux before hardware qualification. Ordinary
-synchronous submission remains the active runtime path.
+Session now connects the native opt-in to a source-owned cold primer, checked
+caller rebinding, live execution-root join, fresh scheduler backing, deferred
+publication, RTKit/report service, closing/render/opening retirement and final
+caller copyback. The source diagnostic and context-owner restrictions remain.
+Kernel #84 passes native C/R/C on RID1: all64 primer outputs/guards,
+both distinct caller compute outputs, eight complete render images, all
+command timestamps, cross-engine barriers and aggregate fence success status1;
+2164061 checks. Native Closing/Render/Opening retire independently. This fixes
+the #82 missing primary-index span and #83 misattributed render terminal mask6.
+Ordinary synchronous submission remains the default; the broader context,
+lifecycle/fault and source-parity coverage still needs validation.
 
 Kernel#73 regression of the graph-selected growth service passes the existing
 `g17p-drm-retained-wave` workload (13227558checks) and memory UAPI (6234checks).
@@ -353,3 +402,201 @@ aggregate fences, invalid suffixes and exhausted-capacity rejection pass.
 Post-close queue/status/descriptor/context/report audit passes on all six CPUs;
 Linux resumes. This validates the ordinary path after the refactor, while the
 native dependency runtime remains unqualified.
+
+Kernel #82 regression after the whole-shim integration passes
+`g17p-drm-retained-wave` (13227558 checks) and memory UAPI (6234 checks),
+including R/Cx258/R outputs, 516 timestamps, fences, guards and invalid suffix
+rejection. The artificial 258-command admission limit is removed; the old
+exhausted-capacity rejection above describes historical kernels. Cleanup,
+maintenance, relocation and fault execution callers are now connected, but
+native owner/fault/lifecycle hardware coverage and the full method-parity audit
+remain open. Reproduction logs and source/input hashes are under
+`neo-rust-port-20260929/whole-shim-integration/` in the adjacent artifacts tree.
+
+Native compute/render VM profiles now have separate real-hardware coverage.
+Kernel #85 with `asahi_neo.native_compute_vms=1` passes
+`g17p-drm-compute-vm --cleanup`: 32 alternating colliding-DVA submissions,
+successful exported fences, exact-span unbind and owned slot-three cleanup
+(8006125 checks). The frozen TTB shows slot three cleared and slot two retained.
+
+Kernel #87 with `asahi_neo.native_render_vms=1
+asahi_neo.partial_independent_owner=1` passes `g17p-drm-render-vm`: 16 alternating
+colliding-DVA renders with separate 131072/65536-triangle programs, complete
+images and inactive guards/timestamps/sentinels, plus successful exported fences
+(21230503 checks). Generate a second render header with `--triangles 65536`,
+renaming its generated `render_`/`RENDER_` and `workload` identifiers to
+`second_render_`/`SECOND_RENDER_` and `second_workload` for inclusion beside the
+first header. Both headers retain their original GPU addresses. The production
+preparation harness also runs the complete second partial-owner constructor
+and all four index aliases; it catches the full-page versus Pool-A-size bug.
+
+The ordinary logical render profile is connected to the source registered-root
+switch without opt-in parameters. Kernel #89 passes
+`g17p-drm-render-vm --cleanup` with32 alternating renders, identical DVAs and
+separate program/output backing, every full image, inactive guard/timestamp,
+successful exported fence and exact-span active/inactive unbind (42449544
+checks). Memory UAPI then passes6234 checks. Source-owned driver/growth mappings
+are retained across independent caller roots; returning roots admit only missing
+owned growth leaves and reject another physical owner before edits.
+
+On a fresh #87 boot with `asahi_neo.cleanup_diagnostics=15`,
+`g17p-drm-compute-vm --relocate` verifies32 alternating submissions, logical VM
+cleanup/maintenance, all four source relocation diagnostics, and eight further
+surviving-file submissions (9833349 checks). Complete outputs, inactive history,
+guards and exported fence success are checked after each new command. These
+runs do not close the full method-coverage audit or the asynchronous plan stages.
+
+Separate-file ordinary engine switching is checked by `g17p_drm_mixed_vm.c`.
+Compile it with the existing mixed/render generated headers and run
+`g17p-drm-mixed-vm` or `g17p-drm-mixed-vm --compute-first` on separate fresh
+boots without opt-in flags. The compute file independently binds its authored
+common code prefix at the fixed USC base, in addition to the mixed main-program
+image at +64 KiB. That prefix was implicit in the shared-file fixture's resident
+graphics image; omitting it creates a real command fault. No executable base
+changes. RID1 #91 passes R/C/R/C/R (4850865 checks), and #92 passes C/R/C/R
+(3671206 checks). Both check complete outputs, both full timestamp allocations
+and histories, and exported sync-file status1 for every command. Session now
+selects the logical caller in registered slot1 for post-render compute and
+allows the dormant render owner to adopt another file after compute retirement.
+Default Source render startup explicitly retains pair zero unless the independent
+owner profile is enabled; its global alternate-pair default alone does not
+admit a second owner. Source native C/R/C requires a fresh global sequence.
+
+`g17p_drm_soft_fault.c` checks the source shader-store recovery path. Compile
+with the two render headers used by the render-VM test. Boot with
+`asahi_neo.owned_render_fault_kind=1` and
+`asahi_neo.owned_render_fault_address=0x1000005c000`, then run
+`g17p-drm-soft-fault`. The address is the first output's page containing the
+actual authored nonzero pixels, rather than attachment page zero. RID1 #92
+passes4064733 checks: discarded target-zero stores, seven complete correct
+images, timestamps/guards and successful exported fences, exact unbind and
+fresh GEMs on the same queue, preserved old backing, and a second logical VM.
+`g17p_drm_fault.c` separately checks command-fetch loss with kind2/address
+0x1000018000: errored aggregate fence, later EIO, and preserved inactive VM.
+
+The independent profile is qualified on RID1 #98 with
+`asahi_neo.partial_independent_owner=1 asahi_neo.alternate_queue_pairs=1` and
+`g17p-drm-render-vm --pair-series`:128 alternating pressure renders,1024 complete
+images,512 ordered caller timestamps,128 successful exported fences and complete
+inactive image/guard/history checks (153089448 checks). The retained graph is
+created before a new logical-root clone so both roots carry its private aliases;
+tilemap recycling resolves the selected caller's owned backing. This does not
+qualify the default sole pair; that profile is qualified separately below.
+
+`g17p_drm_limit.c` checks owned terminal-limit attribution and recovery. Generate
+the first header with --triangles400017, the second with --triangles65536 using
+the renaming described above, and a recovery header with --triangles1. Rename
+the recovery header's render_/RENDER_/workload identifiers to
+recovery_render_/RECOVERY_RENDER_/recovery_workload and save it as
+g17p_drm_limit_recovery_workload.h. Compile with these generated headers. Boot
+with the independent alternating profile plus
+`asahi_neo.tvb_max_blocks_pool0=8
+asahi_neo.first_render_fragment_sync_grow=1
+asahi_neo.repeat_fragment_sync_grow=1`, then run `g17p-drm-limit`.
+RID1 #100 passes3491357 checks: four source negative replies and an owned type7
+produce aggregate -ENOMEM; the other caller completes eight correct images;
+the failed queue then renders eight fresh exact images from a one-triangle
+encoder and fresh output GEMs. Old failed backing, timestamp history, inactive
+outputs and sentinels remain unchanged. Successful work requires successful
+exported fences and ordered caller timestamps. A negative reply alone does not
+establish a terminal limit; the smaller131072-triangle default-fragment case
+emitted ordinary completion instead.
+
+Source TVB controls accept global/per-pool bounds8..2048. Global0 is unbounded,
+per-pool0 is explicitly unbounded, and per-pool0xffffffff inherits global.
+Fragment diagnostic0/1 maps the source bool; default2 leaves caller behavior.
+
+RID1 #104 fixes the ordinary sole-pair71st missing terminal. Recycled pool-A
+records retain their firmware counter, so the host scheduler slot must advance
+from its retired value instead of resetting0/1/2. Both Source's production
+phase callback and Rust now publish current/current+1/current+2 on reuse;
+fresh records retain0/1/2 and native explicit-base behavior is preserved.
+`g17p-drm-render-vm --single-series` runs128 renders on the default boot profile:
+153089448 checks cover1024 complete images,512 ordered caller timestamps,
+128 successful exported fences and all inactive guards/history. Memory UAPI
+also passes6234 checks. #107 subsequently fixes the separate172nd failure by
+keeping the context marker fixed and wrapping only the hardware stamp's low
+eight bits. Full scheduler nodes remain monotonic. --extended passes all255
+renders:303293792 checks,2040 complete images,1020 ordered caller timestamps,
+255 successful exported fences and complete inactive guards/history. Memory
+UAPI passes6234 checks. No terminal or timestamp gate is bypassed.
+The production Source/Rust lifecycle comparison passes2108 objects and
+3197478 bytes, including fresh/reused phase writes and overflow rejection.
+The same #104 kernel also passes --pair-series with the independent alternating
+boot profile:153089448 checks. Final owned queue triples are192/192/192 for
+both engines on both pairs, and pool-A record-zero counter/host-slot values
+are4/4 on each pair. All six CPUs and owned objects are saved before resuming.
+
+--stress requests4096 renders in one run with two independently backed caller
+VMs sharing identical DVAs. Each file has2048 timestamp records in a guarded
+five-page timestamp object. Every render checks both callers' complete images,
+sentinels, timestamp guards/history and successful binary/timeline/exported
+fences. Check counts accumulate in64 bits. Ordinary physical storage reuses
+256 retired descriptor/optional/event/status/context slots while retaining
+logical identities and firmware-owned context fields. Status clear/tail,
+GPU-register and completion-reader addresses all use the same retired slot.
+Eight-bit control producers/consumers advance modulo256 without resetting
+firmware consumers. The finite inner pointer/item storage is replaced using
+two retained banks after both stages and both outer consumers retire; inactive
+backing is checked before reuse. The handoff reads the pointer block's0x500
+bound and retains queue identity and dependency points. Only the queue record's
+local mirrored read index is initialized for new backing; other firmware
+fields survive the retired handoff.
+Cycle and index registers select slots inside their existing owned16KiB
+scratch pages, independently of logical counts. The ordinary65535 lifetime
+admission is removed; optional u16 metadata and narrow descriptor fields encode
+their storage width. Real arithmetic/wire-format checks remain. Native
+explicit dependency-wave admission retains its separately qualified255 bound.
+Source/Rust comparison passes2791 objects/3459953 bytes across275 variations,
+including physical/self-alias/scratch wraps through131072. All479 Source tests,
+460-object transport comparison and production preparation pass. Kernel#116 passes4096 renders:5102761512 checks,32768 complete images,16384
+ordered timestamps and4096 successful exported fences. Transcript audit checks
+16 work/control/report ring wraps,15 descriptor/status/optional/event storage
+wraps,16 context wraps,8 cycle-scratch wraps and1 index-scratch wrap, plus9
+two-bank transport handoffs per engine. All six CPU states and owned objects
+are saved before resuming Linux. The operator accepts this run; the proposed
+additional8192 run was not started. Broad default-only descriptor self/status
+selectors also match Source after a correction; kernel#117 builds but was not
+hardware booted. Recipes18497 objects and graph3410 objects pass Source
+comparisons. Full source-method/default parity certification remains open.
+The growth oracle executes the source policy assignments and validation for
+216 global/override combinations as part of93724 protocol/policy cases.
+Production preparation runs both allocator-error and bounded-policy paths;
+invoke the latter as /tmp/neo-dependency-prepare --pool-limit.
+
+Latest combined-session qualification (2026-09-30): stage completion requires
+memory, retained-wave, render-vm --cleanup, compute-vm --cleanup, mixed-vm,
+mixed-batch and memory consecutively through the UAPI in one retained session.
+Unit tests are explicitly unnecessary for this completion bar. Box1 remains
+open: kernel#122 passes memory and258-compute retained wave, then fails the
+render complete-image assertion; the later && suffix has not executed.
+
+The runtime now publishes the Source compute allocator's complete three-page
+4KiB GPU page list, rather than one page of16KiB entries. This parity correction
+builds and is verified in live owned data, but does not resolve the image issue.
+CPU-store tracing records no writes to output pages during a reproduced bad
+submission. The --tiny diagnostic passes32 one-triangle renders after the
+compute wave; --single-owner subsequently exposes a pressure failure without
+alternating submitting VMs. Both keep complete-image, timestamp, fence and
+inactive-owner checks. Neither substitutes for the unchanged --cleanup suite.
+Artifacts: neo-rust-port-20260929/whole-shim-integration/combined-compute-directory/
+and combined-tiny/. Published GEM and firmware backing remains retained until
+session shutdown, as required by the M1/M2/M4 grow-only backing policy.
+
+Further combined-session evidence (kernel#128, 2026-09-30): Source logical
+activation barriers, upper-root preservation and reserved robustness aliases
+build and boot but do not fix complete-image corruption. Memory and retained
+wave pass, followed by render-vm submission3/owner1 failing target0 byte34880
+with u32 0x2ea; later commands in the required && sequence do not execute.
+Box1 remains open. Live descriptor DATA agrees with actual Python UAPI
+conversion, including all three embedded fragment programs and tilemap
+advancement. A frozen sparse-pattern scan finds no0x2ea in5136 unique owned
+allocator/scratch pages; transient data remains possible.
+
+The compute-only logical-context correction has separate UAPI evidence:
+memory, retained-wave, compute-vm --cleanup, mixed-vm, mixed-batch, memory
+pass consecutively on#126. This removes the observed compute admission EBUSY,
+but that diagnostic omits render-vm and does not satisfy stage completion.
+The full suite on that session still fails the later retained-wave pressure
+render. Artifact-only partial-load-to-clear diagnostics do not alter the
+required complete-image integration oracle or count as qualification.

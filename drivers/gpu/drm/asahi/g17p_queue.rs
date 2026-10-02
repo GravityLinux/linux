@@ -48,6 +48,24 @@ pub(crate) struct Record {
     pub(crate) unk_94: u32,
     pub(crate) sentinel_size: usize,
 }
+/// g17p.queue_priority_profile / set_muxed_queue_priority host-owned family.
+pub(crate) fn priority_profile(priority: u32) -> Result<[u8; 0x20]> {
+    let (unk30, unk38, prio5) = match priority {
+        0 => (0xffffffffffff0000, 1, 1),
+        1 => (0xffffffff00000000, 0, 0),
+        2 => (0xffff000000000000, 0, 2),
+        3 => (0, 0, 3),
+        _ => return Err(Error::Invalid),
+    };
+    let mut body = [0; 0x20];
+    put32(&mut body, 0, priority);
+    put32(&mut body, 4, priority);
+    put64(&mut body, 8, unk30);
+    put32(&mut body, 0x10, unk38);
+    put32(&mut body, 0x18, prio5);
+    put32(&mut body, 0x1c, u32::MAX);
+    Ok(body)
+}
 impl Record {
     pub(crate) fn build(&self) -> Result<[u8; 0xc0]> {
         if self.sentinel_size > 6 {

@@ -10,14 +10,22 @@ pub(crate) const TA_SIZE: usize = 0x9c0;
 pub(crate) const FRAGMENT_SIZE: usize = 0x2240;
 pub(crate) const SUPPORT_SIZE: usize = 0x70;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Parameters {
+    pub(crate) firmware_priority: Option<u32>,
+    // UAPI bit 3 moves only the selected FR dependency to this command's FR.
+    pub(crate) vdm_barrier_fragment: bool,
+    pub(crate) prior_queue_ta: Option<(u8, u32)>,
+    pub(crate) vdm_dependency: Option<(u8, u32)>,
+    pub(crate) fragment_attachments: [[u64; 2]; 16],
+    pub(crate) fragment_attachment_count: usize,
     pub(crate) width: u64,
     pub(crate) height: u64,
     pub(crate) context_base: u64,
     pub(crate) tilemap: u64,
     pub(crate) heapmeta: u64,
     pub(crate) tpc: u64,
+    pub(crate) scratch_pair_stride: u64,
     pub(crate) deflake_1: u64,
     pub(crate) deflake_2: u64,
     pub(crate) deflake_3: u64,
@@ -82,6 +90,9 @@ pub(crate) struct Parameters {
     pub(crate) aux_fb_flags: u64,
     pub(crate) aux_fb_page_count: u64,
     pub(crate) lifecycle_ordinal: u64,
+    // Native retained TA/3D work selects one after the opening render.
+    // Keep these controls separate from full descriptor/scheduler ordinals.
+    pub(crate) completion_control: u64,
     pub(crate) native_context_slot: Option<u64>,
     pub(crate) queue_pair: u64,
     pub(crate) queue_item_index: u64,
@@ -99,12 +110,19 @@ pub(crate) struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
+            firmware_priority: None,
+            vdm_barrier_fragment: false,
+            prior_queue_ta: None,
+            vdm_dependency: None,
+            fragment_attachments: [[0; 2]; 16],
+            fragment_attachment_count: 0,
             width: 0,
             height: 0,
             context_base: 0,
             tilemap: 0,
             heapmeta: 0,
             tpc: 0,
+            scratch_pair_stride: 0x1b0000,
             deflake_1: 0,
             deflake_2: 0,
             deflake_3: 0,
@@ -169,6 +187,7 @@ impl Default for Parameters {
             aux_fb_flags: 49153,
             aux_fb_page_count: 1048576,
             lifecycle_ordinal: 0,
+            completion_control: 0,
             native_context_slot: None,
             queue_pair: 0,
             queue_item_index: 0,
@@ -219,6 +238,27 @@ struct Geometry {
 }
 
 impl Parameters {
+    fn tib_encoding(&self) -> u64 {
+        // M4-derived sample/bank encoding; keep raw allocation size separate.
+        let blocks = self.tib_blocks & 0x3f;
+        if self.samples == 1 {
+            blocks
+        } else {
+            let banks = if self.tib_blocks > 32 { 2 } else { 1 };
+            ((self.samples * banks) << 16) | blocks
+        }
+    }
+
+    fn sample_size_field(&self) -> Result<u32> {
+        // Existing typed fixtures default to zero; nonzero UAPI values are literal.
+        let value = if self.sample_size == 0 {
+            self.tib_blocks.checked_mul(2).ok_or(Error::Overflow)?
+        } else {
+            self.sample_size
+        };
+        narrow(value)
+    }
+
     pub(crate) fn validate(&self) -> Result {
         // Check this first, before deriving any address or modifying output.
         if self.usc_exec_base != USC_EXEC_BASE {
@@ -248,6 +288,20 @@ impl Parameters {
         }
         Ok(())
     }
+    pub(crate) fn scratch_layout(&self) -> Result<(u64, u64, u64)> {
+        let g = self.geometry()?;
+        let tilemap = g.size1.checked_mul(64).and_then(|n| n.checked_mul(self.layers))
+            .ok_or(Error::Overflow)?;
+        let heap = tilemap.checked_add(0xfff).ok_or(Error::Overflow)? & !0xfff;
+        let stride = heap.checked_add(0x200).ok_or(Error::Overflow)?;
+        let tpc = g.size3.checked_mul(64).and_then(|n| n.checked_mul(self.layers))
+            .ok_or(Error::Overflow)?;
+        Ok((heap, stride, tpc))
+    }
+    pub(crate) fn with_geometry_scratch(&self) -> Result<Self> {
+        let (heap, _, _) = self.scratch_layout()?;
+        Ok(Self { heapmeta: self.tilemap.checked_add(heap).ok_or(Error::Overflow)?, ..*self })
+    }
     fn ta_offset(&self, address: u64) -> Result<u64> {
         address.checked_sub(self.context_base).ok_or(Error::Invalid)
     }
@@ -271,47 +325,28 @@ impl Parameters {
     }
     fn work_stamp(&self) -> u64 {
         (self.native_context_slot.unwrap_or(1) << 8)
-            | (self.lifecycle_ordinal + self.lifecycle_ordinal / 2)
+            + ((self.lifecycle_ordinal + self.lifecycle_ordinal / 2) & 0xff)
     }
     fn cycle(&self) -> Result<u64> {
-        let pair =
-            self.native_item_fields || self.native_pair_registers || self.native_cycle_registers;
-        let mut value = 0x178020;
-        if pair {
-            value = add(
-                value,
-                self.queue_pair
-                    .checked_mul(self.pair_resource_stride)
-                    .ok_or(Error::Overflow)?,
-            )?;
-        }
-        if pair || self.local_item_registers {
-            value = add(
-                value,
-                self.queue_item_index
-                    .checked_mul(0x20)
-                    .ok_or(Error::Overflow)?,
-            )?;
-        }
-        Ok(value)
+        let pair = self.native_item_fields || self.native_pair_registers || self.native_cycle_registers;
+        let base = add(0x178000, if pair {
+            self.queue_pair.checked_mul(self.pair_resource_stride).ok_or(Error::Overflow)?
+        } else { 0 })?;
+        // The source owns one 16 KiB page of 32-byte scratch slots. The
+        // first item uses +0x20; the last slot wraps to +0 after retirement.
+        let offset = if pair || self.local_item_registers {
+            ((self.queue_item_index % 512 + 1) % 512) * 0x20
+        } else { 0x20 };
+        add(base, offset)
     }
     fn record_index(&self) -> Result<u64> {
-        let pair = self.native_item_fields
-            || self.native_pair_registers
-            || self.native_record_index_register;
-        let mut value = 0x80005;
-        if pair {
-            value = add(value, self.queue_pair * 0x140)?;
-        }
-        if pair || self.local_item_registers {
-            value = add(
-                value,
-                self.queue_item_index
-                    .checked_mul(4)
-                    .ok_or(Error::Overflow)?,
-            )?;
-        }
-        Ok(value)
+        let pair = self.native_item_fields || self.native_pair_registers || self.native_record_index_register;
+        let offset = if pair || self.local_item_registers {
+            ((if pair { self.queue_pair * 0x140 } else { 0 })
+                + (self.queue_item_index % 4096 + 1) * 4) % 0x4000
+        } else { 4 };
+        // Bit zero is the register's flag, separate from its page offset.
+        Ok(0x80001 + offset)
     }
     fn status(&self, kind: Kind) -> Result<u64> {
         let bases = match kind {
@@ -329,7 +364,7 @@ impl Parameters {
         add(
             base,
             self.status_item_index
-                .unwrap_or(self.queue_item_index)
+                .unwrap_or(self.queue_item_index & 0xff)
                 .checked_mul(0x40)
                 .ok_or(Error::Overflow)?,
         )
@@ -400,7 +435,7 @@ pub(crate) fn tiling_registers(p: &Parameters) -> Result<[Register; 73]> {
         (0x1c8f8, 0x8860),
         (0x1c0b1, g.size1),
         (0x1c850, g.size1),
-        (0x10131, p.multisample_control),
+        (0x10131, 0x88),
         (0x10121, p.ppp_control),
         (0x10129, g.pixels),
         (0x101b9, g.screen),
@@ -445,7 +480,7 @@ pub(crate) fn tiling_registers(p: &Parameters) -> Result<[Register; 73]> {
         (0x10209, work_stamp),
         (0x1c9f0, work_stamp),
         (0x14320, work_stamp),
-        (0x14308, 0x0),
+        (0x14308, p.completion_control),
         (0x14318, (status | 0x1)),
         (0x1740, 0x1),
         (0x1c880, deflake_1),
@@ -500,7 +535,7 @@ pub(crate) fn fragment_registers(p: &Parameters) -> Result<[Register; 89]> {
         (0x15021, p.aux_fb_flags),
         (0x15211, ((p.height << 0x20) | p.width)),
         (0x15049, p.aux_fb_page_count),
-        (0x10051, p.tib_blocks),
+        (0x10051, p.tib_encoding()),
         (0x15321, p.depth_dimensions),
         (0x15301, p.depth_clear_value_bits),
         (0x15309, (p.stencil_clear_value | 0x300)),
@@ -559,7 +594,7 @@ pub(crate) fn fragment_registers(p: &Parameters) -> Result<[Register; 89]> {
         (0x1ca28, cycle),
         (0x10211, work_stamp),
         (0x10420, work_stamp),
-        (0x14048, 0x0),
+        (0x14048, p.completion_control),
         (0x14080, (status | 0x1)),
         (0x1731, 0x1),
         (0x16020, 0x1),
@@ -769,7 +804,7 @@ impl Descriptor<'_> {
             .ordinal
             .checked_add(self.ordinal / 2)
             .ok_or(Error::Overflow)?;
-        let stamp = narrow((native_slot.unwrap_or(self.context.max(1) as u64) << 8) + work as u64)?;
+        let stamp = narrow((native_slot.unwrap_or(self.context.max(1) as u64) << 8) + (work & 0xff) as u64)?;
         let pool = parameters
             .and_then(|p| p.tvb_pool_id)
             .unwrap_or(self.queue_pair as u64) as u32;
@@ -807,14 +842,7 @@ impl Descriptor<'_> {
             0
         };
         if self.write_tail && self.write_item {
-            let max = if self.kind == Kind::Tiling {
-                0xff
-            } else {
-                0xffffff
-            };
-            if item > max
-                || grid == u32::MAX
-                || self
+            if grid == u32::MAX                || self
                     .item_overrides
                     .iter()
                     .any(|&(at, _)| at > out.len() - 4)
@@ -831,12 +859,11 @@ impl Descriptor<'_> {
                 p.store_pipeline_bind,
                 p.partial_store_pipeline_bind,
                 p.depth_clear_value_bits,
+                p.stencil_clear_value,
             ] {
                 narrow(v)?;
             }
-            if p.tib_blocks > u64::MAX >> 33 {
-                return Err(Error::Overflow);
-            }
+            p.sample_size_field()?;
         }
         let mut pointers = [(0usize, 0u64); 11];
         let count = if self.write_tail {
@@ -995,14 +1022,14 @@ impl Descriptor<'_> {
                         if let Some(alias) = self.low_alias {
                             add(alias, v & 0x3fff)?
                         } else {
-                            add(v, self.ordinal as u64 * self.kind.size() as u64)?
+                            add(v, (self.ordinal % 256) as u64 * self.kind.size() as u64)?
                         }
                     }
                     2 => add(v, self.queue_pair as u64 * 8)?,
                     3 => add(
                         self.status_base
                             .unwrap_or(status_bases[self.queue_pair as usize]),
-                        self.index as u64 * 0x40,
+                        (self.index % 256) as u64 * 0x40,
                     )?,
                     _ => v,
                 }
@@ -1015,9 +1042,9 @@ impl Descriptor<'_> {
         if self.kind == Kind::Tiling {
             for (at, v) in [
                 (0x79c, grid + 1),
-                (0x7a0, item * 0x100),
+                (0x7a0, item.wrapping_mul(0x100)),
                 (0x7a8, item),
-                (0x7b0, item * 0x101),
+                (0x7b0, item.wrapping_mul(0x101)),
                 (0x8b4, (item << 24) | 0xffff),
                 (0x8c4, item << 16),
                 (0x8c8, item << 24),
@@ -1061,6 +1088,7 @@ impl Descriptor<'_> {
             }
             for (at, v) in [
                 (0x780, p.tpc),
+                (0x788, p.scratch_layout().unwrap().2),
                 (0x87a, p.sampler_array),
                 (0x8fe, p.timestamp_a),
                 (0x906, p.ta_timestamp_end),
@@ -1070,7 +1098,6 @@ impl Descriptor<'_> {
                 u64_at(out, at, v);
             }
             for (at, v) in [
-                (0x789, 0x78),
                 (0x892, p.reactive_tvb_growth as u8),
                 (0x89a, p.vertex_store_flag as u8),
                 (0x932, 0x44),
@@ -1081,6 +1108,7 @@ impl Descriptor<'_> {
             }
             return;
         }
+        u32_at(out, 0x50, p.samples as u32);
         // Parameters were validated before any bytes were written. Each
         // embedded program is encoded independently to bound stack use.
         u32_at(
@@ -1099,13 +1127,26 @@ impl Descriptor<'_> {
             (0x1e80, p.load_pipeline),
             (0x1ea8, p.partial_load_pipeline_bind),
             (0x1eb0, p.partial_load_pipeline),
-            (0x1f38, p.tib_blocks),
+            (0x1eb8, p.depth_flags),
+            (0x1ec8, p.depth_buffer),
+            (0x1ed0, p.depth_stride),
+            (0x1ed8, p.depth_aux_stride),
+            (0x1ee0, p.depth_buffer),
+            (0x1ee8, p.depth_buffer),
+            (0x1ef0, p.depth_aux_buffer),
+            (0x1ef8, p.stencil_buffer),
+            (0x1f00, p.stencil_stride),
+            (0x1f08, p.stencil_aux_stride),
+            (0x1f10, p.stencil_buffer),
+            (0x1f18, p.stencil_buffer),
+            (0x1f20, p.stencil_aux_buffer),
+            (0x1f38, p.tib_encoding()),
             (0x1f40, p.aux_fb_flags),
             (0x1f50, p.aux_fb_page_count),
             (0x1f58, p.tile_config),
             (0x1f7c, p.store_pipeline),
             (0x1f9c, p.partial_store_pipeline),
-            (0x1fac, (p.tib_blocks << 33) | 0x300),
+            (0x1fd0, p.depth_dimensions),
             (0x2114, p.sampler_array),
             (0x2198, p.fragment_timestamp_start),
             (0x21a0, p.fragment_timestamp_end),
@@ -1121,6 +1162,9 @@ impl Descriptor<'_> {
             (0x1f78, p.store_pipeline_bind as u32),
             (0x1f98, p.partial_store_pipeline_bind as u32),
             (0x1fa8, p.depth_clear_value_bits as u32),
+            (0x1fac, p.stencil_clear_value as u32 | 0x300),
+            (0x1fb0, p.sample_size_field().unwrap()),
+            (0x212c, u32::from(p.samples > 1)),
             (0x2110, u32::MAX),
             (0x211c, p.sampler_count as u32),
             (0x2120, sampler_max),

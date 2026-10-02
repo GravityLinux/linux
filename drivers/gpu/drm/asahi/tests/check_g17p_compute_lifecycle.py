@@ -78,13 +78,13 @@ for n in (1,2,3,4,35,36,127,128,239,240,255,256,257):
 from types import SimpleNamespace as NS
 gs=importlib.util.spec_from_file_location('g17p',args.m1n1/'proxyclient/m1n1/agx/g17p.py')
 g17p=importlib.util.module_from_spec(gs);gs.loader.exec_module(g17p)
-tns=dict(struct=struct,g17p=g17p)
+tns=dict(struct=struct,g17p=g17p,PAGE=0x4000,ITEM_BYTES=0x2870,POOL_BASE=0xfffffc20cf000000,POOL_SLOTS=2)
 for filename, name in [('g17p_backend.py','G17PQueue'),('g17p_compute_transport.py','G17PComputeTransportPool')]:
     tree=ast.parse((args.m1n1/'proxyclient/m1n1/agx'/filename).read_text())
     nodes=[n for n in tree.body if isinstance(n,ast.ClassDef) and n.name==name]
     exec(compile(ast.Module(body=nodes,type_ignores=[]),filename,'exec'),tns)
 tns.update(PAGE=0x4000,ITEM_BYTES=0x2870,POOL_BASE=0xfffffc20cf000000,POOL_SLOTS=2)
-for case in range(8):
+for case in range(40):
     old=(0xfffffc200165a870+case*0x4000,0xfffffc20c08aa870+case*0x4000)
     done=384+case*3
     record=bytearray((i*17+case*13)&255 for i in range(0xc0))
@@ -96,8 +96,8 @@ for case in range(8):
         _write_dva=lambda at,body:ram.__setitem__(at,bytes(body)),
         _clean_dva_range=lambda *a:None,u=NS(inst=lambda *a:None),
         channels=NS(counters=lambda _: [case]*3,by_name=lambda _:None))
-    pool=tns['G17PComputeTransportPool'](backend);pool.history=[None]*(case%2)
-    pool._backing=lambda slot: pool.slots.setdefault(slot,dict(address=tns['POOL_BASE']+slot*0x8000,pa=0x10080000000+slot*0x8000))
+    pool=tns['G17PComputeTransportPool'](backend,base=tns['POOL_BASE']+(case//8)*0x10000);pool.history=[None]*(case%2)
+    pool._backing=lambda slot: pool.slots.setdefault(slot,dict(address=pool.base+slot*0x8000,pa=0x10080000000+slot*0x8000))
     queue=tns['G17PQueue'](backend._read_dva,0xfffffc20c0000300,4)
     replacement=pool.switch(queue,128+case)
     emit(f'transport-{case}:record',ram[queue.address])

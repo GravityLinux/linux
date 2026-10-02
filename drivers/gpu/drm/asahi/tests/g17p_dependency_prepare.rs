@@ -130,6 +130,10 @@ mod g17p_queue;
 mod g17p_render;
 #[path = "../g17p_render_graph.rs"]
 mod g17p_render_graph;
+#[path = "../g17p_resource_record.rs"]
+mod g17p_resource_record;
+#[path = "../g17p_partial_runtime.rs"]
+mod g17p_partial_runtime;
 #[path = "../g17p_render_lifecycle.rs"]
 mod g17p_render_lifecycle;
 #[path = "../g17p_topology.rs"]
@@ -151,6 +155,9 @@ mod g17p_memory {
         address: u64,
     }
     impl Word64<'_> {
+        pub fn load(&self) -> u64 {
+            self.owner.read64(self.address).unwrap()
+        }
         pub fn store(&self, value: u64) {
             self.owner.put(self.address, &value.to_le_bytes()).unwrap();
         }
@@ -252,6 +259,9 @@ mod g17p_user_vm {
         pub fn root(&self) -> u64 {
             self.root
         }
+        pub fn invalidate(context: u16) {
+            assert!((1..=3).contains(&context));
+        }
         pub fn pte(&self, va: u64) -> Result<u64> {
             Ok(*self.leaves.get(&va).unwrap_or(&0))
         }
@@ -285,6 +295,7 @@ mod g17p_vm {
         pub fresh: Vec<(u64, u64, u64)>,
     }
     impl Vm {
+        pub fn invalidate_gpu() {}
         pub fn new() -> Self {
             Self {
                 leaves: BTreeMap::new(),
@@ -476,7 +487,32 @@ fn client(root: u64) -> c::Client {
         owner: (1, 1),
     }
 }
+fn partial_owner_graph() -> Result {
+    let mut memory = g17p_memory::Memory::new();
+    let mut vm = g17p_vm::Vm::new();
+    let mut root = g17p_user_vm::UserVm::new(0x10098000000);
+    let primary = g17p_render_lifecycle::ORDINARY;
+    let control = g17p_render_lifecycle::SECOND.support;
+    vm.ensure_firmware(&mut memory, control, 0x4000)?;
+    vm.write(&mut memory, 2, control + 0x4c, &0xfffffc2000004000u64.to_le_bytes())?;
+    g17p_partial_runtime::build_graph(&mut memory, &mut vm, &mut root, primary, control)?;
+    let graph = g17p_partial_runtime::GRAPH;
+    let shared = vm.physical(&memory, 2, graph[8].1)?;
+    assert_eq!(memory.read_firmware32(shared + 0xc)?, 1);
+    assert_eq!(memory.read_firmware32(shared + 0x3c)?, 8);
+    assert_eq!(memory.read64(shared + 0x20)?, graph[0].1);
+    assert_eq!(memory.read64(shared + 0x28)?, 0x1000340000);
+    for offset in (0..0x10000).step_by(0x4000) {
+        assert_eq!(root.pte(0x1000340000 + offset)? & 0x3ffffffc000,
+                   vm.physical(&memory, 2, graph[0].1 + offset)?);
+    }
+    let array = vm.physical(&memory, 2, graph[6].1)?;
+    for i in 0..35 { assert_eq!(memory.read64(array + i * 0x100)?, graph[2].1 + 4 + i * 4); }
+    println!("PASS production second partial owner construction and full four-page index aliases");
+    Ok(())
+}
 fn main() -> Result {
+    partial_owner_graph()?;
     let mut memory = Memory::new();
     let mut vm = Vm::new();
     let channel = |index: u64| g17p_abi::Channel {
@@ -698,7 +734,8 @@ fn main() -> Result {
     assert_eq!(before, compute.client.root.leaves);
     println!("PASS: production dependency preparation: four held outer producers, hidden closing inner/context, live joins, compact descriptors and four fresh scheduler owners");
     control_checks(&mut memory, &mut vm, &mut compute, &prepared)?;
-    report_checks(&mut memory, &mut vm, &mut compute)?;
+    report_checks(&mut memory, &mut vm, &mut compute,
+        std::env::args().any(|arg| arg == "--pool-limit"))?;
     use g17p_dependency_retire::{Owner, Reports};
     let reports = |render_complete| Reports {
         valid: true,
@@ -847,12 +884,13 @@ fn control_checks(
         memory,
         vm,
         ttbs,
-        compute.client.root.root(),
+        &compute.client.root,
         command,
         report,
     )?;
     service.begin_compute(1)?;
     service.begin_compute(2)?;
+    service.bind_work(d::RENDER_DESCRIPTORS[1])?;
     let counters = control.states.map(|va| vm.physical(memory, 2, va).unwrap());
     let messages = Rc::new(RefCell::new(Vec::new()));
     let waits = Rc::new(RefCell::new(0));
@@ -958,7 +996,7 @@ fn control_checks(
     Ok(())
 }
 
-fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) -> Result {
+fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission, bounded: bool) -> Result {
     let ttbs = memory.allocate(0x4000)?;
     memory.write64(ttbs + 16, (1 << 48) | compute.client.root.root() | 1)?;
     let command = g17p_abi::Channel {
@@ -976,17 +1014,20 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
         memory,
         vm,
         ttbs,
-        compute.client.root.root(),
+        &compute.client.root,
         command,
         report,
     )?;
+    if bounded {
+        service.set_source_pool_limits(18, [u32::MAX; 2])?;
+    }
     service.expect_dependency_receipt(1)?;
     service.begin_compute(1)?;
     service.begin_compute(2)?;
     service.bind_work(d::RENDER_DESCRIPTORS[1])?;
     let mut cl = [0u8; 0x48];
     cl[..4].copy_from_slice(&1u32.to_le_bytes());
-    cl[4..8].copy_from_slice(&4u32.to_le_bytes());
+    cl[4..8].copy_from_slice(&1u32.to_le_bytes());
     let mut growth = [0u8; 0x48];
     growth[..4].copy_from_slice(&6u32.to_le_bytes());
     growth[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -996,8 +1037,10 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
     receipt[..0x28].copy_from_slice(&d::render_receipt(1));
     let mut render = [0u8; 0x48];
     render[..4].copy_from_slice(&1u32.to_le_bytes());
-    render[4..8].copy_from_slice(&3u32.to_le_bytes());
-    for (i, body) in [cl, growth, receipt, render, cl].iter().enumerate() {
+    render[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let mut closing = cl;
+    closing[4..8].copy_from_slice(&8u32.to_le_bytes());
+    for (i, body) in [cl, growth, receipt, render, closing].iter().enumerate() {
         vm.write(memory, 2, report.states[1] + i as u64 * 0x48, body)?;
     }
     vm.write(memory, 2, report.states[0] + 0x20, &5u32.to_le_bytes())?;
@@ -1020,14 +1063,16 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
     assert_eq!(service.compute_terminals(), 2);
     assert_eq!(service.terminals(), 1);
     assert_eq!(service.cursor(), 5);
-    // Refusal follows an actual allocation error. Only this graph's fragment
+    // Run both the real allocator-error path and the source bounded-policy
+    // path. Only this graph's fragment
     // event 2 can close it; event 1 belongs to the ordinary graph and must keep
     // its report credit. Context event_slot remains 1 in both graphs.
     let mut next_growth = growth;
     next_growth[12..16].copy_from_slice(&1u32.to_le_bytes());
     vm.write(memory, 2, report.states[1] + 5 * 0x48, &next_growth)?;
     vm.write(memory, 2, report.states[0] + 0x20, &6u32.to_le_bytes())?;
-    memory.fail_next_allocation = true;
+    memory.fail_next_allocation = !bounded;
+    let allocations_before = memory.pages.borrow().len();
     assert!(matches!(
         service.step_dependency(memory, vm, &mut compute.client.root, ttbs)?,
         g17p_growth_runtime::Action::Reply {
@@ -1037,6 +1082,7 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
             ..
         }
     ));
+    assert_eq!(memory.pages.borrow().len(), allocations_before);
     let limit = |event: u32| {
         let mut body = [0; 0x48];
         for (offset, word) in [(0, 7u32), (8, 1), (12, event)] {
@@ -1053,13 +1099,20 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
         }
         body
     };
-    vm.write(memory, 2, report.states[1] + 6 * 0x48, &limit(1))?;
-    vm.write(memory, 2, report.states[0] + 0x20, &7u32.to_le_bytes())?;
-    assert!(service
-        .step_dependency(memory, vm, &mut compute.client.root, ttbs)
-        .is_err());
+    // Identity rejection is checked without reviving a quarantined reader.
+    // Production dispatch failure permanently freezes that reader, which the
+    // duplicate-report cases below exercise independently of this valid wave.
+    assert!(g17p_growth::Owner { vm: 1, pool: 0 }
+        .limit(
+            &limit(1),
+            &[0xfffffc2000000100, 0xfffffc2000000200],
+            d::RENDER_DESCRIPTORS[1],
+            2
+        )
+        .is_none());
     assert_eq!(service.cursor(), 6);
     vm.write(memory, 2, report.states[1] + 6 * 0x48, &limit(2))?;
+    vm.write(memory, 2, report.states[0] + 0x20, &7u32.to_le_bytes())?;
     assert!(matches!(
         service.step_dependency(memory, vm, &mut compute.client.root, ttbs)?,
         g17p_growth_runtime::Action::Limit
@@ -1100,14 +1153,51 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
         vm.write(memory, 2, va, &8u32.to_le_bytes())?;
     }
     vm.write(memory, 2, report.states[0] + 0x20, &0u32.to_le_bytes())?;
-    let mut ordinary = g17p_growth_runtime::Service::new(
-        memory,
-        vm,
-        ttbs,
-        compute.client.root.root(),
-        command,
-        report,
-    )?;
+    // The standalone profile has its own source list, with retained TVB
+    // leaves already admitted by production preparation. Copy the eight
+    // initial source IDs, not allocator or validation substitutes.
+    let mut initial = [0; 64];
+    for (index, word) in initial.chunks_exact_mut(8).enumerate() {
+        word.copy_from_slice(
+            &memory
+                .read64(vm.physical(memory, 2, d::LEAVES[1] + index as u64 * 8)?)?
+                .to_le_bytes(),
+        );
+    }
+    vm.write(memory, 2, 0xfffffc20c0838000, &initial)?;
+    let mut ordinary =
+        g17p_growth_runtime::Service::new(memory, vm, ttbs, &compute.client.root, command, report)?;
+    ordinary.pools[0].retired = true;
+    let mut logical = g17p_user_vm::UserVm::new(0x10099000000);
+    let sentinel = (0x11000000000, 0x10099080000 | 0xc0000000000c8b);
+    logical.leaves.insert(sentinel.0, sentinel.1);
+    let mut expected = BTreeMap::from([sentinel]);
+    for id in initial.chunks_exact(8) {
+        let base = 0x1000000000 + u64::from_le_bytes(id.try_into().unwrap()) * 0x8000;
+        for offset in (0..0x20000).step_by(0x4000) {
+            let pte = compute.client.root.pte(base + offset)?;
+            // The source initial tranche is sparse. Absent leaves are not
+            // owned backing and must remain absent in the other logical VM.
+            if pte != 0 && memory.word64(pte & 0x3ffffffc000).is_ok() {
+                expected.insert(base + offset, pte);
+            }
+        }
+    }
+    ordinary.mirror_retained_mappings(&mut logical)?;
+    assert_eq!(logical.leaves, expected);
+    assert_eq!(logical.pte(sentinel.0)?, sentinel.1);
+    let retained = logical.leaves.clone();
+    ordinary.mirror_retained_mappings(&mut logical)?;
+    assert_eq!(logical.leaves, retained);
+    let address = *logical.leaves.keys().find(|&&va| va != sentinel.0).unwrap();
+    logical.leaves.insert(address, logical.pte(address)? ^ 0x4000);
+    let conflict = logical.leaves.clone();
+    assert_eq!(ordinary.mirror_retained_mappings(&mut logical), Err(EIO));
+    assert_eq!(logical.leaves, conflict);
+    ordinary.pools[0].retired = false;
+    assert_eq!(ordinary.mirror_retained_mappings(&mut logical), Err(EBUSY));
+    assert_eq!(logical.leaves, conflict);
+    println!("PASS retained growth mappings into logical roots: idempotent owned leaves, caller sentinel preserved, conflicting owner and pending work rejected before changes");
     assert!(ordinary.expect_dependency_receipt(1).is_err());
     assert!(ordinary
         .step_dependency(memory, vm, &mut compute.client.root, ttbs)
@@ -1124,6 +1214,13 @@ fn report_checks(memory: &mut Memory, vm: &mut Vm, compute: &mut c::Submission) 
         .step(memory, vm, &mut compute.client.root, ttbs, None)
         .is_err());
     assert_eq!(ordinary.cursor(), 0);
+    // A failed report service remains quarantined. Admit the valid case
+    // through a fresh reader/owner instead of reviving the failed service.
+    vm.write(memory, 2, report.states[0] + 0x20, &0u32.to_le_bytes())?;
+    let mut ordinary =
+        g17p_growth_runtime::Service::new(memory, vm, ttbs, &compute.client.root, command, report)?;
+    ordinary.begin_compute(9)?;
+    vm.write(memory, 2, report.states[0] + 0x20, &1u32.to_le_bytes())?;
     assert!(matches!(
         ordinary.step(memory, vm, &mut compute.client.root, ttbs, Some(9))?,
         g17p_growth_runtime::Action::Consumed

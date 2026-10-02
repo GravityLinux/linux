@@ -81,6 +81,40 @@ pub(crate) struct Prepared {
     pub(crate) render_timestamps: [u64; 4],
 }
 impl Prepared {
+    /// Replace only context 1's low root after a quiescent source primer.
+    /// The independently owned hardware upper roots stay empty; the populated
+    /// firmware high tree is used only for software translation of fields.
+    pub(crate) fn activate(&self, memory: &Memory, ttbs: u64, render_root: u64) -> Result {
+        let tagged = (1 << 48) | self.root | 1;
+        if (self.root | render_root | ttbs) & 0x3fff != 0
+            || self.root >= 1 << 42
+            || render_root >= 1 << 42
+            || memory.read64(ttbs + 16)? != ((1 << 48) | render_root | 1)
+        {
+            return Err(EINVAL);
+        }
+        for context in 0..2u64 {
+            let entry = memory.read64(ttbs + context * 16 + 8)?;
+            let upper = entry & ADDRESS;
+            if entry != ((context << 48) | upper | 1) || upper == 0 {
+                return Err(EIO);
+            }
+            memory.invalidate(upper, PAGE)?;
+            for offset in (0..PAGE).step_by(8) {
+                if memory.read64(upper + offset as u64)? != 0 {
+                    return Err(EBUSY);
+                }
+            }
+        }
+        let word = memory.word64(ttbs + 16)?;
+        // All ownership checks precede the first break. Retained compute and
+        // render Clients pin both generations until the final invalidation.
+        word.store(0);
+        Vm::invalidate_gpu();
+        word.store(tagged);
+        Vm::invalidate_gpu();
+        Ok(())
+    }
     /// Capture before release; these are the source's own command destinations,
     /// not a shared global word or a terminal count borrowed from another owner.
     pub(crate) fn retirement(
@@ -385,11 +419,20 @@ pub(crate) fn prepare(
     ] {
         vm.ensure_firmware(memory, va, size)?;
     }
+    // The packed render owner advertises a 64 KiB primary-index view
+    // (Shared +0x30). Its first page contains the authored group indices;
+    // firmware also clears the remaining pages during partial allocation.
+    // Preserve existing owners, including the retired primer scheduler page,
+    // and supply zero backing for the two absent pages before publication.
+    vm.ensure_firmware(memory, d::LEAVES[0], 0x10000)?;
     let leaves = Iterator::chain(d::LEAVES.into_iter(), d::RENDER_STATUS);
-    for va in Iterator::chain(leaves, [
-        d::Compute::Opening.completion(),
-        d::Compute::Closing.completion(),
-    ]) {
+    for va in Iterator::chain(
+        leaves,
+        [
+            d::Compute::Opening.completion(),
+            d::Compute::Closing.completion(),
+        ],
+    ) {
         vm.ensure_firmware(memory, va, PAGE)?;
     }
     let mut permissions = KVec::new();

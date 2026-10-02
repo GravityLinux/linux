@@ -18,6 +18,8 @@ pub(crate) enum Action {
     Idle,
     Consumed,
     Reply {
+        pool: u32,
+        vm: u32,
         counter: u32,
         old: u32,
         new: u32,
@@ -25,24 +27,54 @@ pub(crate) enum Action {
     },
     Limit,
 }
+/// Owned analogue of GrowthService's pool_counters, pool_storage and work_owners.
+pub(crate) struct Pool {
+    pub(crate) identity: g::Owner,
+    pub(crate) root: u64,
+    pub(crate) slot: u16,
+    pub(crate) counter: u32,
+    pub(crate) generation: u32,
+    pub(crate) retired: bool,
+    pub(crate) limit_report: Option<[u8; 0x48]>,
+    pub(crate) terminals: u32,
+    state: u64,
+    list: u64,
+    growth_base: u64,
+    request_limit: u32,
+    refused: bool,
+    limited: bool,
+    counter_baseline: u32,
+    work: [u64; 2],
+    fragment: u64,
+    fragment_event: u32,
+    terminal_mask: u32,
+    // Every retained initial and newly allocated TVB leaf, for root admission.
+    mappings: KVec<(u64, u64)>,
+}
+/// Exact accepted render identity inside a retained pool. A different pool's
+/// report or a later generation must never retire this publication.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkToken {
+    pool: u32,
+    root: u64,
+    generation: u32,
+    fragment: u64,
+    event: u32,
+}
 pub(crate) struct Service {
     command: Channel,
     report: Channel,
-    root: u64,
     cursor: u32,
-    counter: u32,
-    refused: bool,
-    limited: bool,
-    terminals: u32,
+    pub(crate) pools: KVec<Pool>,
+    active_pool: usize,
+    pub(crate) failed: Option<Error>,
     compute_terminals: u32,
     compute_owners: KVec<u32>,
-    fragment: u64,
-    fragment_event: u32,
-    state: u64,
-    list: u64,
     receipt: Option<super::g17p_dependency::Receipt>,
     dependency: bool,
+    pool_limits: [u32; 2],
 }
+
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
     memory.read_firmware32(vm.physical(memory, 2, va)?)
 }
@@ -65,18 +97,286 @@ fn verify_root(memory: &Memory, ttbs: u64, root: u64) -> Result {
     Ok(())
 }
 impl Service {
-    pub(crate) fn bind_work(&mut self, fragment: u64) -> Result {
-        if self.refused || self.limited {
+    pub(crate) fn set_source_pool_limits(&mut self, global: u32, overrides: [u32; 2]) -> Result {
+        let limits = g::source_pool_limits(global, overrides).ok_or(EINVAL)?;
+        if self.pools.iter().any(|pool| pool.counter != 0) { return Err(EBUSY); }
+        self.pool_limits = limits;
+        Ok(())
+    }
+    fn initial_mappings(
+        memory: &Memory,
+        vm: &Vm,
+        list: u64,
+        root: &UserVm,
+    ) -> Result<KVec<(u64, u64)>> {
+        let mut mappings = KVec::with_capacity(8 * (g::BLOCK / g::PAGE) as usize, GFP_KERNEL)?;
+        for i in 0..8 {
+            let mut bytes = [0; 8];
+            read(memory, vm, list + i * 8, &mut bytes)?;
+            let address = u64::from_le_bytes(bytes)
+                .checked_mul(g::UNIT)
+                .and_then(|offset| g::CONTEXT_BASE.checked_add(offset))
+                .ok_or(EIO)?;
+            g::block_id(address).ok_or(EIO)?;
+            for offset in (0..g::BLOCK).step_by(g::PAGE as usize) {
+                let pte = root.pte(address + offset)?;
+                // Initial source IDs describe the sparse retained bootstrap
+                // shape, unlike a newly allocated full growth block. Caller
+                // leaves in that shape retain their GEM owner independently.
+                if pte == 0 {
+                    continue;
+                }
+                if pte & 3 != 3 {
+                    return Err(EIO);
+                }
+                let pa = pte & 0x000003ffffffc000;
+                if memory.word64(pa).is_ok() {
+                    mappings.push((address + offset, pa), GFP_KERNEL)?;
+                }
+            }
+        }
+        Ok(mappings)
+    }
+    fn verify_pool_root(memory: &Memory, ttbs: u64, pool: &Pool) -> Result {
+        let at = ttbs + pool.slot as u64 * 16;
+        memory.invalidate(at, 8)?;
+        if memory.read64(at)? != ((pool.slot as u64) << 48 | pool.root | 1) {
             return Err(EIO);
         }
-        self.fragment = fragment;
         Ok(())
+    }
+    pub(crate) fn register_pool(
+        &mut self,
+        memory: &Memory,
+        vm: &Vm,
+        root: &UserVm,
+        state: u64,
+        list: u64,
+        shared: u64,
+        request_limit: u32,
+    ) -> Result {
+        if self.failed.is_some()
+            || self.dependency
+            || self.pools.len() != 1
+            || !(1..=512).contains(&request_limit)
+            || word(memory, vm, shared + 0xc)? != 1
+            || word(memory, vm, state)? != 8
+            || word(memory, vm, state + 4)? != 8
+        {
+            return Err(EINVAL);
+        }
+        let length = (request_limit as u64).checked_mul(g::INCREMENT as u64)
+            .and_then(|n| n.checked_mul(0x28000)).ok_or(EOVERFLOW)?;
+        let mut growth_base = self.pools[0].growth_base.checked_add(
+            self.pools[0].request_limit as u64 * g::INCREMENT as u64 * 0x28000)
+            .ok_or(EOVERFLOW)?;
+        // Select a whole tranche absent from the executable caller/private
+        // root. Valid caller bindings (including future shader encoders) are
+        // not rejected merely because they occupy an old fixed candidate VA.
+        // No PTE is changed here; allocation retains its checked grow() path.
+        loop {
+            let end = growth_base.checked_add(length).ok_or(EOVERFLOW)?;
+            if end > (1u64 << 42) { return Err(ENOMEM); }
+            let mut conflict = None;
+            for address in (growth_base..end).step_by(g::PAGE as usize) {
+                if root.pte(address)? != 0 {
+                    conflict = Some(address);
+                    break;
+                }
+            }
+            if let Some(address) = conflict {
+                growth_base = address.checked_add(g::PAGE).and_then(|v| v.checked_add(g::UNIT - 1))
+                    .ok_or(EOVERFLOW)? & !(g::UNIT - 1);
+            } else { break; }
+        }
+        self.pools.push(
+            Pool {
+                identity: g::Owner { vm: 1, pool: 1 },
+                root: root.root(),
+                slot: 1,
+                counter: 0,
+                generation: 0,
+                retired: true,
+                limit_report: None,
+                terminals: 0,
+                state,
+                list,
+                growth_base,
+                request_limit,
+                refused: false,
+                limited: false,
+                counter_baseline: 0,
+                work: [0; 2],
+                fragment: 0,
+                fragment_event: 3,
+                terminal_mask: 12,
+                mappings: Self::initial_mappings(memory, vm, list, root)?,
+            },
+            GFP_KERNEL,
+        )?;
+        Ok(())
+    }
+    /// Retained driver growth pages are shared by logical render roots. A
+    /// returning root may predate an allocation made while another VM ran.
+    /// Install only absent owned pages; a different physical owner is fatal.
+    pub(crate) fn mirror_retained_mappings(&self, root: &mut UserVm) -> Result {
+        if self.failed.is_some() || self.pools.iter().any(|pool| !pool.retired) {
+            return Err(EBUSY);
+        }
+        let mut missing = KVec::new();
+        for pool in &self.pools {
+            for &(va, pa) in &pool.mappings {
+                let leaf = root.pte(va)?;
+                if leaf == 0 {
+                    missing.push((va, pa), GFP_KERNEL)?;
+                } else if leaf & 0x000003ffffffc003 != pa | 3 {
+                    return Err(EIO);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            root.grow(&missing)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn bind_pool_root(
+        &mut self,
+        memory: &Memory,
+        ttbs: u64,
+        pool_id: u32,
+        root: &UserVm,
+        slot: u16,
+        firmware_vm: u32,
+    ) -> Result {
+        let pool = self
+            .pools
+            .iter_mut()
+            .find(|p| p.identity.pool == pool_id)
+            .ok_or(EINVAL)?;
+        let identity = g::Owner {
+            vm: firmware_vm,
+            pool: pool_id,
+        };
+        if self.failed.is_some()
+            || !pool.retired
+            || ![1, 2].contains(&slot)
+            || !identity.valid()
+            || (identity != pool.identity && pool.counter != 0)
+        {
+            return Err(EBUSY);
+        }
+        let at = ttbs + slot as u64 * 16;
+        memory.invalidate(at, 8)?;
+        if memory.read64(at)? != ((slot as u64) << 48 | root.root() | 1) {
+            return Err(EIO);
+        }
+        for &(va, pa) in &pool.mappings {
+            if root.pte(va)? & 0x000003ffffffc003 != pa | 3 {
+                return Err(EIO);
+            }
+        }
+        pool.identity = identity;
+        pool.root = root.root();
+        pool.slot = slot;
+        Ok(())
+    }
+    pub(crate) fn bind_work(&mut self, fragment: u64) -> Result {
+        let pool = &self.pools[self.active_pool];
+        self.bind_pool_work(
+            pool.identity.pool,
+            pool.work,
+            fragment,
+            pool.fragment_event,
+            pool.generation.checked_add(1).ok_or(EIO)?,
+        )
+    }
+    pub(crate) fn bind_pool_work(
+        &mut self,
+        pool_id: u32,
+        work: [u64; 2],
+        fragment: u64,
+        event: u32,
+        generation: u32,
+    ) -> Result {
+        if self.failed.is_some() || fragment == 0 || work.contains(&0) {
+            return Err(EINVAL);
+        }
+        let index = self
+            .pools
+            .iter()
+            .position(|p| p.identity.pool == pool_id)
+            .ok_or(EINVAL)?;
+        let pool = &mut self.pools[index];
+        if !pool.retired {
+            return Err(EBUSY);
+        }
+        if ![1, 3].contains(&event) && !(self.dependency && pool_id == 0 && event == 2) {
+            return Err(EINVAL);
+        }
+        pool.generation = generation;
+        pool.counter_baseline = pool.counter;
+        pool.retired = false;
+        pool.refused = false;
+        pool.limited = false;
+        pool.limit_report = None;
+        pool.work = work;
+        pool.fragment = fragment;
+        pool.fragment_event = event;
+        self.active_pool = index;
+        Ok(())
+    }
+    pub(crate) fn work_token(&self) -> Result<WorkToken> {
+        let pool = self.pools.get(self.active_pool).ok_or(EIO)?;
+        if pool.retired || self.failed.is_some() { return Err(EIO); }
+        Ok(WorkToken { pool: pool.identity.pool, root: pool.root,
+            generation: pool.generation, fragment: pool.fragment,
+            event: pool.fragment_event })
+    }
+    fn token_index(&self, token: WorkToken) -> Result<usize> {
+        let index = self.pools.iter().position(|pool| pool.identity.pool == token.pool)
+            .ok_or(EIO)?;
+        let pool = &self.pools[index];
+        if self.failed.is_some() || pool.retired || pool.root != token.root
+            || pool.generation != token.generation || pool.fragment != token.fragment
+            || pool.fragment_event != token.event {
+            return Err(EIO);
+        }
+        Ok(index)
+    }
+    pub(crate) fn token_terminals(&self, token: WorkToken) -> Result<u32> {
+        Ok(self.pools[self.token_index(token)?].terminals)
+    }
+    pub(crate) fn token_limited(&self, token: WorkToken) -> Result<bool> {
+        Ok(self.pools[self.token_index(token)?].limit_report.is_some())
+    }
+    pub(crate) fn retire_token(&mut self, token: WorkToken) -> Result {
+        let index = self.token_index(token)?;
+        self.pools[index].retired = true;
+        Ok(())
+    }
+    pub(crate) fn retire_work(&mut self) -> Result {
+        let pool = &mut self.pools[self.active_pool];
+        if pool.retired || self.failed.is_some() {
+            return Err(EIO);
+        }
+        pool.retired = true;
+        Ok(())
+    }
+    pub(crate) fn limit_report(&self) -> Option<&[u8; 0x48]> {
+        self.pools[self.active_pool].limit_report.as_ref()
+    }
+    pub(crate) fn reserved_growth_end(&self) -> Result<u64> {
+        self.pools.iter().try_fold(0, |last, pool| {
+            let size = (pool.request_limit as u64).checked_mul(g::INCREMENT as u64)
+                .and_then(|n| n.checked_mul(0x28000)).ok_or(EOVERFLOW)?;
+            Ok(last.max(pool.growth_base.checked_add(size).ok_or(EOVERFLOW)?))
+        })
     }
     pub(crate) fn cursor(&self) -> u32 {
         self.cursor
     }
     pub(crate) fn terminals(&self) -> u32 {
-        self.terminals
+        self.pools[self.active_pool].terminals
     }
     pub(crate) fn compute_terminals(&self) -> u32 {
         self.compute_terminals
@@ -98,7 +398,7 @@ impl Service {
         memory: &Memory,
         vm: &Vm,
         ttbs: u64,
-        root: u64,
+        root: &UserVm,
         command: Channel,
         report: Channel,
     ) -> Result<Self> {
@@ -109,7 +409,7 @@ impl Service {
         memory: &Memory,
         vm: &Vm,
         ttbs: u64,
-        root: u64,
+        root: &UserVm,
         command: Channel,
         report: Channel,
     ) -> Result<Self> {
@@ -118,10 +418,16 @@ impl Service {
             memory, vm, ttbs, root, command, report, LEAVES[4], LEAVES[1],
         )?;
         service.dependency = true;
+        service.pools[0].retired = true;
         // The fragment queue moves from grid 1 to grid 2 in the native
         // four-queue graph. Growth report identity follows the queue grid,
         // independently of the render context's event_slot (which stays 1).
-        service.fragment_event = super::g17p_dependency::LAYOUTS[2].grid;
+        service.pools[0].fragment_event = super::g17p_dependency::LAYOUTS[2].grid;
+        // Terminal subtypes are queue-grid bitmasks. Native C/R/C inserts CL
+        // at grid zero, moving the retained render pair to grids one/two.
+        // Keep its terminal separate from both CL owners (masks one/eight).
+        service.pools[0].terminal_mask = (1 << super::g17p_dependency::LAYOUTS[1].grid)
+            | (1 << super::g17p_dependency::LAYOUTS[2].grid);
         Ok(service)
     }
     #[allow(dead_code)]
@@ -137,22 +443,22 @@ impl Service {
     }
     #[allow(dead_code)]
     pub(crate) fn require_dependency(&self, memory: &Memory, ttbs: u64, root: &UserVm) -> Result {
-        if !self.dependency || root.root() != self.root {
+        if !self.dependency || root.root() != self.pools[0].root {
             return Err(EINVAL);
         }
-        verify_root(memory, ttbs, self.root)
+        verify_root(memory, ttbs, self.pools[0].root)
     }
     fn new_graph(
         memory: &Memory,
         vm: &Vm,
         ttbs: u64,
-        root: u64,
+        root: &UserVm,
         command: Channel,
         report: Channel,
         state: u64,
         list: u64,
     ) -> Result<Self> {
-        verify_root(memory, ttbs, root)?;
+        verify_root(memory, ttbs, root.root())?;
         if report.states[1].checked_add(256 * 0x48) != Some(report.ring)
             || word(memory, vm, state)? != 8
             || word(memory, vm, state + 4)? != 8
@@ -164,44 +470,79 @@ impl Service {
         if cursor >= 256 {
             return Err(EIO);
         }
+        let mut pools = KVec::with_capacity(2, GFP_KERNEL)?;
+        pools.push(
+            Pool {
+                identity: g::Owner { vm: 1, pool: 0 },
+                root: root.root(),
+                slot: 1,
+                counter: 0,
+                refused: false,
+                limited: false,
+                terminals: 0,
+                fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
+                fragment_event: 1,
+                terminal_mask: 3,
+                generation: 0,
+                counter_baseline: 0,
+                retired: false,
+                limit_report: None,
+                work: [0xfffffc2000000100, 0xfffffc2000000200],
+                state,
+                list,
+                growth_base: g::GROWTH_BASE,
+                request_limit: g::REQUEST_LIMIT,
+                mappings: Self::initial_mappings(memory, vm, list, root)?,
+            },
+            GFP_KERNEL,
+        )?;
         Ok(Self {
             command,
             report,
-            root,
             cursor,
-            counter: 0,
-            refused: false,
-            limited: false,
-            terminals: 0,
+            pools,
+            active_pool: 0,
+            failed: None,
             compute_terminals: 0,
             compute_owners: KVec::with_capacity(36, GFP_KERNEL)?,
-            fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
-            fragment_event: 1,
-            state,
-            list,
             receipt: None,
             dependency: false,
+            pool_limits: [CAPACITY; 2],
         })
     }
+
     fn consume(&mut self, memory: &mut Memory, vm: &Vm, next: u32) -> Result {
         vm.write(memory, 2, self.report.states[0], &next.to_le_bytes())?;
         g17p_memory::sync();
         self.cursor = next;
         Ok(())
     }
-    fn allocate(&self, memory: &mut Memory, vm: &Vm, root: &mut UserVm, old: u32) -> Result<u32> {
+    fn allocate(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        root: &mut UserVm,
+        old: u32,
+        index: usize,
+    ) -> Result<u32> {
         if old > CAPACITY {
             return Err(EIO);
         }
         let new = old.checked_add(g::INCREMENT as u32).ok_or(EIO)?;
-        if new > CAPACITY {
+        if new > self.pool_limits[index] {
             return Err(ENOMEM);
         }
-        let addresses = g::block_addresses(self.counter).ok_or(EIO)?;
+        let pool = &mut self.pools[index];
+        if pool.counter >= pool.request_limit {
+            return Err(EIO);
+        }
+        let addresses: [u64; g::INCREMENT] = core::array::from_fn(|i| {
+            pool.growth_base + (pool.counter as u64 * g::INCREMENT as u64 + i as u64) * 0x28000
+        });
         let mut prior = KVec::with_capacity(old as usize, GFP_KERNEL)?;
         for i in 0..old {
             let mut body = [0; 8];
-            read(memory, vm, self.list + i as u64 * 8, &mut body)?;
+            read(memory, vm, pool.list + i as u64 * 8, &mut body)?;
             let id = u64::from_le_bytes(body);
             let address = id
                 .checked_mul(g::UNIT)
@@ -229,17 +570,22 @@ impl Service {
         }
         // grow() allocates/preflights all table paths before any live store.
         // Backing stays owned by Memory even if preparation/publication fails.
+        pool.mappings.reserve(pages.len(), GFP_KERNEL)?;
         root.grow(&pages)?;
+        UserVm::invalidate(pool.slot);
+        for &(va, pa) in &pages {
+            pool.mappings.push((va, pa), GFP_KERNEL)?;
+        }
         let mut ids = [0; g::INCREMENT * 8];
         for (i, address) in addresses.into_iter().enumerate() {
             ids[i * 8..i * 8 + 8].copy_from_slice(&g::block_id(address).ok_or(EIO)?.to_le_bytes());
         }
-        vm.write(memory, 2, self.list + old as u64 * 8, &ids)?;
+        vm.write(memory, 2, pool.list + old as u64 * 8, &ids)?;
         g17p_memory::sync();
         let mut counts = [0; 8];
         counts[..4].copy_from_slice(&new.to_le_bytes());
         counts[4..].copy_from_slice(&new.to_le_bytes());
-        vm.write(memory, 2, self.state, &counts)?;
+        vm.write(memory, 2, pool.state, &counts)?;
         g17p_memory::sync();
         Ok(new)
     }
@@ -254,7 +600,7 @@ impl Service {
         if self.dependency {
             return Err(EINVAL);
         }
-        self.step_inner(memory, vm, root, ttbs, compute_ordinal, false)
+        self.checked_step(memory, vm, root, ttbs, compute_ordinal, false)
     }
     /// One native report stream has both live CL owners and the render pair.
     /// Route CL terminals through their owned FIFO, and keep serving render
@@ -271,8 +617,60 @@ impl Service {
         if !self.dependency || self.receipt.is_none() {
             return Err(EINVAL);
         }
-        self.step_inner(memory, vm, root, ttbs, None, true)
+        self.checked_step(memory, vm, root, ttbs, None, true)
     }
+    /// The same mixed reader services later renders on the retained native
+    /// pair. Its receipt/cursor history and TVB inventory must survive CL.
+    pub(crate) fn step_dependency_render(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        root: &mut UserVm,
+        ttbs: u64,
+    ) -> Result<Action> {
+        self.require_dependency(memory, ttbs, root)?;
+        self.checked_step(memory, vm, root, ttbs, None, false)
+    }
+    /// After the native wave, the retained report reader still owns its
+    /// cursor/receipt history. A subsequent standalone CL command cannot
+    /// attribute a new growth/limit request to the completed render.
+    pub(crate) fn step_dependency_compute(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        root: &mut UserVm,
+        ttbs: u64,
+        ordinal: u32,
+    ) -> Result<Action> {
+        self.require_dependency(memory, ttbs, root)?;
+        self.checked_step(memory, vm, root, ttbs, Some(ordinal), false)
+    }
+
+    fn checked_step(
+        &mut self,
+        memory: &mut Memory,
+        vm: &Vm,
+        root: &mut UserVm,
+        ttbs: u64,
+        compute_ordinal: Option<u32>,
+        mixed: bool,
+    ) -> Result<Action> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = self.step_inner(memory, vm, root, ttbs, compute_ordinal, mixed);
+        if let Err(error) = &result {
+            let mut body = [0; 0x48];
+            let _ = read(memory, vm, self.report.states[1] + self.cursor as u64 * 0x48, &mut body);
+            pr_err!("G17P: growth service failed {:?}, cursor {}, report {:02x?}\n", error, self.cursor, body);
+            for pool in &self.pools {
+                pr_err!("G17P: growth pool {} root {:#x} counter {} baseline {} retired {} refused {} limited {} fragment {:#x} event {}\n", pool.identity.pool, pool.root, pool.counter, pool.counter_baseline, pool.retired, pool.refused, pool.limited, pool.fragment, pool.fragment_event);
+            }
+            self.failed = Some(*error);
+        }
+        result
+    }
+
     fn step_inner(
         &mut self,
         memory: &mut Memory,
@@ -298,7 +696,6 @@ impl Service {
         )?;
         let opcode = u32::from_le_bytes(body[..4].try_into().unwrap());
         let next = (self.cursor + 1) & 255;
-        let owner = g::Owner { vm: 1, pool: 0 };
         if opcode == 13 && self.receipt.as_mut().is_some_and(|r| r.consume(0, &body)) {
             self.consume(memory, vm, next)?;
             return Ok(Action::Consumed);
@@ -309,21 +706,26 @@ impl Service {
             return Err(EIO);
         }
         if opcode == 7 {
-            if !self.refused
-                || self.limited
-                || owner
-                    .limit(
-                        &body,
-                        &[0xfffffc2000000100, 0xfffffc2000000200],
-                        self.fragment,
-                        self.fragment_event,
-                    )
-                    .is_none()
-            {
-                return Err(EIO);
+            let mut matched = None;
+            for (index, pool) in self.pools.iter().enumerate() {
+                if !pool.retired
+                    && pool.counter > pool.counter_baseline
+                    && pool.refused
+                    && !pool.limited
+                    && pool
+                        .identity
+                        .limit(&body, &pool.work, pool.fragment, pool.fragment_event)
+                        .is_some()
+                {
+                    if matched.replace(index).is_some() {
+                        return Err(EIO);
+                    }
+                }
             }
-            // Qualified consume-only closure: no guessed command/doorbell.
-            self.limited = true;
+            let index = matched.ok_or(EIO)?;
+            self.pools[index].limited = true;
+            self.pools[index].limit_report = Some(body);
+            // Qualified consume-only closure: no command or doorbell.
             self.consume(memory, vm, next)?;
             return Ok(Action::Limit);
         }
@@ -338,9 +740,17 @@ impl Service {
             // terminal belongs only to the active synchronous compute owner;
             // it cannot satisfy the render pair's terminal baseline.
             let subtype = u32::from_le_bytes(body[4..8].try_into().unwrap());
-            if subtype != 3 && body[8..16] == [0; 8] {
-                // render_startup.completion_handler routes every non-render
-                // mask to the oldest active CL owner, exactly once.
+            let combined = self
+                .pools
+                .iter()
+                .fold(0, |bits, pool| bits | pool.terminal_mask);
+            let mut mask = 0;
+            for (index, pool) in self.pools.iter().enumerate() {
+                if subtype == pool.terminal_mask || (self.pools.len() == 2 && subtype == combined) {
+                    mask |= 1 << index;
+                }
+            }
+            if mask == 0 && body[8..16] == [0; 8] {
                 if (!mixed && compute_ordinal.is_none()) || self.compute_owners.is_empty() {
                     return Err(EIO);
                 }
@@ -349,18 +759,34 @@ impl Service {
                 self.consume(memory, vm, next)?;
                 return Ok(Action::Consumed);
             }
-            if body[4..16] != [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+            if mask == 0 || body[8..16] != [0; 8] {
                 return Err(EIO);
             }
-            self.terminals = self.terminals.checked_add(1).ok_or(EIO)?;
+            for (index, pool) in self.pools.iter_mut().enumerate() {
+                if mask & (1 << index) != 0 {
+                    pool.terminals = pool.terminals.checked_add(1).ok_or(EIO)?;
+                }
+            }
             self.consume(memory, vm, next)?;
             return Ok(Action::Consumed);
         }
-        if !owner.request(&body, self.counter) || self.counter >= g::REQUEST_LIMIT || self.limited {
+        let pool_id = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let index = self
+            .pools
+            .iter()
+            .position(|p| p.identity.pool == pool_id)
+            .ok_or(EIO)?;
+        let pool = &self.pools[index];
+        let owner = pool.identity;
+        if pool.retired
+            || !owner.request(&body, pool.counter)
+            || pool.counter >= pool.request_limit
+            || pool.limited
+        {
             return Err(EIO);
         }
-        verify_root(memory, ttbs, self.root)?;
-        if root.root() != self.root {
+        Self::verify_pool_root(memory, ttbs, pool)?;
+        if root.root() != pool.root {
             return Err(EIO);
         }
         let head = word(memory, vm, self.command.states[0])?;
@@ -368,16 +794,18 @@ impl Service {
         if head >= 256 || slot >= 256 || (slot + 1) & 255 == head {
             return Err(EIO);
         }
-        let old = word(memory, vm, self.state)?;
-        if old != word(memory, vm, self.state + 4)? {
+        let old = word(memory, vm, self.pools[index].state)?;
+        if old != word(memory, vm, self.pools[index].state + 4)? {
             return Err(EIO);
         }
-        let (new, refused) = match self.allocate(memory, vm, root, old) {
+        let (new, refused) = match self.allocate(memory, vm, root, old, index) {
             Ok(new) => (new, false),
             Err(e) if e == ENOMEM => (old, true),
             Err(e) => return Err(e),
         };
-        let command = owner.reply(&body, self.counter, !refused).ok_or(EIO)?;
+        let command = owner
+            .reply(&body, self.pools[index].counter, !refused)
+            .ok_or(EIO)?;
         vm.write(memory, 2, self.command.ring + slot as u64 * 0x40, &command)?;
         // Command body -> report credit -> barrier -> command producer ->
         // barrier -> caller's doorbell. Match the source service ordering.
@@ -389,10 +817,12 @@ impl Service {
             &((slot + 1) & 255).to_le_bytes(),
         )?;
         g17p_memory::sync();
-        let counter = self.counter;
-        self.counter += 1;
-        self.refused = refused;
+        let counter = self.pools[index].counter;
+        self.pools[index].counter += 1;
+        self.pools[index].refused = refused;
         Ok(Action::Reply {
+            pool: self.pools[index].identity.pool,
+            vm: self.pools[index].identity.vm,
             counter,
             old,
             new,

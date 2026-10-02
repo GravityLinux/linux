@@ -115,6 +115,7 @@ fn parameters(words: &mut impl Iterator<Item = u64>) -> Parameters {
         native_status_registers: words.next().unwrap() != 0,
         local_item_registers: words.next().unwrap() != 0,
         native_item_fields: words.next().unwrap() != 0,
+        ..Parameters::default()
     }
 }
 fn main() {

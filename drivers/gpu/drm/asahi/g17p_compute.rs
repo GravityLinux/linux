@@ -84,7 +84,9 @@ impl Program {
         if self.usc_exec_base != USC_EXEC_BASE {
             return Err(Error::UnsupportedExecBase);
         }
-        let context = (self.context as u64) << 8 | self.ordinal as u64;
+        // The low eight bits are a reusable hardware work tag. Preserve the
+        // context above it; full ordinals live in the descriptor/scheduler.
+        let context = (self.context as u64) << 8 | (self.ordinal as u64 & 0xff);
         Ok([
             (0x1a510, self.preempt),
             (0x1a420, self.cdm),

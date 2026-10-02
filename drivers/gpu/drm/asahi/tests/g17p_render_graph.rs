@@ -149,9 +149,11 @@ fn main() {
             assert_eq!(body, saved);
             optional.overrides = &[];
             optional.context_phase = None;
+            optional.context_index = None;
             optional.item = 256;
-            assert!(optional.build(&mut body).is_err());
-            assert_eq!(body, saved);
+            optional.build(&mut body).unwrap();
+            assert_eq!(&body[0x2a..0x2c], &[0, 0]);
+            assert_eq!(&body[0x2e..0x30], &[0, 0]);
         }
         // Only the authored record changes; subsequent event storage is retained.
         let mut events = vec![0xa5; 0x400];

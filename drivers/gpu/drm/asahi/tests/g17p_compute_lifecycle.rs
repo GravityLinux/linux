@@ -100,7 +100,7 @@ fn main() {
         let mut ctx = [0;0x200];
         spec.after_render_context(&mut ctx).unwrap(); emit(&ctx);
     }
-    for case in 0..8u32 {
+    for case in 0..40u32 {
         let old = [
             0xfffffc200165a870 + case as u64 * 0x4000,
             0xfffffc20c08aa870 + case as u64 * 0x4000,
@@ -119,7 +119,8 @@ fn main() {
             assert!(lifecycle::transport_record(&mut rejected, wrong, bad_done, slot).is_err());
             assert_eq!(rejected, record);
         }
-        lifecycle::transport_record(&mut record, old, done, case % 2).unwrap();
+        lifecycle::transport_record_at(&mut record, old, done, case % 2,
+            lifecycle::TRANSPORT_BASE + (case / 8) as u64 * 0x10000).unwrap();
         emit(&record);
         emit(&lifecycle::transport_pointers());
     }

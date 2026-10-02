@@ -17,8 +17,6 @@ struct sync_test {
 	pid_t child;
 	uint64_t started, last_stamp;
 };
-static volatile sig_atomic_t sync_interrupted;
-static void sync_interrupt(int sig) { (void)sig; sync_interrupted = 1; }
 static uint64_t now_ns(void)
 {
 	struct timespec ts;
@@ -132,26 +130,28 @@ static void sync_setup(int fd, struct sync_test *t, struct drm_asahi_submit *sub
 	struct drm_syncobj_destroy destroy = { .handle = failed_timeline };
 	OK(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
 	t->entries[0] = (struct drm_asahi_sync){ .handle = t->input };
-	t->sw = sync_import_pending(fd, t->input);
-	uint64_t before = now_ns();
-	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, ETIMEDOUT);
-	CHECK(now_ns() - before >= 1500000000);
-	sync_empty(fd, t);
-	CHECK(close(t->sw) == 0);
+    t->sw = sync_import_pending(fd,t->input);
+    /* Accept a pending input without blocking the ioctl, then fail it by
+     * closing its producer. Neither shader output nor timestamps may change. */
+    uint64_t before=now_ns();
+    CHECK(g17p_raw_ioctl(fd,DRM_IOCTL_ASAHI_SUBMIT,submit)==0);
+    uint64_t returned=now_ns();
+    struct drm_syncobj_wait pending={.handles=(uintptr_t)&t->binary,.count_handles=1};
+    BAD(fd,DRM_IOCTL_SYNCOBJ_WAIT,&pending,ETIME);
+    CHECK(close(t->sw)==0);
+    pending.timeout_nsec=now_ns()+15000000000ULL;
+    OK(fd,DRM_IOCTL_SYNCOBJ_WAIT,&pending);
+    struct drm_syncobj_handle exported={.handle=t->binary,
+        .flags=DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE};
+    OK(fd,DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,&exported);
+    struct sync_file_info info={0};OK(exported.fd,SYNC_IOC_FILE_INFO,&info);
+    CHECK(info.status == -ENOENT);CHECK(close(exported.fd)==0);
+    uint32_t handles[]={t->binary,t->timeline};
+    struct drm_syncobj_array reset={.handles=(uintptr_t)handles,.count_handles=2};
+    OK(fd,DRM_IOCTL_SYNCOBJ_RESET,&reset);sync_empty(fd,t);
+    printf("G17P_SYNC_REJECTION_PASS malformed/missing/errored admission; pending dependency accepted in %llu ns, error fence -ENOENT; outputs untouched\n",
+        (unsigned long long)(returned-before));
 
-	t->sw = sync_import_pending(fd, t->input);
-	struct sigaction action = { .sa_handler = sync_interrupt };
-	CHECK(sigemptyset(&action.sa_mask) == 0);
-	CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
-	pid_t parent = getpid(), child = fork();
-	CHECK(child >= 0);
-	if (child == 0) { usleep(150000); CHECK(kill(parent, SIGUSR1) == 0); _exit(0); }
-	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, submit, EINTR);
-	CHECK(sync_interrupted == 1);
-	sync_join(child);
-	sync_empty(fd, t);
-	CHECK(close(t->sw) == 0);
-	printf("G17P_SYNC_REJECTION_PASS malformed, missing, errored, timed-out and interrupted inputs; outputs untouched\n");
 }
 static void sync_before(int fd, struct sync_test *t, unsigned n, uint32_t vm,
 			const unsigned char *output)

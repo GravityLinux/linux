@@ -15,6 +15,8 @@ use super::{
 };
 use kernel::prelude::*;
 const PAGE: usize = 0x4000;
+// Full-page clears must not consume the ARM64 kernel's 32 KiB task stack.
+static ZERO_PAGE: [u8; PAGE] = [0; PAGE];
 use super::g17p_render_lifecycle::{
     self as life, EVENTS, FW_TIMESTAMPS, JOB_LIST, LEAVES, OPTIONAL, POOLS, QUEUES, RINGS, SHARED,
 };
@@ -28,20 +30,155 @@ pub(crate) fn first_parameters() -> Parameters {
         tpc: 0x10001d8000,
         ta_status: 0x1000078000,
         fragment_status: 0x10001a8000,
-        deflake_1: 0x10000682a0,
-        deflake_2: 0x1000068020,
-        deflake_3: 0x1000068000,
-        aux_fb: 0x10000300000,
+        // Mesa owns its fixed render-state BO through +0x6c000. Keep
+        // tiler scratch in the already-owned source page above that BO.
+        deflake_1: 0x10000702a0,
+        deflake_2: 0x1000070020,
+        deflake_3: 0x1000070000,
+        // Auxiliary metadata must also stay outside Mesa's fixed USC arena.
+        aux_fb: 0x1000074000,
         reactive_tvb_growth: true,
         emit_uapi_fields: true,
         ..Default::default()
     }
 }
 
+// Exact logical geometry identity, never just allocation counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ScratchKey([u64; 10]);
+impl ScratchKey {
+    fn of(p: &Parameters) -> Self {
+        Self([p.context_base, p.width, p.height, p.layers, p.utile_width, p.utile_height,
+              p.samples, p.utile_config, p.tib_blocks, p.tile_config])
+    }
+}
+struct ScratchLease {
+    key: ScratchKey,
+    tilemap: u64,
+    tpc: u64,
+    pair_stride: u64,
+    span: u64,
+    pages: KVec<(u64, u64)>,
+}
 struct Deferred {
     address: u64,
     body: KVVec<u8>,
 }
+fn transport_pools(pair: u32) -> [super::g17p_compute_runtime::TransportPool; 2] {
+    let base = 0xfffffc20cf010000 + pair as u64 * 0x20000;
+    [super::g17p_compute_runtime::TransportPool::new(base),
+     super::g17p_compute_runtime::TransportPool::new(base + 0x10000)]
+}
+struct Transport {
+    layout: life::Layout,
+    item_index: u32,
+    publications: [q::Publication; 2],
+    deferred: [KVec<Deferred>; 2],
+    transports: [super::g17p_compute_runtime::TransportPool; 2],
+    fresh: bool,
+}
+/// Short-lock seed for CPU-only preparation. It owns the exact immutable
+/// caller identities and executable root pages; construction does not read
+/// firmware, change PTEs, clear scratch or publish any queue/control producer.
+pub(crate) struct PreparationSeed {
+    item: life::Item,
+    parameters: Parameters,
+    client: super::g17p_compute_runtime::ClientLease,
+    bindings: KVec<(u64, u64, u64, u32)>,
+}
+pub(crate) struct PreparedAppend {
+    seed: KBox<PreparationSeed>,
+    objects: [KVec<Deferred>; 2],
+}
+impl PreparationSeed {
+    /// Execute after dropping the runtime mutex; only Source serialization
+    /// and host allocations run here. No hardware or cache operation occurs.
+    pub(crate) fn prepare(seed: KBox<Self>) -> Result<KBox<PreparedAppend>> {
+        let objects = build_host_objects(seed.item, &seed.parameters)?;
+        Ok(KBox::new(PreparedAppend { seed, objects }, GFP_KERNEL)?)
+    }
+}
+fn build_host_objects(item: life::Item, p: &Parameters) -> Result<[KVec<Deferred>; 2]> {
+    let mut objects = [KVec::new(), KVec::new()];
+    for (index, kind) in [Kind::Tiling, Kind::Fragment].into_iter().enumerate() {
+        for (address, size, ty) in [
+            (item.descriptor_address(kind), kind.size(), 0),
+            (item.optional_address(kind), 0xc0, 1),
+            (item.context_address(kind), graph::CONTEXT_SIZE, 2),
+        ] {
+            let mut body = KVVec::with_capacity(size, GFP_KERNEL)?;
+            body.resize(size, 0, GFP_KERNEL)?;
+            match ty {
+                0 => item.descriptor(kind, p, &mut body),
+                1 => item.optional(kind, &mut body),
+                _ => item.context(kind, p, &mut body),
+            }.map_err(|_| EINVAL)?;
+            objects[index].push(Deferred { address, body }, GFP_KERNEL)?;
+        }
+    }
+    Ok(objects)
+}
+impl PreparedAppend {
+    fn matches(&self, work: &Submission, item: life::Item, p: &Parameters) -> bool {
+        self.seed.item == item && self.seed.parameters == *p
+            && self.seed.client.owner == work.client.owner
+            && self.seed.client.root.root() == work.client.root.root()
+            && self.seed.bindings.as_slice() == work.client.bindings.as_slice()
+            && self.seed.client.matches_buffers(&work.client)
+    }
+}
+
+/// Source queue-context dependency point. Host/public fences own completion;
+/// these values identify firmware publication barriers without a CPU wait.
+#[derive(Clone, Copy)]
+pub(crate) struct Milestone {
+    pub(crate) event_slot: u8,
+    pub(crate) grid: u8,
+    pub(crate) value: u32,
+}
+pub(crate) fn milestones(item: life::Item) -> Result<[Milestone; 2]> {
+    if item.layout.native {
+        return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+    }
+    let event_slot: u8 = item.layout.pair.try_into().map_err(|_| EINVAL)?;
+    if event_slot > 1 { return Err(EINVAL); }
+    let value = item.index.checked_add(1).ok_or(EOVERFLOW)?;
+    if value >= (1 << 30) { return Err(EOVERFLOW); }
+    let mut result = [Milestone { event_slot, grid: 0, value }; 2];
+    for (milestone, grid) in result.iter_mut().zip(item.layout.grids) {
+        milestone.grid = grid.try_into().map_err(|_| EINVAL)?;
+    }
+    Ok(result)
+}
+
+/// Completion and resource identity captured before publishing a render.
+/// Later producer preparation must not change what this ticket retires.
+pub(crate) struct Ticket {
+    pub(crate) item: life::Item,
+    pub(crate) publications: [q::Publication; 2],
+    pub(crate) channels: [abi::Channel; 2],
+    pub(crate) statuses: [u64; 2],
+    pub(crate) timestamps: [u64; 4],
+    pub(crate) client: super::g17p_compute_runtime::ClientLease,
+    pub(crate) growth: Option<super::g17p_growth_runtime::WorkToken>,
+    pub(crate) firmware_completion: u64,
+}
+impl Ticket {
+    pub(crate) fn capture(work: &Submission, ordinary_growth: bool) -> Result<Self> {
+        let item = life::Item { ordinal: work.ordinal, index: work.item_index, layout: work.layout };
+        let mut statuses = [0; 2];
+        for (status, base) in statuses.iter_mut().zip(work.layout.status) {
+            *status = base.checked_add((work.item_index % life::STORAGE_SUBMISSIONS) as u64 * 0x40)
+                .ok_or(EOVERFLOW)?;
+        }
+        Ok(Self { item, publications: work.publications, channels: work.channels,
+            statuses, timestamps: work.timestamps, firmware_completion: work.firmware_completion, client: work.client.lease()?,
+            growth: if ordinary_growth {
+                Some(work.growth.as_ref().ok_or(EIO)?.work_token()?)
+            } else { None } })
+    }
+}
+
 pub(crate) struct Submission {
     pub(crate) client: Client,
     pub(crate) publications: [q::Publication; 2],
@@ -49,34 +186,145 @@ pub(crate) struct Submission {
     pub(crate) timestamps: [u64; 4],
     pub(crate) growth: Option<super::g17p_growth_runtime::Service>,
     pub(crate) ordinal: u32,
+    pub(crate) item_index: u32,
+    pub(crate) layout: life::Layout,
     deferred: [KVec<Deferred>; 2],
+    transports: [super::g17p_compute_runtime::TransportPool; 2],
     empty_high: [u64; 2],
     adopted: bool,
+    other: Option<Transport>,
+    fresh_pair: bool,
+    scratch_layout: (u64, u64, u64),
+    scratch_key: ScratchKey,
+    scratch_leases: KVec<ScratchLease>,
+    scratch_cursor: u64,
+    firmware_timestamps: Option<u64>,
+    firmware_completion: u64,
+}
+impl Submission {
+    pub(crate) fn same_geometry(&self, p: &Parameters) -> bool {
+        self.scratch_key == ScratchKey::of(p)
+    }
+    fn ticket_parameters(&self, ordinal: u32, p: Parameters) -> Parameters {
+        let Some(base) = self.firmware_timestamps else { return p; };
+        // Finite descriptor ownership has the same 256-item storage cycle.
+        // The selected pool must retire before any timestamp slot is reused.
+        // CPU Vm::write performs whole64-byte line maintenance. Never
+        // clear/clean a line containing another live firmware timestamp.
+        let a = base + (ordinal % life::STORAGE_SUBMISSIONS) as u64 * 64;
+        Parameters { timestamp_a: a, timestamp_b: a + 8,
+            ta_timestamp_end: a + 8, fragment_timestamp_start: a,
+            fragment_timestamp_end: a + 8, ..p }
+    }
+    pub(crate) fn preparation_seed(&self, p: &Parameters, ahead: u32) -> Result<Option<KBox<PreparationSeed>>> {
+        if ahead == 0 { return Err(EINVAL); }
+        if self.layout.native { return Ok(None); }
+        let mut p = p.with_geometry_scratch().map_err(|_| EINVAL)?;
+        let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
+        if stride.checked_mul(8).ok_or(EOVERFLOW)? > 0x24000 || tpc > PAGE as u64 {
+            let key = ScratchKey::of(&p);
+            let Some(lease) = self.scratch_leases.iter().find(|lease| lease.key == key) else {
+                return Ok(None); // New private geometry requires locked allocation.
+            };
+            p = Parameters { tilemap: lease.tilemap, tpc: lease.tpc,
+                scratch_pair_stride: lease.pair_stride, ..p }
+                .with_geometry_scratch().map_err(|_| EINVAL)?;
+        }
+        let ordinal = self.ordinal.checked_add(ahead).ok_or(EOVERFLOW)?;
+        let (layout, index) = if ahead == 1 && self.layout.independent
+            && *crate::module_parameters::alternate_queue_pairs.value() == 1
+            && self.layout.pair != (ordinal & 1) {
+            let Some(other) = self.other.as_ref() else { return Ok(None); };
+            (other.layout, if other.fresh { 0 } else { other.item_index.checked_add(1).ok_or(EOVERFLOW)? })
+        } else {
+            (self.layout, if self.fresh_pair { ahead - 1 } else { self.item_index.checked_add(ahead).ok_or(EOVERFLOW)? })
+        };
+        let item = life::Item::retained(ordinal, index, layout).map_err(|_| EINVAL)?;
+        p = self.ticket_parameters(item.ordinal, p);
+        let mut bindings = KVec::new();
+        bindings.extend_from_slice(&self.client.bindings, GFP_KERNEL)?;
+        Ok(Some(KBox::new(PreparationSeed { item, parameters: p, client: self.client.lease()?, bindings }, GFP_KERNEL)?))
+    }
+    pub(crate) fn set_priority(&self, memory: &mut Memory, vm: &Vm, priority: u32) -> Result {
+        let profile = q::priority_profile(priority).map_err(|_| EINVAL)?;
+        for pointers in self.layout.pointers {
+            let mut values = [0; 3];
+            for (value, offset) in
+                values
+                    .iter_mut()
+                    .zip([q::POINTER_DONE, q::POINTER_READ, q::POINTER_WRITE])
+            {
+                *value = memory.read_firmware32(vm.physical(memory, 2, pointers + offset)?)?;
+            }
+            if values[0] != values[1] || values[1] != values[2] {
+                return Err(EBUSY);
+            }
+        }
+        // Resolve both host-owned families before changing either queue.
+        let mut addresses = [0; 2];
+        for (address, queue) in addresses.iter_mut().zip(self.layout.queues) {
+            *address = vm.physical(memory, 2, queue + 0x28)?;
+        }
+        for address in addresses {
+            // The priority family shares cache lines with firmware-owned
+            // queue fields. Match Vm::write: discard the CPU clean copy
+            // before the partial store so a later clean preserves those
+            // adjacent fields after firmware has advanced them.
+            memory.invalidate(address, profile.len())?;
+            memory.write(address, &profile)?;
+            memory.clean(address, profile.len())?;
+        }
+        g17p_memory::sync();
+        Ok(())
+    }
 }
 
 /// quiesce_submission(semantic_complete=True), for the sole synchronous owner.
 /// Call only after its queues, statuses and new terminal have all completed.
+pub(crate) fn complete_leaf_publication(memory: &mut Memory, vm: &Vm, work: &Submission) -> Result {
+    // _complete_native_leaf_publication, enabled by G17P_DEFAULTS. Retain
+    // the created pair's first retired shared-slot value before list cleanup.
+    complete_ticket_leaf_publication(memory, vm, life::Item {
+        ordinal: work.ordinal, index: work.item_index, layout: work.layout,
+    })
+}
+pub(crate) fn complete_ticket_leaf_publication(memory: &mut Memory, vm: &Vm, item: life::Item) -> Result {
+    if let Some(address) = item.retirement_leaf() {
+        vm.write(memory, 2, address, &0x13u32.to_le_bytes())?;
+        g17p_memory::sync();
+    }
+    Ok(())
+}
 pub(crate) fn quiesce(memory: &mut Memory, vm: &Vm, work: &Submission) -> Result<bool> {
     for stage in 0..2 {
         let target = work.publications[stage].write_after;
         for offset in [q::POINTER_DONE, q::POINTER_READ, q::POINTER_WRITE] {
-            if memory.read_firmware32(vm.physical(memory, 2, POINTERS[stage] + offset)?)? != target
+            if memory.read_firmware32(vm.physical(
+                memory,
+                2,
+                work.layout.pointers[stage] + offset,
+            )?)? != target
             {
                 return Err(EBUSY);
             }
         }
     }
-    let tail = vm.physical(memory, 2, JOB_LIST + 8)?;
+    let tail = vm.physical(memory, 2, work.layout.job_list + 8)?;
     memory.invalidate(tail, 8)?;
-    if memory.read64(tail)? == JOB_LIST {
+    if memory.read64(tail)? == work.layout.job_list {
         return Ok(false);
     }
     // Both halves name this one retained head. Never clear pool records or
     // neighboring list nodes; Python resets only the 0x18-byte list header.
-    vm.write(memory, 2, JOB_LIST, &q::job_list(JOB_LIST))?;
+    vm.write(
+        memory,
+        2,
+        work.layout.job_list,
+        &q::job_list(work.layout.job_list),
+    )?;
     g17p_memory::sync();
     memory.invalidate(tail, 8)?;
-    if memory.read64(tail)? != JOB_LIST {
+    if memory.read64(tail)? != work.layout.job_list {
         return Err(EIO);
     }
     Ok(true)
@@ -123,6 +371,18 @@ fn overlap(client: &Client, address: u64, size: u64) -> bool {
 
 pub(crate) fn validate_client(client: &Client, p: &Parameters) -> Result {
     p.validate().map_err(|_| EINVAL)?;
+    if *crate::module_parameters::partial_independent_owner.value() == 1 {
+        for (address, size) in super::g17p_partial_runtime::private_ranges() {
+            if overlap(client, address, size as u64) {
+                return Err(EINVAL);
+            }
+        }
+        for address in super::g17p_partial_runtime::alias_pages() {
+            if overlap(client, address, PAGE as u64) {
+                return Err(EINVAL);
+            }
+        }
+    }
     // These writable/private pages cannot be handed over to caller bindings.
     for (va, len) in [
         (p.deflake_3, PAGE as u64),
@@ -216,6 +476,85 @@ fn first_descriptor(index: usize, p: &Parameters, page: &mut [u8]) -> Result {
     Ok(())
 }
 
+fn align_page(n: u64) -> Result<u64> {
+    Ok(n.checked_add(PAGE as u64 - 1).ok_or(EOVERFLOW)? & !(PAGE as u64 - 1))
+}
+// Selection occurs under the serialized render owner before any publication.
+// New pages and old generations stay in Memory through session shutdown.
+fn select_scratch(memory: &mut Memory, client: &mut Client,
+                  leases: &mut KVec<ScratchLease>, cursor: &mut u64,
+                  p: &Parameters) -> Result<Parameters> {
+    p.validate().map_err(|_| EINVAL)?;
+    let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
+    let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
+    if ring <= 0x24000 && tpc <= PAGE as u64 {
+        return p.with_geometry_scratch().map_err(|_| EINVAL);
+    }
+    let key = ScratchKey::of(p);
+    let i = if let Some(i) = leases.iter().position(|lease| lease.key == key) { i } else {
+        let tilemap_size = align_page(ring)?;
+        let tpc_size = align_page(tpc)?;
+        let pair_stride = tilemap_size.checked_add(tpc_size).ok_or(EOVERFLOW)?;
+        // Both independent queue-pair namespaces have disjoint region/TPC pages.
+        let span = pair_stride.checked_mul(2).ok_or(EOVERFLOW)?;
+        let base = align_page(*cursor)?;
+        let end = base.checked_add(span).ok_or(EOVERFLOW)?;
+        // TA compact addresses cover exactly the source context's 4GB aperture.
+        if base < p.context_base || end > p.context_base.checked_add(1 << 32).ok_or(EOVERFLOW)? {
+            return Err(ENOMEM);
+        }
+        if overlap(client, base, span) { return Err(EINVAL); }
+        let pages_count = usize::try_from(span / PAGE as u64).map_err(|_| EOVERFLOW)?;
+        let mut pages = KVec::with_capacity(pages_count, GFP_KERNEL)?;
+        leases.reserve(1, GFP_KERNEL)?;
+        // Allocate all backing before any PTE is visible. On failure Memory
+        // still retains acquired pages; no queue or command was published.
+        for offset in (0..span).step_by(PAGE) {
+            let pa = memory.allocate(PAGE)?;
+            memory.clean(pa, PAGE)?;
+            pages.push((base + offset, pa), GFP_KERNEL)?;
+        }
+        leases.push(ScratchLease { key, tilemap: base,
+            tpc: base + tilemap_size, pair_stride, span, pages }, GFP_KERNEL)?;
+        *cursor = end;
+        leases.len() - 1
+    };
+    let lease = &leases[i];
+    if overlap(client, lease.tilemap, lease.span) { return Err(EINVAL); }
+    // An older logical owner may predate this lease. Mirror only absent leaves;
+    // refuse every mismatched physical identity or attribute before publication.
+    let mut absent = KVec::new();
+    for &(va, pa) in &lease.pages {
+        let pte = client.root.pte(va)?;
+        if pte == 0 { absent.push((va, pa), GFP_KERNEL)?; }
+        else if pte != pa | 0x00c0000000000c8b { return Err(EBUSY); }
+    }
+    if !absent.is_empty() {
+        client.root.grow(&absent)?;
+        Vm::invalidate_gpu();
+    }
+    Parameters { tilemap: lease.tilemap, tpc: lease.tpc,
+        scratch_pair_stride: lease.pair_stride, ..*p }
+        .with_geometry_scratch().map_err(|_| EINVAL)
+}
+fn validate_scratch_backing(client: &Client, p: &Parameters) -> Result {
+    let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
+    let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
+    let pairs: u64 = if *crate::module_parameters::partial_independent_owner.value() == 1 { 2 } else { 1 };
+    for pair in 0..pairs {
+        let delta = pair.checked_mul(p.scratch_pair_stride).ok_or(EOVERFLOW)?;
+        for (base, len) in [(p.tilemap, ring), (p.tpc, tpc)] {
+            let base = base.checked_add(delta).ok_or(EOVERFLOW)?;
+            let end = base.checked_add(len).ok_or(EOVERFLOW)?;
+            let mut at = base & !(PAGE as u64 - 1);
+            while at < end {
+                if client.root.pte(at)? & 3 != 3 { return Err(ENOMEM); }
+                at = at.checked_add(PAGE as u64).ok_or(EOVERFLOW)?;
+            }
+        }
+    }
+    Ok(())
+}
 pub(crate) fn build(
     memory: &mut Memory,
     vm: &mut Vm,
@@ -224,7 +563,27 @@ pub(crate) fn build(
     mut client: Client,
     p: &Parameters,
 ) -> Result<Submission> {
+    let configured = p.with_geometry_scratch().map_err(|_| EINVAL)?;
+    let p = &configured;
     validate_client(&client, p)?;
+    if *crate::module_parameters::partial_independent_owner.value() == 1 {
+        for (base, size) in super::g17p_partial_runtime::private_ranges() {
+            let pa = memory.allocate(size)?;
+            if base == 0x1001004000 {
+                let mut body = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+                body.resize(PAGE, 0, GFP_KERNEL)?;
+                r::aux_fb(&mut body).map_err(|_| EINVAL)?;
+                memory.write(pa, &body)?;
+            }
+            memory.clean(pa, size)?;
+            client.root.prepare(base, size as u64)?;
+            for offset in (0..size).step_by(PAGE) {
+                client
+                    .root
+                    .map_page(base + offset as u64, pa + offset as u64, true)?;
+            }
+        }
+    }
     // Borrow only the already-owned, zero/source-built private render shape.
     // Caller pages keep their own GEM backing, permissions and physical owner.
     for &(first, count, flags) in topology::RENDER_RUNS {
@@ -246,6 +605,12 @@ pub(crate) fn build(
         client.root.prepare(va, PAGE as u64)?;
         client.root.map_page(va, pa, true)?;
     }
+    let mut scratch_leases = KVec::new();
+    let mut scratch_cursor = super::g17p_growth::GROWTH_END;
+    let configured = select_scratch(memory, &mut client, &mut scratch_leases,
+        &mut scratch_cursor, p)?;
+    let p = &configured;
+    validate_scratch_backing(&client, p)?;
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     r::aux_fb(&mut page).map_err(|_| EINVAL)?;
@@ -274,13 +639,13 @@ pub(crate) fn build(
         memory,
         DESCRIPTORS[0],
         0x7000000000,
-        life::SUBMISSIONS as usize * r::TA_SIZE,
+        128 * r::TA_SIZE,
     )?;
     vm.alias_firmware(
         memory,
         DESCRIPTORS[1],
         0x7000098000,
-        life::SUBMISSIONS as usize * r::FRAGMENT_SIZE,
+        128 * r::FRAGMENT_SIZE,
     )?;
     let kinds = [
         graph::Leaf::PrimaryIndex,
@@ -554,7 +919,18 @@ pub(crate) fn build(
         ],
         growth: None,
         ordinal: 0,
+        item_index: 0,
+        layout: life::ORDINARY,
         adopted: false,
+        other: None,
+        transports: transport_pools(0),
+        fresh_pair: false,
+        scratch_layout: p.scratch_layout().map_err(|_| EINVAL)?,
+        scratch_key: ScratchKey::of(p),
+        scratch_leases,
+        scratch_cursor,
+        firmware_timestamps: None,
+        firmware_completion: FW_TIMESTAMPS[1],
     })
 }
 
@@ -571,6 +947,188 @@ fn tlbi() {
     }
 }
 impl Submission {
+    pub(crate) fn create_second_pair(&mut self, memory: &mut Memory, vm: &mut Vm) -> Result {
+        if self.other.is_some() {
+            return Ok(());
+        }
+        if self.layout.native || self.layout.pair != 0 || self.growth.is_none() {
+            return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+        }
+        // G17PFirstRender reserved the inventory before the first publication.
+        for (base, size) in super::g17p_partial_runtime::private_ranges() {
+            for offset in (0..size).step_by(PAGE) {
+                let pte = self.client.root.pte(base + offset as u64)?;
+                if pte & 3 != 3 {
+                    return Err(EIO);
+                }
+                memory.word64(pte & 0x000003ffffffc000)?;
+            }
+        }
+        // Fresh owned firmware backing, collision checked by the same Source
+        // allocator as transport banks. No existing captured data is adopted.
+        if self.firmware_timestamps.is_none() {
+            let base = 0xfffffc20cf050000;
+            vm.transport_backing(memory, base)?;
+            self.firmware_timestamps = Some(base);
+        }
+        // Compute startup owns the legacy SECOND Pool-B/status/shared-slot
+        // templates. Preflight/allocate fresh exact firmware mappings, retaining
+        // all old physical backing. Reject any existing private owner; never
+        // remap its leaves or infer ownership from an allocation count.
+        for (address, attributes) in life::SECOND_OWNED_STORAGE.into_iter()
+            .zip(life::SECOND_OWNED_ATTRIBUTES) {
+            vm.transport_backing_with_attributes(memory, address, attributes)?;
+        }
+        let layout = life::SECOND;
+        for index in 0..2 {
+            for (address, size) in [
+                (layout.queues[index], 0xc0),
+                (layout.pointers[index], 0x80),
+                (layout.rings[index], PAGE),
+                (layout.status[index], PAGE),
+            ] {
+                vm.ensure_firmware(memory, address, size)?;
+            }
+            let (high, low) = layout.contexts[index];
+            vm.alias_firmware(memory, high, low, 8 * PAGE)?;
+            let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+            page.resize(PAGE, 0, GFP_KERNEL)?;
+            graph::Context {
+                kind: if index == 0 {
+                    Kind::Tiling
+                } else {
+                    Kind::Fragment
+                },
+                descriptor: 0,
+                queue: 0,
+                pair: 1,
+                item: 0,
+                context: None,
+                grid: None,
+                locator_context: None,
+                partial_opening: false,
+                dependency_grid: None,
+                points: None,
+                event_slot: None,
+                completion: None,
+            }
+            .build(&mut page[0x200..0x200 + graph::CONTEXT_SIZE])
+            .map_err(|_| EINVAL)?;
+            vm.write(memory, 2, high, &page)?;
+            for offset in (PAGE..8 * PAGE).step_by(PAGE) {
+                vm.write(memory, 2, high + offset as u64, &ZERO_PAGE)?;
+            }
+            // Root one owns the existing GPU operand pages at these DVAs.
+            // Firmware queue contexts have separate backing; keep the root-zero
+            // companion aliases without replacing the render operand owner.
+            let status_low = [0x1000230000, 0x1000358000][index];
+            let pa = vm.physical(memory, 2, layout.status[index])?;
+            self.client.root.prepare(status_low, PAGE as u64)?;
+            self.client.root.map_page(status_low, pa, true)?;
+            vm.write(memory, 2, layout.status[index], &ZERO_PAGE)?;
+            let mut pointers = [0; 0x80];
+            pointers[..0x60].copy_from_slice(&q::pointers(u32::MAX));
+            c::u32_at(&mut pointers, 0x60, 0x500);
+            vm.write(memory, 2, layout.pointers[index], &pointers)?;
+            vm.write(memory, 2, layout.rings[index], &ZERO_PAGE)?;
+            let mut record = q::Record {
+                pointers: layout.pointers[index],
+                ring: layout.rings[index],
+                job_list: layout.job_list,
+                context: layout.control,
+                uuid: layout.uuid as u32,
+                priority: 0,
+                prio5: 1,
+                unk_2c: 0,
+                unk_38: 1,
+                unk_30: None,
+                unk_94: 0,
+                sentinel_size: 6,
+            }
+            .build()
+            .map_err(|_| EINVAL)?;
+            for (at, value) in [
+                (0x20, 0xffffffff00000000),
+                (0x30, 0xffffffffffff0000),
+                (0x38, 1),
+                (0x40, 0xffffffff00000001),
+            ] {
+                c::u64_at(&mut record, at, value);
+            }
+            vm.write(memory, 2, layout.queues[index], &record)?;
+        }
+        vm.write(memory, 2, layout.job_list, &q::job_list(layout.job_list))?;
+        super::g17p_partial_runtime::build_graph(
+            memory,
+            vm,
+            &mut self.client.root,
+            self.layout,
+            layout.support,
+        )?;
+        // Both entries share a CPU cacheline with firmware counters. Seed
+        // their immutable lowindex/count inputs before either render producer
+        // is exposed, not by a dirty partial-line store during another pool's
+        // execution. The selected-pool stage refresh then only changes data
+        // if it differs; ordinary eight-group ownership remains unchanged.
+        for owner in [self.layout, layout] {
+            let count = memory.read_firmware32(vm.physical(memory, 2, owner.shared[0] + 0x34)?)?;
+            let pa = vm.physical(memory, 2, owner.shared[0] + 0x28)?;
+            memory.invalidate(pa, 8)?;
+            if let Some(body) = life::index_registration(memory.read64(pa)?, count).map_err(|_| EIO)? {
+                vm.write(memory, 2, 0xfffffc20015e0000 + owner.pair as u64 * 0x10, &body)?;
+            }
+        }
+        self.growth.as_mut().ok_or(EINVAL)?.register_pool(
+            memory,
+            vm,
+            &self.client.root,
+            layout.leaves[4],
+            layout.leaves[1],
+            layout.shared[0],
+            super::g17p_growth::REQUEST_LIMIT,
+        )?;
+        // Later geometry allocations cannot occupy the selected pool's
+        // unpublished growth tranche. Its pages are allocated on demand.
+        self.scratch_cursor = self.scratch_cursor.max(
+            self.growth.as_ref().ok_or(EINVAL)?.reserved_growth_end()?);
+        vm.flush_tables(memory)?;
+        super::g17p_user_vm::UserVm::invalidate(1);
+        let empty = q::Publication {
+            slot: 0,
+            producer: 0,
+            consumers_before: [0; 2],
+            write_before: 0,
+            write_after: 0,
+            deferred_inner: None,
+            deferred_outer: None,
+        };
+        self.other = Some(Transport {
+            layout,
+            item_index: 0,
+            publications: [empty; 2],
+            deferred: [KVec::new(), KVec::new()],
+            transports: transport_pools(layout.pair),
+            fresh: true,
+        });
+        self.layout.independent = true;
+        Ok(())
+    }
+    pub(crate) fn select_pair(&mut self, pair: u32) -> Result {
+        if self.layout.pair == pair {
+            return Ok(());
+        }
+        let other = self.other.as_mut().ok_or(EINVAL)?;
+        if other.layout.pair != pair {
+            return Err(EINVAL);
+        }
+        core::mem::swap(&mut self.layout, &mut other.layout);
+        core::mem::swap(&mut self.item_index, &mut other.item_index);
+        core::mem::swap(&mut self.publications, &mut other.publications);
+        core::mem::swap(&mut self.deferred, &mut other.deferred);
+        core::mem::swap(&mut self.fresh_pair, &mut other.fresh);
+        core::mem::swap(&mut self.transports, &mut other.transports);
+        Ok(())
+    }
     pub(crate) fn after_control(&self, memory: &mut Memory, vm: &Vm, ttbs: u64) -> Result {
         if self.adopted {
             // The dormant startup already installed these roots and operands.
@@ -578,7 +1136,15 @@ impl Submission {
             return Ok(());
         }
         for (slot, pa) in self.empty_high.into_iter().enumerate() {
-            memory.write64(ttbs + slot as u64 * 16 + 8, ((slot as u64) << 48) | pa | 1)?;
+            let high = if slot == 1 && *crate::module_parameters::native_render_vms.value() == 1 {
+                vm.firmware_root()
+            } else {
+                pa
+            };
+            memory.write64(
+                ttbs + slot as u64 * 16 + 8,
+                ((slot as u64) << 48) | high | 1,
+            )?;
         }
         memory.write64(ttbs + 2 * 16, 0)?;
         memory.write64(ttbs + 2 * 16 + 8, 0)?;
@@ -646,7 +1212,7 @@ impl Submission {
                 changes.push((address, old, new), GFP_KERNEL)?;
             }
         }
-        client.cache(false)?;
+        client.cache_with(false, &self.client.cpu_maps)?;
         self.client.root.rebind(&changes, &[1])?;
         self.client.buffers = client.buffers;
         self.client.bindings = client.bindings;
@@ -670,6 +1236,26 @@ impl Submission {
         g17p_memory::sync();
         Ok(())
     }
+    pub(crate) fn retain_native(
+        &mut self,
+        publications: [q::Publication; 2],
+        channels: [abi::Channel; 2],
+        timestamps: [u64; 4],
+    ) -> Result {
+        if !self.adopted || self.ordinal != 0 || self.growth.is_some() {
+            return Err(EINVAL);
+        }
+        self.publications = publications;
+        self.channels = channels;
+        self.timestamps = timestamps;
+        self.layout = life::NATIVE;
+        self.ordinal = 1;
+        self.item_index = 0;
+        for list in &mut self.deferred {
+            list.clear();
+        }
+        Ok(())
+    }
     pub(crate) fn restore(&self, memory: &mut Memory, vm: &Vm, index: usize) -> Result {
         for store in self.deferred.get(index).ok_or(EINVAL)? {
             vm.write(memory, 2, store.address, &store.body)?;
@@ -686,17 +1272,42 @@ impl Submission {
 /// and report validation. Preserve all firmware-owned pool and directory state.
 pub(crate) fn stage_next(
     memory: &mut Memory,
-    vm: &Vm,
+    vm: &mut Vm,
     work: &mut Submission,
     p: &Parameters,
 ) -> Result {
-    let item = life::Item::new(work.ordinal + 1).map_err(|_| EINVAL)?;
+    stage_next_prepared(memory, vm, work, p, None)
+}
+pub(crate) fn stage_next_prepared(
+    memory: &mut Memory, vm: &mut Vm, work: &mut Submission,
+    p: &Parameters, prepared: Option<KBox<PreparedAppend>>,
+) -> Result {
+    let configured = p.with_geometry_scratch().map_err(|_| EINVAL)?;
+    let p = &configured;
+    let mut item = life::Item::retained(
+        work.ordinal.checked_add(1).ok_or(EOVERFLOW)?,
+        if work.fresh_pair {
+            0
+        } else {
+            work.item_index.checked_add(1).ok_or(EOVERFLOW)?
+        },
+        work.layout,
+    )
+    .map_err(|_| EINVAL)?;
     let mut counters = [q::Counters::new([0; 3]).map_err(|_| EIO)?; 2];
     let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
+    // Source scheduler_publication_values: firmware retains +0x0c across
+    // finite record reuse. A fresh seeded slot must still start at 0/1/2.
+    let record_a = work.layout.pools[0] + item.records()[0] as u64 * 0x100;
+    // Native dependency waves explicitly select scheduler publication base
+    // zero in the source; retain that diagnostic override for this profile.
+    let reused = !work.layout.native && word(record_a + 0x0c)? != 0;
+    let phases = life::scheduler_phases(word(item.slot())?, reused)
+        .map_err(|_| EIO)?;
     for index in 0..2 {
         let previous = work.publications[index].write_after;
         for at in [0, 0x30, 0x40] {
-            if word(POINTERS[index] + at)? != previous {
+            if word(work.layout.pointers[index] + at)? != previous {
                 return Err(EBUSY);
             }
         }
@@ -707,84 +1318,206 @@ pub(crate) fn stage_next(
             word(channel.states[2])?,
         ])
         .map_err(|_| EIO)?;
-        if !work.publications[index].completed(previous, counters[index]) {
+        if !work.fresh_pair && !work.publications[index].completed(previous, counters[index]) {
             return Err(EBUSY);
         }
         counters[index].slot().map_err(|_| EBUSY)?;
     }
     if counters[0].0 != counters[1].0 {
+        pr_err!("G17P: append fail site stage_counters ordinal {} pair {} TA {:?} FR {:?}\n",item.ordinal,item.layout.pair,counters[0].0,counters[1].0);
         return Err(EIO);
     }
+    let configured = select_scratch(memory, &mut work.client,
+        &mut work.scratch_leases, &mut work.scratch_cursor, p)?;
+    let configured = work.ticket_parameters(item.ordinal, configured);
+    let p = &configured;
+    validate_scratch_backing(&work.client, p)?;
+    let next_scratch = p.scratch_layout().map_err(|_| EINVAL)?;
+    let next_key = ScratchKey::of(p);
+    // All preceding GPU readers retired before geometry input is cleared.
+    if work.scratch_key != next_key {
+        let (_, stride, tpc) = next_scratch;
+        let pairs: u64 = if *crate::module_parameters::partial_independent_owner.value() == 1 { 2 } else { 1 };
+        for pair in 0..pairs {
+        let delta = pair * p.scratch_pair_stride;
+        for (base, len) in [(p.tilemap + delta, stride * 8), (p.tpc + delta, tpc)] {
+            let mut offset = 0;
+            while offset < len {
+                let size = (len - offset).min(PAGE as u64) as usize;
+                let at = base + offset;
+                let pte = work.client.root.pte(at & !(PAGE as u64 - 1))?;
+                let pa = (pte & 0x000003ffffffc000) | (at & (PAGE as u64 - 1));
+                memory.invalidate(pa, size)?;
+                memory.write(pa, &ZERO_PAGE[..size])?;
+                memory.clean(pa, size)?;
+                offset += size as u64;
+            }
+        }
+        }
+        work.scratch_layout = next_scratch;
+        work.scratch_key = next_key;
+    }
+    // Both stages and both channel consumers have retired. Replace only
+    // their finite pointer/item backing; retain queue identities and logical
+    // completion counters. Inactive banks are checked before every reuse.
+    if !work.layout.native {
+        for index in 0..2 {
+            let backing_capacity = if work.layout.independent && work.layout.pair == 1
+                && work.layout.pointers[index] < 0xfffffc20cf000000 {
+                PAGE as u32 / 8
+            } else { 0x2870 / 8 };
+            let capacity = memory.read_firmware32(vm.physical(memory, 2, work.layout.pointers[index] + 0x60)?)?.min(backing_capacity);
+            if capacity < 3 { return Err(EIO); }
+            let previous = work.publications[index].write_after;
+            if previous.checked_add(3).ok_or(EOVERFLOW)? > capacity {
+                let next = work.transports[index].switch(memory, vm,
+                    work.layout.queues[index], work.layout.pointers[index],
+                    work.layout.rings[index], previous).inspect_err(|e|
+                        pr_err!("G17P: append fail site transport_switch ordinal {} pair {} stage {} previous {} error {:?}\n",item.ordinal,item.layout.pair,index,previous,e))?;
+                work.layout.pointers[index] = next[0];
+                work.layout.rings[index] = next[1];
+                work.publications[index].write_after = 0;
+            }
+        }
+        item.layout = work.layout;
+    }
+    // Source _map_descriptor_alias grows context-zero descriptor aliases on
+    // demand. Do not expose the late fragment range during cold startup: its
+    // low DVAs overlap earlier context-zero operand backing.
+    if item.ordinal >= 128 {
+        for kind in [Kind::Tiling, Kind::Fragment] {
+            vm.alias_firmware(
+                memory,
+                item.descriptor_address(kind),
+                item.descriptor_alias(kind),
+                kind.size(),
+            )?;
+        }
+        vm.flush_tables(memory)?;
+        tlbi();
+    }
+    let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
     // Allocate/build the entire append before editing any live resource state.
     // Every destination was mapped and retained before the first publication.
-    let mut objects: [KVec<Deferred>; 2] = [KVec::new(), KVec::new()];
-    for index in 0..2 {
-        let kind = if index == 0 {
-            Kind::Tiling
-        } else {
-            Kind::Fragment
-        };
-        for (address, size, ty) in [
-            (item.descriptor_address(kind), kind.size(), 0),
-            (item.optional_address(kind), 0xc0, 1),
-            (
-                opening::CONTEXTS[index].0 + 0x200 * (item.ordinal as u64 + 1),
-                graph::CONTEXT_SIZE,
-                2,
-            ),
-        ] {
-            let mut body = KVVec::with_capacity(size, GFP_KERNEL)?;
-            body.resize(size, 0, GFP_KERNEL)?;
-            match ty {
-                0 => item.descriptor(kind, p, &mut body),
-                1 => item.optional(kind, &mut body),
-                _ => item.context(kind, &mut body),
+    let mut objects = if let Some(plan) = prepared.filter(|plan| plan.matches(work, item, p)) {
+        KBox::into_inner(plan).objects
+    } else {
+        // Stale ordinal/layout/BO/flag/VA/offset/geometry identities never
+        // publish an old plan. Rebuild against the exact current owner.
+        build_host_objects(item, p)?
+    };
+    for (index, kind) in [Kind::Tiling, Kind::Fragment].into_iter().enumerate() {
+        for (ty, object) in objects[index].iter_mut().enumerate() {
+            let size = object.body.len();
+            if ty == 2 && item.index >= life::STORAGE_SUBMISSIONS - 1 {
+                let mut previous = KVVec::with_capacity(size, GFP_KERNEL)?;
+                previous.resize(size, 0, GFP_KERNEL)?;
+                let mut offset = 0;
+                while offset < size {
+                    let va = object.address.checked_add(offset as u64).ok_or(EOVERFLOW)?;
+                    let count = (size - offset).min(PAGE - (va as usize & (PAGE - 1)));
+                    let pa = vm.physical(memory, 2, va)?;
+                    let last = va.checked_add(count as u64 - 1).ok_or(EOVERFLOW)?;
+                    if vm.physical(memory, 2, last)? != pa.checked_add(count as u64 - 1).ok_or(EOVERFLOW)? {
+                        pr_err!("G17P: append fail site context_span ordinal {} stage {} address {:#x} count {}\n",item.ordinal,index,va,count);
+                        return Err(EIO);
+                    }
+                    memory.read_firmware_words(pa, &mut previous[offset..offset + count])?;
+                    offset += count;
+                }
+                graph::update_context(kind, &mut previous, &object.body).map_err(|_| EINVAL)?;
+                object.body = previous;
             }
-            .map_err(|_| EINVAL)?;
             for off in (0..size).step_by(PAGE) {
-                vm.physical(memory, 2, address + off as u64)?;
+                vm.physical(memory, 2, object.address + off as u64)?;
             }
-            vm.physical(memory, 2, address + size as u64 - 1)?;
-            objects[index].push(Deferred { address, body }, GFP_KERNEL)?;
+            vm.physical(memory, 2, object.address + size as u64 - 1)?;
         }
+    }
+    if !work.layout.native {
+        for (index, kind) in [Kind::Tiling, Kind::Fragment].into_iter().enumerate() {
+            item.scheduler_node(kind, &mut objects[index][0].body).map_err(|_| EINVAL)?;
+        }
+    }
+    // _apply_scheduler_node retains the base mirrors for every pair-zero
+    // item and the created pair's first item. Only its later items use the
+    // live selected Pool-B record, whose finite cycle differs from registers.
+    if item.refresh_pool_b_mirrors() {
+        let pool_b = work.layout.pools[1] + item.records()[1] as u64 * 0x80;
+        let b00 = word(pool_b)?;
+        let b28 = word(pool_b + 0x28)?;
+        for (index, kind) in [Kind::Tiling, Kind::Fragment].into_iter().enumerate() {
+            item.pool_b_mirrors(kind, &mut objects[index][0].body, b00, b28);
+        }
+    }
+    let inner = word(work.layout.inner)?;
+    if inner > 2 * (item.ordinal + 1) {
+        pr_err!("G17P: append fail site inner_progress ordinal {} pair {} inner {}\n",item.ordinal,item.layout.pair,inner);
+        return Err(EIO);
     }
     // _advance_tilemap_block resets a completed allocation only when its
     // eight-block ring wraps. Keep the persistent directory and TPC intact.
-    if item.ordinal >= 8 {
-        let zeros = [0u8; 0x1200];
-        vm.write(
-            memory,
-            1,
-            p.tilemap + (item.ordinal % 8) as u64 * 0x1200,
-            &zeros,
-        )?;
+    if let Some(address) = item.tilemap_reset(p) {
+        let mut zeros = KVVec::with_capacity(next_scratch.1 as usize, GFP_KERNEL)?;
+        zeros.resize(next_scratch.1 as usize, 0, GFP_KERNEL)?;
+        // Source _write_dva resolves the currently selected caller root.
+        // Second-owner private pages belong to that root and need not exist
+        // in the original VM template. Validate every owned span first.
+        let mut spans = KVec::new();
+        let mut offset = 0;
+        while offset < zeros.len() {
+            let at = address + offset as u64;
+            let pte = work.client.root.pte(at & !(PAGE as u64 - 1))?;
+            if pte & 3 != 3 {
+                pr_err!("G17P: append fail site tilemap_pte ordinal {} address {:#x} pte {:#x}\n",item.ordinal,at,pte);
+                return Err(EIO);
+            }
+            let pa = (pte & 0x000003ffffffc000) | (at & (PAGE as u64 - 1));
+            let size = (zeros.len() - offset).min(PAGE - (at as usize & (PAGE - 1)));
+            memory.word64(pa & !7)?;
+            memory.word64((pa + size as u64 - 1) & !7)?;
+            spans.push((pa, offset, size), GFP_KERNEL)?;
+            offset += size;
+        }
+        for (pa, offset, size) in spans {
+            memory.invalidate(pa, size)?;
+            memory.write(pa, &zeros[offset..offset + size])?;
+            memory.clean(pa, size)?;
+        }
     }
     work.client.cache(false)?;
-    work.growth
-        .as_mut()
-        .ok_or(EINVAL)?
-        .bind_work(item.descriptor_address(Kind::Fragment))?;
+    if let Some(service) = work.growth.as_mut() {
+        service.bind_pool_work(
+            work.layout.pair,
+            [0xfffffc2000000100, 0xfffffc2000000200],
+            item.descriptor_address(Kind::Fragment),
+            work.layout.grids[1],
+            item.ordinal,
+        )?;
+    } else if !work.layout.native {
+        return Err(EINVAL);
+    }
     let write = |memory: &mut Memory, address, body: &[u8]| vm.write(memory, 2, address, body);
     let records = item.records();
     let node = item.ordinal + item.ordinal / 2;
     write(
         memory,
-        POOLS[0] + records[0] as u64 * 0x100 + 8,
+        work.layout.pools[0] + records[0] as u64 * 0x100 + 8,
         &node.to_le_bytes(),
     )?;
     write(
         memory,
-        POOLS[0] + records[0] as u64 * 0x100 + 0x10,
+        work.layout.pools[0] + records[0] as u64 * 0x100 + 0x10,
         &0x50u32.to_le_bytes(),
     )?;
     write(
         memory,
-        POOLS[1] + records[1] as u64 * 0x80 + 0x4c,
+        work.layout.pools[1] + records[1] as u64 * 0x80 + 0x4c,
         &1u32.to_le_bytes(),
     )?;
     // Source lifecycle before -> fragment -> tiling. No producer yet visible.
-    write(memory, LEAVES[4] + 0x60, &1u32.to_le_bytes())?;
-    write(memory, item.slot(), &0u32.to_le_bytes())?;
+    write(memory, work.layout.leaves[4] + 0x60, &1u32.to_le_bytes())?;
+    write(memory, item.slot(), &phases[0].to_le_bytes())?;
     for index in [1, 0] {
         for object in &objects[index] {
             write(memory, object.address, &object.body)?;
@@ -792,10 +1525,10 @@ pub(crate) fn stage_next(
         // Do not copy this firmware record into the render-root operand
         // backing at the same low DVA. Context 0 already aliases the high view.
         let phase = if index == 1 { 1u32 } else { 2u32 };
-        write(memory, item.slot(), &phase.to_le_bytes())?;
+        write(memory, item.slot(), &phases[phase as usize].to_le_bytes())?;
         write(
             memory,
-            opening::STATE,
+            work.layout.inner,
             &(2 * item.ordinal + phase).to_le_bytes(),
         )?;
         write(
@@ -808,21 +1541,38 @@ pub(crate) fn stage_next(
             &[0; 0x40],
         )?;
         if index == 1 {
-            write(memory, LEAVES[5], &(item.ordinal + 1).to_le_bytes())?;
-            for address in FW_TIMESTAMPS {
+            write(
+                memory,
+                work.layout.leaves[5],
+                &(item.index + 1).to_le_bytes(),
+            )?;
+            for address in [p.timestamp_a, p.timestamp_b] {
                 write(memory, address, &[0; 8])?;
             }
         }
     }
     // Retired prior PB release, then the same retained owner is selected again.
-    write(memory, SHARED[0] + 0x0c, &u32::MAX.to_le_bytes())?;
-    write(memory, SHARED[0] + 0x0c, &0u32.to_le_bytes())?;
-    write(memory, SHARED[0], &item.ordinal.to_le_bytes())?;
-    let count = memory.read_firmware32(vm.physical(memory, 2, SHARED[0] + 0x34)?)?;
-    let pa = vm.physical(memory, 2, SHARED[0] + 0x28)?;
+    write(
+        memory,
+        work.layout.shared[0] + 0x0c,
+        &u32::MAX.to_le_bytes(),
+    )?;
+    write(
+        memory,
+        work.layout.shared[0] + 0x0c,
+        &work.layout.pair.to_le_bytes(),
+    )?;
+    write(memory, work.layout.shared[0], &item.index.to_le_bytes())?;
+    let count = memory.read_firmware32(vm.physical(memory, 2, work.layout.shared[0] + 0x34)?)?;
+    let pa = vm.physical(memory, 2, work.layout.shared[0] + 0x28)?;
     memory.invalidate(pa, 8)?;
     if let Some(body) = life::index_registration(memory.read64(pa)?, count).map_err(|_| EIO)? {
-        write(memory, 0xfffffc20015e0000, &body)?;
+        let at = 0xfffffc20015e0000 + work.layout.pair as u64 * 0x10;
+        let pa = vm.physical(memory, 2, at)?;
+        memory.invalidate(pa, 8)?;
+        if memory.read64(pa)? != u64::from_le_bytes(body) {
+            write(memory, at, &body)?;
+        }
     }
     g17p_memory::sync();
     for index in 0..2 {
@@ -833,10 +1583,15 @@ pub(crate) fn stage_next(
         };
         let channel = work.channels[index];
         work.publications[index] = q::Stage {
-            queue: QUEUES[index],
-            pointers: POINTERS[index],
-            item_ring: RINGS[index],
-            item_capacity: 0x2870 / 8,
+            queue: work.layout.queues[index],
+            pointers: work.layout.pointers[index],
+            item_ring: work.layout.rings[index],
+            item_capacity: if work.layout.independent && work.layout.pair == 1
+                && work.layout.pointers[index] < 0xfffffc20cf000000 {
+                PAGE as u32 / 8
+            } else {
+                0x2870 / 8
+            },
             write_index: work.publications[index].write_after,
             channel_ring: channel.ring,
             channel_producer: channel.states[2],
@@ -847,14 +1602,14 @@ pub(crate) fn stage_next(
                 item.optional_address(kind),
                 item.event_address(kind),
             ],
-            group: item.ordinal + 1,
-            grid: index as u32,
+            group: item.index + 1,
+            grid: work.layout.grids[index],
             kind: if index == 0 {
                 q::Kind::Tiling
             } else {
                 q::Kind::Fragment
             },
-            first: false,
+            first: work.fresh_pair,
             in_place: false,
             announce: false,
             defer_inner: false,
@@ -872,7 +1627,10 @@ pub(crate) fn stage_next(
     for index in 0..2 {
         work.deferred[index].clear();
     }
+    work.firmware_completion = p.fragment_timestamp_end;
     work.ordinal = item.ordinal;
+    work.item_index = item.index;
+    work.fresh_pair = false;
     work.timestamps = [
         p.ta_user_timestamp_start,
         p.ta_user_timestamp_end,

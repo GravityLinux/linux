@@ -30,6 +30,9 @@ struct Mapping {
 
 pub(crate) struct Memory {
     mappings: KVec<Mapping>,
+    // Match the M1/M2/M4 firmware heap policy: backing only grows while the
+    // session is live. Retiring objects or reusing ring slots never removes
+    // allocations here. Pages are released only after session shutdown.
     allocations: KVec<Allocation>,
 }
 
@@ -44,6 +47,30 @@ enum WordBacking {
     Reserved(*mut u64),
 }
 impl Word64<'_> {
+    pub(crate) fn load(&self) -> u64 {
+        let read = |p: *mut u64| {
+            sync();
+            // SAFETY: Constructor checked the live owner's aligned RAM word.
+            unsafe {
+                core::arch::asm!("dc ivac, {p}", p=in(reg)p, options(nostack,preserves_flags));
+            }
+            sync();
+            // SAFETY: The borrowed owner retains this readable word.
+            u64::from_le(unsafe { p.read_volatile() })
+        };
+        match self.backing {
+            WordBacking::Allocated(address) => {
+                let base = address & !(PAGE as u64 - 1);
+                // SAFETY: word64 checked ownership of the physical page.
+                let page = unsafe { page::Page::borrow_phys_unchecked(&base) };
+                page.with_page_mapped(|p| {
+                    // SAFETY: The checked offset lies wholly within the page.
+                    read(unsafe { p.add((address - base) as usize).cast::<u64>() })
+                })
+            }
+            WordBacking::Reserved(pointer) => read(pointer),
+        }
+    }
     /// No allocation, address lookup, or fallible operation after the first
     /// page-table break. Only checked, host-owned PTE words use this API.
     pub(crate) fn store(&self, value: u64) {
@@ -59,7 +86,7 @@ impl Word64<'_> {
             // SAFETY: The borrowed owner retains the checked writable word.
             unsafe {
                 p.write_volatile(value.to_le());
-                core::arch::asm!("dc cvac, {p}", p=in(reg)p, options(nostack,preserves_flags));
+                core::arch::asm!("dc civac, {p}", p=in(reg)p, options(nostack,preserves_flags));
             }
             sync();
         };
@@ -265,6 +292,27 @@ impl Memory {
         Ok(())
     }
 
+    /// Read retired firmware-owned words after discarding the CPU's clean
+    /// copy. Callers must have published every prior host write and observed
+    /// hardware retirement; this does not replace any completion/status proof.
+    pub(crate) fn read_firmware_words(&self, address: u64, bytes: &mut [u8]) -> Result {
+        if address & 7 != 0 || bytes.is_empty() || bytes.len() & 7 != 0 {
+            return Err(EINVAL);
+        }
+        // Same ordering and cache-line coverage as invalidate/read64, with
+        // one synchronization pair around the complete owned span.
+        self.invalidate(address, bytes.len())?;
+        self.chunks(address, bytes.len(), |pointer, offset, count| {
+            for index in (0..count).step_by(8) {
+                // SAFETY: chunks checks the live owned RAM span, and both
+                // its page-aligned split and our requested words are aligned.
+                let word = unsafe { pointer.add(index).cast::<u64>().read_volatile() };
+                bytes[offset + index..offset + index + 8]
+                    .copy_from_slice(&u64::from_le(word).to_le_bytes());
+            }
+        })
+    }
+
     pub(crate) fn write64(&mut self, address: u64, value: u64) -> Result {
         if address & 7 != 0 {
             return Err(EINVAL);
@@ -329,10 +377,13 @@ impl Memory {
         let start = (pointer as usize) & !63;
         let end = pointer as usize + count;
         for address in (start..end).step_by(64) {
+            // Source uses dc_civac after publication writes. Firmware may
+            // update other fields in this same line before our next partial
+            // write, so do not retain a stale CPU copy after handing it off.
             // SAFETY: The live RAM mappings are page aligned, so rounding
             // down to a cache line remains within the same mapped page.
             unsafe {
-                core::arch::asm!("dc cvac, {address}", address = in(reg) address, options(nostack, preserves_flags))
+                core::arch::asm!("dc civac, {address}", address = in(reg) address, options(nostack, preserves_flags))
             };
         }
         })?;

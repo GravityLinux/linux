@@ -8,7 +8,12 @@ use super::{
     g17p_compute_memory as cm, g17p_drm::Object, g17p_image::Image, g17p_memory::Memory,
     g17p_queue as q, g17p_user_vm::UserVm, g17p_vm::Vm,
 };
-use kernel::{drm::gem::BaseObject, prelude::*, sync::aref::ARef};
+use kernel::{
+    drm::gem::{shmem, BaseObject},
+    prelude::*,
+    rbtree::RBTree,
+    sync::{aref::ARef, Arc, Mutex},
+};
 
 const PAGE: usize = 0x4000;
 pub(crate) const QUEUE: u64 = 0xfffffc20c0000300;
@@ -33,16 +38,176 @@ const OPERAND_TABLE: u64 = 0x7000208000;
 const STATE: u64 = 0x7000220000;
 const ROBUSTNESS: u64 = 0x1000018000;
 
+/// CPU mappings are created only by execution-time cache maintenance. The
+/// retained cache lives outside GEM Objects, avoiding an Object/ARef cycle.
+/// Entries own their exact Object identity, so addresses cannot be recycled
+/// while a mapping remains cached. Roots/binding snapshots stay immutable.
+#[derive(Clone)]
+pub(crate) struct CpuMaps(
+    Arc<Mutex<RBTree<usize, shmem::VMap<super::g17p_drm::Bo, u8>>>>,
+);
+impl CpuMaps {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self(Arc::pin_init(kernel::new_mutex!(RBTree::new()), GFP_KERNEL)?))
+    }
+}
+
 pub(crate) struct Client {
     pub(crate) root: UserVm,
     pub(crate) buffers: KVec<ARef<Object>>,
+    pub(crate) cpu_maps: CpuMaps,
     pub(crate) bindings: KVec<(u64, u64, u64, u32)>,
     pub(crate) owner: (u64, u32),
+    // Only the source-owned primer may lend these legacy robustness DVAs.
+    // Record exact leaves so caller admission can retire the aliases safely.
+    pub(crate) primer_aliases: Option<[(u64, u64); 2]>,
+}
+/// Immutable caller ownership for one publication, independent of later
+/// retained Client binding generations. Physical pages stay Session-owned.
+pub(crate) struct ClientLease {
+    pub(crate) owner: (u64, u32),
+    pub(crate) root: super::g17p_user_vm::RootLease,
+    buffers: KVec<ARef<Object>>,
+    cpu_maps: CpuMaps,
+}
+impl ClientLease {
+    pub(crate) fn buffers(&self) -> &[ARef<Object>] { &self.buffers }
+    pub(crate) fn matches_buffers(&self, owner: &Client) -> bool {
+        self.buffers.len() == owner.buffers.len() && self.buffers.iter()
+            .zip(owner.buffers.iter()).all(|(left, right)|
+                core::ptr::eq(&**left, &**right))
+    }
+    pub(crate) fn cache(&self, invalidate: bool) -> Result {
+        cache_buffers(&self.buffers, invalidate, &self.cpu_maps)
+    }
+    pub(crate) fn refresh_root(&mut self, owner: &Client) -> Result {
+        if self.owner != owner.owner { return Err(EIO); }
+        self.root.refresh(&owner.root)
+    }
 }
 impl Client {
+    pub(crate) fn lease(&self) -> Result<ClientLease> {
+        let mut buffers = KVec::with_capacity(self.buffers.len(), GFP_KERNEL)?;
+        for bo in &self.buffers { buffers.push(bo.clone(), GFP_KERNEL)?; }
+        Ok(ClientLease {
+            owner: self.owner,
+            root: self.root.lease()?,
+            buffers,
+            cpu_maps: self.cpu_maps.clone(),
+        })
+    }
+    /// Source adapter.unbind: remove only this caller's quiescent leaves and
+    /// metadata, preserving every private and grown mapping in the root.
+    pub(crate) fn unbind(
+        &mut self,
+        start: u64,
+        size: u64,
+        expected: &[(u64, u64)],
+        render: bool,
+        contexts: &[u16],
+    ) -> Result {
+        let end = start.checked_add(size).ok_or(EINVAL)?;
+        let mut bindings = KVec::new();
+        let mut buffers = KVec::new();
+        let mut changes = KVec::new();
+        for (index, &(base, length, offset, flags)) in self.bindings.iter().enumerate() {
+            let finish = base.checked_add(length).ok_or(EINVAL)?;
+            if start < finish && base < end {
+                for address in (base.max(start)..finish.min(end)).step_by(PAGE) {
+                    let va = if render && address < 0x1000000000 {
+                        address + 0x1000000000
+                    } else {
+                        address
+                    };
+                    let old = self.root.pte(va)?;
+                    if old != 0 {
+                        if !expected.contains(&(address, old)) {
+                            return Err(EIO);
+                        }
+                        changes.push((va, old, 0), GFP_KERNEL)?;
+                    }
+                }
+                for (first, last) in [(base, start.min(finish)), (end.max(base), finish)] {
+                    if first < last {
+                        let part_offset = offset
+                            + if flags
+                                & kernel::uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE
+                                != 0
+                            {
+                                0
+                            } else {
+                                first - base
+                            };
+                        bindings.push((first, last - first, part_offset, flags), GFP_KERNEL)?;
+                        buffers.push(self.buffers[index].clone(), GFP_KERNEL)?;
+                    }
+                }
+            } else {
+                bindings.push((base, length, offset, flags), GFP_KERNEL)?;
+                buffers.push(self.buffers[index].clone(), GFP_KERNEL)?;
+            }
+        }
+        self.root.rebind(&changes, contexts)?;
+        self.bindings = bindings;
+        self.buffers = buffers;
+        Ok(())
+    }
+
+    /// Before native compute VM admission, retire the completed source primer
+    /// leaves. Python mirrors the first caller before adopting its template;
+    /// native bind_vm performs that mirror here after this checked removal.
+    /// All primer data stays Memory-owned, and no producer is published here.
+    pub(crate) fn retire_primer(&mut self) -> Result {
+        let aliases = self.primer_aliases.ok_or(EINVAL)?;
+        if !self.buffers.is_empty() {
+            return Err(EIO);
+        }
+        let mut changes = KVec::new();
+        for &(base, size, _, _) in &self.bindings {
+            for offset in (0..size).step_by(PAGE) {
+                let va = base + offset;
+                let expected = self.root.pte(va)?;
+                if expected == 0 {
+                    return Err(EIO);
+                }
+                changes.push((va, expected, 0), GFP_KERNEL)?;
+            }
+        }
+        for (va, expected) in aliases {
+            if expected == 0 || self.root.pte(va)? != expected {
+                return Err(EIO);
+            }
+            changes.push((va, expected, 0), GFP_KERNEL)?;
+        }
+        self.root.rebind(&changes, &[2, 3])?;
+        self.bindings.clear();
+        self.primer_aliases = None;
+        Ok(())
+    }
+
     /// Update only the caller-owned part of the quiescent retained root. Both
     /// generations of GEM references remain pinned until the final TLBI.
     pub(crate) fn rebind(&mut self, next: Self, render: bool) -> Result {
+        self.rebind_contexts(next, render, if render { &[1] } else { &[1, 2, 3] })
+    }
+    pub(crate) fn rebind_contexts(&mut self, next: Self, render: bool, contexts: &[u16]) -> Result {
+        self.prepare_rebind(&next, render, contexts, &[])?.commit();
+        self.adopt_rebound(next);
+        Ok(())
+    }
+    pub(crate) fn adopt_rebound(&mut self, next: Self) {
+        self.buffers = next.buffers;
+        self.bindings = next.bindings;
+        self.owner = next.owner;
+        self.primer_aliases = next.primer_aliases;
+    }
+    pub(crate) fn prepare_rebind<'a>(
+        &'a mut self,
+        next: &Self,
+        render: bool,
+        contexts: &[u16],
+        private: &[(u64, u64, u64)],
+    ) -> Result<super::g17p_user_vm::RebindPlan<'a>> {
         if render && self.owner != next.owner {
             return Err(EINVAL);
         }
@@ -62,6 +227,31 @@ impl Client {
                     return Err(EIO);
                 }
                 changes.push((va, old, 0), GFP_KERNEL)?;
+            }
+        }
+        // Source _mirror_compute_vm replaces completed bootstrap mappings.
+        // Robustness state already has its retained reserved-aperture aliases;
+        // retire only the two recorded primer leaves before caller admission.
+        // Their backing remains owned by Session through the final ASID flush.
+        if let Some(aliases) = self.primer_aliases {
+            for (va, expected) in aliases {
+                if expected == 0 || self.root.pte(va)? != expected {
+                    return Err(EIO);
+                }
+                changes.push((va, expected, 0), GFP_KERNEL)?;
+            }
+        }
+        // Merge a checked private transfer with removal of the previous
+        // caller. A new reserved leaf may replace a retiring old caller leaf;
+        // a new caller may occupy a retired private VA, never its new VA.
+        for &(va, old, new) in private {
+            if let Some(row) = changes.iter_mut().find(|r| r.0 == va) {
+                if row.1 != old || row.2 != 0 {
+                    return Err(EBUSY);
+                }
+                row.2 = new;
+            } else {
+                changes.push((va, old, new), GFP_KERNEL)?;
             }
         }
         for &(base, size, _, _) in &next.bindings {
@@ -85,19 +275,44 @@ impl Client {
                 }
             }
         }
-        next.cache(false)?;
-        self.root
-            .rebind(&changes, if render { &[1] } else { &[2, 3] })?;
-        // rebind cannot fail after its first live store. Its final ASID flush
-        // precedes release of old BOs; the root and all private state survive.
-        self.buffers = next.buffers;
-        self.bindings = next.bindings;
-        self.owner = next.owner;
-        Ok(())
+        // Execution is quiescent here. Reuse exact Object mappings across
+        // binding generations; only next.buffers are maintained by cache().
+        next.cache_with(false, &self.cpu_maps)?;
+        self.root.prepare_rebind(&changes, contexts)
     }
     pub(crate) fn cache(&self, invalidate: bool) -> Result {
-        for bo in &self.buffers {
-            let map = bo.vmap::<u8>()?;
+        self.cache_with(invalidate, &self.cpu_maps)
+    }
+    pub(crate) fn cache_with(&self, invalidate: bool, retained: &CpuMaps) -> Result {
+        cache_buffers(&self.buffers, invalidate, retained)
+    }
+}
+fn cache_buffers(buffers: &[ARef<Object>], invalidate: bool, retained: &CpuMaps) -> Result {
+        let mut maps = retained.0.lock();
+        for (index, bo) in buffers.iter().enumerate() {
+            // Multiple DVA bindings may alias one GEM. Cache maintenance is
+            // physical, so sweep each owned Object once without changing its
+            // lifetime, covered bytes, direction or the final publication barrier.
+            if buffers[..index]
+                .iter()
+                .any(|prior| core::ptr::eq(&**prior, &**bo))
+            {
+                continue;
+            }
+            let identity = &**bo as *const Object as usize;
+            if maps.get(&identity).is_none() {
+                let map = bo.owned_vmap::<u8>()?;
+                if map.get().is_iomem() {
+                    return Err(EINVAL);
+                }
+                maps.try_create_and_insert(identity, map, GFP_KERNEL)?;
+            }
+            let owned = maps.get(&identity).ok_or(EIO)?;
+            if !core::ptr::eq(owned.owner(), &**bo) {
+                return Err(EIO);
+            }
+            // get() borrows the retained map without another vmap/vunmap.
+            let map = owned.get();
             if map.is_iomem() {
                 return Err(EINVAL);
             }
@@ -110,15 +325,17 @@ impl Client {
                     if invalidate {
                         core::arch::asm!("dc ivac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
                     } else {
-                        core::arch::asm!("dc cvac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
+                        // Match Source uploads: CVAC is a no-op on Apple
+                        // Silicon; CIVAC publishes the caller's dirty lines.
+                        core::arch::asm!("dc civac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
                     }
                 }
             }
         }
         super::g17p_memory::sync();
         Ok(())
-    }
 }
+
 pub(crate) struct Parameters {
     pub(crate) preempt: u64,
     pub(crate) cdm: u64,
@@ -133,9 +350,18 @@ pub(crate) struct Submission {
     pub(crate) channel: abi::Channel,
     pub(crate) ordinal: u32,
     pub(crate) preempt: u64,
+    // Immutable physical/attribute ownership, retained across VM carveouts.
+    private_ptes: [u64; 8],
+    // Only aliases created by ordinary startup are recorded here. A legacy
+    // VA already owned by a caller is neither changed nor claimed. Cold
+    // primer aliases retain their existing Client ownership representation.
+    pub(crate) compatibility_aliases: [Option<(u64, u64)>; 2],
     pub(crate) status: [u64; 2],
     pub(crate) timestamps: [u64; 2],
     pub(crate) after_render: bool,
+    // Complement of the actual render completion profile, never an ordinal.
+    pub(crate) retained_execution_gate: u64,
+    pub(crate) native_context: Option<u16>,
     pub(crate) pointers: u64,
     ring: u64,
     transport: TransportPool,
@@ -153,7 +379,100 @@ pub(crate) struct Pending {
     pub(crate) timestamps: [u64; 2],
     pub(crate) resources: [u64; 10],
 }
+// Two preemption tranches and two robustness pages in the VM reservation.
+const PRIVATE_OFFSETS: [u64; 8] = [0, 0x4000, 0x8000, 0x78000, 0x7c000, 0x80000,
+                                  0x100000, 0x108000];
 impl Submission {
+    /// Merge exact Source-created compatibility aliases into one quiescent
+    /// caller/private handoff. Physical backing and contents remain owned.
+    /// A new reserved private leaf may reuse this same VA; its checked target
+    /// wins over alias retirement, without relaxing any current-PTE check.
+    pub(crate) fn append_compatibility_retirements(
+        &self,
+        changes: &mut KVec<(u64, u64, u64)>,
+    ) -> Result {
+        for &(address, expected) in self.compatibility_aliases.iter().flatten() {
+            if expected & 3 != 3 || self.client.root.pte(address)? != expected
+                || self.client.bindings.iter().any(|&(va, size, _, _)| va <= address && address < va + size)
+            {
+                return Err(EIO);
+            }
+            if let Some(row) = changes.iter_mut().find(|r| r.0 == address) {
+                if row.1 != expected { return Err(EBUSY); }
+                // Preserve a checked private transfer's new owner at this VA.
+            } else {
+                changes.push((address, expected, 0), GFP_KERNEL)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn private_carveout_changes(
+        &self,
+        next: &Client,
+        base: u64,
+    ) -> Result<KVec<(u64, u64, u64)>> {
+        if base & (PAGE as u64 - 1) != 0
+            || base.checked_add(0x10c000).ok_or(EINVAL)? > 1 << 42
+            || self.robustness != self.preempt.checked_add(0x100000).ok_or(EINVAL)?
+        {
+            return Err(EINVAL);
+        }
+        let mut changes = KVec::with_capacity(16, GFP_KERNEL)?;
+        for (index, offset) in PRIVATE_OFFSETS.into_iter().enumerate() {
+            let old = self.preempt.checked_add(offset).ok_or(EINVAL)?;
+            let expected = self.private_ptes[index];
+            if expected & 3 != 3 || self.client.root.pte(old)? != expected
+                || self.client.bindings.iter().any(|&(va, size, _, _)| va <= old && old < va + size)
+            {
+                return Err(EIO);
+            }
+            changes.push((old, expected, 0), GFP_KERNEL)?;
+        }
+        for (index, offset) in PRIVATE_OFFSETS.into_iter().enumerate() {
+            let address = base.checked_add(offset).ok_or(EINVAL)?;
+            if next.bindings.iter().any(|&(va, size, _, _)| va <= address && address < va + size) {
+                return Err(EBUSY);
+            }
+            let old = self.client.root.pte(address)?;
+            if let Some(row) = changes.iter_mut().find(|r| r.0 == address) {
+                if row.1 != old { return Err(EIO); }
+                row.2 = self.private_ptes[index];
+            } else {
+                // Only an old caller leaf scheduled for removal may lend its
+                // VA. Unrelated private/growth mappings retain their owner.
+                if old != 0 && !self.client.bindings.iter().any(|&(va, size, _, _)| {
+                    va <= address && address < va + size
+                }) { return Err(EBUSY); }
+                changes.push((address, old, self.private_ptes[index]), GFP_KERNEL)?;
+            }
+        }
+        Ok(changes)
+    }
+    pub(crate) fn adopt_private_carveout(&mut self, preempt: u64, robustness: u64) {
+        self.preempt = preempt;
+        self.robustness = robustness;
+    }
+    pub(crate) fn private_robustness_aliases(&self, base: u64) -> Result<[(u64, u64); 2]> {
+        Ok([(base.checked_add(0x100000).ok_or(EINVAL)?, self.private_ptes[6]),
+            (base.checked_add(0x108000).ok_or(EINVAL)?, self.private_ptes[7])])
+    }
+    /// Source _ensure_compute_robustness shares these exact driver-owned
+    /// leaves with an existing logical root, independently of caller BOs.
+    pub(crate) fn robustness_aliases(&self) -> Result<[(u64, u64); 2]> {
+        let mut aliases = [(0, 0); 2];
+        for (index, offset) in [0, 0x8000].into_iter().enumerate() {
+            let address = self.robustness + offset;
+            let pte = self.client.root.pte(address)?;
+            if pte & 3 != 3 || pte != self.private_ptes[index + 6] {
+                return Err(EIO);
+            }
+            aliases[index] = (address, pte);
+        }
+        Ok(aliases)
+    }
+    pub(crate) fn has_transport_pool(&self) -> bool {
+        self.transport.switches != 0 || self.transport.slots.iter().any(Option::is_some)
+    }
     pub(crate) fn resources(&self, ordinal: u32) -> Result<[u64; 10]> {
         let status = self.status_base + ordinal as u64 * 0x10;
         if ordinal == 0 {
@@ -174,13 +493,17 @@ impl Submission {
         if self.after_render {
             return Ok([
                 spec.descriptor,
-                lifecycle::AFTER_RENDER_OPTIONAL,
+                if ordinal == 1 {
+                    lifecycle::AFTER_RENDER_OPTIONAL
+                } else {
+                    0
+                },
                 spec.after_render_event(),
                 spec.scheduler,
                 spec.scheduler_slot,
                 spec.after_render_context_address().map_err(|_| EINVAL)?,
-                0xfffffc20001c8014,
-                0xfffffc20c07c0014,
+                spec.after_render_dispatch()[0],
+                spec.after_render_dispatch()[1],
                 status,
                 status + 8,
             ]);
@@ -210,18 +533,22 @@ impl Submission {
         })
     }
     pub(crate) fn capacity(&self) -> u32 {
-        SUBMISSIONS
+        MAX_SUBMISSIONS
     }
 }
 // The source direct bootstrap reserves 258 logical command placements while
 // recycling its 240 descriptors, 256 context records and 36 scheduler records.
 pub(crate) const SUBMISSIONS: u32 = 258;
+// Descriptor queue_submission is a 24-bit count; the source wraps descriptor,
+// context and scheduler storage independently of this logical count.
+pub(crate) const MAX_SUBMISSIONS: u32 = 0xffffff;
 
 struct TransportSlot {
     physical: u64,
     retired: Option<KVVec<u8>>,
 }
-struct TransportPool {
+pub(crate) struct TransportPool {
+    base: u64,
     slots: [Option<TransportSlot>; 2],
     switches: u32,
 }
@@ -239,19 +566,37 @@ fn read_owned(memory: &Memory, vm: &Vm, address: u64, body: &mut [u8]) -> Result
 }
 
 impl TransportPool {
-    fn switch(
+    pub(crate) fn new(base: u64) -> Self {
+        Self {
+            base,
+            slots: [None, None],
+            switches: 0,
+        }
+    }
+    pub(crate) fn switch(
         &mut self,
         memory: &mut Memory,
         vm: &mut Vm,
+        queue: u64,
         pointers: u64,
         ring: u64,
         done: u32,
     ) -> Result<[u64; 2]> {
         let mut record = [0; 0xc0];
-        read_owned(memory, vm, QUEUE, &mut record)?;
+        read_owned(memory, vm, queue, &mut record)?;
         let slot = self.switches as usize % 2;
-        let next = lifecycle::transport_record(&mut record, [pointers, ring], done, slot as u32)
-            .map_err(|_| EIO)?;
+        let next = if self.base == lifecycle::TRANSPORT_BASE {
+            lifecycle::transport_record(&mut record, [pointers, ring], done, slot as u32)
+        } else {
+            lifecycle::transport_record_at(
+                &mut record,
+                [pointers, ring],
+                done,
+                slot as u32,
+                self.base,
+            )
+        }
+        .map_err(|_| EIO)?;
         // Preserve snapshots on the heap, never on the small kernel stack.
         let mut snapshot = KVVec::with_capacity(0x80 + 0x2870, GFP_KERNEL)?;
         snapshot.resize(0x80 + 0x2870, 0, GFP_KERNEL)?;
@@ -259,7 +604,7 @@ impl TransportPool {
             let Some(owned) = owned else {
                 continue;
             };
-            let base = lifecycle::TRANSPORT_BASE + index as u64 * 0x8000;
+            let base = self.base + index as u64 * 0x8000;
             for offset in [0, PAGE as u64] {
                 if vm.physical(memory, 2, base + offset)? != owned.physical + offset {
                     return Err(EIO);
@@ -276,7 +621,7 @@ impl TransportPool {
             }
         }
         for (index, owned) in self.slots.iter_mut().enumerate() {
-            if lifecycle::TRANSPORT_BASE + index as u64 * 0x8000 == pointers {
+            if self.base + index as u64 * 0x8000 == pointers {
                 let owned = owned.as_mut().ok_or(EIO)?;
                 read_owned(memory, vm, pointers, &mut snapshot[..0x80])?;
                 read_owned(memory, vm, ring, &mut snapshot[0x80..])?;
@@ -297,10 +642,10 @@ impl TransportPool {
         memory.zero(physical + PAGE as u64, 0x2870)?;
         memory.clean(physical + PAGE as u64, 0x2870)?;
         super::g17p_memory::sync();
-        vm.write(memory, 2, QUEUE, &record)?;
+        vm.write(memory, 2, queue, &record)?;
         super::g17p_memory::sync();
         let mut after = [0; 0xc0];
-        read_owned(memory, vm, QUEUE, &mut after)?;
+        read_owned(memory, vm, queue, &mut after)?;
         if after[..16] != record[..16] {
             return Err(EIO);
         }
@@ -368,11 +713,18 @@ pub(crate) fn build(
     // preemption slots occupy its first 0x84000 bytes, so use the next MiB.
     // This is driver state, not a change to the fixed USC execution base.
     let robustness = parameters.preempt + 0x100000;
-    for offset in [0, 0x8000] {
+    let mut compatibility_aliases = [None; 2];
+    for (index, offset) in [0, 0x8000].into_iter().enumerate() {
         let pa = client_storage(memory, &mut client.root, robustness + offset, PAGE)?;
         if client.root.pte(ROBUSTNESS + offset)? == 0 {
             client.root.prepare(ROBUSTNESS + offset, PAGE as u64)?;
             client.root.map_page(ROBUSTNESS + offset, pa, true)?;
+            let alias = (ROBUSTNESS + offset, client.root.pte(ROBUSTNESS + offset)?);
+            if let Some(aliases) = &mut client.primer_aliases {
+                aliases[index] = alias;
+            } else {
+                compatibility_aliases[index] = Some(alias);
+            }
         }
     }
     client_storage(memory, &mut client.root, parameters.preempt, 0xc000)?;
@@ -382,17 +734,22 @@ pub(crate) fn build(
         parameters.preempt + 0x78000,
         0xc000,
     )?;
-    cm::PageLists {
+    // The allocator consumes 4 KiB GPU pages even though UAT and Linux use
+    // 16 KiB pages. Source build_compute_operand_page_lists publishes all
+    // three padded list pages for these 21 one-megabyte tranches.
+    let page_lists = cm::PageLists {
         base: OPERANDS,
         entries: 21,
         buffer_size: 0x100000,
         buffer_stride: 0x108000,
-        page_size: PAGE,
-    }
-    .build(&mut page)
-    .map_err(|_| EINVAL)?;
-    memory.write(lists, &page)?;
-    memory.clean(lists, PAGE)?;
+        page_size: 0x1000,
+    };
+    let list_size = page_lists.size().map_err(|_| EINVAL)?;
+    let mut directory = KVVec::with_capacity(list_size, GFP_KERNEL)?;
+    directory.resize(list_size, 0, GFP_KERNEL)?;
+    page_lists.build(&mut directory).map_err(|_| EINVAL)?;
+    memory.write(lists, &directory)?;
+    memory.clean(lists, list_size)?;
     cm::operand_table_contiguous(&mut page, OPERANDS, 21).map_err(|_| EINVAL)?;
     memory.write(operands, &page)?;
     memory.clean(operands, PAGE)?;
@@ -695,23 +1052,29 @@ pub(crate) fn build(
             options(nostack, preserves_flags)
         );
     }
+    let mut private_ptes = [0; 8];
+    for (index, offset) in PRIVATE_OFFSETS.into_iter().enumerate() {
+        private_ptes[index] = client.root.pte(parameters.preempt + offset)?;
+        if private_ptes[index] & 3 != 3 { return Err(EIO); }
+    }
     Ok(Submission {
         client,
         publication,
         channel,
         ordinal: 0,
         preempt: parameters.preempt,
+        private_ptes,
+        compatibility_aliases,
         status,
         timestamps: parameters.timestamps,
         after_render,
+        retained_execution_gate: 0,
+        native_context: None,
         pointers: POINTERS,
         robustness,
         status_base,
         ring: RING,
-        transport: TransportPool {
-            slots: [None, None],
-            switches: 0,
-        },
+        transport: TransportPool::new(lifecycle::TRANSPORT_BASE),
     })
 }
 
@@ -739,6 +1102,26 @@ pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Co
     Ok((counters, done))
 }
 
+fn write_context_item(
+    memory: &mut Memory,
+    vm: &Vm,
+    address: u64,
+    current: &[u8],
+    reused: bool,
+) -> Result {
+    if !reused {
+        return vm.write(memory, 2, address, current);
+    }
+    let mut previous = [0u8; 0x200];
+    for offset in (0..previous.len()).step_by(8) {
+        let pa = vm.physical(memory, 2, address + offset as u64)?;
+        memory.invalidate(pa, 8)?;
+        previous[offset..offset + 8].copy_from_slice(&memory.read64(pa)?.to_le_bytes());
+    }
+    c::update_context(&mut previous, current).map_err(|_| EINVAL)?;
+    vm.write(memory, 2, address, &previous)
+}
+
 pub(crate) fn stage_next(
     memory: &mut Memory,
     vm: &mut Vm,
@@ -749,6 +1132,10 @@ pub(crate) fn stage_next(
     let ordinal = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
     if ordinal >= work.capacity() || parameters.preempt != work.preempt {
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
+    }
+    if !work.after_render && ordinal % (PAGE as u32 / 16) == 0 {
+        let page = vm.fresh_firmware_page(memory, lifecycle::AFTER_RENDER_STATUS)?;
+        work.status_base = page.checked_sub(ordinal as u64 * 16).ok_or(EINVAL)?;
     }
     let mut spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
     spec.status = [
@@ -775,6 +1162,18 @@ pub(crate) fn stage_next(
     } else {
         idle(memory, vm, work)?
     };
+    if ordinal % lifecycle::TRANSPORT_INTERVAL == 0 {
+        if pending {
+            return Err(EBUSY);
+        }
+        let queue = if work.after_render { lifecycle::AFTER_RENDER_QUEUE } else { QUEUE };
+        let next =
+            work.transport
+                .switch(memory, vm, queue, work.pointers, work.ring, write_index)?;
+        work.pointers = next[0];
+        work.ring = next[1];
+        write_index = 0;
+    }
     if work.after_render {
         return if ordinal == 1 {
             stage_after_render(memory, vm, work, parameters, counters)
@@ -782,17 +1181,21 @@ pub(crate) fn stage_next(
             stage_retained_after_render(memory, vm, work, parameters, counters, write_index)
         };
     }
-    if ordinal % lifecycle::TRANSPORT_INTERVAL == 0 {
-        if pending {
-            return Err(EBUSY);
-        }
-        let next = work
-            .transport
-            .switch(memory, vm, work.pointers, work.ring, write_index)?;
-        work.pointers = next[0];
-        work.ring = next[1];
-        write_index = 0;
+    for (address, size) in [
+        (spec.scheduler, 0x100),
+        (spec.scheduler_slot, 4),
+        (spec.optional, 0xc0),
+        (spec.event, 0x40),
+        (spec.dispatch[0], 8),
+        (spec.dispatch[1], 8),
+        (spec.status[0], 16),
+        (spec.context_record, 0x200),
+    ] {
+        vm.ensure_firmware(memory, address, size)?;
     }
+    vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
+    vm.flush_tables(memory)?;
+    Vm::invalidate_gpu();
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     let write = |memory: &mut Memory, address, bytes: &[u8]| vm.write(memory, 2, address, bytes);
@@ -840,6 +1243,11 @@ pub(crate) fn stage_next(
         if *number == 0x14070 {
             *value = (work.robustness + (ordinal % 2) as u64 * 0x8000) | 1;
         }
+        if let Some(slot) = work.native_context {
+            if [0x10201, 0x10428].contains(number) {
+                *value = (*value & !0xff00) | ((slot as u64) << 8);
+            }
+        }
     }
     spec.descriptor_body(
         &mut page,
@@ -850,10 +1258,19 @@ pub(crate) fn stage_next(
         parameters.timestamps,
     )
     .map_err(|_| EINVAL)?;
+    if let Some(slot) = work.native_context {
+        c::u32_at(&mut page, 0xc, slot as u32);
+    }
     write(memory, spec.descriptor, &page[..0x1000])?;
     write(memory, spec.optional, &spec.optional_body())?;
     spec.context_body(&mut page[..0x200]).map_err(|_| EINVAL)?;
-    write(memory, spec.context_record, &page[..0x200])?;
+    write_context_item(
+        memory,
+        vm,
+        spec.context_record,
+        &page[..0x200],
+        ordinal >= 256,
+    )?;
     write(memory, spec.event, &[0; 0x40])?;
     work.client.cache(false)?;
     let publication = q::Stage {
@@ -950,6 +1367,7 @@ fn stage_after_render(
         .program(parameters.preempt, parameters.cdm, 1)
         .map_err(|_| EINVAL)?;
     for (number, value) in &mut registers {
+        if *number == 0x14028 { *value = work.retained_execution_gate; }
         if *number == 0x14070 {
             *value = (work.robustness + 0x8000) | 1;
         }
@@ -1039,6 +1457,10 @@ fn stage_retained_after_render(
     write_index: u32,
 ) -> Result {
     let ordinal = work.ordinal + 1;
+    if ordinal % (PAGE as u32 / 16) == 0 {
+        let page = vm.fresh_firmware_page(memory, lifecycle::AFTER_RENDER_STATUS)?;
+        work.status_base = page.checked_sub(ordinal as u64 * 16).ok_or(EINVAL)?;
+    }
     let mut spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
     spec.status = [
         work.status_base + ordinal as u64 * 16,
@@ -1054,6 +1476,8 @@ fn stage_retained_after_render(
         (event, 0x40),
         (context, 0x200),
         (spec.status[0], 16),
+        (spec.after_render_dispatch()[0], 8),
+        (spec.after_render_dispatch()[1], 8),
     ] {
         vm.ensure_firmware(memory, address, size)?;
     }
@@ -1068,8 +1492,8 @@ fn stage_retained_after_render(
         lifecycle::SUPPORT_STATE,
         &(ordinal + 1).to_le_bytes(),
     )?;
-    for address in [0xfffffc20001c8014, 0xfffffc20c07c0014] {
-        vm.write(memory, 2, address, &[0; 4])?;
+    for address in spec.after_render_dispatch() {
+        vm.write(memory, 2, address, &[0; 8])?;
     }
     for address in spec.status {
         vm.write(memory, 2, address, &[0; 8])?;
@@ -1078,6 +1502,13 @@ fn stage_retained_after_render(
         .program(parameters.preempt, parameters.cdm, ordinal % 2)
         .map_err(|_| EINVAL)?;
     for (number, value) in &mut registers {
+        // The actual installed render layout selects the complementary gate.
+        // Legacy ordinary completion1 retains qualified gate0; independent
+        // completion0 uses Native-established post-render gate1. Cold-start
+        // ordinal-three activation remains a separate lifecycle.
+        if *number == 0x14028 {
+            *value = work.retained_execution_gate;
+        }
         if *number == 0x14070 {
             *value = (work.robustness + (ordinal % 2) as u64 * 0x8000) | 1;
         }
@@ -1094,7 +1525,7 @@ fn stage_retained_after_render(
     vm.write(memory, 2, spec.descriptor, &page[..0x1000])?;
     spec.after_render_context(&mut page[..0x200])
         .map_err(|_| EINVAL)?;
-    vm.write(memory, 2, context, &page[..0x200])?;
+    write_context_item(memory, vm, context, &page[..0x200], ordinal - 1 >= 256)?;
     vm.write(memory, 2, event, &[0; 0x40])?;
     vm.flush_tables(memory)?;
     super::g17p_memory::sync();

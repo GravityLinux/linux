@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Caller timestamp BO aliases in the source adapter's firmware aperture.
-//! Aliases and backing stay owned until both firmware instances stop. This
-//! deliberately does not recycle addresses while firmware could retain them.
+//! Bound tokens retain their backing and per-command fences. Only an unbound
+//! token whose work retired successfully can release its alias for reuse.
 
 use super::{
     g17p_drm::Object,
     g17p_memory::Memory,
     g17p_vm::{Vm, TIMESTAMP_BASE as BASE, TIMESTAMP_SIZE as SIZE},
 };
-use kernel::{drm::gem::BaseObject, prelude::*, sync::aref::ARef};
+use kernel::{
+    bindings,
+    dma_fence::{Fence, RawDmaFence},
+    drm::gem::BaseObject,
+    prelude::*,
+    sync::aref::ARef,
+};
 
 const PAGE: u64 = 0x4000;
 
@@ -18,15 +24,16 @@ struct Alias {
     offset: u64,
     size: u64,
     address: u64,
+    pages: KVec<u64>,
+    fences: KVec<Fence>,
+    unbound: bool,
 }
 pub(crate) struct Registry {
-    next: u64,
     aliases: KVec<Alias>,
 }
 impl Registry {
     pub(crate) fn new() -> Self {
         Self {
-            next: BASE,
             aliases: KVec::new(),
         }
     }
@@ -45,7 +52,23 @@ impl Registry {
         {
             return Err(EINVAL);
         }
-        let address = self.next;
+        self.reap(memory, vm)?;
+        // Source _timestamp_address: first fit over all retained allocations,
+        // including unbound tokens with pending or failed work.
+        let mut address = BASE;
+        loop {
+            let next = self
+                .aliases
+                .iter()
+                .filter(|a| a.address >= address)
+                .min_by_key(|a| a.address);
+            match next {
+                Some(alias) if address.checked_add(size).ok_or(EOVERFLOW)? > alias.address => {
+                    address = alias.address.checked_add(alias.size).ok_or(EOVERFLOW)?;
+                }
+                _ => break,
+            }
+        }
         let end = address.checked_add(size).ok_or(EOVERFLOW)?;
         if end > BASE + SIZE {
             return Err(ENOSPC);
@@ -76,11 +99,13 @@ impl Registry {
                 offset,
                 size,
                 address,
+                pages,
+                fences: KVec::new(),
+                unbound: false,
             },
             GFP_KERNEL,
         )?;
-        self.next = end;
-        for (index, pa) in pages.into_iter().enumerate() {
+        for (index, &pa) in self.aliases.last().ok_or(EIO)?.pages.iter().enumerate() {
             vm.timestamp_page(memory, address + index as u64 * PAGE, pa)?;
         }
         vm.flush_tables(memory)?;
@@ -95,6 +120,80 @@ impl Registry {
             );
         }
         Ok(address)
+    }
+
+    fn reap(&mut self, memory: &Memory, vm: &Vm) -> Result {
+        let mut index = 0;
+        while index < self.aliases.len() {
+            let alias = &mut self.aliases[index];
+            // SAFETY: The token owns each fence reference. An error signal
+            // does not prove that firmware released this timestamp backing.
+            alias
+                .fences
+                .retain(|f| unsafe { bindings::dma_fence_get_status(f.raw()) } <= 0);
+            if alias.unbound && alias.fences.is_empty() {
+                vm.unmap_timestamp(memory, alias.address, &alias.pages)?;
+                self.aliases.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unbind(&mut self, memory: &Memory, vm: &Vm, address: u64, lost: bool) -> Result {
+        self.aliases
+            .iter_mut()
+            .find(|a| a.address == address)
+            .ok_or(ENOENT)?
+            .unbound = true;
+        if !lost {
+            self.reap(memory, vm)?;
+        }
+        Ok(())
+    }
+
+    /// Retain the actual command's fence before either producer is exposed.
+    pub(crate) fn retain(&mut self, addresses: &[u64], fence: &Fence) -> Result {
+        let mut indices = KVec::new();
+        for &address in addresses {
+            if address == 0 {
+                continue;
+            }
+            let index = self
+                .aliases
+                .iter()
+                .position(|a| {
+                    !a.unbound
+                        && address >= a.address
+                        && address
+                            .checked_add(8)
+                            .is_some_and(|end| end <= a.address + a.size)
+                })
+                .ok_or(EINVAL)?;
+            if !indices.contains(&index) {
+                indices.push(index, GFP_KERNEL)?;
+            }
+        }
+        for &index in &indices {
+            self.aliases[index].fences.reserve(1, GFP_KERNEL)?;
+        }
+        for index in indices {
+            self.aliases[index].fences.push(fence.clone(), GFP_KERNEL)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fail_pending(&mut self, error: Error) {
+        for alias in &self.aliases {
+            for fence in &alias.fences {
+                // SAFETY: The alias owns this live reference throughout.
+                if unsafe { bindings::dma_fence_get_status(fence.raw()) } == 0 {
+                    fence.set_error(error);
+                    fence.signal();
+                }
+            }
+        }
     }
 
     pub(crate) fn cache(&self, addresses: [u64; 2], invalidate: bool) -> Result {
@@ -126,7 +225,7 @@ impl Registry {
                 if invalidate {
                     core::arch::asm!("dc ivac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
                 } else {
-                    core::arch::asm!("dc cvac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
+                    core::arch::asm!("dc civac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
                 }
             }
         }

@@ -22,6 +22,16 @@ pub(crate) fn transport_record(
     done: u32,
     slot: u32,
 ) -> Result<[u64; 2]> {
+    transport_record_at(record, old, done, slot, TRANSPORT_BASE)
+}
+
+pub(crate) fn transport_record_at(
+    record: &mut [u8; 0xc0],
+    old: [u64; 2],
+    done: u32,
+    slot: u32,
+    base: u64,
+) -> Result<[u64; 2]> {
     if slot > 1
         || u64::from_le_bytes(record[..8].try_into().unwrap()) != old[0]
         || u64::from_le_bytes(record[8..16].try_into().unwrap()) != old[1]
@@ -29,7 +39,9 @@ pub(crate) fn transport_record(
     {
         return Err(Error::Invalid);
     }
-    let pointers = TRANSPORT_BASE + slot as u64 * 0x8000;
+    let pointers = base
+        .checked_add(slot as u64 * 0x8000)
+        .ok_or(Error::Overflow)?;
     let ring = pointers + 0x4000;
     c::u64_at(record, 0, pointers);
     c::u64_at(record, 8, ring);
@@ -289,10 +301,20 @@ impl Retained {
     /// Ordinary force_fresh startup keeps queue one after ordinal one,
     /// omits later optionals and preserves its shared dispatch locations.
     pub(crate) fn after_render_event(&self) -> u64 {
-        match self.ordinal {
-            3 => 0xfffffc20c05e98c0,
-            n if n % 2 == 0 => 0xfffffc20c05e9c80,
-            _ => AFTER_RENDER_EVENT,
+        if self.ordinal == 1 {
+            AFTER_RENDER_EVENT
+        } else {
+            0xfffffc20c0d00000 + (self.ordinal as u64 % 256) * 0x40
+        }
+    }
+    pub(crate) fn after_render_dispatch(&self) -> [u64; 2] {
+        // Ordinal one owns the measured startup record. Later commands use
+        // ordinary source fresh dispatch slots, away from that live record.
+        if self.ordinal == 1 {
+            [0xfffffc20001c8014, 0xfffffc20c07c0014]
+        } else {
+            let slot = self.ordinal as u64 % 256;
+            [0xfffffc2001b00000 + slot * 8, 0xfffffc20c0e00000 + slot * 8]
         }
     }
     pub(crate) fn after_render_context_address(&self) -> Result<u64> {
@@ -314,7 +336,7 @@ impl Retained {
             sequence: self.ordinal as u64,
             context: 3,
             grid: 5,
-            dispatch: [0xfffffc20001c8014, 0xfffffc20c07c0014],
+            dispatch: self.after_render_dispatch(),
             status: self.status,
             timestamps,
             shared_control: SUPPORT,

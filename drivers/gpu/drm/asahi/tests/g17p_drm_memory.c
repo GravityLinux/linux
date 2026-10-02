@@ -17,6 +17,12 @@
 #include <unistd.h>
 #include "asahi_drm.h"
 
+/* These output oracles consume completed work. The extra private syncobj
+ * explicitly waits through the existing UAPI; dedicated async tests use the
+ * raw ioctl below to verify acceptance while fences are still pending. */
+#include <time.h>
+#include "g17p_drm_wait.h"
+
 #define PAGE 0x4000ULL
 #define VA 0x200000000ULL
 #define EXEC 0x10000000000ULL

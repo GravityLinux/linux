@@ -221,6 +221,8 @@ pub(crate) const RENDER_RUNS: &[(u64, usize, u64)] = &[
     (0x1000048000, 2, 0x80000000000c8b),
     (0x1000058000, 2, 0xc0000000000c8b),
     (0x1000068000, 3, 0xc0000000000c8b),
+    // Driver auxiliary metadata, outside Mesa's fixed context/printf BOs.
+    (0x1000074000, 1, 0xc0000000000c8b),
     (0x1000078000, 1, 0xc0000000000c8b),
     (0x1000080000, 1, 0xc0000000000c8b),
     (0x1000088000, 8, 0xc0000000000c8b),

@@ -74,10 +74,10 @@ pub(crate) enum Error<E> {
 /// tick2/owners2,1,0. Retirement is a separate, closing-first operation.
 /// On any failure the caller must retain all GPU-reachable owners and fail the
 /// Session. A published prefix cannot be retried or rolled back as rejection.
-pub(crate) fn release<T: Target>(
+pub(crate) fn release_opening<T: Target>(
     target: &mut T,
     b: &Boundary<'_>,
-) -> core::result::Result<(), Error<T::Error>> {
+) -> core::result::Result<Control, Error<T::Error>> {
     if !b.valid() {
         return Err(Error::InvalidBoundary);
     }
@@ -110,9 +110,13 @@ pub(crate) fn release<T: Target>(
     target.barrier();
     target.notify(RENDER_DOORBELL).map_err(Error::Access)?;
 
-    // This wait is deliberately after the complete first release window. Work
-    // remains live on both engines while the control plane catches up.
-    target.await_control(class).map_err(Error::Access)?;
+    Ok(class)
+}
+
+pub(crate) fn release_closing<T: Target>(
+    target: &mut T,
+    b: &Boundary<'_>,
+) -> core::result::Result<(), Error<T::Error>> {
     let state = target.read32(d::RENDER_INNER).map_err(Error::Access)?;
     if state != 2 {
         return Err(Error::ClassState(state));

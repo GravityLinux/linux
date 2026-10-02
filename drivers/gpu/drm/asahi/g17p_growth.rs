@@ -12,6 +12,15 @@ pub(crate) const INCREMENT: usize = 10;
 pub(crate) const REQUEST_LIMIT: u32 = 32;
 pub(crate) const GROWTH_END: u64 = GROWTH_BASE + REQUEST_LIMIT as u64 * INCREMENT as u64 * 0x28000;
 
+/// Source G17PFirstRender's global and independently overridable pool bounds.
+pub(crate) fn source_pool_limits(global: u32, overrides: [u32; 2]) -> Option<[u32; 2]> {
+    fn valid(value: u32) -> bool { value == 0 || (8..=2048).contains(&value) }
+    if !valid(global) { return None; }
+    let values = overrides.map(|value| if value == u32::MAX { global } else { value });
+    if !values.into_iter().all(valid) { return None; }
+    Some(values.map(|value| if value == 0 { 2048 } else { value }))
+}
+
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
