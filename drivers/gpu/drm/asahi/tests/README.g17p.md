@@ -41,8 +41,36 @@ free. Physical backing remains retained.
 Build compute-stress from g17p_drm_retained_wave.c with
 `-DG17P_TIMESTAMP_CAPACITY=4096`; this increases the integration fixture's
 caller timestamp storage. The driver uses normal resource leases and retired
-transport rotation. Both compute profiles recycle two finite pointer/item
-backing banks after the preceding wave retires.
+transport rotation. The ordinary path keeps separate firmware queue/context/private-state owners
+for public queues. At each 128-command transport boundary, it can publish the
+next generation on another owner while the old generation is live. Only that
+owner's own retirement permits reusing its two finite transport banks. Native
+diagnostic profiles retain the previous transport path.
+
+Independent compute queue qualification (ordinary default `compute_queues=1`):
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/make_g17p_compute_workload.py /path/to/m1n1 /tmp/g17p_drm_retained_wave_workload.h --batch-count 56 --mixed
+python3 drivers/gpu/drm/asahi/tests/make_g17p_render_workload.py /path/to/m1n1 /tmp/g17p_drm_render_batch_workload.h --triangles 131072 --batch-pair
+gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-compute-queues drivers/gpu/drm/asahi/tests/g17p_drm_compute_queues_render.c
+gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-first-compute drivers/gpu/drm/asahi/tests/g17p_drm_first_compute.c
+```
+
+On a cold driver, run `g17p-drm-compute-vm --cleanup` followed by
+`g17p-drm-compute-queues 25`: three independent public queues/VMs and distinct
+private apertures, 4200 computes, complete input/output/guard checks, each
+batch's exported fence status, and every command's timestamp pair. The first
+render is submitted after accepting the initial compute batches; eight full
+images and its own fence must pass. Reverse wait order does not substitute for
+checking every queue. Firmware publication logs and retained queue counters
+provide the rollover/ownership evidence.
+
+On a separate fresh boot, run `g17p-drm-first-compute`: the first compute is
+submitted while a long render's fence is pending, and GPU timestamps must
+show overlap. Both complete render images, compute outputs/guards, timestamp
+guards, and owned fences are checked. Follow with the retained integration
+suite above, mixed dependency/error/teardown tests, and the 90-image MSAA suite.
+No unit tests are required. GPU executable fixtures remain untouched.
 
 `g17p_drm_wait.h` adds explicit output-fence waits to the older integration
 programs. `g17p-drm-async` bypasses that adapter for submission and proves

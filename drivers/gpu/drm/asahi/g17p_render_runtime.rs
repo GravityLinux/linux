@@ -1276,7 +1276,8 @@ impl Submission {
         p: &Parameters,
     ) -> Result {
         validate_client(&client, p)?;
-        if self.adopted || self.ordinal != 0 || self.growth.is_some() {
+        if self.adopted || self.ordinal != 0
+            || (self.growth.is_some() && *crate::module_parameters::compute_queues.value()!=1) {
             return Err(EINVAL);
         }
         for index in 0..2 {

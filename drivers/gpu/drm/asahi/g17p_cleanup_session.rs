@@ -120,6 +120,7 @@ impl Session {
         if self.phase == Phase::Failed {
             return Ok(());
         }
+        self.independent_compute.require_owner_idle(owner)?;
         self.restore_owned_render_fault()?;
         if *crate::module_parameters::cleanup_diagnostics.value() & !15 != 0 {
             return Err(EINVAL);

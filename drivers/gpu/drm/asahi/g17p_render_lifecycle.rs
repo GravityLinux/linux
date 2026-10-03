@@ -322,10 +322,10 @@ impl Item {
     pub(crate) fn parameters(self, p: &Parameters) -> Parameters {
         let p = Parameters {
             lifecycle_ordinal: self.ordinal as u64,
-            // Paired-profile diagnostic: ordinary retained renders after a
-            // compute owner use the established completion1/CS-gate0 pair,
-            // including independent pools. Opening, render-only and native
-            // profiles retain their previous values; ownership is unchanged.
+            // Ordinary independent compute can start during any retained
+            // render, so its caller preselects the completion1/CS-gate0 pair.
+            // Opening and native profiles retain their qualified values;
+            // ownership and per-pool lifetime rules are unchanged.
             completion_control: u64::from(self.ordinal > 0
                 && (!self.layout.independent || !self.layout.native)
                 && p.completion_control != 0),

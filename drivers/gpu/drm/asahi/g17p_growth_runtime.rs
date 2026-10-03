@@ -69,6 +69,8 @@ pub(crate) struct Service {
     active_pool: usize,
     pub(crate) failed: Option<Error>,
     compute_terminals: u32,
+    independent_compute_mask: u128,
+    independent_compute_terminals: [u32; 128],
     compute_owners: KVec<u32>,
     receipt: Option<super::g17p_dependency::Receipt>,
     dependency: bool,
@@ -380,6 +382,12 @@ impl Service {
     pub(crate) fn terminals(&self) -> u32 {
         self.pools[self.active_pool].terminals
     }
+    pub(crate) fn register_independent_compute(&mut self, mask: u128) {
+        self.independent_compute_mask |= mask;
+    }
+    pub(crate) fn independent_compute_terminals(&self,grid:u8)->u32 {
+        self.independent_compute_terminals[usize::from(grid)]
+    }
     pub(crate) fn compute_terminals(&self) -> u32 {
         self.compute_terminals
     }
@@ -506,6 +514,8 @@ impl Service {
             active_pool: 0,
             failed: None,
             compute_terminals: 0,
+            independent_compute_mask: 0,
+            independent_compute_terminals: [0; 128],
             compute_owners: KVec::with_capacity(36, GFP_KERNEL)?,
             receipt: None,
             dependency: false,
@@ -746,6 +756,24 @@ impl Service {
             return Err(EIO);
         }
         if opcode == 1 {
+            let flags=u128::from_le_bytes(body[4..20].try_into().unwrap());
+            let independent=flags & self.independent_compute_mask;
+            if independent != 0 {
+                for grid in 0..128 {
+                    if independent & (1u128<<grid)!=0 {
+                        self.independent_compute_terminals[grid]=self.independent_compute_terminals[grid]
+                            .checked_add(1).ok_or(EOVERFLOW)?;
+                    }
+                }
+                let remaining=flags & !self.independent_compute_mask;
+                if remaining==0 {
+                    self.consume(memory,vm,next)?;
+                    return Ok(Action::Consumed);
+                }
+                // A coalesced notification can contain render and compute
+                // progress. Retire jobs only from their immutable own tickets.
+                body[4..20].copy_from_slice(&remaining.to_le_bytes());
+            }
             // The same physical report ring serves both engines. A CL2
             // terminal belongs only to the active synchronous compute owner;
             // it cannot satisfy the render pair's terminal baseline.
