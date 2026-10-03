@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/sound/apple,j773g-speaker.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple J773g internal speaker
+title: Apple J773g internal speaker and headphones
 
 maintainers:
   - Niklas Sheth <hi@niklassheth.com>
@@ -25,6 +25,10 @@ properties:
   apple,codec:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: SN012776 amplifier on the speaker I2C bus.
+
+  apple,headphone-codec:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: CS42L84 headphone codec on MCA TX2.
 
 required:
   - compatible

@@ -8,7 +8,7 @@ title: Apple MCA I2S transceiver
 
 description: |
   MCA is an I2S transceiver peripheral found on M1 and other Apple chips.
-  T8132 uses a single banked aperture; currently only its TX0 route is exposed.
+  T8132 uses a single banked aperture with one TX serializer per cluster.
   Earlier hardware is composed of a number of identical clusters which can
   operate independently or in an interlinked fashion. Up to 6 clusters have
   been seen on an MCA.
@@ -28,13 +28,16 @@ allOf:
         reg:
           maxItems: 1
         dmas:
-          maxItems: 1
+          maxItems: 6
         dma-names:
-          maxItems: 1
-        clocks:
-          maxItems: 1
-        power-domains:
-          maxItems: 2
+          minItems: 1
+          items:
+            - const: tx0a
+            - const: tx1a
+            - const: tx2a
+            - const: tx3a
+            - const: tx4a
+            - const: tx5a
     else:
       properties:
         reg:
@@ -43,6 +46,31 @@ allOf:
           minItems: 16
         dma-names:
           minItems: 16
+          items:
+            - const: tx0a
+            - const: rx0a
+            - const: tx0b
+            - const: rx0b
+            - const: tx1a
+            - const: rx1a
+            - const: tx1b
+            - const: rx1b
+            - const: tx2a
+            - const: rx2a
+            - const: tx2b
+            - const: rx2b
+            - const: tx3a
+            - const: rx3a
+            - const: tx3b
+            - const: rx3b
+            - const: tx4a
+            - const: rx4a
+            - const: tx4b
+            - const: rx4b
+            - const: tx5a
+            - const: rx5a
+            - const: tx5b
+            - const: rx5b
         clocks:
           minItems: 4
         power-domains:
@@ -91,31 +119,7 @@ properties:
 
   dma-names:
     minItems: 1
-    items:
-      - const: tx0a
-      - const: rx0a
-      - const: tx0b
-      - const: rx0b
-      - const: tx1a
-      - const: rx1a
-      - const: tx1b
-      - const: rx1b
-      - const: tx2a
-      - const: rx2a
-      - const: tx2b
-      - const: rx2b
-      - const: tx3a
-      - const: rx3a
-      - const: tx3b
-      - const: rx3b
-      - const: tx4a
-      - const: rx4a
-      - const: tx4b
-      - const: rx4b
-      - const: tx5a
-      - const: rx5a
-      - const: tx5b
-      - const: rx5b
+    maxItems: 24
     description: |
       Names for the DMA channels: 'tx'/'rx', then cluster number, then 'a'/'b'
       based on the associated SERDES unit.
