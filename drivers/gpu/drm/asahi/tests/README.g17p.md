@@ -18,6 +18,26 @@ g17p-drm-compute-stress --compute-count 4096
 g17p-drm-render-vm --stress
 ```
 
+The independent-pool fixture submits fifteen separate queues in one VM, with
+120 independent full-image oracles, per-job output fences, four GPU timestamps,
+and timestamp guard regions. Generate its caller data from the same authored
+payloads as the retained-render tests (opaque executable pages stay unchanged):
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/make_g17p_multi_pool_workload.py /path/to/m1n1 drivers/gpu/drm/asahi/tests/g17p_drm_multi_pool_workload.h
+gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-multi-pool drivers/gpu/drm/asahi/tests/g17p_drm_multi_pool.c
+g17p-drm-multi-pool 1 --require-overlap
+g17p-drm-multi-pool 4096 && g17p-drm-multi-pool 4096
+```
+
+The short overlap mode requires at least three simultaneous TA-start through
+FR-end intervals. The long runs verify every image and fence through repeated
+descriptor, context, status, pool-record, scratch and transport reuse, including
+the shared TA249..255 / FR0..1 descriptor-address collision. They also cross
+the global u16 optional-ordinal wrap. Each finite storage slot remains leased
+until its own render retires; a conflicting slot is skipped when another is
+free. Physical backing remains retained.
+
 Build compute-stress from g17p_drm_retained_wave.c with
 `-DG17P_TIMESTAMP_CAPACITY=4096`; this increases the integration fixture's
 caller timestamp storage. The driver uses normal resource leases and retired

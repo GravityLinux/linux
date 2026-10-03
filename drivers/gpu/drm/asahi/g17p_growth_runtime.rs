@@ -72,7 +72,7 @@ pub(crate) struct Service {
     compute_owners: KVec<u32>,
     receipt: Option<super::g17p_dependency::Receipt>,
     dependency: bool,
-    pool_limits: [u32; 2],
+    pool_limits: [u32; super::g17p_render_lifecycle::POOL_SLOTS as usize],
 }
 
 fn word(memory: &Memory, vm: &Vm, va: u64) -> Result<u32> {
@@ -100,7 +100,8 @@ impl Service {
     pub(crate) fn set_source_pool_limits(&mut self, global: u32, overrides: [u32; 2]) -> Result {
         let limits = g::source_pool_limits(global, overrides).ok_or(EINVAL)?;
         if self.pools.iter().any(|pool| pool.counter != 0) { return Err(EBUSY); }
-        self.pool_limits = limits;
+        self.pool_limits.fill(if global == 0 { CAPACITY } else { global });
+        self.pool_limits[..2].copy_from_slice(&limits);
         Ok(())
     }
     fn initial_mappings(
@@ -154,12 +155,14 @@ impl Service {
         list: u64,
         shared: u64,
         request_limit: u32,
+        layout: super::g17p_render_lifecycle::Layout,
     ) -> Result {
         if self.failed.is_some()
             || self.dependency
-            || self.pools.len() != 1
+            || layout.pair as usize != self.pools.len()
+            || super::g17p_render_lifecycle::pool_grids(layout.pair).map_err(|_| EINVAL)? != layout.grids
             || !(1..=512).contains(&request_limit)
-            || word(memory, vm, shared + 0xc)? != 1
+            || word(memory, vm, shared + 0xc)? != layout.pair
             || word(memory, vm, state)? != 8
             || word(memory, vm, state + 4)? != 8
         {
@@ -167,9 +170,7 @@ impl Service {
         }
         let length = (request_limit as u64).checked_mul(g::INCREMENT as u64)
             .and_then(|n| n.checked_mul(0x28000)).ok_or(EOVERFLOW)?;
-        let mut growth_base = self.pools[0].growth_base.checked_add(
-            self.pools[0].request_limit as u64 * g::INCREMENT as u64 * 0x28000)
-            .ok_or(EOVERFLOW)?;
+        let mut growth_base = self.reserved_growth_end()?;
         // Select a whole tranche absent from the executable caller/private
         // root. Valid caller bindings (including future shader encoders) are
         // not rejected merely because they occupy an old fixed candidate VA.
@@ -191,7 +192,7 @@ impl Service {
         }
         self.pools.push(
             Pool {
-                identity: g::Owner { vm: 1, pool: 1 },
+                identity: g::Owner { vm: 1, pool: layout.pair },
                 root: root.root(),
                 slot: 1,
                 counter: 0,
@@ -208,8 +209,8 @@ impl Service {
                 counter_baseline: 0,
                 work: [0; 2],
                 fragment: 0,
-                fragment_event: 3,
-                terminal_mask: 12,
+                fragment_event: layout.grids[1],
+                terminal_mask: (1 << layout.grids[0]) | (1 << layout.grids[1]),
                 mappings: Self::initial_mappings(memory, vm, list, root)?,
             },
             GFP_KERNEL,
@@ -310,7 +311,7 @@ impl Service {
         if !pool.retired {
             return Err(EBUSY);
         }
-        if ![1, 3].contains(&event) && !(self.dependency && pool_id == 0 && event == 2) {
+        if event != pool.fragment_event {
             return Err(EINVAL);
         }
         pool.generation = generation;
@@ -508,7 +509,7 @@ impl Service {
             compute_owners: KVec::with_capacity(36, GFP_KERNEL)?,
             receipt: None,
             dependency: false,
-            pool_limits: [CAPACITY; 2],
+            pool_limits: [CAPACITY; super::g17p_render_lifecycle::POOL_SLOTS as usize],
         })
     }
 
@@ -755,10 +756,13 @@ impl Service {
                 .fold(0, |bits, pool| bits | pool.terminal_mask);
             let mut mask = 0;
             for (index, pool) in self.pools.iter().enumerate() {
-                if subtype == pool.terminal_mask || (self.pools.len() == 2 && subtype == combined) {
+                if subtype & !combined == 0 && subtype & pool.terminal_mask == pool.terminal_mask {
                     mask |= 1 << index;
                 }
             }
+            let recognized = self.pools.iter().enumerate().fold(0, |bits, (index, pool)|
+                bits | if mask & (1 << index) != 0 { pool.terminal_mask } else { 0 });
+            if mask != 0 && subtype != recognized { return Err(EIO); }
             if mask == 0 && body[8..16] == [0; 8] {
                 if (!mixed && compute_ordinal.is_none()) || self.compute_owners.is_empty() {
                     return Err(EIO);

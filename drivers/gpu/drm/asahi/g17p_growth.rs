@@ -35,7 +35,8 @@ pub(crate) struct Owner {
 }
 impl Owner {
     pub(crate) fn valid(self) -> bool {
-        matches!((self.vm, self.pool), (1, 0) | (1, 1) | (2, 1))
+        (self.vm == 1 && self.pool < super::g17p_render_lifecycle::POOL_SLOTS)
+            || (self.vm == 2 && self.pool == 1)
     }
     pub(crate) fn request(self, body: &[u8], counter: u32) -> bool {
         if !self.valid() || body.len() != 0x48 {
@@ -46,7 +47,8 @@ impl Owner {
             && u32_at(body, 4) == self.vm
             && u32_at(body, 8) == self.pool
             && u32_at(body, 12) == counter
-            && (scheduling == (0, 1) || self.pool == 1 && scheduling == (2, 4))
+            && (scheduling == (0, 1) || super::g17p_render_lifecycle::pool_grids(self.pool)
+                .is_ok_and(|grids| scheduling == (grids[0], 1u64 << grids[0])))
             && body[20..56].iter().all(|b| *b == 0)
             && u64_at(body, 56) == 1
     }

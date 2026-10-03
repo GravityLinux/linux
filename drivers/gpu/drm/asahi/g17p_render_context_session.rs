@@ -197,7 +197,7 @@ impl Session {
             if *crate::module_parameters::partial_independent_owner.value() == 1
                 && *crate::module_parameters::alternate_queue_pairs.value() == 1
             {
-                work.create_second_pair(
+                work.create_render_pools(
                     self.memory.as_mut().ok_or(EINVAL)?,
                     self.vm.as_mut().ok_or(EINVAL)?,
                 )?;

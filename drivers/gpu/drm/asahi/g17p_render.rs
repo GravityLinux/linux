@@ -101,6 +101,9 @@ pub(crate) struct Parameters {
     pub(crate) status_item_index: Option<u64>,
     pub(crate) native_cycle_registers: bool,
     pub(crate) pair_resource_stride: u64,
+    pub(crate) cycle_base: Option<u64>,
+    pub(crate) record_index_base: Option<u64>,
+    pub(crate) record_index_offset: Option<u64>,
     pub(crate) native_record_index_register: bool,
     pub(crate) native_pair_registers: bool,
     pub(crate) native_status_registers: bool,
@@ -196,6 +199,9 @@ impl Default for Parameters {
             status_queue_pair: None,
             status_item_index: None,
             native_cycle_registers: false,
+            cycle_base: None,
+            record_index_base: None,
+            record_index_offset: None,
             pair_resource_stride: 6160384,
             native_record_index_register: false,
             native_pair_registers: false,
@@ -275,12 +281,14 @@ impl Parameters {
                 (32, 32) | (32, 16) | (16, 16)
             )
             || !matches!(self.samples, 1 | 2 | 4)
-            || self.queue_pair > 3
+            || self.queue_pair >= super::g17p_render_lifecycle::POOL_SLOTS as u64
             || self.status_queue_pair.is_some_and(|v| v > 3)
             || self
                 .native_context_slot
                 .is_some_and(|v| !matches!(v, 1 | 2))
-            || self.tvb_pool_id.is_some_and(|v| v > 1)
+            || self.tvb_pool_id.is_some_and(|v| v >= super::g17p_render_lifecycle::POOL_SLOTS as u64)
+            || ((self.native_item_fields || self.native_status_registers)
+                && self.status_queue_pair.unwrap_or(self.queue_pair) > 3)
             || self.lifecycle_ordinal > u32::MAX as u64 * 2 / 3
             || self.sampler_count >= u32::MAX as u64
             || (self.sampler_array == 0) != (self.sampler_count == 0)
@@ -331,9 +339,9 @@ impl Parameters {
     }
     fn cycle(&self) -> Result<u64> {
         let pair = self.native_item_fields || self.native_pair_registers || self.native_cycle_registers;
-        let base = add(0x178000, if pair {
+        let base = self.cycle_base.unwrap_or(add(0x178000, if pair {
             self.queue_pair.checked_mul(self.pair_resource_stride).ok_or(Error::Overflow)?
-        } else { 0 })?;
+        } else { 0 })?);
         // The source owns one 16 KiB page of 32-byte scratch slots. The
         // first item uses +0x20; the last slot wraps to +0 after retirement.
         let offset = if pair || self.local_item_registers {
@@ -344,11 +352,11 @@ impl Parameters {
     fn record_index(&self) -> Result<u64> {
         let pair = self.native_item_fields || self.native_pair_registers || self.native_record_index_register;
         let offset = if pair || self.local_item_registers {
-            ((if pair { self.queue_pair * 0x140 } else { 0 })
+            ((self.record_index_offset.unwrap_or(if pair { self.queue_pair * 0x140 } else { 0 }))
                 + (self.queue_item_index % 4096 + 1) * 4) % 0x4000
         } else { 4 };
         // Bit zero is the register's flag, separate from its page offset.
-        Ok(0x80001 + offset)
+        Ok(self.record_index_base.unwrap_or(0x80000) + 1 + offset)
     }
     fn status(&self, kind: Kind) -> Result<u64> {
         let bases = match kind {
@@ -794,7 +802,7 @@ impl Descriptor<'_> {
         if let Some(p) = parameters {
             p.validate()?;
         }
-        if out.len() != self.kind.size() || registers.len() > 128 || self.queue_pair > 3 {
+        if out.len() != self.kind.size() || registers.len() > 128 || self.queue_pair >= super::g17p_render_lifecycle::POOL_SLOTS {
             return Err(Error::Invalid);
         }
         let native_slot = parameters.and_then(|p| p.native_context_slot);
@@ -1030,7 +1038,7 @@ impl Descriptor<'_> {
                     2 => add(v, self.queue_pair as u64 * 8)?,
                     3 => add(
                         self.status_base
-                            .unwrap_or(status_bases[self.queue_pair as usize]),
+                            .or_else(|| status_bases.get(self.queue_pair as usize).copied()).ok_or(Error::Invalid)?,
                         (self.index % 256) as u64 * 0x40,
                     )?,
                     _ => v,

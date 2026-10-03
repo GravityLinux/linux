@@ -301,15 +301,16 @@ pub(crate) fn paired_dependencies(
     pair: u8,
     item: u32,
 ) -> Result<([(u8, u32); 2], usize)> {
-    if pair > 1 || item >= (1 << 30) - 1 {
+    paired_grid_dependencies(kind, super::g17p_render_lifecycle::pool_grids(pair as u32)?, item)
+}
+pub(crate) fn paired_grid_dependencies(kind: Kind, grids: [u32; 2], item: u32)
+    -> Result<([(u8, u32); 2], usize)> {
+    if grids.iter().any(|grid| *grid >= 128) || item >= (1 << 30) - 1 {
         return Err(Error::Invalid);
     }
-    let grid = pair * 2 + u8::from(kind == Kind::Fragment);
-    Ok(if kind == Kind::Tiling {
-        ([(grid, item), (0, 0)], 1)
-    } else {
-        ([(grid - 1, item + 1), (grid, item)], 2)
-    })
+    let [ta, fr] = grids.map(|grid| grid as u8);
+    Ok(if kind == Kind::Tiling { ([(ta, item), (0, 0)], 1) }
+       else { ([(ta, item + 1), (fr, item)], 2) })
 }
 
 pub(crate) struct Context<'a> {
@@ -407,7 +408,7 @@ impl Context<'_> {
                 w[1] = 0;
                 extended_locators = true;
             } else {
-                if self.pair > 1 {
+                if self.pair >= super::g17p_render_lifecycle::POOL_SLOTS {
                     return Err(Error::Invalid);
                 }
                 if self.pair == 1 {
@@ -434,6 +435,14 @@ impl Context<'_> {
                         w[0x160 / 8] = 0x0000100380004d89;
                         w[0x168 / 8] = 0x0000100380004dc2;
                     }
+                }
+                if self.pair >= 2 {
+                    let grid = self.grid.ok_or(Error::Invalid)?;
+                    if grid >= 32 || grid % 2 != u32::from(fragment) { return Err(Error::Invalid); }
+                    w[0] = (u64::from(fragment) << 58) | ((grid as u64) << 42) | 4;
+                    w[0x20 / 8] |= (self.pair as u64) << 32;
+                    w[0x28 / 8] = ((grid - u32::from(fragment)) as u64) << 40 | u64::from(fragment);
+                    if fragment { w[0x30 / 8] = (grid as u64) << 40; }
                 }
                 w[0] = add(w[0], self.item as u64 * 4)?;
                 w[0x28 / 8] = add(w[0x28 / 8], self.item as u64)?;
