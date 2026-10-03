@@ -22,6 +22,7 @@
 		compatible = "apple,j773g-speaker";
 		apple,mca = <&mca>;
 		apple,codec = <&speaker_amp>;
+		apple,headphone-codec = <&jack_codec>;
 	};
 
 	aliases {
@@ -296,5 +297,19 @@
 		reg = <0x38>;
 		#sound-dai-cells = <0>;
 		shutdown-gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <98 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
 	};
 };

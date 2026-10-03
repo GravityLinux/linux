@@ -691,10 +691,11 @@
 			compatible = "apple,t8132-mca";
 			reg = <0x3 0x93600000 0 0xc000>;
 			#sound-dai-cells = <1>;
-			clocks = <&clkref>;
-			power-domains = <&ps_audio_p>, <&ps_audio_mca0_m>;
-			dmas = <&admac 0>;
-			dma-names = "tx0a";
+			clocks = <&clkref>, <&clkref>, <&clkref>;
+			power-domains = <&ps_audio_p>, <&ps_audio_mca0_m>,
+					<&ps_audio_mca1_m>, <&ps_audio_mca2_m>;
+			dmas = <&admac 0>, <&admac 2>, <&admac 4>;
+			dma-names = "tx0a", "tx1a", "tx2a";
 			status = "disabled";
 		};
 

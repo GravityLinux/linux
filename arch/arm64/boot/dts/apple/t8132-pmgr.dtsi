@@ -1177,4 +1177,22 @@
 		power-domains = <&ps_audio_p>;
 	};
 
+	ps_audio_mca1_m: power-controller@f0 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xf0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca1_m";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_mca2_m: power-controller@f8 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xf8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca2_m";
+		power-domains = <&ps_audio_p>;
+	};
+
 };
