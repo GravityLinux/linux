@@ -15,6 +15,37 @@ use super::{
 // previously qualified bounded storage profile.
 pub(crate) const STORAGE_SUBMISSIONS: u32 = 256;
 pub(crate) const NATIVE_SUBMISSIONS: u32 = 255;
+// The terminal report is a u32 grid bitmap. Compute reserves grids 4/5;
+// each render owner consumes an adjacent TA/FR pair from the remaining bits.
+pub(crate) const POOL_SLOTS: u32 = (u32::BITS - 2) / 2;
+pub(crate) fn pool_grids(pool: u32) -> Result<[u32; 2]> {
+    if pool >= POOL_SLOTS { return Err(Error::Invalid); }
+    let ta = 2 * pool + if pool >= 2 { 2 } else { 0 };
+    Ok([ta, ta + 1])
+}
+pub(crate) fn private_delta(pool: u32) -> u64 {
+    if pool < 2 { 0 } else { 0x80000000 + (pool as u64 - 2) * 0x2000000 }
+}
+pub(crate) fn extra_pool(pool: u32) -> Result<Layout> {
+    if pool < 2 { return Err(Error::Invalid); }
+    let grids = pool_grids(pool)?;
+    let base = 0xfffffc20d0000000 + (pool as u64 - 2) * 0x200000;
+    let low = 0x7100000000 + (pool as u64 - 2) * 0x100000;
+    Ok(Layout {
+        queues: [base, base + 0xc0],
+        pointers: [base + 0x8000, base + 0x10000],
+        rings: [base + 0x18000, base + 0x20000],
+        status: [base + 0x28000, base + 0x30000],
+        job_list: base + 0x38000,
+        pools: [base + 0x40100, base + 0x48080],
+        shared: [base + 0x88000, base + 0x4a800],
+        leaves: [base + 0x50000, base + 0x60000, base + 0x68000,
+                 base + 0x70000, base + 0x78000, base + 0x80000],
+        contexts: [(base + 0x90000, low), (base + 0xb0000, low + 0x20000)],
+        grids, pair: pool, ..SECOND
+    })
+}
+
 pub(crate) const DESCRIPTORS: [u64; 2] = [0xfffffc20c0018000, 0xfffffc20c00b0000];
 pub(crate) const QUEUES: [u64; 2] = [0xfffffc20c0000000, 0xfffffc20c00000c0];
 pub(crate) const POINTERS: [u64; 2] = [0xfffffc2000010000, 0xfffffc2000012870];
@@ -34,6 +65,24 @@ pub(crate) const LEAVES: [u64; 6] = [
 ];
 pub(crate) const JOB_LIST: u64 = 0xfffffc2000000000;
 pub(crate) const FW_TIMESTAMPS: [u64; 2] = [0xfffffc2000024c68, 0xfffffc2000024c70];
+
+/// Descriptor arrays retain their Source addresses and partially overlap:
+/// TA slots 249..255 intersect FR slots 0..1. Ownership follows physical
+/// intervals, not matching slot numbers. Equal slots also own the optional,
+/// event and timestamp records. The low aliases have the same relative layout.
+pub(crate) fn storage_conflicts(left: u32, right: u32) -> bool {
+    if left == right { return true; }
+    for a in [Kind::Tiling, Kind::Fragment] {
+        let start = DESCRIPTORS[a.index() as usize] + left as u64 * a.size() as u64;
+        for b in [Kind::Tiling, Kind::Fragment] {
+            let other = DESCRIPTORS[b.index() as usize] + right as u64 * b.size() as u64;
+            if start < other + b.size() as u64 && other < start + a.size() as u64 {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Source scheduler_publication_values for the synchronous ordinary pair.
 pub(crate) fn scheduler_phases(current: u32, reused: bool) -> Result<[u32; 3]> {
@@ -174,6 +223,7 @@ pub(crate) const SECOND: Layout = Layout {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Item {
     pub(crate) ordinal: u32,
+    pub(crate) storage: u32,
     pub(crate) index: u32,
     pub(crate) layout: Layout,
 }
@@ -184,6 +234,7 @@ impl Item {
         }
         Ok(Self {
             ordinal,
+            storage: ordinal % STORAGE_SUBMISSIONS,
             index: ordinal,
             layout: ORDINARY,
         })
@@ -195,6 +246,7 @@ impl Item {
         }
         Ok(Self {
             ordinal,
+            storage: ordinal % STORAGE_SUBMISSIONS,
             index,
             layout,
         })
@@ -202,7 +254,7 @@ impl Item {
     pub(crate) fn descriptor_address(self, kind: Kind) -> u64 {
         DESCRIPTORS[kind.index() as usize] + self.storage_ordinal() as u64 * kind.size() as u64
     }
-    pub(crate) fn storage_ordinal(self) -> u32 { self.ordinal % STORAGE_SUBMISSIONS }
+    pub(crate) fn storage_ordinal(self) -> u32 { self.storage }
     pub(crate) fn descriptor_alias(self, kind: Kind) -> u64 {
         [0x7000000000, 0x7000098000][kind.index() as usize]
             + self.storage_ordinal() as u64 * kind.size() as u64
@@ -242,7 +294,7 @@ impl Item {
         }
     }
     pub(crate) fn retirement_leaf(self) -> Option<u64> {
-        (self.layout.pair == 1 && self.index == 0).then_some(self.layout.leaves[4] + 0x40)
+        (self.layout.pair != 0 && self.index == 0).then_some(self.layout.leaves[4] + 0x40)
     }
     pub(crate) fn tilemap_reset(self, p: &Parameters) -> Option<u64> {
         (self.index >= 8).then_some(
@@ -297,13 +349,17 @@ impl Item {
             if self.layout.pair == 0 {
                 return p;
             }
+            let delta = private_delta(self.layout.pair);
             Parameters {
-                ta_status: 0x1000230000,
-                fragment_status: 0x1000358000,
-                deflake_1: 0x10010002a0,
-                deflake_2: 0x1001000020,
-                deflake_3: 0x1001000000,
-                aux_fb: 0x1001004000,
+                cycle_base: Some(0x328000 + delta),
+                record_index_base: Some(0x80000 + delta),
+                record_index_offset: Some(0x140),
+                ta_status: 0x1000230000 + delta,
+                fragment_status: 0x1000358000 + delta,
+                deflake_1: 0x10010002a0 + delta,
+                deflake_2: 0x1001000020 + delta,
+                deflake_3: 0x1001000000 + delta,
+                aux_fb: 0x1001004000 + delta,
                 ..p
             }
         } else {
@@ -426,7 +482,7 @@ impl Item {
         .build(out)
     }
     pub(crate) fn context(self, kind: Kind, p: &r::Parameters, out: &mut [u8]) -> Result {
-        let (internal, count) = graph::paired_dependencies(kind, self.layout.pair as u8, self.index)?;
+        let (internal, count) = graph::paired_grid_dependencies(kind, self.layout.grids, self.index)?;
         let mut points = [(0u8, 0u32); 4];
         points[..count].copy_from_slice(&internal[..count]);
         let mut count = count;

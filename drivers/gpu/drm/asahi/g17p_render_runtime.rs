@@ -64,8 +64,15 @@ struct Deferred {
     address: u64,
     body: KVVec<u8>,
 }
+fn pool_count() -> u64 {
+    if *crate::module_parameters::partial_independent_owner.value() != 1 { 1 }
+    else if *crate::module_parameters::alternate_queue_pairs.value() != 1
+        || *crate::module_parameters::native_render_vms.value() == 1 { 2 }
+    else { life::POOL_SLOTS as u64 }
+}
 fn transport_pools(pair: u32) -> [super::g17p_compute_runtime::TransportPool; 2] {
-    let base = 0xfffffc20cf010000 + pair as u64 * 0x20000;
+    let base = if pair < 2 { 0xfffffc20cf010000 + pair as u64 * 0x20000 }
+        else { 0xfffffc20d00d0000 + (pair as u64 - 2) * 0x200000 };
     [super::g17p_compute_runtime::TransportPool::new(base),
      super::g17p_compute_runtime::TransportPool::new(base + 0x10000)]
 }
@@ -141,7 +148,7 @@ pub(crate) fn milestones(item: life::Item) -> Result<[Milestone; 2]> {
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
     let event_slot: u8 = item.layout.pair.try_into().map_err(|_| EINVAL)?;
-    if event_slot > 1 { return Err(EINVAL); }
+    if u32::from(event_slot) >= life::POOL_SLOTS { return Err(EINVAL); }
     let value = item.index.checked_add(1).ok_or(EOVERFLOW)?;
     if value >= (1 << 30) { return Err(EOVERFLOW); }
     let mut result = [Milestone { event_slot, grid: 0, value }; 2];
@@ -165,7 +172,7 @@ pub(crate) struct Ticket {
 }
 impl Ticket {
     pub(crate) fn capture(work: &Submission, ordinary_growth: bool) -> Result<Self> {
-        let item = life::Item { ordinal: work.ordinal, index: work.item_index, layout: work.layout };
+        let item = life::Item { ordinal: work.ordinal, storage: work.storage, index: work.item_index, layout: work.layout };
         let mut statuses = [0; 2];
         for (status, base) in statuses.iter_mut().zip(work.layout.status) {
             *status = base.checked_add((work.item_index % life::STORAGE_SUBMISSIONS) as u64 * 0x40)
@@ -186,13 +193,15 @@ pub(crate) struct Submission {
     pub(crate) timestamps: [u64; 4],
     pub(crate) growth: Option<super::g17p_growth_runtime::Service>,
     pub(crate) ordinal: u32,
+    pub(crate) storage: u32,
+    pub(crate) next_storage: Option<u32>,
     pub(crate) item_index: u32,
     pub(crate) layout: life::Layout,
     deferred: [KVec<Deferred>; 2],
     transports: [super::g17p_compute_runtime::TransportPool; 2],
     empty_high: [u64; 2],
     adopted: bool,
-    other: Option<Transport>,
+    others: KVec<Transport>,
     fresh_pair: bool,
     scratch_layout: (u64, u64, u64),
     scratch_key: ScratchKey,
@@ -205,23 +214,25 @@ impl Submission {
     pub(crate) fn same_geometry(&self, p: &Parameters) -> bool {
         self.scratch_key == ScratchKey::of(p)
     }
-    fn ticket_parameters(&self, ordinal: u32, p: Parameters) -> Parameters {
+    fn ticket_parameters(&self, storage: u32, p: Parameters) -> Parameters {
         let Some(base) = self.firmware_timestamps else { return p; };
         // Finite descriptor ownership has the same 256-item storage cycle.
-        // The selected pool must retire before any timestamp slot is reused.
+        // The physical slot lease must retire before its timestamp is reused.
         // CPU Vm::write performs whole64-byte line maintenance. Never
         // clear/clean a line containing another live firmware timestamp.
-        let a = base + (ordinal % life::STORAGE_SUBMISSIONS) as u64 * 64;
+        let a = base + storage as u64 * 64;
         Parameters { timestamp_a: a, timestamp_b: a + 8,
             ta_timestamp_end: a + 8, fragment_timestamp_start: a,
             fragment_timestamp_end: a + 8, ..p }
     }
-    pub(crate) fn preparation_seed(&self, p: &Parameters, ahead: u32) -> Result<Option<KBox<PreparationSeed>>> {
+    pub(crate) fn preparation_seed(&self, p: &Parameters, ahead: u32, pair: u32, storage: u32) -> Result<Option<KBox<PreparationSeed>>> {
+        if storage >= life::STORAGE_SUBMISSIONS { return Err(EINVAL); }
         if ahead == 0 { return Err(EINVAL); }
+        if ahead != 1 { return Ok(None); }
         if self.layout.native { return Ok(None); }
         let mut p = p.with_geometry_scratch().map_err(|_| EINVAL)?;
         let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-        if stride.checked_mul(8).ok_or(EOVERFLOW)? > 0x24000 || tpc > PAGE as u64 {
+        if pool_count() > 2 || stride.checked_mul(8).ok_or(EOVERFLOW)? > 0x24000 || tpc > PAGE as u64 {
             let key = ScratchKey::of(&p);
             let Some(lease) = self.scratch_leases.iter().find(|lease| lease.key == key) else {
                 return Ok(None); // New private geometry requires locked allocation.
@@ -231,16 +242,15 @@ impl Submission {
                 .with_geometry_scratch().map_err(|_| EINVAL)?;
         }
         let ordinal = self.ordinal.checked_add(ahead).ok_or(EOVERFLOW)?;
-        let (layout, index) = if ahead == 1 && self.layout.independent
-            && *crate::module_parameters::alternate_queue_pairs.value() == 1
-            && self.layout.pair != (ordinal & 1) {
-            let Some(other) = self.other.as_ref() else { return Ok(None); };
+        let (layout, index) = if self.layout.pair != pair {
+            let Some(other) = self.others.iter().find(|other| other.layout.pair == pair) else { return Ok(None); };
             (other.layout, if other.fresh { 0 } else { other.item_index.checked_add(1).ok_or(EOVERFLOW)? })
         } else {
-            (self.layout, if self.fresh_pair { ahead - 1 } else { self.item_index.checked_add(ahead).ok_or(EOVERFLOW)? })
+            (self.layout, if self.fresh_pair { 0 } else { self.item_index.checked_add(1).ok_or(EOVERFLOW)? })
         };
-        let item = life::Item::retained(ordinal, index, layout).map_err(|_| EINVAL)?;
-        p = self.ticket_parameters(item.ordinal, p);
+        let mut item = life::Item::retained(ordinal, index, layout).map_err(|_| EINVAL)?;
+        item.storage = storage;
+        p = self.ticket_parameters(item.storage, p);
         let mut bindings = KVec::new();
         bindings.extend_from_slice(&self.client.bindings, GFP_KERNEL)?;
         Ok(Some(KBox::new(PreparationSeed { item, parameters: p, client: self.client.lease()?, bindings }, GFP_KERNEL)?))
@@ -285,7 +295,7 @@ pub(crate) fn complete_leaf_publication(memory: &mut Memory, vm: &Vm, work: &Sub
     // _complete_native_leaf_publication, enabled by G17P_DEFAULTS. Retain
     // the created pair's first retired shared-slot value before list cleanup.
     complete_ticket_leaf_publication(memory, vm, life::Item {
-        ordinal: work.ordinal, index: work.item_index, layout: work.layout,
+        ordinal: work.ordinal, storage: work.storage, index: work.item_index, layout: work.layout,
     })
 }
 pub(crate) fn complete_ticket_leaf_publication(memory: &mut Memory, vm: &Vm, item: life::Item) -> Result {
@@ -487,7 +497,7 @@ fn select_scratch(memory: &mut Memory, client: &mut Client,
     p.validate().map_err(|_| EINVAL)?;
     let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
     let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
-    if ring <= 0x24000 && tpc <= PAGE as u64 {
+    if pool_count() <= 2 && ring <= 0x24000 && tpc <= PAGE as u64 {
         return p.with_geometry_scratch().map_err(|_| EINVAL);
     }
     let key = ScratchKey::of(p);
@@ -496,7 +506,7 @@ fn select_scratch(memory: &mut Memory, client: &mut Client,
         let tpc_size = align_page(tpc)?;
         let pair_stride = tilemap_size.checked_add(tpc_size).ok_or(EOVERFLOW)?;
         // Both independent queue-pair namespaces have disjoint region/TPC pages.
-        let span = pair_stride.checked_mul(2).ok_or(EOVERFLOW)?;
+        let span = pair_stride.checked_mul(pool_count()).ok_or(EOVERFLOW)?;
         let base = align_page(*cursor)?;
         let end = base.checked_add(span).ok_or(EOVERFLOW)?;
         // TA compact addresses cover exactly the source context's 4GB aperture.
@@ -540,7 +550,7 @@ fn select_scratch(memory: &mut Memory, client: &mut Client,
 fn validate_scratch_backing(client: &Client, p: &Parameters) -> Result {
     let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
     let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
-    let pairs: u64 = if *crate::module_parameters::partial_independent_owner.value() == 1 { 2 } else { 1 };
+    let pairs = pool_count();
     for pair in 0..pairs {
         let delta = pair.checked_mul(p.scratch_pair_stride).ok_or(EOVERFLOW)?;
         for (base, len) in [(p.tilemap, ring), (p.tpc, tpc)] {
@@ -919,10 +929,12 @@ pub(crate) fn build(
         ],
         growth: None,
         ordinal: 0,
+        storage: 0,
+        next_storage: None,
         item_index: 0,
         layout: life::ORDINARY,
         adopted: false,
-        other: None,
+        others: KVec::new(),
         transports: transport_pools(0),
         fresh_pair: false,
         scratch_layout: p.scratch_layout().map_err(|_| EINVAL)?,
@@ -948,7 +960,7 @@ fn tlbi() {
 }
 impl Submission {
     pub(crate) fn create_second_pair(&mut self, memory: &mut Memory, vm: &mut Vm) -> Result {
-        if self.other.is_some() {
+        if self.others.len() >= 1 {
             return Ok(());
         }
         if self.layout.native || self.layout.pair != 0 || self.growth.is_none() {
@@ -1086,6 +1098,7 @@ impl Submission {
             layout.leaves[1],
             layout.shared[0],
             super::g17p_growth::REQUEST_LIMIT,
+            layout,
         )?;
         // Later geometry allocations cannot occupy the selected pool's
         // unpublished growth tranche. Its pages are allocated on demand.
@@ -1102,25 +1115,114 @@ impl Submission {
             deferred_inner: None,
             deferred_outer: None,
         };
-        self.other = Some(Transport {
+        self.others.push(Transport {
             layout,
             item_index: 0,
             publications: [empty; 2],
             deferred: [KVec::new(), KVec::new()],
             transports: transport_pools(layout.pair),
             fresh: true,
-        });
+        }, GFP_KERNEL)?;
         self.layout.independent = true;
+        Ok(())
+    }
+    pub(crate) fn pool_count(&self) -> u32 { self.others.len() as u32 + 1 }
+    /// Construct all representable ordinary owners before the first producer.
+    /// This also seeds immutable registration fields while their neighboring
+    /// firmware counters are still quiescent. Physical backing is retained.
+    pub(crate) fn create_render_pools(&mut self, memory: &mut Memory, vm: &mut Vm) -> Result {
+        self.create_second_pair(memory, vm)?;
+        for pool in self.pool_count()..life::POOL_SLOTS {
+            self.create_extra_pool(memory, vm, pool)?;
+        }
+        Ok(())
+    }
+    fn create_extra_pool(&mut self, memory: &mut Memory, vm: &mut Vm, pair: u32) -> Result {
+        if self.ordinal != 0 || self.layout.pair != 0 || self.pool_count() != pair { return Err(EBUSY); }
+        let layout = life::extra_pool(pair).map_err(|_| EINVAL)?;
+        let delta = life::private_delta(pair);
+        self.others.reserve(1, GFP_KERNEL)?;
+        // Fresh low private inventory. These are ordinary source-built GPU
+        // operands, never aliases of firmware queue-context memory.
+        for (base, size) in Iterator::chain(super::g17p_partial_runtime::private_ranges().into_iter(),
+            [(0x1000080000, PAGE)]) {
+            let base = base + delta;
+            if overlap(&self.client, base, size as u64) { return Err(EBUSY); }
+            for offset in (0..size).step_by(PAGE) {
+                if self.client.root.pte(base + offset as u64)? != 0 { return Err(EBUSY); }
+            }
+            let pa = memory.allocate(size)?;
+            if base == 0x1001004000 + delta {
+                let mut body = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+                body.resize(PAGE, 0, GFP_KERNEL)?;
+                r::aux_fb(&mut body).map_err(|_| EINVAL)?;
+                memory.write(pa, &body)?;
+            }
+            memory.clean(pa, size)?;
+            self.client.root.prepare(base, size as u64)?;
+            for offset in (0..size).step_by(PAGE) {
+                self.client.root.map_page(base + offset as u64, pa + offset as u64, true)?;
+            }
+        }
+        for base in super::g17p_partial_runtime::alias_pages() {
+            if overlap(&self.client, base + delta, PAGE as u64)
+                || self.client.root.pte(base + delta)? != 0 { return Err(EBUSY); }
+        }
+        let arena = layout.queues[0];
+        // Same AttrIndex as each original object. Reserve exact disjoint
+        // spans; the allocator refuses existing mappings instead of adopting.
+        for offset in (0..0xd0000).step_by(0x8000) {
+            let normal = matches!(offset, 0 | 0x18000 | 0x20000 | 0x40000 | 0x48000 |
+                0x50000 | 0x58000 | 0x60000 | 0x88000);
+            vm.transport_backing_with_attributes(memory, arena + offset,
+                if normal { 0x00c0000000000443 } else { 0x00c000000000044b })?;
+        }
+        for index in 0..2 {
+            let (high, low) = layout.contexts[index];
+            vm.alias_firmware(memory, high, low, 8 * PAGE)?;
+            let status_low = [0x1000230000, 0x1000358000][index] + delta;
+            let pa = vm.physical(memory, 2, layout.status[index])?;
+            self.client.root.prepare(status_low, PAGE as u64)?;
+            self.client.root.map_page(status_low, pa, true)?;
+            let mut pointers = [0; 0x80];
+            pointers[..0x60].copy_from_slice(&q::pointers(u32::MAX));
+            c::u32_at(&mut pointers, 0x60, 0x500);
+            vm.write(memory, 2, layout.pointers[index], &pointers)?;
+            let mut record = q::Record {
+                pointers: layout.pointers[index], ring: layout.rings[index],
+                job_list: layout.job_list, context: layout.control,
+                uuid: layout.uuid as u32, priority: 0, prio5: 1, unk_2c: 0,
+                unk_38: 1, unk_30: None, unk_94: 0, sentinel_size: 6,
+            }.build().map_err(|_| EINVAL)?;
+            for (at, value) in [(0x20, 0xffffffff00000000), (0x30, 0xffffffffffff0000),
+                (0x38, 1), (0x40, 0xffffffff00000001)] { c::u64_at(&mut record, at, value); }
+            vm.write(memory, 2, layout.queues[index], &record)?;
+        }
+        vm.write(memory, 2, layout.job_list, &q::job_list(layout.job_list))?;
+        super::g17p_partial_runtime::build_pool_graph(memory, vm, &mut self.client.root,
+            self.layout, layout, delta, layout.support)?;
+        let body = life::index_registration(0x1000340000 + delta, 32)
+            .map_err(|_| EINVAL)?.ok_or(EINVAL)?;
+        vm.write(memory, 2, 0xfffffc20015e0000 + pair as u64 * 0x10, &body)?;
+        self.growth.as_mut().ok_or(EINVAL)?.register_pool(memory, vm, &self.client.root,
+            layout.leaves[4], layout.leaves[1], layout.shared[0],
+            super::g17p_growth::REQUEST_LIMIT, layout)?;
+        self.scratch_cursor = self.scratch_cursor.max(self.growth.as_ref().ok_or(EINVAL)?.reserved_growth_end()?);
+        vm.flush_tables(memory)?;
+        super::g17p_user_vm::UserVm::invalidate(1);
+        let empty = q::Publication { slot: 0, producer: 0, consumers_before: [0; 2],
+            write_before: 0, write_after: 0, deferred_inner: None, deferred_outer: None };
+        self.others.push(Transport { layout, item_index: 0, publications: [empty; 2],
+            deferred: [KVec::new(), KVec::new()], transports: transport_pools(pair), fresh: true }, GFP_KERNEL)?;
+        pr_info!("G17P: independent render pool {} grids {:?} firmware {:#x} private {:#x}\n",
+            pair, layout.grids, arena, delta);
         Ok(())
     }
     pub(crate) fn select_pair(&mut self, pair: u32) -> Result {
         if self.layout.pair == pair {
             return Ok(());
         }
-        let other = self.other.as_mut().ok_or(EINVAL)?;
-        if other.layout.pair != pair {
-            return Err(EINVAL);
-        }
+        let other = self.others.iter_mut().find(|other| other.layout.pair == pair).ok_or(EINVAL)?;
         core::mem::swap(&mut self.layout, &mut other.layout);
         core::mem::swap(&mut self.item_index, &mut other.item_index);
         core::mem::swap(&mut self.publications, &mut other.publications);
@@ -1250,6 +1352,8 @@ impl Submission {
         self.timestamps = timestamps;
         self.layout = life::NATIVE;
         self.ordinal = 1;
+        self.storage = 1;
+        self.next_storage = None;
         self.item_index = 0;
         for list in &mut self.deferred {
             list.clear();
@@ -1294,6 +1398,10 @@ pub(crate) fn stage_next_prepared(
         work.layout,
     )
     .map_err(|_| EINVAL)?;
+    if let Some(storage) = work.next_storage {
+        if storage >= life::STORAGE_SUBMISSIONS { return Err(EINVAL); }
+        item.storage = storage;
+    }
     let mut counters = [q::Counters::new([0; 3]).map_err(|_| EIO)?; 2];
     let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
     // Source scheduler_publication_values: firmware retains +0x0c across
@@ -1329,7 +1437,7 @@ pub(crate) fn stage_next_prepared(
     }
     let configured = select_scratch(memory, &mut work.client,
         &mut work.scratch_leases, &mut work.scratch_cursor, p)?;
-    let configured = work.ticket_parameters(item.ordinal, configured);
+    let configured = work.ticket_parameters(item.storage, configured);
     let p = &configured;
     validate_scratch_backing(&work.client, p)?;
     let next_scratch = p.scratch_layout().map_err(|_| EINVAL)?;
@@ -1337,7 +1445,7 @@ pub(crate) fn stage_next_prepared(
     // All preceding GPU readers retired before geometry input is cleared.
     if work.scratch_key != next_key {
         let (_, stride, tpc) = next_scratch;
-        let pairs: u64 = if *crate::module_parameters::partial_independent_owner.value() == 1 { 2 } else { 1 };
+        let pairs = pool_count();
         for pair in 0..pairs {
         let delta = pair * p.scratch_pair_stride;
         for (base, len) in [(p.tilemap + delta, stride * 8), (p.tpc + delta, tpc)] {
@@ -1629,6 +1737,8 @@ pub(crate) fn stage_next_prepared(
     }
     work.firmware_completion = p.fragment_timestamp_end;
     work.ordinal = item.ordinal;
+    work.storage = item.storage;
+    work.next_storage = None;
     work.item_index = item.index;
     work.fresh_pair = false;
     work.timestamps = [

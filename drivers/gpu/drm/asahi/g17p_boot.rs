@@ -996,7 +996,7 @@ impl Session {
     pub(crate) fn render_publication_receipt(&self) -> Result<[render::Milestone; 2]> {
         let work = self.render.as_ref().ok_or(EINVAL)?;
         render::milestones(super::g17p_render_lifecycle::Item {
-            ordinal: work.ordinal, index: work.item_index, layout: work.layout,
+            ordinal: work.ordinal, storage: work.storage, index: work.item_index, layout: work.layout,
         })
     }
 
@@ -1008,7 +1008,9 @@ impl Session {
         if self.native.is_some() || self.phase != Phase::Running { return Ok(None); }
         let mut p = source_fragment_parameters(p, false)?;
         p.completion_control = u64::from(self.compute.is_some());
-        work.preparation_seed(&p, ahead)
+        let Some(pair) = self.next_render_pool()? else { return Ok(None); };
+        let Some(storage) = self.next_render_storage()? else { return Ok(None); };
+        work.preparation_seed(&p, ahead, pair, storage)
     }
     /// Registered private pool owners are the current live-resource bound.
     /// Descriptor/status/context/ring conflicts remain separate checks.
@@ -1057,14 +1059,36 @@ impl Session {
             || *crate::module_parameters::partial_independent_owner.value() != 1
             || *crate::module_parameters::alternate_queue_pairs.value() != 1
             || !work.same_geometry(p) { return Ok(false); }
+        Ok(self.next_render_pool()?.is_some() && self.next_render_storage()?.is_some())
+    }
+    fn next_render_pool(&self) -> Result<Option<u32>> {
+        let work = self.render.as_ref().ok_or(EINVAL)?;
         let next = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        let pair = next & 1;
-        if let Some(PendingWork::Render(wave)) = &self.pending {
-            if wave.frames[wave.next..].iter().any(|frame| frame.ticket.item.layout.pair == pair) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let count = if work.layout.independent && !work.layout.native
+            && *crate::module_parameters::alternate_queue_pairs.value() == 1 {
+            work.pool_count()
+        } else { return Ok(Some(work.layout.pair)); };
+        let frames = match &self.pending {
+            Some(PendingWork::Render(wave)) => &wave.frames[wave.next..],
+            _ => &[],
+        };
+        Ok((0..count).map(|offset| (next + offset) % count).find(|pair|
+            frames.iter().all(|frame| frame.ticket.item.layout.pair != *pair)))
+    }
+
+    fn next_render_storage(&self) -> Result<Option<u32>> {
+        use super::g17p_render_lifecycle::{storage_conflicts, STORAGE_SUBMISSIONS};
+        let work = self.render.as_ref().ok_or(EINVAL)?;
+        let next = work.ordinal.checked_add(1).ok_or(EOVERFLOW)? % STORAGE_SUBMISSIONS;
+        let frames = match &self.pending {
+            Some(PendingWork::Render(wave)) => &wave.frames[wave.next..],
+            _ => &[],
+        };
+        // Lease a free physical slot independently of the logical ordinal.
+        // A slow owner cannot stall other pools when another slot is free.
+        Ok((0..STORAGE_SUBMISSIONS).map(|offset| (next + offset) % STORAGE_SUBMISSIONS)
+            .find(|slot| frames.iter().all(|frame|
+                !storage_conflicts(*slot, frame.ticket.item.storage_ordinal()))))
     }
 
     pub(crate) fn submit_next_render(
@@ -1122,23 +1146,12 @@ impl Session {
             && *crate::module_parameters::native_render_vms.value() == 0
             && *crate::module_parameters::partial_independent_owner.value() == 1
         {
-            let pair = if *crate::module_parameters::alternate_queue_pairs.value() == 1 {
-                ordinal & 1
-            } else {
-                0
-            };
+            let pair = self.next_render_pool()?.ok_or(EBUSY)?;
+            let storage = self.next_render_storage()?.ok_or(EBUSY)?;
             let work = self.render.as_mut().ok_or(EINVAL)?;
-            if pair == 1 {
-                let created = work.create_second_pair(
-                    self.memory.as_mut().ok_or(EINVAL)?,
-                    self.vm.as_mut().ok_or(EINVAL)?,
-                );
-                if let Err(error) = created {
-                    self.phase = Phase::Failed;
-                    return Err(error);
-                }
-            }
             work.select_pair(pair)?;
+            // No later render may publish while this control owner is pending.
+            work.next_storage = Some(storage);
         }
         let work = self.render.as_ref().ok_or(EINVAL)?;
         if work.layout.native
@@ -1469,7 +1482,7 @@ impl Session {
             && *crate::module_parameters::partial_independent_owner.value() == 1
             && *crate::module_parameters::alternate_queue_pairs.value() == 1
         {
-            self.render.as_mut().ok_or(EINVAL)?.create_second_pair(
+            self.render.as_mut().ok_or(EINVAL)?.create_render_pools(
                 self.memory.as_mut().ok_or(EINVAL)?, self.vm.as_mut().ok_or(EINVAL)?)?;
         }
         self.inject_owned_render_fault(parameters)?;
@@ -2654,29 +2667,30 @@ impl Session {
                 PendingWork::Native => self.poll_native(dev, image),
                 PendingWork::Control(state) => self.poll_control(dev, image, state),
                 PendingWork::Render(wave) => {
-                    while wave.next < wave.frames.len() {
-                        let last = wave.next + 1 == wave.frames.len();
-                        let state = &mut wave.frames[wave.next];
-                        let control_before = state.control_done;
-                        let mut done = self.poll_render(dev, image, state, last)?;
-                        if !done && !control_before && state.control_done {
-                            // One fresh closure pass; no watchdog-sized gap.
-                            done = self.poll_render(dev, image, state, last)?;
-                        }
-                        if !done {
-                            if wave.next != 0 {
-                                // Verified gates/cache/status/reports retired
-                                // this prefix. Reclaim only host ticket records;
-                                // permanent physical backing remains retained.
-                                drop(wave.frames.drain(..wave.next));
-                                wave.next = 0;
-                            }
-                            return Ok(false);
-                        }
-                        state.gate.signal();
-                        wave.next += 1;
+                    if wave.next != 0 {
+                        drop(wave.frames.drain(..wave.next));
+                        wave.next = 0;
                     }
-                    Ok(true)
+                    // A blocked scene does not retain another pool's credit.
+                    // Probe every exact ticket and retire each completed owner
+                    // independently; physical pages remain session-owned.
+                    let mut index = 0;
+                    while index < wave.frames.len() {
+                        let sole = wave.frames.len() == 1;
+                        let state = &mut wave.frames[index];
+                        let control_before = state.control_done;
+                        let mut done = self.poll_render(dev, image, state, sole)?;
+                        if !done && !control_before && state.control_done {
+                            done = self.poll_render(dev, image, state, sole)?;
+                        }
+                        if done {
+                            state.gate.signal();
+                            drop(wave.frames.remove(index).map_err(|_| EIO)?);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    Ok(wave.frames.is_empty())
                 },
 
             }

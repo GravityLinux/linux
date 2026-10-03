@@ -92,6 +92,22 @@ pub(crate) fn build_graph(
     primary: Layout,
     control: u64,
 ) -> Result {
+    build_pool_graph(memory, vm, root, primary, SECOND, 0, control)
+}
+
+pub(crate) fn build_pool_graph(
+    memory: &mut Memory, vm: &mut Vm, root: &mut UserVm,
+    primary: Layout, layout: Layout, delta: u64, control: u64,
+) -> Result {
+    let graph = [
+        (layout.leaves[0], 0x10000), (layout.leaves[1], 0x8000),
+        (layout.leaves[2], PAGE), (layout.leaves[3], PAGE),
+        (layout.leaves[4], PAGE), (layout.leaves[5], PAGE),
+        (layout.pools[0], 0x2300), (layout.pools[1], 0x2780),
+        (layout.shared[0], 0x88), (layout.shared[1], 0x100),
+    ];
+    let group_delta: u32 = (delta / 0x8000).try_into().map_err(|_| EINVAL)?;
+    if delta % 0x8000 != 0 { return Err(EINVAL); }
     let inner = read64(memory, vm, control + 0x4c)?;
     if inner == 0 {
         return Err(EIO);
@@ -110,7 +126,7 @@ pub(crate) fn build_graph(
     ] {
         protected.push((address, PAGE as u64), GFP_KERNEL)?;
     }
-    for &(_, address, size) in &GRAPH {
+    for &(address, size) in &graph {
         if protected
             .iter()
             .any(|&(base, length)| base < address + size as u64 && address < base + length)
@@ -118,7 +134,7 @@ pub(crate) fn build_graph(
             return Err(EBUSY);
         }
     }
-    for &(_, address, size) in &GRAPH {
+    for &(address, size) in &graph {
         vm.ensure_firmware(memory, address, size)?;
     }
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
@@ -134,49 +150,49 @@ pub(crate) fn build_graph(
     .into_iter()
     .enumerate()
     {
-        graph::leaf(&mut page, kind, 0, &[(71, 6), (114, 2)], 8, 0).map_err(|_| EINVAL)?;
+        graph::leaf(&mut page, kind, 0, &[(71 + group_delta, 6), (114 + group_delta, 2)], 8, 0).map_err(|_| EINVAL)?;
         if index == 3 {
-            vm.write(memory, 2, GRAPH[index].1 + 0x140, &[0; 0x140])?;
+            vm.write(memory, 2, graph[index].0 + 0x140, &[0; 0x140])?;
         } else {
-            vm.write(memory, 2, GRAPH[index].1, &page)?;
+            vm.write(memory, 2, graph[index].0, &page)?;
         }
     }
-    graph::record_array_a(&mut page[..graph::POOL_A_SIZE], GRAPH[2].1 + 4, 0)
+    graph::record_array_a(&mut page[..graph::POOL_A_SIZE], graph[2].0 + 4, 0)
         .map_err(|_| EINVAL)?;
-    vm.write(memory, 2, GRAPH[6].1, &page[..graph::POOL_A_SIZE])?;
+    vm.write(memory, 2, graph[6].0, &page[..graph::POOL_A_SIZE])?;
     page[..0x100].fill(0);
-    c::u64_at(&mut page, 0, GRAPH[2].1);
-    vm.write(memory, 2, GRAPH[6].1 - 0x100, &page[..0x100])?;
+    c::u64_at(&mut page, 0, graph[2].0);
+    vm.write(memory, 2, graph[6].0 - 0x100, &page[..0x100])?;
     resource::build_partial_pool_b(
         &mut page,
-        GRAPH[3].1 + 0x140,
-        GRAPH[4].1 + 0x40,
-        0x80140,
-        0x328000,
+        graph[3].0 + 0x140,
+        graph[4].0 + 0x40,
+        (0x80140 + delta).try_into().map_err(|_| EINVAL)?,
+        (0x328000 + delta).try_into().map_err(|_| EINVAL)?,
         1,
     )
     .map_err(|_| EINVAL)?;
-    vm.write(memory, 2, GRAPH[7].1 - 0x80, &page[..0x2800])?;
+    vm.write(memory, 2, graph[7].0 - 0x80, &page[..0x2800])?;
     resource::PartialIndexSharedObject {
-        index_high: GRAPH[0].1,
-        index_low: BASE + 0x340000,
-        pool_b_slots: GRAPH[1].1,
-        shared_slots: GRAPH[4].1,
-        flag: GRAPH[5].1,
-        owner: 1,
+        index_high: graph[0].0,
+        index_low: BASE + 0x340000 + delta,
+        pool_b_slots: graph[1].0,
+        shared_slots: graph[4].0,
+        flag: graph[5].0,
+        owner: layout.pair,
         head: 8,
         tail: 0,
         group_count: 8,
-        opaque_84: 0x330000,
+        opaque_84: (0x330000 + delta).try_into().map_err(|_| EINVAL)?,
     }
     .build(&mut page)
     .map_err(|_| EINVAL)?;
-    vm.write(memory, 2, GRAPH[8].1, &page[..0x88])?;
-    vm.write(memory, 2, GRAPH[9].1, &[0; 0x100])?;
+    vm.write(memory, 2, graph[8].0, &page[..0x88])?;
+    vm.write(memory, 2, graph[9].0, &[0; 0x100])?;
     let mut changes = KVec::with_capacity(4, GFP_KERNEL)?;
     for offset in (0..0x10000).step_by(PAGE) {
-        let low = BASE + 0x340000 + offset as u64;
-        let pa = vm.physical(memory, 2, GRAPH[0].1 + offset as u64)?;
+        let low = BASE + 0x340000 + delta + offset as u64;
+        let pa = vm.physical(memory, 2, graph[0].0 + offset as u64)?;
         let old = root.pte(low)?;
         if old != 0 && old & 0x000003ffffffc000 != pa {
             return Err(EBUSY);
