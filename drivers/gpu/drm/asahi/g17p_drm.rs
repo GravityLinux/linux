@@ -495,6 +495,8 @@ mod scheduling;
 pub(crate) mod asynchronous;
 
 struct Prepared {
+    queue_key: super::g17p_compute_queues::Key,
+    queue_priority: u32,
     owner: (u64, u32),
     history: Arc<QueueHistory>,
     // Frozen only after the preceding accepted queue job has published.
@@ -1403,6 +1405,8 @@ impl File {
             buffers.push(object.bo.clone(), GFP_KERNEL)?;
         }
         let prepared = Prepared {
+            queue_key: (inner.id, data.queue_id),
+            queue_priority,
             owner,
             history,
             history_seed: None,
@@ -1454,6 +1458,8 @@ impl File {
         joining: bool,
     ) -> Result {
         let Prepared {
+            queue_key: _,
+            queue_priority: _,
             owner,
             history: _,
             history_seed: _,

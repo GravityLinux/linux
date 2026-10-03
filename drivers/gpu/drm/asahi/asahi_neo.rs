@@ -19,6 +19,7 @@ mod g17p_compute_lifecycle;
 #[allow(dead_code)]
 mod g17p_compute_memory;
 mod g17p_compute_runtime;
+mod g17p_compute_queues;
 #[allow(dead_code)]
 mod g17p_context;
 #[allow(dead_code)]
@@ -208,6 +209,10 @@ kernel::module_platform_driver! {
         cleanup_diagnostics: u32 {
             default: 0,
             description: "Source cleanup relocation diagnostics at VM_DESTROY: bit0 descriptor, bit1 context, bit2 transport, bit3 root",
+        },
+        compute_queues: u32 {
+            default: 1,
+            description: "Use independently owned ordinary compute queues (0: legacy diagnostic path)",
         },
         native_render_vms: u32 {
             default: 0,

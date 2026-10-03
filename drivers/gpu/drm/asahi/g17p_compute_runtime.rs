@@ -553,7 +553,7 @@ pub(crate) struct TransportPool {
     switches: u32,
 }
 
-fn read_owned(memory: &Memory, vm: &Vm, address: u64, body: &mut [u8]) -> Result {
+pub(crate) fn read_owned(memory: &Memory, vm: &Vm, address: u64, body: &mut [u8]) -> Result {
     if address & 7 != 0 || body.len() % 8 != 0 {
         return Err(EINVAL);
     }
@@ -780,7 +780,7 @@ pub(crate) fn build(
     // preserves all page-table and alias placement while firmware is running.
     for ordinal in 1..if after_render { 2 } else { SUBMISSIONS } {
         let spec = lifecycle::Retained::new(ordinal).map_err(|_| EINVAL)?;
-        vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
+        vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1040)?;
         for (address, size) in [
             (spec.scheduler, 0x100),
             (spec.scheduler_slot, 4),
@@ -1102,7 +1102,7 @@ pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Co
     Ok((counters, done))
 }
 
-fn write_context_item(
+pub(crate) fn write_context_item(
     memory: &mut Memory,
     vm: &Vm,
     address: u64,
@@ -1194,7 +1194,7 @@ pub(crate) fn stage_next(
     ] {
         vm.ensure_firmware(memory, address, size)?;
     }
-    vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
+    vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1040)?;
     vm.flush_tables(memory)?;
     Vm::invalidate_gpu();
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
@@ -1486,7 +1486,7 @@ fn stage_retained_after_render(
     ] {
         vm.ensure_firmware(memory, address, size)?;
     }
-    vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1000)?;
+    vm.alias_firmware(memory, spec.descriptor, spec.descriptor_low, 0x1040)?;
     let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
     page.resize(PAGE, 0, GFP_KERNEL)?;
     vm.write(memory, 2, spec.scheduler, &spec.scheduler_body())?;
@@ -1748,5 +1748,58 @@ fn prepare_cold_queues(memory: &mut Memory, vm: &mut Vm, page: &mut [u8], count:
         .map_err(|_| EINVAL)?;
         write(memory, high, page)?;
     }
+    Ok(())
+}
+
+/// Build an independent compute client's private operand/preemption storage.
+/// No firmware queue, shared render object or installed ASID is changed here.
+pub(crate) fn build_independent_client(memory: &mut Memory, client: &mut Client,
+    parameters: &Parameters) -> Result {
+    let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+    page.resize(PAGE, 0, GFP_KERNEL)?;
+    let lists = client_storage(memory, &mut client.root, 0x7000000000, 0x200000)?;
+    let operands = client_storage(memory, &mut client.root, OPERAND_TABLE, 0x10000)?;
+    client_storage(memory, &mut client.root, STATE, 0x14000)?;
+    // Source maps a zero native-control page at 0x70013a0000 before
+    // allocating operands, which replace that leaf. Map the final owner once:
+    // the control address and blank low queue contexts lie in these tranches.
+    for i in 0..42 {
+        client_storage(memory, &mut client.root, OPERANDS + i * 0x108000, 0x100000)?;
+    }
+    // _ensure_compute_robustness retains private state in the VM's reserved
+    // aperture before caller BOs replace the old native DVAs. The kernel's
+    // preemption slots occupy its first 0x84000 bytes, so use the next MiB.
+    // This is driver state, not a change to the fixed USC execution base.
+    let robustness = parameters.preempt + 0x100000;
+    for offset in [0, 0x8000] {
+        client_storage(memory, &mut client.root, robustness + offset, PAGE)?;
+    }
+    client_storage(memory, &mut client.root, parameters.preempt, 0xc000)?;
+    client_storage(
+        memory,
+        &mut client.root,
+        parameters.preempt + 0x78000,
+        0xc000,
+    )?;
+    // The allocator consumes 4 KiB GPU pages even though UAT and Linux use
+    // 16 KiB pages. Source build_compute_operand_page_lists publishes all
+    // three padded list pages for these 21 one-megabyte tranches.
+    let page_lists = cm::PageLists {
+        base: OPERANDS,
+        entries: 21,
+        buffer_size: 0x100000,
+        buffer_stride: 0x108000,
+        page_size: 0x1000,
+    };
+    let list_size = page_lists.size().map_err(|_| EINVAL)?;
+    let mut directory = KVVec::with_capacity(list_size, GFP_KERNEL)?;
+    directory.resize(list_size, 0, GFP_KERNEL)?;
+    page_lists.build(&mut directory).map_err(|_| EINVAL)?;
+    memory.write(lists, &directory)?;
+    memory.clean(lists, list_size)?;
+    cm::operand_table_contiguous(&mut page, OPERANDS, 21).map_err(|_| EINVAL)?;
+    memory.write(operands, &page)?;
+    memory.clean(operands, PAGE)?;
+
     Ok(())
 }

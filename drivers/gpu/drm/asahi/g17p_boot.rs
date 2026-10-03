@@ -166,6 +166,9 @@ enum Phase {
 pub(crate) struct Session {
     phase: Phase,
     ttbs: u64,
+    independent_compute: super::g17p_compute_queues::Queues,
+    independent_pending: KVec<IndependentPending>,
+    independent_count: u32,
     compute: Option<compute::Submission>,
     compute_contexts: Option<super::g17p_context::NativeComputeContexts>,
     render_contexts: Option<super::g17p_context::NativeRenderContexts>,
@@ -287,6 +290,12 @@ struct RenderPending {
     control_done: bool,
     started: kernel::time::Instant<kernel::time::Monotonic>,
 }
+struct IndependentPending {
+    ticket: super::g17p_compute_queues::Ticket,
+    receipt: Arc<ComputeReceipt>,
+    started: kernel::time::Instant<kernel::time::Monotonic>,
+    outer_done: [bool; 2],
+}
 struct ComputePending {
     frames: KVec<compute::Pending>,
     gates: KVec<kernel::dma_fence::Fence>,
@@ -379,6 +388,9 @@ impl Session {
             Self {
                 phase: Phase::Prepared,
                 ttbs: platform.regions[0].base,
+                independent_compute: super::g17p_compute_queues::Queues::new(),
+                independent_pending: KVec::new(),
+                independent_count: 0,
                 compute: None,
                 compute_contexts: None,
                 render_contexts: None,
@@ -522,7 +534,16 @@ impl Session {
                 memory.read64(root + 16)?
             );
         }
-        session.vm = Some(Vm::build(dev, memory, platform, image)?);
+        let vm = Vm::build(dev, memory, platform, image)?;
+        if *crate::module_parameters::compute_queues.value()==1
+            && *crate::module_parameters::native_compute_vms.value()==0
+            && *crate::module_parameters::native_render_vms.value()==0
+            && *crate::module_parameters::native_barriers.value()==0 {
+            let mut dispatch=[0;0x20];
+            super::g17p_abi::compute_dispatch(&mut dispatch).map_err(|_|EINVAL)?;
+            vm.write(memory,2,0xfffffc20015e8020,&dispatch)?;
+        }
+        session.vm = Some(vm);
         Ok(session)
     }
 
@@ -649,6 +670,7 @@ impl Session {
                     .ok_or(EINVAL)?,
             )?;
         }
+        self.independent_compute.unbind(owner,start,size)?;
         if self.compute_contexts.is_some() {
             self.unbind_native_compute(owner, start, size, expected)?;
         } else if let Some(work) = self.compute.as_mut() {
@@ -1007,7 +1029,9 @@ impl Session {
         let Some(work) = self.render.as_ref() else { return Ok(None); };
         if self.native.is_some() || self.phase != Phase::Running { return Ok(None); }
         let mut p = source_fragment_parameters(p, false)?;
-        p.completion_control = u64::from(self.compute.is_some());
+        // A first compute may arrive while this render is live. Select the
+        // qualified mixed profile now; changing only future renders is too late.
+        p.completion_control = u64::from(self.compute.is_some() || self.independent_compute_enabled());
         let Some(pair) = self.next_render_pool()? else { return Ok(None); };
         let Some(storage) = self.next_render_storage()? else { return Ok(None); };
         work.preparation_seed(&p, ahead, pair, storage)
@@ -1027,7 +1051,7 @@ impl Session {
     fn render_compute_owner_compatible(&self) -> Result<bool> {
         let Some(compute) = self.compute.as_ref() else { return Ok(true); };
         let Some(render) = self.render.as_ref() else { return Ok(false); };
-        if !compute.after_render || compute.native_context.is_some()
+        if (!compute.after_render && !(self.independent_compute_enabled() && self.bootstrapped)) || compute.native_context.is_some()
             || self.compute_contexts.is_some() || self.render_contexts.is_some()
             || compute.retained_execution_gate != 0 || !render.layout.independent
             || render.layout.native {
@@ -1114,7 +1138,7 @@ impl Session {
         p: &super::g17p_render::Parameters, prepared: Option<KBox<render::PreparedAppend>>,
     ) -> Result<Arc<RenderReceipt>> {
         let mut configured = source_fragment_parameters(p, false)?;
-        configured.completion_control = u64::from(self.compute.is_some());
+        configured.completion_control = u64::from(self.compute.is_some() || self.independent_compute_enabled());
         let p = &configured;
         if self.phase != Phase::Running { return Err(EIO); }
         if !self.can_append_render(p)? { return Err(EBUSY); }
@@ -1423,7 +1447,8 @@ impl Session {
         } else if self.phase != Phase::Running {
             return Err(EIO);
         }
-        let joining_live_wave = self.live_render_count() != 0 || self.compute_pending.is_some();
+        let joining_live_wave = self.live_render_count() != 0 || self.compute_pending.is_some()
+            || self.independent_compute.any();
         if joining_live_wave {
             // Another pool can retire while descriptors/transport are built.
             // Route its terminal/growth before capturing the new baseline.
@@ -1464,15 +1489,17 @@ impl Session {
             let memory = self.memory.as_mut().ok_or(EINVAL)?;
             if work.ordinal == 0 {
                 work.after_control(memory, vm, self.ttbs)?;
-                work.growth = Some(super::g17p_growth_runtime::Service::new(
-                    memory,
-                    vm,
-                    self.ttbs,
-                    &work.client.root,
-                    image.graph.channels[0][12],
-                    image.graph.channels[0][13],
-                )?);
-                configure_growth_limits(work.growth.as_mut().ok_or(EINVAL)?)?;
+                if work.growth.is_none() {
+                    work.growth = Some(super::g17p_growth_runtime::Service::new(
+                        memory,
+                        vm,
+                        self.ttbs,
+                        &work.client.root,
+                        image.graph.channels[0][12],
+                        image.graph.channels[0][13],
+                    )?);
+                    configure_growth_limits(work.growth.as_mut().ok_or(EINVAL)?)?;
+                }
             }
         }
         if self.render.as_ref().ok_or(EINVAL)?.ordinal == 0 {
@@ -1552,7 +1579,7 @@ impl Session {
         // retaining the runtime lock and the sole active root owner.
         for _ in 0..32 {
             use super::g17p_growth_runtime::Action;
-            let work = self.render.as_mut().ok_or(EINVAL)?;
+            let work = self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EINVAL)?;
             let action = if let Some(native) = self.native.as_mut() {
                 native.service.step_dependency_render(
                     self.memory.as_mut().ok_or(EINVAL)?,
@@ -2558,6 +2585,8 @@ impl Session {
     }
 
     fn fail_owned_receipts(&self, error: Error) {
+        self.independent_compute.fail(error);
+        for pending in &self.independent_pending { pending.receipt.fail(error); }
         if let Some(control) = &self.render_control { control.receipt.fail(error); }
         if let Some(pending) = &self.pending {
             match pending {
@@ -2579,7 +2608,8 @@ impl Session {
             // A waiting render must never prevent compute progress/retirement.
             let render_done = self.poll_render_pending_work(dev, image)?;
             let compute_done = self.poll_compute_pending_work(dev, image)?;
-            Ok(render_done && compute_done)
+            let independent_done=self.poll_independent_compute(dev,image)?;
+            Ok(render_done && compute_done && independent_done)
         })();
         if let Err(error) = result {
             self.phase = Phase::Failed; self.events.fail(error);
@@ -2874,6 +2904,8 @@ impl Drop for Session {
             // permanent; keep the runtime owner too as it gains owned tables.
             core::mem::forget(self.memory.take());
             core::mem::forget(self.compute.take());
+            core::mem::forget(core::mem::replace(&mut self.independent_compute, super::g17p_compute_queues::Queues::new()));
+            core::mem::forget(core::mem::replace(&mut self.independent_pending, KVec::new()));
             core::mem::forget(self.compute_contexts.take());
             core::mem::forget(self.render_contexts.take());
             core::mem::forget(core::mem::replace(&mut self.render_clients, KVec::new()));
@@ -2883,5 +2915,139 @@ impl Drop for Session {
             core::mem::forget(core::mem::replace(&mut self.faults, fault::State::new()));
             core::mem::forget(core::mem::replace(&mut self.retained_buffers, KVec::new()));
         }
+    }
+}
+
+impl Session {
+    pub(crate) fn independent_compute_enabled(&self) -> bool {
+        *crate::module_parameters::compute_queues.value()==1 && self.native.is_none()
+            && *crate::module_parameters::native_compute_vms.value()==0
+            && *crate::module_parameters::native_render_vms.value()==0
+            && *crate::module_parameters::native_barriers.value()==0
+    }
+    pub(crate) fn independent_compute_client(&self,key:super::g17p_compute_queues::Key,
+        client:&compute::Client,p:&compute::Parameters,priority:u32)->Option<&compute::Client> {
+        self.independent_compute.client(key,client,p,priority)
+    }
+    pub(crate) fn can_stage_independent_compute(&self,image:&Image,key:super::g17p_compute_queues::Key,
+        client:&compute::Client,p:&compute::Parameters,priority:u32)->Result<bool> {
+        if self.phase==Phase::Failed {return Err(EIO);}
+        if !matches!(self.phase,Phase::Prepared|Phase::Running) || !self.independent_compute_enabled() {return Ok(false);}
+        let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
+        let mut values=[0;3];
+        for (v,at) in values.iter_mut().zip(image.graph.channels[0][queue::COMPUTE_CHANNEL].states) {
+            *v=memory.read_firmware32(vm.physical(memory,2,at)?)?;
+        }
+        if queue::Counters::new(values).map_err(|_|EIO)?.slot().is_err() {return Ok(false);}
+        Ok(self.independent_compute.can_stage(key,client,p,priority)
+            && self.cleanup.require_idle().is_ok())
+    }
+    pub(crate) fn stage_independent_compute(&mut self,dev:&kernel::device::Device,image:&Image,
+        key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
+        p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
+        let result=self.stage_independent_compute_inner(dev,image,key,reference,client,p,priority,dependencies);
+        if let Err(error)=result.as_ref() {
+            self.phase=Phase::Failed;self.fail_owned_receipts(*error);self.events.fail(*error);
+        }
+        result
+    }
+    fn stage_independent_compute_inner(&mut self,dev:&kernel::device::Device,image:&Image,
+        key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
+        p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
+        self.independent_pending.reserve(1,GFP_KERNEL)?;
+        let ordinal=self.independent_count.checked_add(1).ok_or(EOVERFLOW)?;
+        let receipt=ComputeReceipt::new(ordinal)?;
+        self.timestamps.as_ref().ok_or(EIO)?.cache(p.timestamps,false)?;
+        if self.phase==Phase::Prepared {
+            self.bootstrap_compute(dev,image,reference.owner,p.preempt)?;
+            // The primer is internal permanent backing, never an application
+            // VM snapshot. Caller cleanup must visit only its real owners.
+            self.compute.as_mut().ok_or(EIO)?.client.owner=(0,0);
+        }
+        if self.render.is_none() {
+            let work=self.dormant_render.as_mut().ok_or(EIO)?;
+            if work.growth.is_none() {
+                work.growth=Some(super::g17p_growth_runtime::Service::new(
+                    self.memory.as_ref().ok_or(EIO)?,self.vm.as_ref().ok_or(EIO)?,self.ttbs,
+                    &work.client.root,image.graph.channels[0][12],image.graph.channels[0][13])?);
+                configure_growth_limits(work.growth.as_mut().ok_or(EIO)?)?;
+            }
+        }
+        self.service_owned_render_reports(dev,image)?;
+        let ticket=self.independent_compute.stage(self.memory.as_mut().ok_or(EIO)?,
+            self.vm.as_mut().ok_or(EIO)?,self.ttbs,image.graph.channels[0][queue::COMPUTE_CHANNEL],
+            key,client,reference,p,priority,dependencies,receipt.fence.clone())?;
+        for bo in ticket.client.buffers() {self.retain_source_backing(bo)?;}
+        self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EIO)?.growth.as_mut().ok_or(EIO)?
+            .register_independent_compute(self.independent_compute.grid_mask());
+        let publication=ticket.publication;let grid=ticket.grid;let value=ticket.value;let bank=ticket.queue;
+        // Observe both consumers before every producer store. Once a ticket
+        // is consumed, retain that fact across later turns of the outer ring.
+        for pending in &mut self.independent_pending {
+            for i in 0..2 {
+                pending.outer_done[i] |= queue::reached(pending.ticket.publication.consumers_before[i],
+                    publication.consumers_before[i],pending.ticket.publication.producer);
+            }
+        }
+        self.independent_pending.push(IndependentPending {ticket,receipt:receipt.clone(),
+            started:kernel::time::Instant::now(),outer_done:[false;2]},GFP_KERNEL)?;
+        self.independent_count=ordinal;
+        let memory=self.memory.as_mut().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
+        if let Some((address,value))=publication.deferred_inner {vm.write(memory,2,address,&value.to_le_bytes())?;}
+        g17p_memory::sync();
+        let (address,producer)=publication.deferred_outer.ok_or(EIO)?;
+        vm.write(memory,2,address,&producer.to_le_bytes())?;g17p_memory::sync();
+        receipt.point.store((2u64<<40)|(u64::from(grid)<<32)|u64::from(value),Ordering::Relaxed);
+        receipt.publication_ready.store(true,Ordering::Release);
+        self.peers[0].rtkit.as_mut().ok_or(EIO)?.as_mut().send_message(0x21,queue::COMPUTE_DOORBELL)?;
+        if *crate::module_parameters::submission_log.value()!=0 {
+            dev_info!(dev,"G17P: independent compute {} queue {:?} bank {} grid {} value {} live {}\n",
+                ordinal,key,bank,grid,value,self.independent_pending.len());
+        }
+        Ok(receipt)
+    }
+    fn poll_independent_compute(&mut self,dev:&kernel::device::Device,image:&Image)->Result<bool> {
+        if self.independent_pending.is_empty() {return Ok(true);}
+        if self.peers.iter().any(|p|p.data.crashed.load(Ordering::Acquire)) {return Err(EIO);}
+        self.service_owned_render_reports(dev,image)?;
+        let report=self.report_snapshot(image)?;
+        if self.render.as_ref().or(self.dormant_render.as_ref()).ok_or(EIO)?.growth.as_ref().ok_or(EIO)?.cursor()!=report[0].firmware {
+            return Ok(false);
+        }
+        // Both peers' report credits are returned only after classification.
+        for peer in &report { for body in &peer.records {
+            if u32::from_le_bytes(body[..4].try_into().unwrap())!=1 {return Err(EIO);}
+        }}
+        let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
+        let mut index=0;
+        while index<self.independent_pending.len() {
+            let pending=&mut self.independent_pending[index];let ticket=&pending.ticket;
+            let done=memory.read_firmware32(vm.physical(memory,2,ticket.pointers)?)?;
+            let mut values=[0;3];
+            for (v,at) in values.iter_mut().zip(ticket.channel.states) {*v=memory.read_firmware32(vm.physical(memory,2,at)?)?;}
+            let _counters=queue::Counters::new(values).map_err(|_|EIO)?;
+            for i in 0..2 {
+                pending.outer_done[i] |= queue::reached(ticket.publication.consumers_before[i],
+                    values[i] as u8,ticket.publication.producer);
+            }
+            let complete=done>=ticket.publication.write_after && pending.outer_done.iter().all(|v|*v);
+            let terminals=self.render.as_ref().or(self.dormant_render.as_ref()).ok_or(EIO)?
+                .growth.as_ref().ok_or(EIO)?.independent_compute_terminals(ticket.grid);
+            let status=vm.physical(memory,2,ticket.status[1])?;memory.invalidate(status,8)?;
+            if !complete || memory.read64(status)?==0 || terminals<ticket.value {
+                if pending.started.elapsed().as_millis()>10000 {
+                    dev_err!(dev,"G17P: independent compute timeout grid {} value {} inner {}/{} outer {:?} status {:#x} terminals {}\n",
+                        ticket.grid,ticket.value,done,ticket.publication.write_after,values,memory.read64(status)?,terminals);
+                    return Err(ETIMEDOUT);
+                }
+                index+=1;continue;
+            }
+            ticket.client.cache(true)?;
+            self.timestamps.as_ref().ok_or(EIO)?.cache(ticket.timestamps,true)?;
+            pending.receipt.fence.signal();
+            self.independent_pending.remove(index).map_err(|_|EIO)?;
+        }
+        self.acknowledge_reports(image,&report)?;
+        Ok(self.independent_pending.is_empty())
     }
 }

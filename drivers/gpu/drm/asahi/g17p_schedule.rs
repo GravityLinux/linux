@@ -325,6 +325,20 @@ impl Schedule {
                 } else {
                     let Command::Compute(parameters) = &prepared.parameters[index] else { unreachable!() };
                     let snapshot = prepared.compute_snapshot.as_ref().ok_or(EIO)?;
+                    if runtime.session.independent_compute_enabled() {
+                        let mut waits = KVec::with_capacity(3,GFP_KERNEL)?;
+                        for point in [previous,dependencies[0],dependencies[1]].into_iter().flatten() {
+                            if !waits.contains(&point) { waits.push(point,GFP_KERNEL)?; }
+                        }
+                        let key=prepared.queue_key; let priority=prepared.queue_priority;
+                        if !runtime.session.can_stage_independent_compute(&runtime.image,key,snapshot.client(),parameters,priority)? {
+                            return Ok(None);
+                        }
+                        let old=runtime.session.independent_compute_client(key,snapshot.client(),parameters,priority);
+                        let client=Self::replacement(snapshot,old,false)?;
+                        return runtime.session.stage_independent_compute(dev.as_ref(),&runtime.image,
+                            key,snapshot.client(),client,parameters,priority,&waits).map(|r|Some(Receipt::Compute(r)));
+                    }
                     if !Self::preferred(runtime,1,node) { return Ok(None); }
                     if !runtime.session.can_stage_compute(Some(snapshot.client()),parameters)? {
                         let replacing = !snapshot.same_client(runtime.session.compute_client()?);
