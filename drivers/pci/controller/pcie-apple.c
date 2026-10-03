@@ -34,6 +34,7 @@
 #include <linux/soc/apple/tunable.h>
 #include <linux/workqueue.h>
 
+#include "../pci.h"
 #include "pci-host-common.h"
 
 static int link_up_timeout = 500;
@@ -222,7 +223,7 @@ struct apple_pcie_port {
 	raw_spinlock_t		lock;
 	struct apple_pcie	*pcie;
 	unsigned int		parent_irq;
-	unsigned int		link_irqs[2];
+	unsigned int		link_irqs[3];
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
@@ -231,6 +232,8 @@ struct apple_pcie_port {
 	unsigned long		*sid_map;
 	int			sid_map_sz;
 	int			idx;
+	unsigned long		link_events;
+	bool			recovering;
 };
 
 static void rmw_set(u32 set, void __iomem *addr)
@@ -420,6 +423,7 @@ static void apple_port_irq_handler(struct irq_desc *desc)
 	chained_irq_enter(chip, desc);
 
 	stat = readl_relaxed(port->base + PORT_INTSTAT);
+	stat &= ~readl_relaxed(port->base + PORT_INTMSK);
 
 	for_each_set_bit(i, &stat, 32)
 		generic_handle_domain_irq(port->domain, i);
@@ -513,14 +517,24 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 		dev_info_ratelimited(port->pcie->dev, "Link up on %pOF\n",
 				     port->np);
 		complete_all(&port->pcie->event);
+		set_bit(PORT_INT_LINK_UP, &port->link_events);
 		if (port->pcie->hw->tunneled && READ_ONCE(port->pcie->registered) &&
 		    !READ_ONCE(port->pcie->removing))
 			mod_delayed_work(system_wq, &port->pcie->rescan_work,
 					 msecs_to_jiffies(100));
 		break;
+	case PORT_INT_TUNNEL_ERR:
 	case PORT_INT_LINK_DOWN:
-		dev_info_ratelimited(port->pcie->dev, "Link down on %pOF\n",
-				     port->np);
+		if (!READ_ONCE(port->recovering))
+			dev_info_ratelimited(port->pcie->dev, "Link down on %pOF\n",
+					     port->np);
+		if (port->pcie->hw->tunneled) {
+			set_bit(PORT_INT_LINK_DOWN, &port->link_events);
+			if (READ_ONCE(port->pcie->registered) &&
+			    !READ_ONCE(port->pcie->removing))
+				mod_delayed_work(system_wq, &port->pcie->rescan_work,
+						 hwirq == PORT_INT_TUNNEL_ERR ? 0 : HZ);
+		}
 		break;
 	default:
 		return IRQ_NONE;
@@ -537,6 +551,7 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 	} port_irqs[] = {
 		{ PORT_INT_LINK_UP,	"Link up",	},
 		{ PORT_INT_LINK_DOWN,	"Link down",	},
+		{ PORT_INT_TUNNEL_ERR,	"Tunnel error",	},
 	};
 	int i;
 
@@ -550,6 +565,10 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		};
 		unsigned int irq;
 		int ret;
+
+		if (port_irqs[i].hwirq == PORT_INT_TUNNEL_ERR &&
+		    !port->pcie->hw->tunneled)
+			continue;
 
 		irq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE,
 					    &fwspec);
@@ -1123,17 +1142,68 @@ static int apple_pcie_probe_port(struct device_node *np)
 	return 0;
 }
 
+/* The caller holds the PCI rescan/remove lock. */
+static void apple_pcie_remove_downstream(struct pci_bus *bus)
+{
+	struct pci_dev *dev, *tmp;
+
+	/* A lost tunnel cannot service the drivers' shutdown MMIO accesses. */
+	pci_walk_bus(bus, pci_dev_set_disconnected, NULL);
+	list_for_each_entry_safe_reverse(dev, tmp, &bus->devices, bus_list) {
+		pci_dev_get(dev);
+		pci_stop_and_remove_bus_device(dev);
+		pci_dev_put(dev);
+	}
+}
+
 static void apple_pcie_rescan(struct work_struct *work)
 {
 	struct apple_pcie *pcie = container_of(to_delayed_work(work),
 					       struct apple_pcie, rescan_work);
 	struct pci_host_bridge *bridge = dev_get_drvdata(pcie->dev);
+	struct apple_pcie_port *port;
+	bool retry = false;
 
 	if (READ_ONCE(pcie->removing))
 		return;
 	pci_lock_rescan_remove();
-	pci_rescan_bus(bridge->bus);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		unsigned long events = xchg(&port->link_events, 0);
+		struct pci_dev *root;
+
+		root = pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0));
+		if (!root)
+			continue;
+		if (events & BIT(PORT_INT_LINK_DOWN)) {
+			if (root->subordinate)
+				apple_pcie_remove_downstream(root->subordinate);
+			WRITE_ONCE(port->recovering, true);
+		}
+
+		/* LINKSTS can retain UP after a tunnel error; require a new IRQ. */
+		if ((events & BIT(PORT_INT_LINK_UP)) &&
+		    (readl(port->base + PORT_LTSSMCTL) & PORT_LTSSMCTL_START) &&
+		    (readl(port->base + PORT_LINKSTS) & PORT_LINKSTS_UP)) {
+			WRITE_ONCE(port->recovering, false);
+			if (root->subordinate)
+				pci_rescan_bus(root->subordinate);
+		}
+		pci_dev_put(root);
+
+		if (!port->recovering)
+			continue;
+		/*
+		 * The error IRQ acknowledges the latched tunnel error before we
+		 * restart training. Training can time out while unauthorized, so
+		 * retry until a subsequent link-up IRQ permits enumeration.
+		 */
+		if (!(readl(port->base + PORT_LTSSMCTL) & PORT_LTSSMCTL_START))
+			writel(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
+		retry = true;
+	}
 	pci_unlock_rescan_remove();
+	if (retry && !READ_ONCE(pcie->removing))
+		queue_delayed_work(system_wq, &pcie->rescan_work, HZ);
 }
 
 static int apple_pcie_probe(struct platform_device *pdev)
@@ -1185,8 +1255,12 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
-	if (!ret)
+	if (!ret) {
 		WRITE_ONCE(pcie->registered, true);
+		if (hw->tunneled)
+			mod_delayed_work(system_wq, &pcie->rescan_work,
+					 msecs_to_jiffies(100));
+	}
 	return ret;
 }
 
