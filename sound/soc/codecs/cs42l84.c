@@ -361,6 +361,7 @@ static const struct cs42l84_pll_params pll_ratio_table[] = {
 	{  5644800, 1, 0, 0x40, 0x000000, 0x03, 0x10, 11289600},
 	{  6144000, 1, 1, 0x40, 0x000000, 0x03, 0x10, 12288000},
 	{ 11289600, 0, 0, 0, 0, 0, 0,                 11289600},
+	{ 12000000, 0, 0, 0, 0, 0, 0,                 12000000},
 	{ 12288000, 0, 0, 0, 0, 0, 0,                 12288000},
 	{ 24576000, 1, 3, 0x40, 0x000000, 0x03, 0x10, 12288000},
 };
@@ -549,6 +550,43 @@ static int cs42l84_pcm_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+/* In TDM mode both receive slots are relative to the same frame edge. */
+static int cs42l84_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
+			      unsigned int rx_mask, int slots, int slot_width)
+{
+	struct snd_soc_component *component = dai->component;
+	unsigned int starts[2], i;
+	int ret;
+
+	/* Transmit TDM is unsupported; retain the legacy machine's I2S fallback. */
+	if (tx_mask)
+		return -ENOTSUPP;
+	if (slots < 2 || slots > 32 || hweight32(rx_mask) != 2 ||
+	    slot_width < 16 || slot_width > 32 ||
+	    (slots < 32 && rx_mask >> slots))
+		return -EINVAL;
+	starts[0] = __ffs(rx_mask) * slot_width;
+	starts[1] = __fls(rx_mask) * slot_width;
+	for (i = 0; i < 2; i++) {
+		ret = snd_soc_component_update_bits(component,
+			CS42L84_ASP_RX_CH1_CTL1 + i * 4,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE | CS42L84_ASP_RX_CHx_CTL1_SLOT_START_LSB,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE |
+			FIELD_PREP(CS42L84_ASP_RX_CHx_CTL1_SLOT_START_LSB, starts[i] & 0x7f));
+		if (ret < 0)
+			return ret;
+		ret = snd_soc_component_update_bits(component,
+			CS42L84_ASP_RX_CH1_CTL2 + i * 4,
+			CS42L84_ASP_RX_CHx_CTL2_SLOT_START_MSB,
+			FIELD_PREP(CS42L84_ASP_RX_CHx_CTL2_SLOT_START_MSB, starts[i] >> 7));
+		if (ret < 0)
+			return ret;
+	}
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
+		CS42L84_ASP_CTL_TDM_MODE, CS42L84_ASP_CTL_TDM_MODE);
+	return ret < 0 ? ret : 0;
+}
+
 static int cs42l84_set_sysclk(struct snd_soc_dai *dai,
 				int clk_id, unsigned int freq, int dir)
 {
@@ -666,6 +704,7 @@ static const struct snd_soc_dai_ops cs42l84_ops = {
 	.hw_params	= cs42l84_pcm_hw_params,
 	.set_fmt	= cs42l84_set_dai_fmt,
 	.set_sysclk	= cs42l84_set_sysclk,
+	.set_tdm_slot	= cs42l84_set_tdm_slot,
 	.mute_stream	= cs42l84_mute_stream,
 };
 
