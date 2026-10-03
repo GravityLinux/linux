@@ -557,10 +557,20 @@ pub(crate) fn read_owned(memory: &Memory, vm: &Vm, address: u64, body: &mut [u8]
     if address & 7 != 0 || body.len() % 8 != 0 {
         return Err(EINVAL);
     }
-    for (i, bytes) in body.chunks_exact_mut(8).enumerate() {
-        let pa = vm.physical(memory, 2, address + i as u64 * 8)?;
-        memory.invalidate(pa, 8)?;
-        bytes.copy_from_slice(&memory.read64(pa)?.to_le_bytes());
+    // These spans belong to a retired transport/context. Translate each
+    // owned page once and invalidate its full clean span before volatile
+    // reads, rather than synchronizing and walking tables for every word.
+    let mut offset = 0;
+    while offset < body.len() {
+        let va = address.checked_add(offset as u64).ok_or(EOVERFLOW)?;
+        let count = (body.len() - offset).min(PAGE - (va as usize & (PAGE - 1)));
+        let pa = vm.physical(memory, 2, va)?;
+        let last = va.checked_add(count as u64 - 1).ok_or(EOVERFLOW)?;
+        if vm.physical(memory, 2, last)? != pa.checked_add(count as u64 - 1).ok_or(EOVERFLOW)? {
+            return Err(EIO);
+        }
+        memory.read_firmware_words(pa, &mut body[offset..offset + count])?;
+        offset += count;
     }
     Ok(())
 }
@@ -1113,11 +1123,7 @@ pub(crate) fn write_context_item(
         return vm.write(memory, 2, address, current);
     }
     let mut previous = [0u8; 0x200];
-    for offset in (0..previous.len()).step_by(8) {
-        let pa = vm.physical(memory, 2, address + offset as u64)?;
-        memory.invalidate(pa, 8)?;
-        previous[offset..offset + 8].copy_from_slice(&memory.read64(pa)?.to_le_bytes());
-    }
+    read_owned(memory, vm, address, &mut previous)?;
     c::update_context(&mut previous, current).map_err(|_| EINVAL)?;
     vm.write(memory, 2, address, &previous)
 }
@@ -1774,13 +1780,13 @@ pub(crate) fn build_independent_client(memory: &mut Memory, client: &mut Client,
     for offset in [0, 0x8000] {
         client_storage(memory, &mut client.root, robustness + offset, PAGE)?;
     }
-    client_storage(memory, &mut client.root, parameters.preempt, 0xc000)?;
-    client_storage(
-        memory,
-        &mut client.root,
-        parameters.preempt + 0x78000,
-        0xc000,
-    )?;
+    // Native live commands have distinct save areas, even within one queue.
+    // The private aperture is at least 512 MiB; 256 sparse save areas at the
+    // source 0x78000 stride fit without intersecting the robustness page.
+    for slot in 0..256u64 {
+        client_storage(memory, &mut client.root,
+            parameters.preempt + slot * 0x78000, 0xc000)?;
+    }
     // The allocator consumes 4 KiB GPU pages even though UAT and Linux use
     // 16 KiB pages. Source build_compute_operand_page_lists publishes all
     // three padded list pages for these 21 one-megabyte tranches.

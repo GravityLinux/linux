@@ -53,7 +53,9 @@ Independent compute queue qualification (ordinary default `compute_queues=1`):
 python3 drivers/gpu/drm/asahi/tests/make_g17p_compute_workload.py /path/to/m1n1 /tmp/g17p_drm_retained_wave_workload.h --batch-count 56 --mixed
 python3 drivers/gpu/drm/asahi/tests/make_g17p_render_workload.py /path/to/m1n1 /tmp/g17p_drm_render_batch_workload.h --triangles 131072 --batch-pair
 gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-compute-queues drivers/gpu/drm/asahi/tests/g17p_drm_compute_queues_render.c
+python3 drivers/gpu/drm/asahi/tests/make_g17p_render_workload.py /path/to/m1n1 /tmp/g17p_drm_render_long_workload.h --triangles 524288 --batch-pair
 gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-first-compute drivers/gpu/drm/asahi/tests/g17p_drm_first_compute.c
+gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-compute-render-overlap drivers/gpu/drm/asahi/tests/g17p_drm_compute_render_overlap.c
 ```
 
 On a cold driver, run `g17p-drm-compute-vm --cleanup` followed by
@@ -71,6 +73,33 @@ show overlap. Both complete render images, compute outputs/guards, timestamp
 guards, and owned fences are checked. Follow with the retained integration
 suite above, mixed dependency/error/teardown tests, and the 90-image MSAA suite.
 No unit tests are required. GPU executable fixtures remain untouched.
+The full qualification sequence starts with render-only VM cleanup, then
+first-compute overlap, repeated compute/render overlap, the three-VM compute
+suite, mixed asynchronous dependencies/errors/teardown, 4,096 compute stress,
+and the retained integration/90-image MSAA/close/pressure regressions.
+
+Run `g17p-drm-compute-render-overlap 25` in the retained integration session:
+4,200 computes across three public queues/VMs, and 25 repeated 131,072-triangle
+renders. Each batch is accepted behind an imported input fence; after actual
+TA start, release all compute queues. Every retained wave must show compute/FR
+GPU timestamp overlap. Check all eight full images per wave, every compute
+input/output/guard, timestamps, and each exported fence status. The initial
+allocation wave checks all outputs but permits setup latency to miss overlap.
+The first-compute fixture uses a separate 524,288-triangle source-generated
+render to keep its measured overlap window longer than cold allocation.
+
+Independent compute uses the observed native asynchronous profile: render
+completion control zero, compute execution gate one, and support word08 one.
+Completion scratch, event allocations, and preemption/robustness records are
+private to every live command; operand allocator state stays private to its
+queue. Context reuse preserves firmware-written words, and retired transport
+snapshots use page-sized volatile reads with checked mappings/cache ordering.
+An idle full-window owner rotates with its existing caller/root; it does not
+materialize a replacement VM just to discard it. Retired owners are reused
+before allocating another permanent owner; live owners cause growth up to the
+available context capacity, rather than a global completion wait. Backing
+pages stay retained.
+
 
 `g17p_drm_wait.h` adds explicit output-fence waits to the older integration
 programs. `g17p-drm-async` bypasses that adapter for submission and proves

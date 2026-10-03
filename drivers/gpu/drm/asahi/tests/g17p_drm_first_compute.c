@@ -4,7 +4,7 @@
 #define main memory_test_main
 #include "g17p_drm_memory.c"
 #undef main
-#include "g17p_drm_render_batch_workload.h"
+#include "g17p_drm_render_long_workload.h"
 #define workload compute_workload
 #define workloads compute_workloads
 #include "g17p_drm_retained_wave_workload.h"
@@ -98,6 +98,13 @@ static void warm_render_compute(int fd,uint32_t vm,uint32_t queue)
         struct drm_syncobj_destroy destroy={.handle=fence};OK(fd,DRM_IOCTL_SYNCOBJ_DESTROY,&destroy);
         printf("G17P_RENDER_AFTER_COMPUTE_WARM_RENDER_PASS stage=%u ownfence\n",j);
     }
+    // The timestamp BO uses a WC CPU mapping: observe actual GPU start,
+    // rather than racing compute against an accepted but unstarted render.
+    volatile uint64_t *live=(void *)(first_timestamps+PAGE);
+    uint64_t deadline=now_ns()+5000000000ULL;
+    while(live[4]==0xa5a5a5a5a5a5a5a5ULL || live[4]==0) {
+        CHECK(now_ns()<deadline);usleep(100);
+    }
     CHECK(late_render && fence_status(fd,late_render)==0);
     struct {
         struct drm_asahi_cmd_header attachment_header;
@@ -171,7 +178,7 @@ int main(void)
             DRM_ASAHI_BIND_READ|(w->writable?DRM_ASAHI_BIND_WRITE:0),0);
     }
     for(unsigned j=0;j<16;j++) CHECK(images[j]);
-    uint32_t bo=bo_new(fd,PAGE*3,DRM_ASAHI_GEM_WRITEBACK,0);
+    uint32_t bo=bo_new(fd,PAGE*3,0,0);
     unsigned char *timestamps=bo_map(fd,bo,PAGE*3);
     memset(timestamps,0xa5,PAGE*3);
     struct drm_asahi_gem_bind_object object={.op=DRM_ASAHI_BIND_OBJECT_OP_BIND,
