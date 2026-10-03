@@ -107,6 +107,7 @@ pub(crate) fn dependency(
     event: u32,
     stamp_self: u32,
     uuid: u32,
+    kind: u32,
 ) -> [u8; 0x40] {
     let mut out = [0; 0x40];
     u32_at(&mut out, 0, 4);
@@ -117,7 +118,7 @@ pub(crate) fn dependency(
         (0x20, event),
         (0x24, stamp_self),
         (0x28, uuid),
-        (0x30, 1),
+        (0x30, kind),
     ] {
         u32_at(&mut out, off, value);
     }

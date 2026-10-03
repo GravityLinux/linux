@@ -207,8 +207,17 @@ pub(crate) struct Bootstrap {
     free_work: [KVec<u64>; 2],
     compute_publication: u64,
     queue_events: Arc<core::sync::atomic::AtomicU64>,
+    /// Queue storage returned by dropped queues, awaiting context destruction.
+    /// It holds a reserved slot for every region, so dropping never allocates.
+    retired_queues: Arc<kernel::sync::Mutex<KVec<u64>>>,
+    queue_regions: usize,
+    /// Storage whose context destruction is published, with its control target.
+    destroying_queues: KVec<(u64, u32)>,
+    free_queues: KVec<u64>,
     render_failed: bool,
     flights: KVec<render_runtime::Flight>,
+    /// Flights retired by the latest scan, returned one per retire() call.
+    retired: KVec<(u64, bool)>,
     publications: KVec<render_runtime::Publication>,
     batch_works: usize,
     context_roots: [Option<crate::g16_vm::Roots>; 64],
@@ -675,8 +684,13 @@ impl Bootstrap {
             free_work: [KVec::new(), KVec::new()],
             compute_publication: *crate::module_parameters::fw_counter_start.value(),
             queue_events: Arc::new(core::sync::atomic::AtomicU64::new(0), GFP_KERNEL)?,
+            retired_queues: Arc::pin_init(kernel::new_mutex!(KVec::new()), GFP_KERNEL)?,
+            queue_regions: 0,
+            destroying_queues: KVec::new(),
+            free_queues: KVec::new(),
             render_failed: false,
             flights: KVec::new(),
+            retired: KVec::new(),
             publications: KVec::new(),
             batch_works: 0,
             context_roots: [None; 64],

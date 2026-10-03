@@ -75,7 +75,8 @@ struct Vm {
     // Tables must be removed before the references keeping GEM pages pinned.
     space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     compute_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
-    mappings: KVec<Mapping>,
+    // Large address spaces hold thousands of mappings; allow vmalloc.
+    mappings: KVVec<Mapping>,
     pending: KVec<dma_fence::Fence>,
     reservation: ARef<Object>,
     render_support: Option<Arc<crate::g16::Support>>,
@@ -87,7 +88,7 @@ struct Vm {
 /// Retain submit-time GEM and timestamp bindings until actual completion.
 /// Command preparation never reads caller CDM or shader resource data.
 struct Bindings {
-    _mappings: KVec<Mapping>,
+    _mappings: KVVec<Mapping>,
     _timestamps: KVec<TimestampBuffer>,
 }
 
@@ -199,6 +200,11 @@ impl DriverObject for Buffer {
             owner: args.0,
             vm: args.1,
         })
+    }
+
+    /// Imported DMA-BUFs are shared, not private to a VM.
+    fn import_args() -> Self::Args {
+        (0, 0)
     }
 
     fn export(obj: &Object, flags: u32) -> Result<drm::gem::DmaBuf<Object>> {
@@ -386,7 +392,7 @@ impl File {
                     kernel::new_mutex!(crate::g16_vm::AddressSpace::new()?),
                     GFP_KERNEL,
                 )?,
-                mappings: KVec::new(),
+                mappings: KVVec::new(),
                 pending: KVec::new(),
                 reservation,
                 render_support: None,
@@ -726,6 +732,25 @@ impl File {
                 (true, false) => crate::pgtable::prot::PROT_GPU_SHARED_RO,
                 _ => crate::pgtable::prot::PROT_GPU_SHARED_WO,
             };
+            // A bind replaces whatever the range held, as sparse residency
+            // and address replay rebind reserved ranges. Remove only the
+            // overlapping parts of existing mappings.
+            let mut overlaps = KVec::new();
+            for m in vm.mappings.iter() {
+                if address < m.range.end && end > m.range.start {
+                    overlaps.push(
+                        m.range.start.max(address)..m.range.end.min(end),
+                        GFP_KERNEL,
+                    )?;
+                }
+            }
+            if !overlaps.is_empty() {
+                drain(&mut vm.pending)?;
+                let runtime = device.runtime.lock();
+                for range in overlaps.iter() {
+                    vm.unmap(range.clone(), &runtime)?;
+                }
+            }
             let runtime = device.runtime.lock();
             vm.map(
                 address..end,
@@ -908,42 +933,58 @@ impl Vm {
         if runtime.render_failed() {
             return Err(EIO);
         }
-        // Prepare ownership splits before changing any page-table entry.
-        let mut retained = KVec::new();
-        for m in &self.mappings {
-            for part in [
-                m.range.start..m.range.end.min(range.start),
-                m.range.start.max(range.end)..m.range.end,
-            ] {
-                if part.start < part.end {
-                    retained.push(
-                        Mapping {
-                            offset: m.offset
-                                + if m.single {
-                                    0
-                                } else {
-                                    part.start - m.range.start
-                                },
-                            range: part,
-                            permissions: m.permissions,
-                            single: m.single,
-                            sg: m.sg.clone(),
-                        },
-                        GFP_KERNEL,
-                    )?;
-                }
-            }
+        // Mappings do not overlap, so removing one interval can split at most
+        // one mapping into two. Reserve that one extra record before editing
+        // PTEs. Whole-mapping teardown needs no new ownership allocation,
+        // especially when GEM close follows an allocation failure.
+        let right = self.mappings.iter().find(|m| {
+            m.range.start < range.start && range.end < m.range.end
+        }).map(|m| Mapping {
+            range: range.end..m.range.end,
+            offset: m.offset + if m.single { 0 } else { range.end - m.range.start },
+            permissions: m.permissions,
+            single: m.single,
+            sg: m.sg.clone(),
+        });
+        if right.is_some() {
+            self.mappings.reserve(1, GFP_KERNEL)?;
         }
         self.space.lock().low.reserve_invalidation()?;
         self.compute_space.lock().low.reserve_invalidation()?;
-        self.space.lock().low.unmap_pages(range.clone())?;
-        self.compute_space.lock().low.unmap_pages(range.clone())?;
+        // Unbinds may span holes, such as unbound sparse pages. Clear only
+        // the parts which mappings cover.
+        for m in self.mappings.iter() {
+            let start = m.range.start.max(range.start);
+            let end = m.range.end.min(range.end);
+            if start < end {
+                self.space.lock().low.unmap_pages(start..end)?;
+                self.compute_space.lock().low.unmap_pages(start..end)?;
+            }
+        }
         self.publish_mappings(runtime);
-        // Both views are unmapped and their translation invalidations have
-        // completed. Drop removed backing now; surviving partial mappings
-        // retain their SGTable references. Any earlier error leaves the
-        // original ownership in self.mappings, including for partial unmaps.
-        self.mappings = retained;
+        // Only release backing after both views and their invalidations are
+        // complete. Any earlier failure preserves all original references.
+        self.mappings.retain(|m| {
+            if m.range.end <= range.start || m.range.start >= range.end {
+                return true;
+            }
+            if m.range.start < range.start {
+                m.range.end = range.start;
+                return true;
+            }
+            if m.range.end > range.end {
+                if !m.single {
+                    m.offset += range.end - m.range.start;
+                }
+                m.range.start = range.end;
+                return true;
+            }
+            false
+        });
+        if let Some(right) = right {
+            self.mappings.push_within_capacity(right)
+                .unwrap_or_else(|_| unreachable!("reserved split mapping"));
+        }
         Ok(())
     }
 }
@@ -1043,7 +1084,15 @@ impl WorkItem for Execution {
             let mut engine = this.device.engine.lock();
             let mut runtime = this.device.runtime.lock();
             let result = (|| -> Result<bool> {
-                wake_result?;
+                match wake_result {
+                    // No notification within the watchdog window: poll the
+                    // stamps. Retirement's watchdog reports a real hang; a
+                    // lost notification simply retires the finished work.
+                    Err(e) if e == ETIMEDOUT => {
+                        pr_warn!("G16: notification wait timed out; polling retirement\n");
+                    }
+                    other => other?,
+                }
                 generation?;
                 if this.device.failed.load(Ordering::Acquire) {
                     return Err(EIO);
@@ -1539,7 +1588,7 @@ impl File {
                 vm.render_broken = false;
             }
         }
-        let mut mappings = KVec::new();
+        let mut mappings = KVVec::with_capacity(vm.mappings.len(), GFP_KERNEL)?;
         for mapping in &vm.mappings {
             mappings.push(mapping.clone(), GFP_KERNEL)?;
         }
@@ -1786,7 +1835,8 @@ impl Vm {
         p.fragment_lifecycle = 0x08009f520900a6ba;
         p.tiling_work_stamp = 0x120;
         p.fragment_work_stamp = 0x121;
-        p.completion_control = 4;
+        // macOS writes 3; this driver's original value is 4 (debug: work_layout & 4).
+        p.completion_control = if *crate::module_parameters::work_layout.value() & 4 != 0 { 3 } else { 4 };
         p.layermeta = p.heapmeta;
         if p.layers > 1 {
             p.heapmeta += 0x100;

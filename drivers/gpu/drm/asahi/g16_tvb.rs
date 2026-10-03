@@ -13,6 +13,10 @@ use kernel::prelude::*;
 // default budget is one third of this, as in Apple8's non-memoryless path.
 pub(crate) const MAX_BLOCKS: u32 = 6579;
 
+/// Scene records initialized in the pool (render::Addresses::private_page).
+/// macOS cycles all 80 of them in order on T8132.
+const SCENES: u32 = 80;
+
 pub(crate) struct Tvb {
     pub(crate) root: u64,
     pub(crate) addresses: render::Addresses,
@@ -21,7 +25,8 @@ pub(crate) struct Tvb {
     pub(crate) counter: u32,
     submissions: u32,
     pub(crate) refused: bool,
-    scenes: u64,
+    scenes: u128,
+    next_scene: u32,
 }
 impl Tvb {
     pub(crate) fn new(
@@ -72,6 +77,7 @@ impl Tvb {
             submissions: 0,
             refused: false,
             scenes: 0,
+            next_scene: 0,
         })
     }
 
@@ -85,18 +91,22 @@ impl Tvb {
     }
 
     pub(crate) fn reserve_scene(&mut self) -> Result<u32> {
-        // The firmware's accelerator scene records have 36 slots. Lease one
-        // until both stages and their event replies have retired.
-        let index = (!self.scenes).trailing_zeros();
-        if index >= 36 {
-            return Err(EBUSY);
+        // Lease a scene record until both stages and their event replies have
+        // retired. Take them in order, as macOS does, so a record is reused
+        // as late as possible.
+        for step in 0..SCENES {
+            let index = (self.next_scene + step) % SCENES;
+            if self.scenes & (1u128 << index) == 0 {
+                self.scenes |= 1u128 << index;
+                self.next_scene = (index + 1) % SCENES;
+                return Ok(index);
+            }
         }
-        self.scenes |= 1 << index;
-        Ok(index)
+        Err(EBUSY)
     }
 
     pub(crate) fn release_scene(&mut self, index: u32) {
-        self.scenes &= !(1 << index);
+        self.scenes &= !(1u128 << index);
     }
 
     pub(crate) fn work_addresses(&self, a: &mut render::Addresses, scene: u32) {
@@ -136,7 +146,8 @@ impl Tvb {
         // pages. Give it the same 3x headroom used by Apple8's growth policy.
         // M4 expands its page list when it consumes this event's reply, so
         // publication stays on the verified allocation-event path.
-        let mut new = (old * 3).min(limit).max(old);
+        let factor = (*crate::module_parameters::tvb_growth.value()).max(2);
+        let mut new = old.saturating_mul(factor).min(limit).max(old);
         if new > fw.read_u32(a.buffer_manager + 0x38)? || new * 8 > 0x10000 || new * 16 > 0x1c000 {
             return Err(EIO);
         }

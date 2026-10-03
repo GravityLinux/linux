@@ -20,6 +20,16 @@ pub(crate) const OPERAND_TABLE: u64 = 0x70_0040_8000;
 pub(crate) const TIMESTAMP_BASE: u64 = 0xffff_fc21_8140_0000;
 pub(crate) const TIMESTAMP_SIZE: u64 = 0x400_0000;
 
+/// Control message releasing firmware's GPU context ID binding for a context
+/// object. The fields are copied from bytes firmware maintains in the context.
+pub(crate) fn destroy_context(address: u64, fields: [u8; 4]) -> [u8; 0x40] {
+    let mut out = [0; 0x40];
+    out[..4].copy_from_slice(&0x14u32.to_le_bytes());
+    out[8..12].copy_from_slice(&fields);
+    put64(&mut out, 12, address);
+    out
+}
+
 /// The two publications following firmware's already-consumed slot zero.
 pub(crate) fn opening_control() -> [u8; 0x80] {
     let mut out = [0u8; 0x80];

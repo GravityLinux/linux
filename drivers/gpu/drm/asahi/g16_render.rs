@@ -102,8 +102,9 @@ impl Parameters {
                 (32, 32) | (32, 16) | (16, 16)
             )
             && matches!(self.samples, 1 | 2 | 4)
-            && self.tib_blocks <= 64
-            && self.scene_slot < 36
+            && self.tib_blocks <= 128
+            // macOS cycles 80 scene records; register 0x1c910 tracks the record.
+            && self.scene_slot < 80
             && (self.sampler_array == 0) == (self.sampler_count == 0)
             && self.sampler_array & 7 == 0
             && self.sampler_count < u32::MAX as u64
@@ -135,14 +136,21 @@ impl Parameters {
         }
     }
     fn tib_encoding(&self) -> u64 {
-        // T8132's 1..8 RGBA16F attachment sweep covers the full 128 KiB
-        // allocation. The low field wraps at 64 blocks; multisample renders
-        // double their bank tag above 64 KiB. Bit 6 is not an allocation bit.
+        // T8132's 1..8 RGBA16F attachment sweep covers 128 KiB. The low field
+        // wraps at 64 blocks; multisample renders double their bank tag above
+        // 64 KiB, and again above 128 KiB, which 128-byte samples reach in
+        // unchanged 32x16 four-sample tiles. Bit 6 is not an allocation bit.
         let blocks = self.tib_blocks & 0x3f;
         if self.samples == 1 {
             blocks
         } else {
-            let banks = if self.tib_blocks > 32 { 2 } else { 1 };
+            let banks = if self.tib_blocks > 64 {
+                4
+            } else if self.tib_blocks > 32 {
+                2
+            } else {
+                1
+            };
             ((self.samples * banks) << 16) | blocks
         }
     }
@@ -457,14 +465,21 @@ impl Addresses {
             u64_at(&mut out, offset, value);
         }
         u32_at(&mut out, 0x44, self.context_id as u32);
-        u32_at(&mut out, 0x48, self.tiling_counter as u32);
+        if macos_counters() {
+            // As macOS: the setup command carries the scene slot, and the
+            // start command carries this Work's position in the queue.
+            u32_at(&mut out, 0x48, 1);
+            u32_at(&mut out, 0x58, self.scene() as u32);
+        } else {
+            u32_at(&mut out, 0x48, self.tiling_counter as u32);
+        }
         u64_at(&mut out, 0x50, self.buffer_manager_slot);
         u64_at(&mut out, 0x64, work + 0x784);
         u64_at(&mut out, 0x6c, work + 0x8a8);
         u32_at(&mut out, 0x7c, self.tiling_uuid as u32);
         u64_at(&mut out, 0x190, self.support);
         u64_at(&mut out, 0x1a8, self.tiling_status_page);
-        u64_at(&mut out, 0x1b8, 1);
+        u64_at(&mut out, 0x1b8, if macos_counters() { self.tiling_counter as u32 as u64 } else { 1 });
         u32_at(&mut out, 0x1c0, self.tiling_event as u32);
         u32_at(&mut out, 0x1cc, 0x80000003);
         for (offset, value) in [
@@ -540,7 +555,13 @@ impl Addresses {
             u64_at(&mut out, offset, value);
         }
         u32_at(&mut out, 0x5c, self.context_id as u32);
-        u32_at(&mut out, 0x60, self.tiling_counter as u32);
+        if macos_counters() {
+            u32_at(&mut out, 0x60, 1);
+            u32_at(&mut out, 0x70, self.scene() as u32);
+            u32_at(&mut out, 0x1d8, self.fragment_counter as u32);
+        } else {
+            u32_at(&mut out, 0x60, self.tiling_counter as u32);
+        }
         u64_at(&mut out, 0x68, self.buffer_manager_slot);
         u64_at(&mut out, 0x7c, work + 0xa58);
         u64_at(&mut out, 0x84, work + 0xbf0);
@@ -604,6 +625,17 @@ impl Addresses {
     }
 }
 
+fn macos_counters() -> bool {
+    *crate::module_parameters::micro_layout.value() != 0
+}
+
+impl Addresses {
+    /// Scene slot selected by this render's BufferThing record.
+    fn scene(&self) -> u64 {
+        (self.buffer_thing & 0x3fff) / 0x80
+    }
+}
+
 fn tagged_page(address: u64) -> u64 {
     (1 << 56) | (address >> 8)
 }
@@ -659,7 +691,8 @@ impl Parameters {
         u64_at(&mut out, 0x878, a.tiling_driver_stamp);
         u64_at(&mut out, 0x880, a.tiling_firmware_stamp);
         u32_at(&mut out, 0x888, a.tiling_stamp as u32);
-        u32_at(&mut out, 0x894, 1); // Flush notifier stamps before storage reuse.
+        // Flush notifier stamps before storage reuse. macOS writes 0 here.
+        u32_at(&mut out, 0x894, *crate::module_parameters::notifier_flush.value());
         u32_at(&mut out, 0x88c, a.tiling_event as u32);
         u32_at(&mut out, 0x898, a.tiling_uuid as u32);
         u64_at(&mut out, 0x8a0, self.layers - 0x1);
@@ -1101,6 +1134,9 @@ impl Addresses {
 
 /// Reserved support leases; Work storage is allocated per publication.
 pub(crate) const SUPPORT_BASE: u64 = 0xffff_fc20_c300_0000;
+/// Per-lease render shared state, one uncached page per support lease. As on
+/// macOS it is separate from the firmware-cached support object.
+pub(crate) const SUPPORT_SHARED_BASE: u64 = 0xffff_fc20_0280_0000;
 
 impl Addresses {
     pub(crate) fn publication(&self, ordinal: u64) -> Self {

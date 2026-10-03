@@ -515,6 +515,9 @@ impl FirmwareSpace {
         if size == 0 || (va as usize | size) & (UAT_PGSZ - 1) != 0 {
             return Err(EINVAL);
         }
+        if *crate::module_parameters::fw_trace.value() & 128 != 0 {
+            pr_info!("G16: fwmap {:#x}+{:#x} {:?}\n", va, size, prot);
+        }
         let end = va.checked_add(size as u64).ok_or(EINVAL)?;
         // Failed mapping cleanup may retain an owned but partly unmapped
         // region. Its address range must not be replaced or overlapped.
@@ -640,6 +643,13 @@ impl FirmwareSpace {
         }
         self.alloc(
             crate::g16_render::SUPPORT_BASE,
+            64 * UAT_PGSZ,
+            prot::PROT_FW_PRIV_RW,
+        )?;
+        // Each lease's render shared state, which the host advances while
+        // firmware runs, stays uncached apart from the cached support page.
+        self.alloc(
+            crate::g16_render::SUPPORT_SHARED_BASE,
             64 * UAT_PGSZ,
             prot::PROT_FW_SHARED_RW,
         )?;

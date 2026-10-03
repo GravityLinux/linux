@@ -116,7 +116,15 @@ kernel::module_platform_driver! {
         },
         fw_trace: u32 {
             default: 0,
-            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies",
+            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies, 16=retirement delays, 32=dump one render's Work structs, 64=firmware RX ring activity, 128=firmware mappings and configuration dump",
+        },
+        perf_base: u32 {
+            default: 0,
+            description: "Debug: GPU performance controller base pstate (0: ADT value; 10 is the top state)",
+        },
+        tvb_growth: u32 {
+            default: 3,
+            description: "TVB growth factor per firmware allocation request (debug; 3 as Apple8)",
         },
         tvb_max_blocks: u32 {
             default: 2193,
@@ -125,6 +133,38 @@ kernel::module_platform_driver! {
         probe_only: u32 {
             default: 0,
             description: "Identify the GPU without starting firmware or registering DRM",
+        },
+        work_timestamps: u32 {
+            default: 0,
+            description: "Per-Work firmware profiling timestamp slots (0: shared end stamp only, as macOS)",
+        },
+        region_c_layout: u32 {
+            default: 0,
+            description: "Debug: region C host tunables as macOS 25G83 holds them (0: original)",
+        },
+        work_layout: u32 {
+            default: 0,
+            description: "Work fields as macOS (debug): 1=no TVB growth request or fragment flags 0xba8/0xbdc, 2=render index rings, 4=completion control 3, 8=fragment gate 0xb5 after each 40-render cycle start",
+        },
+        micro_layout: u32 {
+            default: 0,
+            description: "Microsequence scene and Work counter fields: 0=original, 1=as macOS (scene slot, per-Work counters)",
+        },
+        render_barrier: u32 {
+            default: 0,
+            description: "Debug render-to-render barriers: 1=apply every render's vdm_barrier at fragment, 2=omit fragment waits already ordered by the queue's fragment lane",
+        },
+        shared_notifier: u32 {
+            default: 1,
+            description: "Renders share one notifier and driver stamp per queue lane, as on macOS (0: one per Work)",
+        },
+        notifier_flush: u32 {
+            default: 0,
+            description: "Tiling Work notifier-stamp flush flag (macOS writes 0; this driver previously wrote 1)",
+        },
+        dependency_kind: u32 {
+            default: 1,
+            description: "Experiment: firmware kind of render-to-render dependencies (1 normal, 0 as the internal TA-to-fragment wait)",
         },
     },
 }
