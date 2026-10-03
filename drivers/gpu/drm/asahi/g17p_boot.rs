@@ -1029,9 +1029,9 @@ impl Session {
         let Some(work) = self.render.as_ref() else { return Ok(None); };
         if self.native.is_some() || self.phase != Phase::Running { return Ok(None); }
         let mut p = source_fragment_parameters(p, false)?;
-        // A first compute may arrive while this render is live. Select the
-        // qualified mixed profile now; changing only future renders is too late.
-        p.completion_control = u64::from(self.compute.is_some() || self.independent_compute_enabled());
+        // Native independent-context overlap keeps render completion control
+        // zero together with compute gate one, from the opening render.
+        p.completion_control = u64::from(self.compute.is_some() && !self.independent_compute_enabled());
         let Some(pair) = self.next_render_pool()? else { return Ok(None); };
         let Some(storage) = self.next_render_storage()? else { return Ok(None); };
         work.preparation_seed(&p, ahead, pair, storage)
@@ -1138,7 +1138,7 @@ impl Session {
         p: &super::g17p_render::Parameters, prepared: Option<KBox<render::PreparedAppend>>,
     ) -> Result<Arc<RenderReceipt>> {
         let mut configured = source_fragment_parameters(p, false)?;
-        configured.completion_control = u64::from(self.compute.is_some() || self.independent_compute_enabled());
+        configured.completion_control = u64::from(self.compute.is_some() && !self.independent_compute_enabled());
         let p = &configured;
         if self.phase != Phase::Running { return Err(EIO); }
         if !self.can_append_render(p)? { return Err(EBUSY); }

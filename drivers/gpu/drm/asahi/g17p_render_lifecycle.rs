@@ -322,10 +322,9 @@ impl Item {
     pub(crate) fn parameters(self, p: &Parameters) -> Parameters {
         let p = Parameters {
             lifecycle_ordinal: self.ordinal as u64,
-            // Ordinary independent compute can start during any retained
-            // render, so its caller preselects the completion1/CS-gate0 pair.
-            // Opening and native profiles retain their qualified values;
-            // ownership and per-pool lifetime rules are unchanged.
+            // The caller selects the render/compute completion profile.
+            // A zero control stays zero across retained render generations;
+            // native independent opening work also retains zero.
             completion_control: u64::from(self.ordinal > 0
                 && (!self.layout.independent || !self.layout.native)
                 && p.completion_control != 0),

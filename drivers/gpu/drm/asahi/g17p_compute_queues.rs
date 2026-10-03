@@ -73,6 +73,9 @@ impl Layout {
     fn zero(self) -> u64 {
         self.high + 0x148000
     }
+    fn completion_scratch(self, slot: u32) -> u64 {
+        self.zero() + slot as u64 * 0x40
+    }
     fn control(self) -> u64 {
         self.high + 0x14c000
     }
@@ -89,7 +92,7 @@ impl Layout {
         self.high + 0x170000 + slot as u64 * 64
     }
     fn event(self, slot: u32) -> u64 {
-        self.high + 0x174000 + slot as u64 * 64
+        self.high + 0x1a0000 + slot as u64 * 0x400
     }
     fn status(self, slot: u32) -> u64 {
         self.high + 0x178000 + slot as u64 * 64
@@ -198,8 +201,11 @@ impl Queues {
             .iter()
             .position(|q| q.matches(key, client, p, priority) && q.window < WINDOW)
             .or_else(|| self.owners.iter().position(|q| q.key == key && q.idle()))
-            .or_else(|| (self.owners.len() < CONTEXTS).then_some(self.owners.len()))
+            // Rebind a fully retired owner before growing the permanent
+            // backing pool. Live owners never block another queue: allocate
+            // another owner when none can be reused safely.
             .or_else(|| self.owners.iter().position(Queue::idle))
+            .or_else(|| (self.owners.len() < CONTEXTS).then_some(self.owners.len()))
     }
     pub(crate) fn can_stage(
         &self,
@@ -217,9 +223,12 @@ impl Queues {
         p: &Parameters,
         priority: u32,
     ) -> Option<&Client> {
+        // Use the same owner stage() will select, including an idle owner
+        // whose full window can rotate without rebuilding its retained VM.
+        let index = self.choose(key, client, p, priority)?;
         self.owners
-            .iter()
-            .find(|q| q.matches(key, client, p, priority) && q.window < WINDOW)
+            .get(index)
+            .filter(|q| q.matches(key, client, p, priority))
             .map(|q| &q.client)
     }
     pub(crate) fn stage(
@@ -315,6 +324,7 @@ impl Queue {
             (layout.job_list(), PAGE),
             (layout.optional(), PAGE),
             (layout.high + 0x160000, 0x24000),
+            (layout.high + 0x1a0000, 0x40000),
         ] {
             vm.ensure_firmware(memory, address, size)?;
         }
@@ -323,8 +333,8 @@ impl Queue {
         page.resize(PAGE, 0, GFP_KERNEL)?;
         cm::Support {
             compact: None,
-            header: 1,
-            word_08: 0,
+            header: u64::from(layout.asid),
+            word_08: 1,
             word_10: 2,
             resource_class: 0x15,
             word_20: Some(0x150000000000),
@@ -432,23 +442,27 @@ impl Queue {
             return Err(EIO);
         }
         // Reuse this owner's allocator and private backing. A changed reserved
-        // aperture moves the same eight leaves, after this owner retires.
+        // aperture moves the same save/robustness leaves after this owner retires.
         let mut private: KVec<(u64, u64, u64)> = KVec::new();
         if self.preempt != p.preempt {
-            let offsets = [
-                0, 0x4000, 0x8000, 0x78000, 0x7c000, 0x80000, 0x100000, 0x108000,
-            ];
-            let mut leaves = [0; 8];
-            for (i, offset) in offsets.into_iter().enumerate() {
+            let mut offsets = KVec::with_capacity(256 * 3 + 2, GFP_KERNEL)?;
+            for slot in 0..256u64 {
+                for page in [0, 0x4000, 0x8000] {
+                    offsets.push(slot * 0x78000 + page, GFP_KERNEL)?;
+                }
+            }
+            for offset in [0x100000, 0x108000] {offsets.push(offset, GFP_KERNEL)?;}
+            let mut leaves = KVec::with_capacity(offsets.len(), GFP_KERNEL)?;
+            for &offset in &offsets {
                 let old = self.preempt + offset;
                 let leaf = self.client.root.pte(old)?;
                 if leaf == 0 {
                     return Err(EIO);
                 }
-                leaves[i] = leaf;
+                leaves.push(leaf, GFP_KERNEL)?;
                 private.push((old, leaf, 0), GFP_KERNEL)?;
             }
-            for (offset, leaf) in offsets.into_iter().zip(leaves) {
+            for (&offset, &leaf) in offsets.iter().zip(leaves.iter()) {
                 let address = p.preempt + offset;
                 if let Some(row) = private.iter_mut().find(|r| r.0 == address) {
                     row.2 = leaf;
@@ -531,6 +545,12 @@ impl Queue {
         } else {
             self.publication.ok_or(EIO)?.write_after
         };
+        // The host event prefix is only 0x40 bytes, but firmware may
+        // append records into the complete 0x400-byte event allocation.
+        vm.write(memory, 2, l.event(slot), &[0; 0x400])?;
+        // Native descriptors use a separate zero-initialized 64-byte
+        // completion record for every simultaneously live command.
+        vm.write(memory, 2, l.completion_scratch(slot), &[0; 0x40])?;
         let dispatch = l.dispatch(slot);
         let status = [l.status(slot), l.status(slot) + 8];
         let scheduler = c::Scheduler {
@@ -550,18 +570,20 @@ impl Queue {
         }
         vm.write(memory, 2, status[0], &[0; 16])?;
         let regs = c::Program {
-            preempt: p.preempt + (ordinal % 2) as u64 * 0x78000,
+            preempt: p.preempt + u64::from(slot) * 0x78000,
             cdm: p.cdm,
             identity: 0x0200020803000247u64 + u64::from(ordinal) * 0x200000001,
             context: u32::from(l.asid),
             ordinal,
-            robustness: p.preempt + 0x100000 + (ordinal % 2) as u64 * 0x8000,
-            operand_state: 0x7000220000 + (ordinal % 2) as u64 * 0x15c0000,
+            robustness: p.preempt + 0x100000 + u64::from(slot) * 0x40,
+            // The operand allocator state belongs to this queue/root,
+            // not to the alternating per-command preemption save areas.
+            operand_state: 0x7000220000,
             usc_exec_base: c::USC_EXEC_BASE,
             helper_binary: 0,
             helper_data: 0,
             helper_cfg: 0,
-            execution_gate: 0,
+            execution_gate: 1,
         }
         .build()
         .map_err(|_| EINVAL)?;
@@ -578,7 +600,7 @@ impl Queue {
             status,
             timestamps: p.timestamps,
             shared_control: l.support(),
-            zero_page: l.zero(),
+            zero_page: l.completion_scratch(slot),
             support_control: 0xe0a00001,
             support_flags: 0,
             ordinal,
