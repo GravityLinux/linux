@@ -159,6 +159,8 @@ pub(super) struct Flight {
     /// complete, and which later conditions still blocked retirement.
     stamps_seen: Option<Instant<Monotonic>>,
     blocked: u32,
+    /// Stamps this Work waits on before it may run, for hang reports.
+    dependencies: [Option<Stamp>; 2],
 }
 
 /// One channel message for all staged commands on this firmware queue.
@@ -817,11 +819,18 @@ impl Bootstrap {
                      fw.read_u64(status + 0x18)?, fw.read_u64(status + 0x20)?, fw.read_u64(status + 0x28)?,
                      fw.read_u64(status + 0x30)?, fw.read_u64(status + 0x38)?);
         }
+        // Never let one unreadable word end the report early.
+        let word = |address: u64| fw.read_u32(address).unwrap_or(0xdead_beef);
         if let Some(flight) = self.flights.first() {
             for (stage, (pointers, head)) in flight.queues.iter().enumerate() {
-                dev_err!(self.dev.as_ref(), "G16: hang queue stage {} read={} done={} published={} flight head={}\n",
-                         stage, fw.read_u32(*pointers)?, fw.read_u32(*pointers + 0x30)?,
-                         fw.read_u32(*pointers + 0x40)?, head);
+                if *pointers == 0 {
+                    continue;
+                }
+                // Ring words +0x0/+0x30/+0x40; on G13 these are the GPU done
+                // pointer, GPU read pointer and CPU write pointer.
+                dev_err!(self.dev.as_ref(), "G16: hang queue stage {} ring+0={} ring+0x30={} ring+0x40={} flight head={}\n",
+                         stage, word(*pointers), word(*pointers + 0x30),
+                         word(*pointers + 0x40), head);
             }
             if let Some(render) = &flight.render {
                 let a = &render.addresses;
@@ -847,22 +856,35 @@ impl Bootstrap {
             }
         }
         for flight in self.flights.iter().take(24) {
-            dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} notifier={:?}\n",
+            // blocked: bit 1 notifier, 2 ring, 3 channel, 4 control reply.
+            dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} blocked={:#x} notifier={:?}\n",
                      flight.id, flight.context, flight.started.elapsed().as_millis(),
-                     flight.render.is_some(),
-                     match flight.notifier_count {
-                         Some((addr, total)) => Some((fw.read_u32(addr)?, total)),
-                         None => None,
-                     });
+                     flight.render.is_some(), flight.blocked,
+                     flight.notifier_count.map(|(addr, total)| (word(addr), total)));
             for (stage, stamp) in flight.stamps.iter().enumerate() {
                 if let Some(stamp) = stamp {
                     dev_err!(self.dev.as_ref(), "G16:   stage {} fw stamp {:#x}={:#x} want {:#x}\n",
-                             stage, stamp.address, fw.read_u32(stamp.address)?, stamp.value);
+                             stage, stamp.address, word(stamp.address), stamp.value);
                 }
             }
             for stamp in flight.driver_stamps.iter().flatten() {
                 dev_err!(self.dev.as_ref(), "G16:   driver stamp {:#x}={:#x} want {:#x}\n",
-                         stamp.address, fw.read_u32(stamp.address)?, stamp.value);
+                         stamp.address, word(stamp.address), stamp.value);
+            }
+            for &(pointers, head) in flight.queues.iter().filter(|q| q.0 != 0) {
+                dev_err!(self.dev.as_ref(), "G16:   ring {:#x} +0={} +0x30={} +0x40={} head={}\n",
+                         pointers, word(pointers), word(pointers + 0x30),
+                         word(pointers + 0x40), head);
+            }
+            for &(channel, target) in flight.channels.iter().filter(|c| c.0 != usize::MAX) {
+                dev_err!(self.dev.as_ref(), "G16:   channel {} target {}\n", channel, target);
+            }
+            for (kind, dep) in flight.dependencies.iter().enumerate() {
+                if let Some(dep) = dep {
+                    let stage = if kind == 0 { "render" } else { "compute" };
+                    dev_err!(self.dev.as_ref(), "G16:   waits on {} stamp {:#x}={:#x} want {:#x} event {}\n",
+                             stage, dep.address, word(dep.address), dep.value, dep.event);
+                }
             }
         }
         // Newest firmware trace-ring entries (512 x 0x48 at 0xe5c40).
@@ -1808,6 +1830,7 @@ impl Bootstrap {
                 notifier_count,
                 stamps_seen: None,
                 blocked: 0,
+                dependencies: *dependencies,
                 stamps: [
                     Some(Stamp {
                         address: a.tiling_firmware_stamp,
@@ -2189,6 +2212,7 @@ impl Bootstrap {
                 notifier_count: None,
                 stamps_seen: None,
                 blocked: 0,
+                dependencies: *dependencies,
                 stamps: [Some(stamp), None],
                 driver_stamps: [
                     Some(Stamp {
