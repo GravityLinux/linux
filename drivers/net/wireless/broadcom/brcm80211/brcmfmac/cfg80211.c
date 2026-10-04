@@ -69,8 +69,6 @@
 #define RSN_CAP_MFPR_MASK		BIT(6)
 #define RSN_CAP_MFPC_MASK		BIT(7)
 #define RSN_PMKID_COUNT_LEN		2
-#define DPP_AKM_SUITE_TYPE		2
-#define WLAN_AKM_SUITE_DPP		SUITE(WLAN_OUI_WFA, DPP_AKM_SUITE_TYPE)
 
 #define VNDR_IE_CMD_LEN			4	/* length of the set command
 						 * string :"add", "del" (+ NUL)
@@ -1894,7 +1892,7 @@ brcmf_set_key_mgmt(struct net_device *ndev, struct cfg80211_connect_params *sme)
 			else
 				profile->use_fwsup = BRCMF_PROFILE_FWSUP_ROAM;
 			break;
-		case WLAN_AKM_SUITE_DPP:
+		case WLAN_AKM_SUITE_WFA_DPP:
 			val = WFA_AUTH_DPP;
 			profile->use_fwsup = BRCMF_PROFILE_FWSUP_NONE;
 			break;
@@ -1908,9 +1906,6 @@ brcmf_set_key_mgmt(struct net_device *ndev, struct cfg80211_connect_params *sme)
 				profile->use_fwsup = BRCMF_PROFILE_FWSUP_1X;
 			else
 				profile->use_fwsup = BRCMF_PROFILE_FWSUP_ROAM;
-			break;
-		case WLAN_AKM_SUITE_WFA_DPP:
-			val = WFA_AUTH_DPP;
 			break;
 		default:
 			bphy_err(drvr, "invalid cipher group (%d)\n",
