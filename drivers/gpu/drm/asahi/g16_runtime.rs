@@ -196,14 +196,23 @@ impl Bootstrap {
     /// Report each exhausted resource once, without logging every retry or
     /// enabling firmware KTrace (which changes command execution timing).
     fn report_pressure(&self, bit: u64, resource: &str) {
-        if crate::module_parameters::fw_trace.value() & 2 != 0
+        // Every resource here is released when work retires. Backpressure with
+        // nothing in flight can therefore never clear: it means an accounting
+        // leak, and submission stalls indefinitely with an idle GPU. Always
+        // report that, and event/ASID exhaustion, once per boot; transient
+        // ring and scene pressure under load stays behind fw_trace & 2.
+        let persistent = bit & (1 | 8) != 0 || self.flights.is_empty();
+        if (persistent || crate::module_parameters::fw_trace.value() & 2 != 0)
             && self.pressure_reported.fetch_or(bit, Ordering::Relaxed) & bit == 0
         {
+            let asids = (1..64).filter(|&i| self.context_users[i] != 0).count();
             dev_info!(
                 self.dev.as_ref(),
-                "G16: backpressure {} outstanding={}\n",
+                "G16: backpressure {} outstanding={} queue_events={}/32 asids={}/63\n",
                 resource,
-                self.flights.len()
+                self.flights.len(),
+                (self.queue_events.load(Ordering::Acquire) & 0xffff_ffff).count_ones(),
+                asids
             );
         }
     }
