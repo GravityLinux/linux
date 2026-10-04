@@ -105,6 +105,10 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
  */
 void apple_rtkit_free(struct apple_rtkit *rtk);
 
+/* Configure before starting the coprocessor. G16 requests its preallocated
+ * crash buffer before the endpoint-map ACK and requires an explicit reply. */
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
+
 /*
  * Reinitialize internal structures. Must only be called with the co-processor
  * is held in reset.

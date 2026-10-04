@@ -170,6 +170,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
+		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
+			apple_rtkit_start_ep(rtk, ep);
 	}
 
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
@@ -184,6 +186,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		return;
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
+		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
+			continue;
 		switch (ep) {
 		/* the management endpoint is started by default */
 		case APPLE_RTKIT_EP_MGMT:
@@ -321,6 +325,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
+	} else if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG) {
+		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
 	return 0;
@@ -377,8 +383,9 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	if (!rtk->crashlog_buffer.size) {
-		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
-						 APPLE_RTKIT_EP_CRASHLOG, msg);
+		if (!apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
+						 APPLE_RTKIT_EP_CRASHLOG, msg))
+			complete_all(&rtk->crashlog_completion);
 		return;
 	}
 
@@ -698,6 +705,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->cookie = cookie;
 	rtk->ops = ops;
 	rtk->boot_ap_power = true;
+	init_completion(&rtk->crashlog_completion);
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
@@ -776,6 +784,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->crashlog_completion);
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
@@ -815,6 +824,13 @@ void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable)
 	rtk->boot_ap_power = enable;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_boot_ap_power);
+
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
+{
+	rtk->early_crashlog = true;
+	reinit_completion(&rtk->crashlog_completion);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
 
 int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
 			      size_t n_endpoints)
@@ -959,6 +975,13 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			"RTKit: timed out waiting for IOP power ACK (state %#x): %d\n",
 			rtk->iop_power_state, ret);
 		return ret;
+	}
+	if (rtk->early_crashlog) {
+		ret = apple_rtkit_wait_for_completion(&rtk->crashlog_completion);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: timed out waiting for crash buffer: %d\n", ret);
+			return ret;
+		}
 	}
 	if (!rtk->boot_ap_power) {
 		dev_dbg(rtk->dev, "RTKit: reusing boot AP power ownership\n");
