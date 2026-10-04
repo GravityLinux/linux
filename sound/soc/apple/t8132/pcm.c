@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/uio.h>
 #include <linux/vmalloc.h>
@@ -561,6 +562,31 @@ static void speaker_put_node(void *node)
 	of_node_put(node);
 }
 
+/*
+ * Building the card's PCMs requests MCA DMA channels from ADMAC. If ADMAC has
+ * not bound yet, ASoC parks the card and only retries it when another ASoC
+ * component registers, which a late DMA controller never triggers. Defer
+ * the whole probe instead, so the driver core retries once ADMAC binds.
+ */
+static int speaker_wait_for_dma(struct device *dev, struct device_node *mca)
+{
+	struct device_node *np = of_parse_phandle(mca, "dmas", 0);
+	struct platform_device *dma;
+	bool bound;
+
+	if (!np)
+		return 0;
+	dma = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!dma)
+		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for the audio DMA controller\n");
+	bound = device_is_bound(&dma->dev);
+	put_device(&dma->dev);
+	if (!bound)
+		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for the audio DMA controller\n");
+	return 0;
+}
+
 static int speaker_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -580,6 +606,9 @@ static int speaker_probe(struct platform_device *pdev)
 	if (!mca)
 		return -EINVAL;
 	ret = devm_add_action_or_reset(dev, speaker_put_node, mca);
+	if (ret)
+		return ret;
+	ret = speaker_wait_for_dma(dev, mca);
 	if (ret)
 		return ret;
 	codec = of_parse_phandle(dev->of_node, "apple,codec", 0);
