@@ -676,7 +676,7 @@ impl File {
         if byte_count > 1024 * 1024 {
             return Err(EINVAL);
         }
-        let mut records = KVec::new();
+        let mut records = KVVec::new();
         UserSlice::new(UserPtr::from_addr(data.userptr.try_into()?), byte_count)
             .reader()
             .read_all(&mut records, GFP_KERNEL)?;
@@ -874,7 +874,7 @@ impl Vm {
             return Err(EEXIST);
         }
         let bo_offset = offset;
-        let mut chunks = KVec::new();
+        let mut chunks = KVVec::new();
         let mut va = range.start;
         for segment in sgt.iter() {
             let length = u64::from(segment.dma_len());
@@ -1387,7 +1387,7 @@ impl File {
         {
             return Err(EINVAL);
         }
-        let mut bytes = KVec::new();
+        let mut bytes = KVVec::new();
         UserSlice::new(
             UserPtr::from_addr(data.cmdbuf.try_into()?),
             data.cmdbuf_size as usize,
