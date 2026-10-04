@@ -786,8 +786,20 @@ impl Bootstrap {
                 let hi = guard.try_read32(offset + 4).unwrap_or(0xdeadbeef);
                 u64::from(lo) | (u64::from(hi) << 32)
             };
+            let info = read64(0xd8c0);
+            let addr = read64(0xd8c8);
             dev_err!(self.dev.as_ref(), "G16: fault info d8c0={:#018x} d8c8={:#018x} 17030={:#018x}\n",
-                     read64(0xd8c0), read64(0xd8c8), read64(0x17030));
+                     info, addr, read64(0x17030));
+            // Field layout as on G14X (regs.rs get_fault_info); not yet
+            // validated on G16 beyond the VM slot matching the hung context.
+            if info & 1 != 0 {
+                let access = if info & (1 << 4) != 0 { "read" } else { "write" };
+                dev_err!(self.dev.as_ref(),
+                         "G16: fault addr={:#x} {} reason={} unit={:#04x} vm_slot={} level={} sideband={:#04x}\n",
+                         addr << 6, access,
+                         (info >> 1) & 7, (info >> 9) & 0xff, (info >> 17) & 0x3f,
+                         (info >> 7) & 3, (info >> 23) & 0x7f);
+            }
         }
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
         for status in [0xffff_fc20_0003_f180u64, 0xffff_fc20_0003_0000] {
