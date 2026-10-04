@@ -42,6 +42,8 @@
 			resets = <&cio_reset 1>;
 			power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
 					<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+			/* The port controller hands over USB4/TBT mode and cable details. */
+			thunderbolt-switch;
 			pinctrl-0 = <&acio1_pins>;
 			pinctrl-names = "default";
 			/* PCIe windows lie outside ACIO's local register aperture. */

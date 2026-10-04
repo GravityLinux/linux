@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple Mac mini (M4, 2024) with experimental USB4 on ACIO1
+ *
+ * target-type: J773g
+ *
+ * Opt-in DTB for USB4 bring-up; t8132-j773g.dtb leaves ACIO1 disabled.
+ */
+
+#include "t8132-j773g.dts"
+#include "t8132-usb4-bringup.dtsi"
