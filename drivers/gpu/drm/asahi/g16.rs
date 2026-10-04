@@ -5,13 +5,13 @@
 //! G16 firmware bootstrap. Its 43-bit address space and initialization graph
 //! must not be passed to a G13/G14 firmware manager.
 
-use kernel::io::Io;
+use kernel::io::{Io, IoBase};
 use kernel::{c_str, device::Core, platform, prelude::*};
 
 const PAGE_SIZE: u64 = 0x4000;
 
 /// Validate the memory contract supplied by m1n1 before starting firmware.
-pub(crate) fn validate_boot_resources(pdev: &platform::Device<Core>) -> Result {
+pub(crate) fn validate_boot_resources(pdev: &platform::Device<Core<'_>>) -> Result {
     let dev = pdev.as_ref();
     let node = dev.of_node().ok_or(EINVAL)?;
     let fwnode = dev.fwnode().ok_or(EINVAL)?;
@@ -79,9 +79,7 @@ pub(crate) fn validate_boot_resources(pdev: &platform::Device<Core>) -> Result {
 }
 
 use kernel::{
-    devres::Devres,
-    io::{self, mem::IoMem},
-    iosys_map::IoSysMapRef,
+    io::{self, mem::DevresIoMem, IoSysMap, SysMem},
     soc::apple::rtkit,
     sync::Arc,
     sync::aref::ARef,
@@ -105,8 +103,17 @@ impl rtkit::Buffer for CrashBuffer {
         Ok(self.iova)
     }
 
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
-        self.map.as_iosys_map(self.offset, self.size)
+    fn buf(&mut self) -> Result<IoSysMap<'_, [u8]>> {
+        if self.offset.checked_add(self.size).ok_or(EINVAL)? > self.map.size() {
+            return Err(EINVAL);
+        }
+        // SAFETY: `offset..offset + size` lies within the mapped reserved
+        // firmware region, which stays mapped while `self` (and the borrow) lives.
+        let region = unsafe {
+            core::ptr::slice_from_raw_parts_mut(self.map.ptr().add(self.offset), self.size)
+        };
+        // SAFETY: As above; the region is valid kernel memory for the borrow.
+        Ok(IoSysMap::Sys(unsafe { SysMem::new(region) }))
     }
 }
 
@@ -189,8 +196,8 @@ pub(crate) struct Bootstrap {
     dev: ARef<platform::Device>,
     pub(crate) notifications: Arc<Notifications>,
     _rtkit: Pin<KBox<rtkit::RtKit<BootOps>>>,
-    _asc: Pin<KBox<Devres<IoMem<0x4000>>>>,
-    _sgx: Pin<KBox<Devres<IoMem<0x4000000>>>>,
+    _asc: DevresIoMem<0x4000>,
+    _sgx: DevresIoMem<0x4000000>,
     _handoff: io::mem::Mem,
     _address_space: Option<crate::g16_vm::AddressSpace>,
     _firmware_space: Option<crate::g16_vm::FirmwareSpace>,
@@ -249,7 +256,7 @@ impl Drop for Bootstrap {
 }
 
 impl Bootstrap {
-    pub(crate) fn new(pdev: &platform::Device<Core>) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<Self> {
         validate_boot_resources(pdev)?;
         let platform = crate::g16_platform::Platform::new(pdev.as_ref())?;
         // All board inputs are checked before any firmware is started.
@@ -262,18 +269,16 @@ impl Bootstrap {
         let mut address_space = crate::g16_vm::AddressSpace::new()?;
         address_space.check_geometry(dev)?;
         address_space.check_borrowed_root(dev)?;
-        let asc = KBox::pin_init(
-            pdev.io_request_by_name(c_str!("asc"))
-                .ok_or(EINVAL)?
-                .iomap_sized::<0x4000>(),
-            GFP_KERNEL,
-        )?;
-        let sgx = KBox::pin_init(
-            pdev.io_request_by_name(c_str!("sgx"))
-                .ok_or(EINVAL)?
-                .iomap_sized::<0x4000000>(),
-            GFP_KERNEL,
-        )?;
+        let asc = pdev
+            .io_request_by_name(c_str!("asc"))
+            .ok_or(EINVAL)?
+            .iomap_sized::<0x4000>()?
+            .into_devres()?;
+        let sgx = pdev
+            .io_request_by_name(c_str!("sgx"))
+            .ok_or(EINVAL)?
+            .iomap_sized::<0x4000000>()?
+            .into_devres()?;
         let res = dev
             .of_node()
             .ok_or(EINVAL)?
@@ -283,8 +288,8 @@ impl Bootstrap {
         let handoff = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
         let asc_guard = asc.try_access().ok_or(ENODEV)?;
         let asc_io = &*asc_guard;
-        let control = asc_io.relaxed().read32(0x44);
-        let status = asc_io.relaxed().read32(0x48);
+        let control = asc_io.as_view().relaxed().read32(0x44);
+        let status = asc_io.as_view().relaxed().read32(0x48);
         drop(asc_guard);
         dev_info!(
             dev,
@@ -297,7 +302,7 @@ impl Bootstrap {
         }
         let sgx_guard = sgx.try_access().ok_or(ENODEV)?;
         let sgx_io = &*sgx_guard;
-        let gpu_id = sgx_io.relaxed().read32(crate::ID_VERSION);
+        let gpu_id = sgx_io.as_view().relaxed().read32(crate::ID_VERSION);
         if gpu_id == 0 || gpu_id == u32::MAX {
             dev_err!(dev, "Invalid GPU ID {:#010x}\n", gpu_id);
             return Err(ENODEV);
@@ -307,9 +312,9 @@ impl Bootstrap {
         let gpu_revision = (gpu_id >> 8) & 0xff;
         dev_info!(dev, "G16: GPU ID={:#010x} revision={:#04x}\n", gpu_id, gpu_revision);
         for offset in [0x1000104, 0x1000108] {
-            sgx_io.relaxed().write32(sgx_io.relaxed().read32(offset) | 1, offset);
+            sgx_io.as_view().relaxed().write32(sgx_io.as_view().relaxed().read32(offset) | 1, offset);
         }
-        sgx_io.relaxed().write32(6, 0xd06030);
+        sgx_io.as_view().relaxed().write32(6, 0xd06030);
         drop(sgx_guard);
         // SAFETY: The region validation guarantees a full aligned page. The
         // coprocessor is stopped, so these host-owned bootstrap fields are
@@ -345,14 +350,12 @@ impl Bootstrap {
         )?;
         rtkit.as_mut().set_early_crashlog();
         let asc_guard = asc.try_access().ok_or(ENODEV)?;
-        asc_guard.relaxed().write32(control | 0x10, 0x44);
+        asc_guard.as_view().relaxed().write32(control | 0x10, 0x44);
         drop(asc_guard);
         crate::mem::sync();
         rtkit.as_mut().boot()?;
         for ep in [0x20, 0x21] {
-            if !rtkit.as_mut().has_endpoint(ep) {
-                return Err(ENODEV);
-            }
+            // Fails with EINVAL if the firmware did not advertise the endpoint.
             rtkit.as_mut().start_endpoint(ep)?;
         }
         dev_info!(
@@ -678,11 +681,11 @@ impl Bootstrap {
             core_mask: platform.core_mask,
             maximum_frequency_khz: platform.freq_a[10] * 1000,
             tvb_pools: KVec::new(),
-            render_publication: *crate::module_parameters::fw_counter_start.value(),
+            render_publication: crate::module_parameters::fw_counter_start.value(),
             next_work_va: 0xffff_fc22_0000_0000,
             work_arenas: [0..0, 0..0],
             free_work: [KVec::new(), KVec::new()],
-            compute_publication: *crate::module_parameters::fw_counter_start.value(),
+            compute_publication: crate::module_parameters::fw_counter_start.value(),
             queue_events: Arc::new(core::sync::atomic::AtomicU64::new(0), GFP_KERNEL)?,
             retired_queues: Arc::pin_init(kernel::new_mutex!(KVec::new()), GFP_KERNEL)?,
             queue_regions: 0,
@@ -701,7 +704,7 @@ impl Bootstrap {
                 GFP_KERNEL,
             )?,
         };
-        if *crate::module_parameters::fw_trace.value() & 1 != 0 {
+        if crate::module_parameters::fw_trace.value() & 1 != 0 {
             // Region C starts with the firmware KTrace mask, as in the shim.
             session
                 ._firmware_space
@@ -715,7 +718,7 @@ impl Bootstrap {
         Ok(session)
     }
 
-    fn submit_barrier(&mut self, pdev: &platform::Device<Core>) -> Result {
+    fn submit_barrier(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
         use crate::g16_fw::queue as q;
         let dev = pdev.as_ref();
         let firmware = self._firmware_space.as_mut().ok_or(EINVAL)?;
@@ -725,9 +728,9 @@ impl Bootstrap {
             firmware.write_live(addr, &0u32.to_le_bytes())?;
         }
         let before = (
-            sgx.relaxed().read32(0xd64040),
-            sgx.relaxed().read32(0xd64048),
-            sgx.relaxed().read32(0xd60020),
+            sgx.as_view().relaxed().read32(0xd64040),
+            sgx.as_view().relaxed().read32(0xd64048),
+            sgx.as_view().relaxed().read32(0xd60020),
         );
         if before != (0, 0, 0) {
             return Err(EBUSY);
@@ -737,7 +740,7 @@ impl Bootstrap {
             crate::g16_fw::BUNDLE_ADDRESS + 0x16240,
             &q::channel(BOOT_QUEUE, 2, 1, 1, true, 1),
         )?;
-        sgx.relaxed().write32(1, 0xd60020);
+        sgx.as_view().relaxed().write32(1, 0xd60020);
         crate::mem::sync();
         drop(sgx_guard);
         let mut committed = false;
@@ -765,8 +768,8 @@ impl Bootstrap {
         for _ in 0..3000 {
             let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
             let sgx = &*sgx_guard;
-            if sgx.relaxed().read32(0xd64040) == 1
-                && sgx.relaxed().read32(0xd64048) == 1
+            if sgx.as_view().relaxed().read32(0xd64040) == 1
+                && sgx.as_view().relaxed().read32(0xd64048) == 1
                 && firmware.read_u32(BOOT_POINTERS + 0x30)? == 2
             {
                 // Barriers consume the inner ring without advancing its
@@ -782,16 +785,16 @@ impl Bootstrap {
         dev_err!(
             dev,
             "G16: barrier timeout; channel {}/{}/{} item done/read {}/{}\n",
-            sgx.relaxed().read32(0xd64040),
-            sgx.relaxed().read32(0xd64048),
-            sgx.relaxed().read32(0xd60020),
+            sgx.as_view().relaxed().read32(0xd64040),
+            sgx.as_view().relaxed().read32(0xd64048),
+            sgx.as_view().relaxed().read32(0xd60020),
             firmware.read_u32(BOOT_POINTERS)?,
             firmware.read_u32(BOOT_POINTERS + 0x30)?
         );
         Err(ETIMEDOUT)
     }
 
-    fn open_control(&mut self, pdev: &platform::Device<Core>) -> Result {
+    fn open_control(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
         let dev = pdev.as_ref();
         let firmware = self._firmware_space.as_mut().ok_or(EINVAL)?;
         let client = self._opening_client.as_ref().ok_or(EINVAL)?;
@@ -844,15 +847,15 @@ impl Bootstrap {
         let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
         let sgx = &*sgx_guard;
         let before = (
-            sgx.relaxed().read32(0xd640c0),
-            sgx.relaxed().read32(0xd640c8),
-            sgx.relaxed().read32(0xd60060),
+            sgx.as_view().relaxed().read32(0xd640c0),
+            sgx.as_view().relaxed().read32(0xd640c8),
+            sgx.as_view().relaxed().read32(0xd60060),
         );
         if before != (1, 1, 1) {
             dev_err!(dev, "G16: unexpected opening cursors {:?}\n", before);
             return Err(EIO);
         }
-        sgx.relaxed().write32(3, 0xd60060);
+        sgx.as_view().relaxed().write32(3, 0xd60060);
         drop(sgx_guard);
         for (address, value) in [
             (0xffff_fc20_0003_4f88, 0xffff_fc21_8100_0000u64),
@@ -871,9 +874,9 @@ impl Bootstrap {
             let sgx_guard = self._sgx.try_access().ok_or(ENODEV)?;
             let sgx = &*sgx_guard;
             let cursors = (
-                sgx.relaxed().read32(0xd640c0),
-                sgx.relaxed().read32(0xd640c8),
-                sgx.relaxed().read32(0xd60060),
+                sgx.as_view().relaxed().read32(0xd640c0),
+                sgx.as_view().relaxed().read32(0xd640c8),
+                sgx.as_view().relaxed().read32(0xd60060),
             );
             if cursors == (3, 3, 3) && firmware.read_u32(0xffff_fc20_0003_f19c)? == 1 {
                 dev_info!(
@@ -891,15 +894,15 @@ impl Bootstrap {
         dev_err!(
             dev,
             "G16: control timeout; cursors {}/{}/{} completion {}\n",
-            sgx.relaxed().read32(0xd640c0),
-            sgx.relaxed().read32(0xd640c8),
-            sgx.relaxed().read32(0xd60060),
+            sgx.as_view().relaxed().read32(0xd640c0),
+            sgx.as_view().relaxed().read32(0xd640c8),
+            sgx.as_view().relaxed().read32(0xd60060),
             firmware.read_u32(0xffff_fc20_0003_f19c)?
         );
         Err(ETIMEDOUT)
     }
 
-    fn publish(&mut self, pdev: &platform::Device<Core>) -> Result {
+    fn publish(&mut self, pdev: &platform::Device<Core<'_>>) -> Result {
         let dev = pdev.as_ref();
         let address_space = self._address_space.as_ref().ok_or(EINVAL)?;
         let firmware_space = self._firmware_space.as_ref().ok_or(EINVAL)?;

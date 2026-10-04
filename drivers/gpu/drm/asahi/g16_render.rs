@@ -626,7 +626,7 @@ impl Addresses {
 }
 
 fn macos_counters() -> bool {
-    *crate::module_parameters::micro_layout.value() != 0
+    crate::module_parameters::micro_layout.value() != 0
 }
 
 impl Addresses {
@@ -692,7 +692,7 @@ impl Parameters {
         u64_at(&mut out, 0x880, a.tiling_firmware_stamp);
         u32_at(&mut out, 0x888, a.tiling_stamp as u32);
         // Flush notifier stamps before storage reuse. macOS writes 0 here.
-        u32_at(&mut out, 0x894, *crate::module_parameters::notifier_flush.value());
+        u32_at(&mut out, 0x894, crate::module_parameters::notifier_flush.value());
         u32_at(&mut out, 0x88c, a.tiling_event as u32);
         u32_at(&mut out, 0x898, a.tiling_uuid as u32);
         u64_at(&mut out, 0x8a0, self.layers - 0x1);

@@ -361,7 +361,7 @@ impl Platform {
         for (off, value) in [(0x54, u16::MAX), (0x56, 40), (0x58, u16::MAX)] {
             out[off..off + 2].copy_from_slice(&value.to_le_bytes());
         }
-        if *crate::module_parameters::region_c_layout.value() != 0 {
+        if crate::module_parameters::region_c_layout.value() != 0 {
             // Debug: the words macOS 26.6.2 (25G83) holds here once booted,
             // observed under the hypervisor on this machine.
             for (off, value, size) in [

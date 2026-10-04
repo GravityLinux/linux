@@ -327,7 +327,7 @@ impl UatPageTable {
     /// Queue cache cleaning for edited tables, including borrowed ancestors.
     /// The enclosing publication batch supplies the completion barrier.
     pub(crate) fn clean(&self) {
-        for phys in self.pending_tables.borrow_mut().drain(..) {
+        for phys in self.pending_tables.borrow_mut().drain_all() {
             self.dirty_tables.get(&phys).unwrap().set(false);
             // SAFETY: Every recorded table is live until this owner is dropped.
             let page = unsafe { Page::borrow_phys_unchecked(&phys) };

@@ -153,7 +153,7 @@ impl Platform {
             0x5e3c => self.maximum_power, 0x5e48 => ppm.duration);
         put64(out, 0x5e50, ppm.clocks);
 
-        let base = match *crate::module_parameters::perf_base.value() {
+        let base = match crate::module_parameters::perf_base.value() {
             0 => uint!("gpu-perf-base-pstate", 1),
             forced => forced,
         };

@@ -515,7 +515,7 @@ impl FirmwareSpace {
         if size == 0 || (va as usize | size) & (UAT_PGSZ - 1) != 0 {
             return Err(EINVAL);
         }
-        if *crate::module_parameters::fw_trace.value() & 128 != 0 {
+        if crate::module_parameters::fw_trace.value() & 128 != 0 {
             pr_info!("G16: fwmap {:#x}+{:#x} {:?}\n", va, size, prot);
         }
         let end = va.checked_add(size as u64).ok_or(EINVAL)?;
@@ -775,7 +775,7 @@ impl FirmwareSpace {
     }
 
     pub(crate) fn sync(&self) {
-        for va in self.dirty_regions.borrow_mut().drain(..) {
+        for va in self.dirty_regions.borrow_mut().drain_all() {
             let region = self.regions.get(&va).unwrap();
             region.pending.set(false);
             for (page, dirty) in region.pages.iter().zip(&region.dirty_pages) {

@@ -24,8 +24,8 @@ mod pgtable;
 #[path = "m4_util.rs"]
 mod util;
 
-use kernel::io::Io;
-use kernel::{c_str, device::Core, devres::Devres, io::mem::IoMem, of, platform, prelude::*};
+use kernel::io::{Io, IoBase};
+use kernel::{c_str, device::Core, drm, io::mem::DevresIoMem, of, platform, prelude::*};
 
 const SGX_SIZE: usize = 0x4000000;
 const ID_VERSION: usize = 0xd04000;
@@ -33,42 +33,44 @@ const ID_COUNTS_1: usize = 0xd04010;
 const ID_COUNTS_2: usize = 0xd04014;
 const ID_CLUSTERS: usize = 0xd0401c;
 
-struct M4Gpu {
-    _sgx: Option<Pin<KBox<Devres<IoMem<SGX_SIZE>>>>>,
-    _drm: Option<g16_drm::DeviceRef>,
+struct M4Gpu;
+
+struct M4GpuData<'bound> {
+    _sgx: Option<DevresIoMem<SGX_SIZE>>,
+    _drm: Option<drm::Registration<'bound, g16_drm::Driver>>,
 }
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <M4Gpu as platform::Driver>::IdInfo,
     [(of::DeviceId::new(c_str!("apple,agx-t8132")), ())]
 );
 
 impl platform::Driver for M4Gpu {
     type IdInfo = ();
+    type Data<'bound> = M4GpuData<'bound>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
-    fn probe(
-        pdev: &platform::Device<Core>,
-        _info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        _info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = pdev.as_ref();
-        if !(11..=g16_tvb::MAX_BLOCKS).contains(module_parameters::tvb_max_blocks.value()) {
+        if !(11..=g16_tvb::MAX_BLOCKS).contains(&module_parameters::tvb_max_blocks.value()) {
             return Err(EINVAL);
         }
 
-        if *module_parameters::probe_only.value() == 0 {
-            return Ok(Self {
+        if module_parameters::probe_only.value() == 0 {
+            return Ok(M4GpuData {
                 _sgx: None,
                 _drm: Some(g16_drm::register(pdev)?),
             });
         }
         let request = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx = KBox::pin_init(request.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
+        let sgx = request.iomap_sized::<SGX_SIZE>()?.into_devres()?;
         {
             let regs = sgx.try_access().ok_or(ENODEV)?;
-            let version = regs.relaxed().read32(ID_VERSION);
+            let version = regs.as_view().relaxed().read32(ID_VERSION);
             if version == 0 || version == u32::MAX {
                 dev_err!(dev, "Invalid GPU ID {:#010x}\n", version);
                 return Err(ENODEV);
@@ -77,9 +79,9 @@ impl platform::Driver for M4Gpu {
                 dev,
                 "Apple M4 GPU recognized: ID={:#010x} counts={:#010x}/{:#010x} clusters={:#010x}\n",
                 version,
-                regs.relaxed().read32(ID_COUNTS_1),
-                regs.relaxed().read32(ID_COUNTS_2),
-                regs.relaxed().read32(ID_CLUSTERS),
+                regs.as_view().relaxed().read32(ID_COUNTS_1),
+                regs.as_view().relaxed().read32(ID_COUNTS_2),
+                regs.as_view().relaxed().read32(ID_CLUSTERS),
             );
             dev_info!(
                 dev,
@@ -96,7 +98,7 @@ impl platform::Driver for M4Gpu {
             platform.registers.len(), platform.core_mask, platform.freq_a[10],
             platform.maximum_power, platform.period_ms, platform.period_clocks,
             hwdata.len(), region_c.len(), bundle.len());
-        Ok(Self {
+        Ok(M4GpuData {
             _sgx: Some(sgx),
             _drm: None,
         })

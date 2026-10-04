@@ -68,7 +68,7 @@ fn render_notifier_count(lanes: &[Lane; 3]) -> u64 {
 }
 
 fn shared_notifier() -> bool {
-    *crate::module_parameters::shared_notifier.value() != 0
+    crate::module_parameters::shared_notifier.value() != 0
 }
 
 /// Reserve three distinct event IDs while this queue has unfinished work.
@@ -110,8 +110,8 @@ impl FirmwareQueues {
             priority,
             events: None,
             pending: 0,
-            render_count: *crate::module_parameters::fw_counter_start.value(),
-            compute_count: *crate::module_parameters::fw_counter_start.value(),
+            render_count: crate::module_parameters::fw_counter_start.value(),
+            compute_count: crate::module_parameters::fw_counter_start.value(),
             notified_works: 0,
             last: [None; 2],
         }
@@ -196,7 +196,7 @@ impl Bootstrap {
     /// Report each exhausted resource once, without logging every retry or
     /// enabling firmware KTrace (which changes command execution timing).
     fn report_pressure(&self, bit: u64, resource: &str) {
-        if *crate::module_parameters::fw_trace.value() & 2 != 0
+        if crate::module_parameters::fw_trace.value() & 2 != 0
             && self.pressure_reported.fetch_or(bit, Ordering::Relaxed) & bit == 0
         {
             dev_info!(
@@ -464,7 +464,7 @@ impl Bootstrap {
             });
             owner.lanes = Some(lanes);
             owner.notified_works = 0;
-            if *crate::module_parameters::fw_trace.value() & 1 != 0 {
+            if crate::module_parameters::fw_trace.value() & 1 != 0 {
                 dev_info!(
                     self.dev.as_ref(),
                     "G16: queues vertex={:#x} fragment={:#x} compute={:#x} priority={} recycled={}\n",
@@ -680,7 +680,7 @@ impl Bootstrap {
                 )?;
             }
         }
-        if *crate::module_parameters::fw_trace.value() & 4 != 0 {
+        if crate::module_parameters::fw_trace.value() & 4 != 0 {
             dev_info!(
                 self.dev.as_ref(),
                 "G16: batch works={} messages={} kicks={}\n",
@@ -710,7 +710,7 @@ impl Bootstrap {
     }
 
     fn trace_publication(&self, kind: &str, id: u64) -> Result {
-        if *crate::module_parameters::fw_trace.value() & 1 != 0 {
+        if crate::module_parameters::fw_trace.value() & 1 != 0 {
             let mut unretired = 0;
             for flight in &self.flights {
                 if !self.stamps_done(flight).unwrap_or(false) {
@@ -743,7 +743,7 @@ impl Bootstrap {
         context: u32,
         dependencies: &[Option<Stamp>; 2],
     ) -> Result {
-        if *crate::module_parameters::fw_trace.value() & 8 != 0 {
+        if crate::module_parameters::fw_trace.value() & 8 != 0 {
             let fw = self._firmware_space.as_ref().ok_or(EIO)?;
             let mut unfinished = 0;
             for dep in dependencies.iter().flatten() {
@@ -1099,7 +1099,7 @@ impl Bootstrap {
                 continue;
             }
             let flight = &self.flights[index];
-            if *crate::module_parameters::fw_trace.value() & 16 != 0 {
+            if crate::module_parameters::fw_trace.value() & 16 != 0 {
                 dev_info!(
                     self.dev.as_ref(),
                     "G16: retire {:#x} render={} after_stamps_us={} last_blocked={:#x} flights={}\n",
@@ -1409,7 +1409,7 @@ impl Bootstrap {
                 );
                 return Err(EIO);
             }
-            if read != write && *crate::module_parameters::fw_trace.value() & 64 != 0 {
+            if read != write && crate::module_parameters::fw_trace.value() & 64 != 0 {
                 // SAFETY: ktime_get() has no preconditions.
                 let now = unsafe { kernel::bindings::ktime_get() };
                 let entry = if state == 0xffff_fc20_0003_f3c0 {
@@ -1588,7 +1588,7 @@ impl Bootstrap {
         a.tiling_status_page = params.ta_status & !0x3fff;
         a.fragment_status_page = params.fragment_status & !0x3fff;
         let queue_ordinal = queue.render_count;
-        if *crate::module_parameters::work_layout.value() & 8 != 0 && queue_ordinal % 40 != 0 {
+        if crate::module_parameters::work_layout.value() & 8 != 0 && queue_ordinal % 40 != 0 {
             // As macOS: only the first render of each 40-render cycle uses
             // 0xd5 in this fragment register; the others use 0xb5.
             params.fragment_gate = 0xb5_0040_0020;
@@ -1661,7 +1661,7 @@ impl Bootstrap {
         let mut frag = params.fragment_work(&a).ok_or(EINVAL)?;
         // Keep firmware's internal profiling destinations distinct from the
         // explicit user timestamp slots used for UAPI completion above.
-        if *crate::module_parameters::work_timestamps.value() != 0 {
+        if crate::module_parameters::work_timestamps.value() != 0 {
             ta[0x8c8..0x8d0].copy_from_slice(&(va + 0x100).to_le_bytes());
             ta[0x8d0..0x8d8].copy_from_slice(&(va + 0x108).to_le_bytes());
             frag[0xc10..0xc18].copy_from_slice(&(va + 0x110).to_le_bytes());
@@ -1673,7 +1673,7 @@ impl Bootstrap {
             frag[0xc10..0xc18].fill(0);
             frag[0xc18..0xc20].copy_from_slice(&(lanes[1].pointers + 0x2080).to_le_bytes());
         }
-        if *crate::module_parameters::fw_trace.value() & 128 != 0
+        if crate::module_parameters::fw_trace.value() & 128 != 0
             && !CONFIG_DUMPED.swap(true, Ordering::Relaxed)
         {
             // Live firmware configuration, for comparison with macOS.
@@ -1701,7 +1701,7 @@ impl Bootstrap {
                 }
             }
         }
-        let layout = *crate::module_parameters::work_layout.value();
+        let layout = crate::module_parameters::work_layout.value();
         if layout & 1 != 0 {
             // As macOS in steady state: no TVB growth request and neither
             // fragment flag that this driver set unconditionally.
@@ -1721,7 +1721,7 @@ impl Bootstrap {
                 bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
             }
         }
-        if *crate::module_parameters::fw_trace.value() & 32 != 0 && queue_ordinal == 10 {
+        if crate::module_parameters::fw_trace.value() & 32 != 0 && queue_ordinal == 10 {
             pr_info!(
                 "G16: work dump TA={:#x} 3D={:#x} queues={:#x}/{:#x} bm={:#x} thing={:#x} support={:#x} micro={:#x}/{:#x}\n",
                 a.tiling_work, a.fragment_work, a.tiling_queue, a.fragment_queue,
@@ -1848,7 +1848,7 @@ impl Bootstrap {
         // Only the render dependency can move to fragment. Compute output
         // may feed the vertex stage, and input fences were already consumed
         // by the scheduler before either lane was published.
-        let mode = *crate::module_parameters::render_barrier.value();
+        let mode = crate::module_parameters::render_barrier.value();
         let vdm_barrier_fragment = vdm_barrier_fragment || mode & 1 != 0;
         // A fragment-stage wait on this queue's own fragment lane is already
         // satisfied by that lane's submission order.
@@ -1930,7 +1930,7 @@ impl Bootstrap {
             let mut pos = firsts[stage];
             // The prelude page leaves +0x40..+0xc0 free before its
             // microsequence. All barrier bytes share the Work's lifetime.
-            let render_kind = *crate::module_parameters::dependency_kind.value();
+            let render_kind = crate::module_parameters::dependency_kind.value();
             let deps = stage_dependencies[stage]
                 .iter()
                 .enumerate()
@@ -2215,7 +2215,7 @@ impl Bootstrap {
         if cursor >= 256 || end >= 256 {
             return Err(EIO);
         }
-        if cursor != end && *crate::module_parameters::fw_trace.value() & 64 != 0 {
+        if cursor != end && crate::module_parameters::fw_trace.value() & 64 != 0 {
             // SAFETY: ktime_get() has no preconditions.
             let now = unsafe { kernel::bindings::ktime_get() };
             let base = RING + u64::from(cursor) * 0x48;

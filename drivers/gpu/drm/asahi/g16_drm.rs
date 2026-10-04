@@ -8,7 +8,7 @@
 use crate::{g16_compute as compute, g16_render as render};
 use core::{
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use kernel::dma_fence::{self, RawDmaFence};
 use kernel::drm::sched;
@@ -20,7 +20,7 @@ use kernel::sync::{Arc, Mutex};
 use kernel::sync::aref::ARef;
 use kernel::uaccess::{UserPtr, UserSlice};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
-use kernel::{bindings, c_str, device::Core, drm, platform, prelude::*, uapi};
+use kernel::{bindings, c_str, device::{Bound, Core}, drm, platform, prelude::*, scatterlist, uapi};
 
 enum Command {
     Render(uapi::drm_asahi_cmd_render),
@@ -35,6 +35,12 @@ enum Parameters {
 pub(crate) struct Driver;
 pub(crate) type Device = drm::Device<Driver>;
 pub(crate) type DeviceRef = ARef<Device>;
+pub(crate) type RegDevice = drm::Device<Driver, drm::Registered>;
+
+/// Registration-scoped data: the bound parent device, for DMA mappings.
+pub(crate) struct RegData<'a> {
+    pdev: &'a platform::Device<Bound>,
+}
 type DrmFile = drm::File<File>;
 type Object = shmem::Object<Buffer>;
 const VM_END: u64 = (1 << 42) - 0x8000;
@@ -47,7 +53,7 @@ struct Mapping {
     permissions: u32,
     offset: u64,
     single: bool,
-    sg: Arc<shmem::SGTable<Buffer>>,
+    obj: ARef<Object>,
 }
 
 impl Mapping {
@@ -111,7 +117,8 @@ struct Queue {
 #[derive(Clone)]
 struct TimestampBuffer {
     id: u32,
-    sg: Arc<shmem::SGTable<Buffer>>,
+    /// Keeps the object, and so its pinned pages and DMA mapping, alive while mapped.
+    _obj: ARef<Object>,
     base: u64,
     extent: u64,
     address: u64,
@@ -137,8 +144,10 @@ pub(crate) struct Data {
 #[vtable]
 impl drm::driver::Driver for Driver {
     type Data = Data;
+    type RegistrationData<'a> = RegData<'a>;
     type File = File;
     type Object = Object;
+    type ParentDevice<Ctx: kernel::device::DeviceContext> = platform::Device<Ctx>;
     const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
         major: 0,
         minor: 0,
@@ -146,10 +155,9 @@ impl drm::driver::Driver for Driver {
         name: c_str!("asahi"),
         desc: c_str!("Apple G16 Graphics"),
     };
-    const FEATURES: u32 = drm::driver::FEAT_GEM
-        | drm::driver::FEAT_RENDER
-        | drm::driver::FEAT_SYNCOBJ
-        | drm::driver::FEAT_SYNCOBJ_TIMELINE;
+    const FEAT_RENDER: bool = true;
+    const FEAT_SYNCOBJ: bool = true;
+    const FEAT_SYNCOBJ_TIMELINE: bool = true;
 
     kernel::declare_drm_ioctls! {
         (ASAHI_GET_PARAMS, drm_asahi_get_params, ioctl::RENDER_ALLOW, File::get_params),
@@ -166,7 +174,9 @@ impl drm::driver::Driver for Driver {
     }
 }
 
-pub(crate) fn register(pdev: &platform::Device<Core>) -> Result<DeviceRef> {
+pub(crate) fn register<'a>(
+    pdev: &'a platform::Device<Core<'_>>,
+) -> Result<drm::Registration<'a, Driver>> {
     use kernel::dma::{Device as _, DmaMask};
     // SAFETY: G16's hardware output address width was validated at bootstrap.
     unsafe {
@@ -182,9 +192,12 @@ pub(crate) fn register(pdev: &platform::Device<Core>) -> Result<DeviceRef> {
         notifications: runtime.notifications.clone(),
         runtime <- kernel::new_mutex!(runtime),
         engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }), });
-    let device = Device::new(pdev.as_ref(), data)?;
-    drm::driver::Registration::new_foreign_owned(&device, pdev.as_ref(), 0)?;
-    Ok(device)
+    let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
+    let bound: &'a platform::Device<Bound> = pdev;
+    // SAFETY: The registration is stored in the platform driver data and dropped on unbind.
+    unsafe {
+        drm::Registration::new(pdev.as_ref(), device, Ok::<_, Error>(RegData { pdev: bound }), 0)
+    }
 }
 
 pub(crate) struct Buffer {
@@ -225,13 +238,13 @@ impl DriverObject for Buffer {
         let result: Result = (|| {
             let mut state = inner.state.lock();
             for vm in &mut state.vms {
-                if !vm.mappings.iter().any(|m| core::ptr::eq(m.sg.object(), obj)) {
+                if !vm.mappings.iter().any(|m| core::ptr::eq(&*m.obj, obj)) {
                     continue;
                 }
                 drain(&mut vm.pending)?;
                 let runtime = inner.device.runtime.lock();
                 while let Some(range) = vm.mappings.iter()
-                    .find(|m| core::ptr::eq(m.sg.object(), obj))
+                    .find(|m| core::ptr::eq(&*m.obj, obj))
                     .map(|m| m.range.clone())
                 {
                     vm.unmap(range, &runtime)?;
@@ -251,7 +264,6 @@ impl DriverObject for Buffer {
 #[pin_data(PinnedDrop)]
 pub(crate) struct File {
     device: DeviceRef,
-    raw: AtomicPtr<bindings::drm_file>,
     id: u64,
     state: Arc<Mutex<FileState>>,
 }
@@ -261,7 +273,6 @@ impl drm::file::DriverFile for File {
         KBox::pin_init(
             try_pin_init!(Self {
                 device: device.into(),
-                raw: AtomicPtr::new(core::ptr::null_mut()),
                 id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
                 state: Arc::pin_init(
                     kernel::new_mutex!(FileState {
@@ -278,12 +289,6 @@ impl drm::file::DriverFile for File {
             }),
             GFP_KERNEL,
         )
-    }
-    fn post_open(&self, file: &DrmFile) {
-        self.raw.store(file.as_raw(), Ordering::Release);
-    }
-    fn as_raw(&self) -> *mut bindings::drm_file {
-        self.raw.load(Ordering::Acquire)
     }
 }
 
@@ -328,7 +333,8 @@ impl PinnedDrop for File {
 
 impl File {
     fn get_time(
-        _device: &Device,
+        _device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_get_time,
         _file: &DrmFile,
     ) -> Result<u32> {
@@ -350,10 +356,12 @@ impl File {
     }
 
     fn vm_create(
-        device: &Device,
+        device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_vm_create,
         file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         if data.pad != 0
             || data.kernel_start < 0x4000
             || data.kernel_end > VM_END
@@ -408,10 +416,12 @@ impl File {
     }
 
     fn vm_destroy(
-        device: &Device,
+        device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_vm_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         if data.pad != 0 {
             return Err(EINVAL);
         }
@@ -436,10 +446,12 @@ impl File {
     }
 
     fn get_params(
-        device: &Device,
+        device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_get_params,
         _file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         if data.param_group != 0 || data.pad != 0 {
             return Err(EINVAL);
         }
@@ -476,10 +488,12 @@ impl File {
     }
 
     fn queue_create(
-        device: &Device,
+        device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_queue_create,
         file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         if data.flags != 0 || data.priority > 1 || data.usc_exec_base != 1 << 40 {
             return Err(EINVAL);
         }
@@ -516,10 +530,12 @@ impl File {
     }
 
     fn queue_destroy(
-        device: &Device,
+        device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_queue_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         if data.pad != 0 {
             return Err(EINVAL);
         }
@@ -550,10 +566,12 @@ impl File {
     }
 
     fn bind_object(
-        device: &Device,
+        device: &RegDevice,
+        reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_gem_bind_object,
         file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         if data.pad != 0 || data.vm_id != 0 {
             return Err(EINVAL);
         }
@@ -576,7 +594,7 @@ impl File {
                 }
                 let id = state.next_timestamp;
                 let next = id.checked_add(1).ok_or(ENOSPC)?;
-                let sg = Arc::new(bo.owned_sg_table()?, GFP_KERNEL)?;
+                let sgt = bo.sg_table(reg.pdev.as_ref())?;
                 let first = data.offset & !0x3fff;
                 let extent = ((data.offset + data.range + 0x3fff) & !0x3fff) - first;
                 state.timestamps.reserve(1, GFP_KERNEL)?;
@@ -585,7 +603,7 @@ impl File {
                 let base = runtime.reserve_timestamp(extent)?;
                 let timestamp = TimestampBuffer {
                     id,
-                    sg,
+                    _obj: bo.clone(),
                     base,
                     extent,
                     address: base + (data.offset - first),
@@ -598,7 +616,7 @@ impl File {
                 let mut offset = first;
                 let mut address = base;
                 let result = (|| {
-                    for segment in timestamp.sg.iter() {
+                    for segment in sgt.iter() {
                         let length = u64::from(segment.dma_len());
                         if offset >= length {
                             offset -= length;
@@ -646,7 +664,8 @@ impl File {
         Ok(0)
     }
 
-    fn vm_bind(device: &Device, data: &mut uapi::drm_asahi_vm_bind, file: &DrmFile) -> Result<u32> {
+    fn vm_bind(device: &RegDevice, reg: &RegData<'_>, data: &mut uapi::drm_asahi_vm_bind, file: &DrmFile) -> Result<u32> {
+        let device: &Device = device;
         if data.pad != 0 || data.num_binds > 4096 || data.stride == 0 {
             return Err(EINVAL);
         }
@@ -755,7 +774,8 @@ impl File {
             vm.map(
                 address..end,
                 offset,
-                bo.owned_sg_table()?,
+                bo.clone(),
+                bo.sg_table(reg.pdev.as_ref())?,
                 access,
                 flags & 6,
                 single,
@@ -766,10 +786,12 @@ impl File {
     }
 
     fn gem_create(
-        device: &Device,
+        device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_gem_create,
         file: &DrmFile,
     ) -> Result<u32> {
+        let device: &Device = device;
         let private = data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0;
         if data.flags
             & !(uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK
@@ -811,7 +833,8 @@ impl File {
     }
 
     fn gem_mmap_offset(
-        _device: &Device,
+        _device: &RegDevice,
+        _reg: &RegData<'_>,
         data: &mut uapi::drm_asahi_gem_mmap_offset,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -835,7 +858,8 @@ impl Vm {
         &mut self,
         range: Range<u64>,
         mut offset: u64,
-        sg: shmem::SGTable<Buffer>,
+        obj: ARef<Object>,
+        sgt: &scatterlist::SGTable,
         access: crate::pgtable::Prot,
         permissions: u32,
         single: bool,
@@ -849,10 +873,9 @@ impl Vm {
             return Err(EEXIST);
         }
         let bo_offset = offset;
-        let sg = Arc::new(sg, GFP_KERNEL)?;
         let mut chunks = KVec::new();
         let mut va = range.start;
-        for segment in sg.iter() {
+        for segment in sgt.iter() {
             let length = u64::from(segment.dma_len());
             if offset >= length {
                 offset -= length;
@@ -880,7 +903,7 @@ impl Vm {
                 permissions,
                 offset: bo_offset,
                 single,
-                sg,
+                obj,
             },
             GFP_KERNEL,
         )?;
@@ -944,7 +967,7 @@ impl Vm {
             offset: m.offset + if m.single { 0 } else { range.end - m.range.start },
             permissions: m.permissions,
             single: m.single,
-            sg: m.sg.clone(),
+            obj: m.obj.clone(),
         });
         if right.is_some() {
             self.mappings.reserve(1, GFP_KERNEL)?;
@@ -1352,7 +1375,8 @@ struct OutputSync {
 }
 
 impl File {
-    fn submit(device: &Device, data: &mut uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+    fn submit(device: &RegDevice, _reg: &RegData<'_>, data: &mut uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+        let device: &Device = device;
         if data.flags != 0
             || data.pad != 0
             || data.cmdbuf_size == 0
@@ -1836,7 +1860,7 @@ impl Vm {
         p.tiling_work_stamp = 0x120;
         p.fragment_work_stamp = 0x121;
         // macOS writes 3; this driver's original value is 4 (debug: work_layout & 4).
-        p.completion_control = if *crate::module_parameters::work_layout.value() & 4 != 0 { 3 } else { 4 };
+        p.completion_control = if crate::module_parameters::work_layout.value() & 4 != 0 { 3 } else { 4 };
         p.layermeta = p.heapmeta;
         if p.layers > 1 {
             p.heapmeta += 0x100;
