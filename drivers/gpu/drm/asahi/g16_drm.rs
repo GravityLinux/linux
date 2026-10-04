@@ -456,7 +456,8 @@ impl File {
             return Err(EINVAL);
         }
         let mut params = uapi::drm_asahi_params_global {
-            features: uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIER.into(),
+            features: u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIER)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES),
             gpu_generation: 16,
             gpu_variant: b'G' as u32,
             gpu_revision: device.gpu_revision,
@@ -1708,11 +1709,12 @@ impl Vm {
     fn render_parameters(&self, c: &uapi::drm_asahi_cmd_render) -> Result<render::Parameters> {
         use uapi::{
             drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT as DBIAS_IS_INT,
+            drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES as FEW_PRIMITIVES,
             drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as PROCESS_EMPTY_TILES,
             drm_asahi_render_flags_DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT as VDM_BARRIER_FRAGMENT,
         };
 
-        if c.flags & !(PROCESS_EMPTY_TILES | DBIAS_IS_INT | VDM_BARRIER_FRAGMENT) != 0
+        if c.flags & !(PROCESS_EMPTY_TILES | DBIAS_IS_INT | VDM_BARRIER_FRAGMENT | FEW_PRIMITIVES) != 0
             || c.vertex_helper.binary != 0
             || c.vertex_helper.cfg != 0
             || c.vertex_helper.data != 0
@@ -1754,7 +1756,14 @@ impl Vm {
         p.ppp_control = u64::from(c.ppp_ctrl);
         p.merge_upper_x_bits = u64::from(c.isp_merge_upper_x);
         p.merge_upper_y_bits = u64::from(c.isp_merge_upper_y);
-        p.aux_fb_flags = 0xc000 | u64::from(c.flags & DBIAS_IS_INT);
+        // ISP control: bit 18 is the integer depth-bias formula (the UAPI flag
+        // matches it). Bit 0 selects a faster fragment tile dispatch that is
+        // only safe for passes with very few primitives; macOS sets it for at
+        // most four statically known primitives per pass, and userspace
+        // asserts the same bound with FEW_PRIMITIVES.
+        p.aux_fb_flags = 0xc000
+            | u64::from(c.flags & DBIAS_IS_INT)
+            | u64::from(c.flags & FEW_PRIMITIVES != 0);
         p.aux_fb_page_count = 0x100000;
         p.scissor_array = c.isp_scissor_base;
         p.depth_bias_array = c.isp_dbias_base;
