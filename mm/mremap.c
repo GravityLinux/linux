@@ -958,7 +958,7 @@ static unsigned long vrm_set_new_addr(struct vma_remap_struct *vrm)
 	struct vm_area_struct *vma = vrm->vma;
 	unsigned long map_flags = 0;
 	/* Page Offset _into_ the VMA. */
-	const pgoff_t pgoff = linear_page_index(vma, vrm->addr);
+	const pgoff_t pgoff = vma_mmap_pgoff(vma, vrm->addr);
 	unsigned long new_addr = vrm_implies_new_addr(vrm) ? vrm->new_addr : 0;
 	unsigned long res;
 
