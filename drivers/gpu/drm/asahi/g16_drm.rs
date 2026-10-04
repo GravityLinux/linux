@@ -62,11 +62,14 @@ impl Mapping {
         if size == 0 {
             return Err(EINVAL);
         }
+        // `mappings` is sorted by address and never overlaps, so the only
+        // candidate for `cursor` is the first mapping ending after it.
         let mut cursor = start;
         while cursor < end {
+            let index = mappings.partition_point(|m| m.range.end <= cursor);
             let mapping = mappings
-                .iter()
-                .find(|m| m.range.contains(&cursor) && m.permissions & permissions == permissions)
+                .get(index)
+                .filter(|m| m.range.contains(&cursor) && m.permissions & permissions == permissions)
                 .ok_or(EINVAL)?;
             cursor = end.min(mapping.range.end);
         }
@@ -82,6 +85,7 @@ struct Vm {
     space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     compute_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     // Large address spaces hold thousands of mappings; allow vmalloc.
+    // Sorted by address; mappings never overlap.
     mappings: KVVec<Mapping>,
     /// Shared copy of `mappings` retained by submissions. Rebuilt only after
     /// the mappings change, so a submit costs one reference, not one per
@@ -914,6 +918,10 @@ impl Vm {
             },
             GFP_KERNEL,
         )?;
+        // Keep the list sorted by address for lookups.
+        let last = self.mappings.len() - 1;
+        let index = self.mappings[..last].partition_point(|m| m.range.start < range.start);
+        self.mappings[index..].rotate_right(1);
         let result = (|| {
             // The shim uses distinct roots for the fixed render and compute
             // private namespaces. Both views share the caller's GEM pages.
@@ -940,6 +948,7 @@ impl Vm {
             self.space.lock().low.unmap_pages(range.clone())?;
             self.compute_space.lock().low.unmap_pages(range)?;
             self.publish_mappings(runtime);
+            self.mappings[index..].rotate_left(1);
             self.mappings.pop();
             return Err(e);
         }
@@ -1013,8 +1022,12 @@ impl Vm {
             false
         });
         if let Some(right) = right {
+            let start = right.range.start;
             self.mappings.push_within_capacity(right)
                 .unwrap_or_else(|_| unreachable!("reserved split mapping"));
+            let last = self.mappings.len() - 1;
+            let index = self.mappings[..last].partition_point(|m| m.range.start < start);
+            self.mappings[index..].rotate_right(1);
         }
         Ok(())
     }
