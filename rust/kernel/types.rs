@@ -479,6 +479,9 @@ pub struct Owned<T: Ownable> {
     _p: PhantomData<T>,
 }
 
+// `Owned<T>` owns `T` through a pointer, like `KBox<T>`: moving it never moves the `T`.
+impl<T: Ownable> Unpin for Owned<T> {}
+
 // SAFETY: It is safe to send `Owned<T>` to another thread when the underlying `T` is `Send` because
 // it effectively means sharing `&mut T` (which is safe because `T` is `Send`).
 unsafe impl<T: Ownable + Send> Send for Owned<T> {}
