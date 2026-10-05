@@ -1546,7 +1546,12 @@ impl Session {
         if self.render.as_ref().ok_or(EINVAL)?.ordinal == 0 {
             self.prepare_first_native_render_context()?;
         }
-        if self.native.is_none() && self.render_compute_owner_compatible()?
+        // A compute-first dormant render has no independent pools yet.
+        // Its legacy compatibility predicate requires those pools, so it
+        // cannot gate their creation in the independently bootstrapped profile.
+        if self.native.is_none()
+            && ((self.independent_render_roots() && self.bootstrapped)
+                || self.render_compute_owner_compatible()?)
             && *crate::module_parameters::partial_independent_owner.value() == 1
             && *crate::module_parameters::alternate_queue_pairs.value() == 1
         {

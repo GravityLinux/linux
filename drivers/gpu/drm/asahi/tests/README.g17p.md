@@ -125,6 +125,11 @@ snapshot; the second must execute through its newer one while the first is
 pending. Both original GPU streams remain unchanged. All 16 outputs, both own
 fences and all timestamp guards must pass, with retained overlap.
 
+Repeat both cases after a fresh compute-first startup (`g17p-drm-compute-vm
+--cleanup`, then the two compute queue/overlap cases above). Adopting the dormant
+render graph must create the same independent pools before its first producer;
+an uninitialized pool cannot be required as the condition for creating it.
+
 Each ordinary render pool retains its root and ASID. Only that pool's own
 retirement permits mapping replacement; other pools remain installed. Completion
 refresh and growth requests use the ticket/pool's exact root. Render and compute
