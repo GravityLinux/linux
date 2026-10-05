@@ -17,10 +17,11 @@ fn retire_render_fallbacks(
     memory: &super::super::g17p_memory::Memory,
     vm: &super::super::g17p_vm::Vm,
 ) -> Result {
-    retire_render_fallbacks_slot(previous, caller, memory, vm, 1)
+    retire_render_fallbacks_slot(previous, caller, memory, vm, 1, None)
 }
 fn retire_render_fallbacks_slot(previous: &mut compute::Client, caller: &compute::Client,
     memory: &super::super::g17p_memory::Memory, vm: &super::super::g17p_vm::Vm, slot: u16,
+    foreign: Option<(&super::super::g17p_growth_runtime::Service, u32)>,
 ) -> Result {
     const PAGE: u64 = 0x4000;
     let address = |base: u64| if base < 0x1000000000 { base + 0x1000000000 } else { base };
@@ -38,16 +39,15 @@ fn retire_render_fallbacks_slot(previous: &mut compute::Client, caller: &compute
             if old == 0 {
                 continue;
             }
-            // Remove only an exact borrowed leaf from the original Source
-            // inventory. Other private/dynamic owners remain checked EBUSY.
-            if !super::super::g17p_topology::RENDER_RUNS.iter().any(|&(first, count, _)| {
+            // Only exact borrowed Source leaves or another pool's tracked
+            // growth may be removed. This root is retired; neither the
+            // foreign pool's live root nor its physical ownership changes.
+            let fallback = super::super::g17p_topology::RENDER_RUNS.iter().any(|&(first, count, _)| {
                 first <= va && va < first + count as u64 * PAGE
-            }) {
-                continue;
-            }
-            if old & 0x000003ffffffc000 != vm.physical(memory, 1, va)? {
-                continue;
-            }
+            }) && old & 0x000003ffffffc000 == vm.physical(memory, 1, va)?;
+            let foreign_growth = foreign.is_some_and(|(service, selected)|
+                service.foreign_growth_leaf(selected, va, old));
+            if !fallback && !foreign_growth { continue; }
             changes.push((va, old, 0), GFP_KERNEL)?;
         }
     }
@@ -491,8 +491,48 @@ impl Session {
         }
         let work = self.render.as_mut().ok_or(EINVAL)?;
         let service = work.growth.as_ref().ok_or(EINVAL)?;
-        if !service.pools.get(pair as usize).ok_or(EIO)?.retired { return Err(EBUSY); }
+        let queued = !service.pools.get(pair as usize).ok_or(EIO)?.retired;
+        if queued {
+            let desired = replacement.as_ref().unwrap_or(&work.client);
+            let installed = if pair == work.layout.pair { &work.client } else {
+                &self.render_pool_clients.iter().find(|(pool,_)| *pool == pair).ok_or(EIO)?.1
+            };
+            if !Self::same_client(desired, installed) || !work.pair_same_geometry(pair,p) {
+                pr_err!("G17P: queued pool mismatch pair {} desired {:?} installed {:?} same_client {} same_geometry {}\n",pair,desired.owner,installed.owner,Self::same_client(desired,installed),work.pair_same_geometry(pair,p));
+                return Err(EBUSY);
+            }
+            // No live root or pool identity is rebound. Select the installed
+            // owner and leave its firmware registration/PTEs untouched.
+            if pair != work.layout.pair {
+                let index=self.render_pool_clients.iter().position(|(pool,_)| *pool==pair).ok_or(EIO)?;
+                core::mem::swap(&mut work.client,&mut self.render_pool_clients[index].1);
+                self.render_pool_clients[index].0=work.layout.pair;
+                work.select_pair(pair)?;
+            }
+            return Ok(());
+        }
         render::validate_client(replacement.as_ref().unwrap_or(&work.client), p)?;
+        let installed = if pair == work.layout.pair { Some(&work.client) } else {
+            self.render_pool_clients.iter().find(|(pool,_)| *pool == pair).map(|(_,client)| client)
+        };
+        let pool = &service.pools[pair as usize];
+        let asid = self.render_pool_asids[pair as usize];
+        if asid != 0 && installed.is_some_and(|installed|
+            Self::same_client(replacement.as_ref().unwrap_or(&work.client), installed)
+                && pool.root == installed.root.root() && pool.slot == asid) {
+            let memory=self.memory.as_ref().ok_or(EIO)?;
+            let expected=(u64::from(asid)<<48) | installed.ok_or(EIO)?.root.root() | 1;
+            if memory.read64(self.ttbs+u64::from(asid)*16)? != expected { return Err(EIO); }
+            // This exact installed snapshot already received its owned growth
+            // leaves. No PTE/ASID mutation: do not rescan or invalidate it.
+            if pair != work.layout.pair {
+                let index=self.render_pool_clients.iter().position(|(pool,_)| *pool==pair).ok_or(EIO)?;
+                core::mem::swap(&mut work.client,&mut self.render_pool_clients[index].1);
+                self.render_pool_clients[index].0=work.layout.pair;
+                work.select_pair(pair)?;
+            }
+            return Ok(());
+        }
         self.render_pool_clients.reserve(1, GFP_KERNEL)?;
         self.render_pool_asids[0] = 1;
         if self.render_pool_asids[pair as usize] == 0 {
@@ -509,7 +549,7 @@ impl Session {
         if pair == work.layout.pair {
             if let Some(desired) = replacement.take() {
                 if !Self::same_client(&desired, &work.client) {
-                    retire_render_fallbacks_slot(&mut work.client, &desired, memory, vm, asid)?;
+                    retire_render_fallbacks_slot(&mut work.client, &desired, memory, vm, asid, Some((service, pair)))?;
                     rebind_retired_pool(&mut work.client, desired, asid)?;
                 }
             }
@@ -530,7 +570,7 @@ impl Session {
                     Some(client) => client,
                     None => clone_render_client(&work.client)?,
                 };
-                retire_render_fallbacks_slot(next, &desired, memory, vm, asid)?;
+                retire_render_fallbacks_slot(next, &desired, memory, vm, asid, Some((service, pair)))?;
                 rebind_retired_pool(next, desired, asid)?;
             }
             service.mirror_pool_mappings(pair, &mut next.root)?;

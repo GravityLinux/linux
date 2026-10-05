@@ -224,6 +224,7 @@ impl Client {
                 let va = address(base) + offset;
                 let old = self.root.pte(va)?;
                 if old == 0 {
+                    pr_err!("G17P: rebind missing old caller owner {:?} next {:?} va {:#x}\n",self.owner,next.owner,va);
                     return Err(EIO);
                 }
                 changes.push((va, old, 0), GFP_KERNEL)?;
@@ -236,6 +237,7 @@ impl Client {
         if let Some(aliases) = self.primer_aliases {
             for (va, expected) in aliases {
                 if expected == 0 || self.root.pte(va)? != expected {
+                    pr_err!("G17P: rebind primer mismatch owner {:?} va {:#x} expected {:#x} actual {:#x}\n",self.owner,va,expected,self.root.pte(va)?);
                     return Err(EIO);
                 }
                 changes.push((va, expected, 0), GFP_KERNEL)?;
@@ -259,6 +261,7 @@ impl Client {
                 let va = address(base) + offset;
                 let new = next.root.pte(va)?;
                 if new == 0 {
+                    pr_err!("G17P: rebind missing new caller owner {:?} next {:?} va {:#x}\n",self.owner,next.owner,va);
                     return Err(EIO);
                 }
                 if let Some(row) = changes.iter_mut().find(|r| r.0 == va) {
@@ -268,7 +271,10 @@ impl Client {
                     row.2 = new;
                 } else {
                     // Never replace a private/growth leaf on an addition.
-                    if self.root.pte(va)? != 0 {
+                    let prior = self.root.pte(va)?;
+                    if prior != 0 {
+                        pr_err!("G17P: caller rebind collision owner {:?} next {:?} render {} contexts {:?} va {:#x} prior {:#x} new {:#x}\n",
+                            self.owner, next.owner, render, contexts, va, prior, new);
                         return Err(EBUSY);
                     }
                     changes.push((va, 0, new), GFP_KERNEL)?;
@@ -293,15 +299,10 @@ fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps
         // and vmap validation plus ordering; no per-submit DC sweep is needed.
         // Firmware/private/table/status/timestamp maintenance uses other paths.
         let mut maps = retained.0.lock();
-        for (index, bo) in buffers.iter().enumerate() {
-            // Multiple DVA bindings may alias one GEM. Validate each exact
-            // owned Object once; retain lifetime and publication ordering.
-            if buffers[..index]
-                .iter()
-                .any(|prior| core::ptr::eq(&**prior, &**bo))
-            {
-                continue;
-            }
+        for bo in buffers {
+            // The retained identity tree already deduplicates mappings. An
+            // additional scan of every preceding binding made large queued
+            // render snapshots quadratic at preparation and retirement.
             let identity = &**bo as *const Object as usize;
             if maps.get(&identity).is_none() {
                 let map = bo.owned_vmap::<u8>()?;
@@ -1277,7 +1278,7 @@ pub(crate) fn stage_next(
         vm,
         spec.context_record,
         &page[..0x200],
-        ordinal >= 256,
+        ordinal >= 255,
     )?;
     write(memory, spec.event, &[0; 0x40])?;
     work.client.cache(false)?;
@@ -1537,7 +1538,7 @@ fn stage_retained_after_render(
     spec.after_render_context(&mut page[..0x200])
         .map_err(|_| EINVAL)?;
     c::context_dependencies(&mut page[..0x200], dependencies).map_err(|_| EINVAL)?;
-    write_context_item(memory, vm, context, &page[..0x200], ordinal - 1 >= 256)?;
+    write_context_item(memory, vm, context, &page[..0x200], ordinal - 1 >= 255)?;
     vm.write(memory, 2, event, &[0; 0x40])?;
     vm.flush_tables(memory)?;
     super::g17p_memory::sync();

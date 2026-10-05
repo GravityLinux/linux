@@ -15,7 +15,7 @@ static void finish(struct client *c)
 }
 int main(int argc,char **argv)
 {
- setbuf(stdout,NULL);unsigned rounds=argc>1?(unsigned)atoi(argv[1]):32;int strict=argc<3 || strcmp(argv[2],"--allow-serial");int snapshots=argc>=3 && !strcmp(argv[2],"--same-vm");CHECK(rounds && rounds<=4096);
+ setbuf(stdout,NULL);unsigned rounds=argc>1?(unsigned)atoi(argv[1]):32;int strict=1,geometry=0,snapshots=0;for(int i=2;i<argc;i++){if(!strcmp(argv[i],"--allow-serial"))strict=0;else if(!strcmp(argv[i],"--geometry"))geometry=1;else if(!strcmp(argv[i],"--same-vm"))snapshots=1;else CHECK(0);}CHECK(rounds && rounds<=4096);
  struct client clients[2]={0};
  for(unsigned n=0;n<2;n++) {
   struct client *c=&clients[n];c->fd=snapshots && n?clients[0].fd:open("/dev/dri/renderD128",O_RDWR|O_CLOEXEC);CHECK(c->fd>=0);c->vm=snapshots && n?clients[0].vm:vm_new(c->fd);
@@ -45,6 +45,7 @@ int main(int argc,char **argv)
    union {uint64_t align;unsigned char bytes[sizeof(render_command)];} draw;
    memcpy(draw.bytes,n?render_second_command:render_command,sizeof(draw.bytes));
    struct drm_asahi_cmd_render *r=(void *)(draw.bytes+sizeof(draw.bytes)-sizeof(*r));struct drm_asahi_cmd_header *h=(void *)((unsigned char *)r-sizeof(*h));h->vdm_barrier=h->cdm_barrier=DRM_ASAHI_BARRIER_NONE;
+   if(geometry && n) {r->width_px=127;r->utile_height_px=16;}
    if(snapshots && n) {
     // Admit the second render's original output bindings after the first
     // ioctl captured its snapshot. Both streams remain byte-for-byte unchanged.
@@ -74,7 +75,7 @@ int main(int argc,char **argv)
   printf("RENDER_ROOTS_WAVE round=%u first_vm=%u overlap=%d A=%llu/%llu/%llu/%llu B=%llu/%llu/%llu/%llu\n",round,order[0],overlap,(unsigned long long)a[0],(unsigned long long)a[1],(unsigned long long)a[2],(unsigned long long)a[3],(unsigned long long)b[0],(unsigned long long)b[1],(unsigned long long)b[2],(unsigned long long)b[3]);
   if(strict && round>=15) CHECK(overlap);
  }
- printf("RENDER_ROOTS_UAPI_PASS rounds=%u overlaps=%u images=%u checks=%u snapshots=%d\n",rounds,overlaps,rounds*32,checks,snapshots);if(strict) CHECK(overlaps>0);
+ printf("RENDER_ROOTS_UAPI_PASS rounds=%u overlaps=%u images=%u checks=%u snapshots=%d geometry=%d\n",rounds,overlaps,rounds*32,checks,snapshots,geometry);if(strict) CHECK(overlaps>0);
  for(unsigned n=0;n<(snapshots?1U:2U);n++) CHECK(close(clients[n].fd)==0);
  return 0;
 }

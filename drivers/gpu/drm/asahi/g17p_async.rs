@@ -12,9 +12,11 @@ use core::{
 use kernel::{
     bindings,
     dma_fence::{self, RawDmaFence},
-    new_mutex,
+    impl_has_hr_timer, new_mutex,
     prelude::*,
-    sync::{aref::ARef, Arc, Mutex},
+    sync::{aref::ARef, Arc, ArcBorrow, Mutex},
+    time::{Delta, Monotonic, hrtimer::{ArcHrTimerHandle, HrTimer, HrTimerCallback,
+        HrTimerCallbackContext, HrTimerPointer, HrTimerRestart, RelativeMode}},
     workqueue::{
         self, impl_has_delayed_work, impl_has_work, new_delayed_work, new_work, DelayedWork, Work,
         WorkItem,
@@ -100,6 +102,8 @@ pub(crate) struct Job {
     timer: DelayedWork<Job, 1>,
     #[pin]
     execution: Mutex<Option<Execution>>,
+    #[pin]
+    control_timer: HrTimer<Job>,
     committed: AtomicBool,
     firmware_waiting: AtomicBool,
     events: Arc<Events>,
@@ -118,6 +122,7 @@ struct Execution {
     waiting: bool,
     work_gate: Option<dma_fence::Fence>,
     callbacks: KVec<KBox<FenceWake>>,
+    control_timer_handle: Option<ArcHrTimerHandle<Job>>,
 }
 impl Execution {
     fn progress(&mut self) -> Result<Option<Option<Error>>> {
@@ -129,6 +134,18 @@ impl Execution {
                 &mut self.cursor,&mut self.waiting,&mut self.work_gate,
                 &mut self.render_receipts,&self.publication)
         }
+    }
+}
+impl_has_hr_timer! {
+    impl HasHrTimer<Self> for Job { mode: RelativeMode<Monotonic>, field: self.control_timer }
+}
+impl HrTimerCallback for Job {
+    type Pointer<'a> = Arc<Self>;
+    fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
+        // IRQ context only schedules this owner. All receipt reads and mapping
+        // edits remain in the existing sleeping worker.
+        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 0>(this.into());
+        HrTimerRestart::NoRestart
     }
 }
 impl_has_work! {impl HasWork<Self> for Job {self.work}}
@@ -152,8 +169,9 @@ impl Job {
             try_pin_init!(Self {
                 work<-new_work!("asahi_neo_event"),
                 timer<-new_delayed_work!("asahi_neo_watchdog"),
-                execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,schedule,
+                execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,schedule,control_timer_handle:None,
                     initialized:false,cursor:0,waiting:false,work_gate:None,callbacks:KVec::new()})),
+                control_timer<-HrTimer::new(),
                 committed:AtomicBool::new(false),firmware_waiting:AtomicBool::new(false),events,
             }),
             GFP_KERNEL,
@@ -213,6 +231,9 @@ impl Job {
         let Some(e) = Option::as_mut(&mut *held) else {
             return;
         };
+        // Cancel the previous one-shot before considering a new retry. The
+        // callback never takes execution, so cancellation cannot invert locks.
+        drop(e.control_timer_handle.take());
         this.firmware_waiting.store(false, Ordering::SeqCst);
         let wake_sequence = this.events.wake_sequence.load(Ordering::SeqCst);
         let mut input_blocked = false;
@@ -246,6 +267,13 @@ impl Job {
                 this.firmware_waiting.store(true, Ordering::SeqCst);
                 if this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
                     let _ = workqueue::system_unbound().enqueue::<_, 0>(this.clone());
+                }
+                if e.schedule.as_ref().is_some_and(|s| s.control_waiting()) {
+                    // These control receipts may have no mailbox notification.
+                    // Retry just this owner promptly; HZ=250 delayed work would
+                    // impose 4ms per receipt. The maintenance deadline remains
+                    // bounded and no worker spins or waits for GPU completion.
+                    e.control_timer_handle = Some(this.clone().start(Delta::from_micros(200)));
                 }
                 // Retain the bounded watchdog for genuinely absent/coalesced
                 // notifications, even when the sequence change requeues work.

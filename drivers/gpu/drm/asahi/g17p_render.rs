@@ -13,6 +13,7 @@ pub(crate) const SUPPORT_SIZE: usize = 0x70;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Parameters {
     pub(crate) firmware_priority: Option<u32>,
+    pub(crate) queue_owner: Option<(u64, u32)>,
     // UAPI bit 3 moves only the selected FR dependency to this command's FR.
     pub(crate) vdm_barrier_fragment: bool,
     pub(crate) prior_queue_ta: Option<(u8, u32)>,
@@ -115,6 +116,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             firmware_priority: None,
+            queue_owner: None,
             vdm_barrier_fragment: false,
             prior_queue_ta: None,
             vdm_dependency: None,

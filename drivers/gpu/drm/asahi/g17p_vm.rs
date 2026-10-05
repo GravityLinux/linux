@@ -516,6 +516,24 @@ impl Vm {
         Ok(())
     }
 
+    /// Exact existing descriptor alias identity. A reused finite slot needs
+    /// neither a PTE store nor a global table clean/TLBI when this matches.
+    pub(crate) fn firmware_alias_matches(&self, memory: &Memory,
+        high: u64, low: u64, size: usize) -> Result<bool> {
+        if (high ^ low) & (PAGE - 1) != 0 { return Err(EINVAL); }
+        let first = high & !(PAGE - 1);
+        let end = high.checked_add(size as u64)
+            .and_then(|v| v.checked_add(PAGE - 1)).ok_or(EINVAL)? & !(PAGE - 1);
+        for at in (first..end).step_by(PAGE as usize) {
+            let Some(pte) = self.lookup(memory, 2, at)? else { return Ok(false); };
+            let alias = (low & !(PAGE - 1)) + at - first;
+            if self.lookup(memory, 0, alias)? != Some((pte & ADDRESS) | 0x0080000000000c8b) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Explicit first-work replacement of the source-owned context-0 alias.
     /// Also used for a new, quiescent compute owner after render completion.
     pub(crate) fn alias_firmware(

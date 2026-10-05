@@ -4,7 +4,7 @@
 //! Does not treat firmware physical addresses as kernel direct-map pointers.
 
 use super::{g17p_platform::Platform, g17p_topology};
-use kernel::{bindings, c_str, device, io::mem, io::resource::Resource, page, prelude::*};
+use kernel::{bindings, c_str, device, io::mem, io::resource::Resource, page, prelude::*, rbtree::{RBTree, RBTreeNodeReservation}};
 
 const PAGE: usize = 0x4000;
 
@@ -34,6 +34,9 @@ pub(crate) struct Memory {
     // session is live. Retiring objects or reusing ring slots never removes
     // allocations here. Pages are released only after session shutdown.
     allocations: KVec<Allocation>,
+    // Exclusive physical ends index the permanently retained, disjoint
+    // allocations. Access checks remain exact while avoiding a heap scan.
+    allocation_ends: RBTree<u64, usize>,
 }
 
 /// A checked aligned word in RAM retained by this Memory owner. The immutable
@@ -110,15 +113,21 @@ impl Word64<'_> {
 unsafe impl Send for Memory {}
 
 impl Memory {
+    fn owns_allocation(&self, address: u64, end: u64) -> bool {
+        // The first allocation ending at or beyond this span is the only
+        // possible owner: the allocator's retained physical ranges disjoint.
+        self.allocation_ends.cursor_lower_bound(&end).is_some_and(|cursor| {
+            let allocation = &self.allocations[*cursor.current().1];
+            address >= allocation.base && end <= allocation.base + allocation.size as u64
+        })
+    }
+
     pub(crate) fn word64(&self, address: u64) -> Result<Word64<'_>> {
         if address & 7 != 0 {
             return Err(EINVAL);
         }
         let end = address.checked_add(8).ok_or(EINVAL)?;
-        let backing = if self
-            .allocations
-            .iter()
-            .any(|a| address >= a.base && end <= a.base + a.size as u64)
+        let backing = if self.owns_allocation(address, end)
         {
             WordBacking::Allocated(address)
         } else {
@@ -148,6 +157,7 @@ impl Memory {
         let mut memory = Self {
             mappings: KVec::new(),
             allocations: KVec::new(),
+            allocation_ends: RBTree::new(),
         };
         for (index, name) in [
             c_str!("ttbs"),
@@ -195,10 +205,7 @@ impl Memory {
         if size == 0 || (address as usize & (PAGE - 1)) + size > PAGE {
             return Err(EINVAL);
         }
-        if self
-            .allocations
-            .iter()
-            .any(|a| address >= a.base && end <= a.base + a.size as u64)
+        if self.owns_allocation(address, end)
         {
             let base = address & !(PAGE as u64 - 1);
             // SAFETY: The allocation above owns this System RAM page for the
@@ -229,6 +236,7 @@ impl Memory {
         let pages = (size / PAGE).checked_next_power_of_two().ok_or(EINVAL)?;
         let order = pages.trailing_zeros();
         self.allocations.reserve(1, GFP_KERNEL)?;
+        let node = RBTreeNodeReservation::new(GFP_KERNEL)?;
         // SAFETY: Standard allocator call; the resulting owner frees exactly
         // this order. All pages are cleared before any firmware publication.
         let ptr = unsafe { bindings::alloc_pages(bindings::GFP_KERNEL, order) };
@@ -246,6 +254,9 @@ impl Memory {
             },
             GFP_KERNEL,
         )?;
+        // Node and vector capacity were reserved before acquiring pages;
+        // installing this ownership index cannot fail or release backing.
+        self.allocation_ends.insert(node.into_node(base + (pages * PAGE) as u64, self.allocations.len() - 1));
         self.zero(base, pages * PAGE)?;
         Ok(base)
     }

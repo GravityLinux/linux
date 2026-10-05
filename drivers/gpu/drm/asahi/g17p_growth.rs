@@ -46,8 +46,11 @@ impl Owner {
             && u32_at(body, 4) == self.vm
             && u32_at(body, 8) == self.pool
             && u32_at(body, 12) == counter
-            && (scheduling == (0, 1) || super::g17p_render_lifecycle::pool_grids(self.pool)
-                .is_ok_and(|grids| scheduling == (grids[0], 1u64 << grids[0])))
+            // This is a scheduler index and its one-hot mask, not the pool's
+            // fixed event grid. Pool9 under load reports (5,32), while older
+            // observed cases use (0,1) and (2,4). Neither field is echoed.
+            // Ownership remains the exact VM/pool/counter and installed root.
+            && scheduling.0 < 64 && scheduling.1 == 1u64 << scheduling.0
             && body[20..56].iter().all(|b| *b == 0)
             && u64_at(body, 56) == 1
     }

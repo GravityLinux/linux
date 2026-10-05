@@ -1043,7 +1043,7 @@ impl Session {
         // Native independent-context overlap keeps render completion control
         // zero together with compute gate one, from the opening render.
         p.completion_control = u64::from(self.compute.is_some() && !self.independent_compute_enabled());
-        let Some(pair) = self.next_render_pool()? else { return Ok(None); };
+        let Some(pair) = self.next_render_pool_for_geometry(None, &p)? else { return Ok(None); };
         let Some(storage) = self.next_render_storage()? else { return Ok(None); };
         let client = self.render_pool_clients.iter().find(|(pool, client)|
             *pool == pair && Self::same_client(client, &work.client)).map(|(_, client)| client);
@@ -1080,10 +1080,13 @@ impl Session {
         }
     }
 
-    /// Nonmutating admission: one live owner per pool; special and mixed
-    /// lifetimes keep their qualified serial profile. Independent ordinary
-    /// pools may retain different caller snapshots while other tickets live.
+    /// Nonmutating admission: free private owners or a compatible queued
+    /// owner with unused finite scratch/transport slots. Special profiles keep
+    /// their qualified serial lifecycle; unrelated roots remain installed.
     pub(crate) fn can_append_render(&self, p: &super::g17p_render::Parameters) -> Result<bool> {
+        self.can_append_render_for(None,p)
+    }
+    fn can_append_render_for(&self, incoming: Option<&compute::Client>, p: &super::g17p_render::Parameters) -> Result<bool> {
         if self.phase != Phase::Running || self.render_control.is_some() { return Ok(false); }
         if matches!(self.pending, Some(PendingWork::Control(_) | PendingWork::Native)) {
             return Ok(false);
@@ -1095,8 +1098,8 @@ impl Session {
         if self.native.is_some() || !self.render_compute_owner_compatible()? || work.layout.native
             || *crate::module_parameters::partial_independent_owner.value() != 1
             || *crate::module_parameters::alternate_queue_pairs.value() != 1
-            || !work.same_geometry(p) { return Ok(false); }
-        Ok(self.next_render_pool()?.is_some() && self.next_render_storage()?.is_some())
+            || (!self.independent_render_roots() && !work.same_geometry(p)) { return Ok(false); }
+        Ok(self.next_render_pool_for_geometry(incoming, p)?.is_some() && self.next_render_storage()?.is_some())
     }
     fn next_render_pool(&self) -> Result<Option<u32>> {
         self.next_render_pool_for(None)
@@ -1130,6 +1133,70 @@ impl Session {
             }) { return Ok(Some(pair)); }
         }
         Ok((0..count).map(|offset| (next + offset) % count).find(available))
+    }
+
+    fn next_render_pool_for_geometry(&self, incoming: Option<&compute::Client>,
+        p: &super::g17p_render::Parameters) -> Result<Option<u32>> {
+        let idle = self.next_render_pool_for(incoming)?;
+        if !self.independent_render_roots() { return Ok(idle); }
+        let work = self.render.as_ref().ok_or(EIO)?;
+        let frames = match &self.pending {
+            Some(PendingWork::Render(wave)) => &wave.frames[wave.next..], _ => &[],
+        };
+        let desired = incoming.unwrap_or(&work.client);
+        let memory = self.memory.as_ref().ok_or(EIO)?;
+        let vm = self.vm.as_ref().ok_or(EIO)?;
+        let mut best = None;
+        let mut least = usize::MAX;
+        let mut owned = false;
+        for pair in 0..work.pool_count() {
+            let own = if pair == work.layout.pair { Some(&work.client) } else {
+                self.render_pool_clients.iter().find(|(pool, _)| *pool == pair).map(|(_, client)| client)
+            };
+            if !own.is_some_and(|own| Self::same_client(desired, own)) || !work.pair_same_geometry(pair, p) { continue; }
+            let mut count = 0;
+            let mut transport = None;
+            let next = work.pair_next_index(pair)?;
+            let mut slot_free = true;
+            for frame in frames.iter().filter(|frame| frame.ticket.item.layout.pair == pair) {
+                count += 1;
+                let index = frame.ticket.item.index;
+                // Count alone does not establish ownership if a slow ticket
+                // survives later retirements. Lease every reused pool-local
+                // tilemap, scheduler record, status and context slot exactly.
+                slot_free &= next % 8 != index % 8
+                    && (2 * next) % 35 != (2 * index) % 35
+                    && next % 79 != index % 79
+                    // Pool-B's 79 records alias 36 physical cycle blocks.
+                    // Record wrap can reuse a block while its earlier record
+                    // remains live (e.g. records 72 and 0 both use phase 0).
+                    && (next % 79) % 36 != (index % 79) % 36
+                    && next % super::g17p_render_lifecycle::STORAGE_SUBMISSIONS
+                        != index % super::g17p_render_lifecycle::STORAGE_SUBMISSIONS;
+                transport = Some(frame.ticket.item.layout);
+            }
+            // Eight tilemap blocks are real private ring storage. They cannot
+            // alias a live generation. Other matching pools stay admissible.
+            let preferred = p.queue_owner.is_some() && work.pair_queue_owner(pair) == p.queue_owner;
+            if count == 0 || !slot_free || (owned && !preferred)
+                || (preferred == owned && count >= least) { continue; }
+            let layout = transport.ok_or(EIO)?;
+            let mut room = true;
+            if let Some(priority) = p.firmware_priority {
+                for queue in layout.queues {
+                    room &= memory.read_firmware32(vm.physical(memory,2,queue+0x28)?)? == priority;
+                }
+            }
+            for ptr in layout.pointers {
+                let capacity = memory.read_firmware32(vm.physical(memory,2,ptr+0x60)?)?.min(0x2870/8);
+                let tail = memory.read_firmware32(vm.physical(memory,2,ptr+0x40)?)?;
+                room &= tail.checked_add(3).ok_or(EOVERFLOW)? <= capacity;
+            }
+            if room { best=Some(pair); least=count; owned=preferred; }
+        }
+        // Keep a public queue's backlog in its installed firmware owner.
+        // A different public queue prefers its own/free pool for fairness.
+        if owned { Ok(best) } else { Ok(idle.or(best)) }
     }
 
     fn next_render_storage(&self) -> Result<Option<u32>> {
@@ -1169,11 +1236,13 @@ impl Session {
         replacement: Option<compute::Client>, compute_replacement: Option<compute::Client>,
         p: &super::g17p_render::Parameters, prepared: Option<KBox<render::PreparedAppend>>,
     ) -> Result<Arc<RenderReceipt>> {
+        let profiling = *crate::module_parameters::submission_log.value() >= 3;
+        let prep_started = profiling.then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         let mut configured = source_fragment_parameters(p, false)?;
         configured.completion_control = u64::from(self.compute.is_some() && !self.independent_compute_enabled());
         let p = &configured;
         if self.phase != Phase::Running { return Err(EIO); }
-        if !self.can_append_render(p)? { return Err(EBUSY); }
+        if !self.can_append_render_for(replacement.as_ref(), p)? { return Err(EBUSY); }
         if self.live_render_count() != 0 {
             // Changing caller PTE ownership while a ticket executes requires
             // a distinct root lease, not the retained-root rebind path.
@@ -1184,7 +1253,7 @@ impl Session {
         }
         self.restore_owned_render_fault()?;
         let private_pair = if self.independent_render_roots() {
-            Some(self.next_render_pool_for(replacement.as_ref())?.ok_or(EBUSY)?)
+            Some(self.next_render_pool_for_geometry(replacement.as_ref(), p)?.ok_or(EBUSY)?)
         } else { None };
         if *crate::module_parameters::native_render_vms.value() == 1 {
             self.prepare_native_render_context(dev, replacement, p)?;
@@ -1192,11 +1261,13 @@ impl Session {
             self.refresh_native_render(replacement, compute_replacement, p)?;
         } else if self.independent_render_roots() {
             let pair = private_pair.ok_or(EIO)?;
-            self.prepare_pool_render_context(dev, pair, replacement, p)?;
+            self.prepare_pool_render_context(dev, pair, replacement, p).inspect_err(|e|
+                dev_err!(dev,"G17P: render fail site prepare_pool pair {} error {:?}\n",pair,e))?;
         } else if let Some(client) = replacement {
             self.prepare_logical_render_context(dev, client, p)?;
             dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
         }
+        let root_us = prep_started.as_ref().map(|start| start.elapsed().as_nanos() / 1000).unwrap_or(0);
         let ordinal = self
             .render
             .as_ref()
@@ -1231,13 +1302,25 @@ impl Session {
                     self.memory.as_mut().ok_or(EINVAL)?,
                     self.vm.as_ref().ok_or(EINVAL)?,
                     priority,
-                )?;
+                ).inspect_err(|e| dev_err!(dev,"G17P: render fail site set_priority {:?}\n",e))?;
             }
             // Allocate the control owner before its producer can be visible.
             let mut control = KBox::new(RenderControl {
                 ordinal, announced: false, before: 0, target: 0, parameters: *p, prepared, receipt: receipt.clone(),
                 started: kernel::time::Instant::now(),
             }, GFP_KERNEL)?;
+            if self.native.is_none() && self.independent_render_roots() {
+                if self.render_control_credit(image, ordinal)? {
+                    return self.stage_announced_render(dev, image, ordinal, p,
+                        control.prepared.take(), receipt.clone());
+                }
+                if matches!(self.pending, Some(PendingWork::Render(_))) {
+                    self.render_control = Some(control);
+                } else {
+                    self.pending = Some(PendingWork::Control(control));
+                }
+                return Ok(());
+            }
             match self.announce_render(dev, image, ordinal) {
                 Ok(None) => self.stage_announced_render(dev, image, ordinal, p, control.prepared.take(), receipt.clone()),
                 announcement => {
@@ -1263,6 +1346,10 @@ impl Session {
             receipt.fail(*error);
             self.fail_render_gate(*error);
         }
+        if profiling && ordinal % 16 == 0 {
+            dev_info!(dev, "G17P: render prep timing ordinal {} root_us {} total_us {}\n",
+                ordinal, root_us, prep_started.ok_or(EIO)?.elapsed().as_nanos() / 1000);
+        }
         result.map(|()| receipt)
     }
 
@@ -1283,6 +1370,8 @@ impl Session {
                 render::DESCRIPTORS[1] + ordinal as u64 * super::g17p_render::FRAGMENT_SIZE as u64,
             )?;
         }
+        let profile_started = (*crate::module_parameters::submission_log.value() >= 3)
+            .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         let work = self.render.as_mut().ok_or(EINVAL)?;
         render::stage_next_prepared(
             self.memory.as_mut().ok_or(EINVAL)?,
@@ -1292,8 +1381,33 @@ impl Session {
             prepared,
         )
         .inspect_err(|e| dev_err!(dev,"G17P: render fail site stage_announced ordinal {} error {:?}\n",ordinal,e))
-        .and_then(|()| self.run_render(dev, image, p, receipt).inspect_err(|e|
-            dev_err!(dev,"G17P: render fail site publish_announced ordinal {} error {:?}\n",ordinal,e)))
+        .and_then(|()| {
+            if ordinal % 16 == 0 {
+                if let Some(start) = profile_started {
+                    dev_info!(dev,"G17P: render stage timing ordinal {} stage_us {}\n",
+                        ordinal,start.elapsed().as_nanos()/1000);
+                }
+            }
+            // Finish retired transport and descriptor edits before waking
+            // firmware. A tick can revisit the queue while handling control;
+            // publishing it before a bank switch races its cached queue header.
+            if self.native.is_none() && self.independent_render_roots() {
+                self.announce_render(dev, image, ordinal)?;
+            }
+            self.run_render(dev, image, p, receipt).inspect_err(|e|
+                dev_err!(dev,"G17P: render fail site publish_announced ordinal {} error {:?}\n",ordinal,e))
+        })
+    }
+
+    fn render_control_credit(&self, image: &Image, ordinal: u32) -> Result<bool> {
+        if ordinal < 2 { return Ok(true); }
+        let memory = self.memory.as_ref().ok_or(EIO)?;
+        let vm = self.vm.as_ref().ok_or(EIO)?;
+        let mut values = [0; 3];
+        for (value, at) in values.iter_mut().zip(image.graph.channels[0][12].states) {
+            *value = memory.read_firmware32(vm.physical(memory, 2, at)?)?;
+        }
+        Ok(queue::Counters::new(values).map_err(|_| EIO)?.available() != 0)
     }
 
     fn announce_render(
@@ -1308,17 +1422,23 @@ impl Session {
         }
         let body = life::control_tick(ordinal).map_err(|_| EINVAL)?;
         let channel = image.graph.channels[0][12];
-        let no_live_render = self.live_render_count() == 0;
+        let pipelined = self.native.is_none() && self.independent_render_roots();
+        // The support prestate is shared with compute. An idle render set
+        // alone does not permit resetting these firmware-owned fields.
+        let no_live_work = self.live_render_count() == 0
+            && (!pipelined || (!self.independent_compute.pending() && self.compute_pending.is_none()));
         let memory = self.memory.as_mut().ok_or(EINVAL)?;
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
         let mut before = [0; 3];
         for (value, at) in before.iter_mut().zip(channel.states) {
             *value = memory.read_firmware32(vm.physical(memory, 2, at)?)?;
         }
-        if before[2] > 255 || before[0] != before[2] || before[1] != before[2] {
+        let credits = queue::Counters::new(before).map_err(|_| EIO)?;
+        if (pipelined && credits.available() == 0)
+            || (!pipelined && (before[0] != before[2] || before[1] != before[2])) {
             return Err(EBUSY);
         }
-        if ordinal >= 3 && no_live_render {
+        if ordinal >= 3 && no_live_work {
             vm.write(
                 memory,
                 2,
@@ -1344,7 +1464,10 @@ impl Session {
             .ok_or(EINVAL)?
             .as_mut()
             .send_message(0x21, 0x0084000000000011)?;
-        Ok(Some((before[0] as u8, target as u8)))
+        // Keep the control-before-work producer order, while allowing the
+        // firmware to consume both rings without a host acknowledgement turn.
+        // Both control consumers still bound finite slot reuse above.
+        if pipelined { Ok(None) } else { Ok(Some((before[0] as u8, target as u8))) }
     }
 
     fn poll_control(
@@ -1361,6 +1484,12 @@ impl Session {
             return Err(EIO);
         }
         if !state.announced {
+            if self.native.is_none() && self.independent_render_roots() {
+                if !self.render_control_credit(image, state.ordinal)? { return Ok(false); }
+                self.stage_announced_render(dev, image, state.ordinal, &state.parameters,
+                    state.prepared.take(), state.receipt.clone())?;
+                return Ok(false);
+            }
             match self.announce_render(dev, image, state.ordinal) {
                 Ok(Some((before,target))) => {
                     state.before = before; state.target = target; state.announced = true;
@@ -1368,6 +1497,11 @@ impl Session {
                 },
                 Err(e) if e == EBUSY => return Ok(false),
                 Err(e) => return Err(e),
+                Ok(None) if self.independent_render_roots() => {
+                    self.stage_announced_render(dev,image,state.ordinal,&state.parameters,
+                        state.prepared.take(),state.receipt.clone())?;
+                    return Ok(false);
+                },
                 Ok(None) => return Err(EIO),
             }
         }
@@ -1603,6 +1737,22 @@ impl Session {
                 stored.store(((ticket.item.layout.pair as u64) << 40)
                     | ((grid as u64) << 32) | u64::from(ticket.item.index + 1), Ordering::Relaxed);
             }
+        }
+        if *crate::module_parameters::submission_log.value() != 0 {
+            let live = match &self.pending { Some(PendingWork::Render(wave)) =>
+                wave.frames[wave.next..].iter().filter(|f| f.ticket.item.layout.pair == ticket.item.layout.pair).count(), _ => 0 };
+            let mut unfinished = 0;
+            if let Some(PendingWork::Render(wave)) = &self.pending {
+                let memory=self.memory.as_ref().ok_or(EIO)?;
+                let vm=self.vm.as_ref().ok_or(EIO)?;
+                for frame in wave.frames[wave.next..].iter().filter(|f| f.ticket.item.layout.pair == ticket.item.layout.pair) {
+                    let pa=vm.physical(memory,2,frame.ticket.firmware_completion)?;
+                    memory.invalidate(pa,8)?;
+                    unfinished += usize::from(memory.read64(pa)? == 0);
+                }
+            }
+            dev_info!(dev, "G17P: render owner publication ordinal {} pool {} local {} prior_live {} unfinished {}\n",
+                ticket.item.ordinal, ticket.item.layout.pair, ticket.item.index, live, unfinished);
         }
         let frame = RenderPending { receipt: receipt.clone(), ticket, gate, startup,
             terminal_baseline, control_done, started: kernel::time::Instant::now() };
@@ -2469,14 +2619,16 @@ impl Session {
             }
             return Ok(false);
         }
-        if !self.can_append_render(p)? { return Ok(false); }
+        if !self.can_append_render_for(next, p)? { return Ok(false); }
         if self.render.as_ref().ok_or(EIO)?.ordinal >= 1 {
             let memory = self.memory.as_ref().ok_or(EIO)?;
             let vm = self.vm.as_ref().ok_or(EIO)?;
             let channel = self.render.as_ref().ok_or(EIO)?.growth.as_ref().ok_or(EIO)?.command_channel();
             let mut values = [0;3];
             for (v,at) in values.iter_mut().zip(channel.states) { *v = memory.read_firmware32(vm.physical(memory,2,at)?)?; }
-            if values[0] != values[2] || values[1] != values[2] { return Ok(false); }
+            if self.independent_render_roots() {
+                if queue::Counters::new(values).map_err(|_| EIO)?.available() == 0 { return Ok(false); }
+            } else if values[0] != values[2] || values[1] != values[2] { return Ok(false); }
         }
         if let (Some(next), Some(work)) = (next, self.render.as_ref()) {
             if !Self::same_client(next, &work.client) && self.live_render_count() != 0
@@ -2565,10 +2717,10 @@ impl Session {
             || *crate::module_parameters::partial_independent_owner.value() != 1
             || *crate::module_parameters::alternate_queue_pairs.value() != 1
             || !matches!(self.pending, Some(PendingWork::Render(_)))
-            || !self.can_append_render(p)? { return Ok(false); }
+            || !self.can_append_render_for(next, p)? { return Ok(false); }
         let (Some(next), Some(work)) = (next, self.render.as_ref()) else { return Ok(false); };
         let old = &work.client;
-        if work.layout.native || !work.same_geometry(p) || next.owner != old.owner
+        if work.layout.native || (!self.independent_render_roots() && !work.same_geometry(p)) || next.owner != old.owner
             || next.bindings != old.bindings || next.buffers.len() != old.buffers.len()
             || !next.buffers.iter().zip(&old.buffers).all(|(a,b)| core::ptr::eq(&**a, &**b)) {
             return Ok(false);
@@ -2988,24 +3140,37 @@ impl Session {
         client:&compute::Client,p:&compute::Parameters,priority:u32)->Option<&compute::Client> {
         self.independent_compute.client(key,client,p,priority)
     }
-    pub(crate) fn can_stage_independent_compute(&self,image:&Image,key:super::g17p_compute_queues::Key,
-        client:&compute::Client,p:&compute::Parameters,priority:u32)->Result<bool> {
+    pub(crate) fn selected_compute_grid(&self,key:super::g17p_compute_queues::Key,
+        client:&compute::Client,p:&compute::Parameters,priority:u32)->Option<u8> {
+        self.independent_compute.selected_grid(key,client,p,priority)
+    }
+    pub(crate) fn can_stage_independent_compute(&mut self,image:&Image,key:super::g17p_compute_queues::Key,
+        client:&compute::Client,p:&compute::Parameters,priority:u32)->Result<(bool,bool)> {
         if self.phase==Phase::Failed {return Err(EIO);}
-        if !matches!(self.phase,Phase::Prepared|Phase::Running) || !self.independent_compute_enabled() {return Ok(false);}
+        if !matches!(self.phase,Phase::Prepared|Phase::Running) || !self.independent_compute_enabled() {return Ok((false,false));}
         let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
         let mut values=[0;3];
         for (v,at) in values.iter_mut().zip(image.graph.channels[0][queue::COMPUTE_CHANNEL].states) {
             *v=memory.read_firmware32(vm.physical(memory,2,at)?)?;
         }
-        if queue::Counters::new(values).map_err(|_|EIO)?.slot().is_err() {return Ok(false);}
-        Ok(self.independent_compute.can_stage(key,client,p,priority)
-            && self.cleanup.require_idle().is_ok())
+        if queue::Counters::new(values).map_err(|_|EIO)?.slot().is_err() {return Ok((false,false));}
+        if !self.independent_compute.can_stage(key,client,p,priority)
+            || self.cleanup.require_idle().is_err() { return Ok((false,false)); }
+        let (ready, notify) = self.independent_compute.prepare_reconfiguration(
+            self.memory.as_mut().ok_or(EIO)?, self.vm.as_ref().ok_or(EIO)?,
+            image.graph.channels[0][12], key, client, p, priority)?;
+        if notify {
+            self.peers[0].rtkit.as_mut().ok_or(EIO)?.as_mut()
+                .send_message(0x21, 0x0084000000000011)?;
+        }
+        Ok((ready,!ready))
     }
     pub(crate) fn stage_independent_compute(&mut self,dev:&kernel::device::Device,image:&Image,
         key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
         p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
         let result=self.stage_independent_compute_inner(dev,image,key,reference,client,p,priority,dependencies);
         if let Err(error)=result.as_ref() {
+            dev_err!(dev,"G17P: compute stage key {:?} failed {:?}\n",key,error);
             self.phase=Phase::Failed;self.fail_owned_receipts(*error);self.events.fail(*error);
         }
         result
@@ -3074,8 +3239,11 @@ impl Session {
             return Ok(false);
         }
         // Both peers' report credits are returned only after classification.
-        for peer in &report { for body in &peer.records {
-            if u32::from_le_bytes(body[..4].try_into().unwrap())!=1 {return Err(EIO);}
+        for (peer,r) in report.iter().enumerate() { for (offset,body) in r.records.iter().enumerate() {
+            if u32::from_le_bytes(body[..4].try_into().unwrap())!=1 {
+                dev_err!(dev,"G17P: compute unhandled report peer {} slot {} DATA {:02x?}\n",peer,(r.host+offset as u32)&255,body);
+                return Err(EIO);
+            }
         }}
         let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
         let mut index=0;

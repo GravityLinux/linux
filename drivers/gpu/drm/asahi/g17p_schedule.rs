@@ -100,12 +100,12 @@ impl Point {
         }
         point
     }
-    fn ordered(point: &Arc<Self>) -> Result<Option<Option<(u8,u32)>>> {
+    fn ordered(point: &Arc<Self>, retire: bool) -> Result<Option<Option<(u8,u32)>>> {
         let mut current = point.clone();
         loop {
             current.refresh();
             if status(&current.completion) >= 0 {
-                return current.dependency(0,false,false);
+                return current.dependency(0,false,retire);
             }
             // A skipped/failed command contributed no engine milestone.
             // Preserve ordering through it to the last real predecessor.
@@ -136,6 +136,7 @@ struct Node {
 pub(super) struct Schedule {
     nodes: KVec<Node>,
     tail: History,
+    control_waiting: bool,
 }
 impl Schedule {
     pub(super) fn enabled() -> bool {
@@ -166,8 +167,9 @@ impl Schedule {
             nodes.push(Node {point:point.clone(),previous:tail[engine].clone(),dependencies,staged:false},GFP_KERNEL)?;
             tail[engine] = Some(point);
         }
-        Ok(Self {nodes,tail})
+        Ok(Self {nodes,tail,control_waiting:false})
     }
+    pub(super) fn control_waiting(&self) -> bool { self.control_waiting }
     pub(super) fn tail(&self) -> History { self.tail.clone() }
     pub(super) fn callback_fences(&self) -> Result<KVec<Fence>> {
         let mut fences = KVec::new();
@@ -215,7 +217,7 @@ impl Schedule {
     }
     fn dependencies(node: &Node, command: &Command) -> Result<Option<(Option<(u8,u32)>,[Option<(u8,u32)>;2])>> {
         let previous = if let Some(point) = &node.previous {
-            let Some(value) = Point::ordered(point)? else { return Ok(None); };
+            let Some(value) = Point::ordered(point,false)? else { return Ok(None); };
             value
         } else { None };
         let mut dependencies = [None,None];
@@ -242,6 +244,7 @@ impl Schedule {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
             let Ok(Some((previous,dependencies))) = Self::dependencies(node,&prepared.parameters[index]) else { continue; };
+            parameters.queue_owner=Some(prepared.queue_key);
             parameters.prior_queue_ta=previous;
             parameters.vdm_dependency=dependencies[0];
             parameters.cdm_dependency=dependencies[1];
@@ -277,7 +280,11 @@ impl Schedule {
     pub(super) fn progress(&mut self, dev: &Device, prepared: &mut Prepared,
         sync: &g17p_sync::Plan, initialized: &mut bool, cursor: &mut usize,
         publication: &Fence) -> Result<Option<Option<Error>>> {
+        self.control_waiting = false;
+        let profile_started = (*crate::module_parameters::submission_log.value() >= 3)
+            .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         let mut prepared_append = if *initialized { self.prepare_render(dev,prepared) } else { None };
+        let seed_us = profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         let mut held = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
         if !*initialized {
@@ -293,10 +300,12 @@ impl Schedule {
             prepared.render_client = None;
             prepared.compute_client = None;
         }
+        let poll_started = profile_started.as_ref().map(|_| kernel::time::Instant::<kernel::time::Monotonic>::now());
         if let Err(error) = runtime.session.poll_work(dev.as_ref(),&runtime.image) {
             runtime.session.notify_failure(error);
             self.fail_unstaged(error);
         }
+        let poll_us = poll_started.map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         for index in 0..self.nodes.len() {
             let node = &mut self.nodes[index];
             node.point.refresh();
@@ -306,6 +315,7 @@ impl Schedule {
                 let Some((previous,dependencies)) = Self::dependencies(node,&prepared.parameters[index])? else { return Ok(None); };
                 if render {
                     let Command::Render(mut parameters) = prepared.parameters[index] else { unreachable!() };
+                    parameters.queue_owner=Some(prepared.queue_key);
                     parameters.prior_queue_ta = previous;
                     parameters.vdm_dependency = dependencies[0];
                     parameters.cdm_dependency = dependencies[1];
@@ -316,7 +326,8 @@ impl Schedule {
                         Self::handoff(runtime,0,node,replacing);
                         return Ok(None);
                     }
-                    let mut client = Self::replacement(snapshot,runtime.session.render_client()?,true)?;
+                    let mut client = Self::replacement(snapshot,runtime.session.render_client()?,true)
+                        .inspect_err(|e| kernel::dev_err!(dev.as_ref(),"G17P: render fail site replacement {:?}\n",e))?;
                     let objects = if prepared_append.as_ref().is_some_and(|(i,_)| *i==index) {
                         prepared_append.take().map(|(_,objects)| objects)
                     } else { None };
@@ -326,12 +337,37 @@ impl Schedule {
                     let Command::Compute(parameters) = &prepared.parameters[index] else { unreachable!() };
                     let snapshot = prepared.compute_snapshot.as_ref().ok_or(EIO)?;
                     if runtime.session.independent_compute_enabled() {
+                        let key=prepared.queue_key; let priority=prepared.queue_priority;
+                        let Some(grid) = runtime.session.selected_compute_grid(key,snapshot.client(),parameters,priority) else { return Ok(None); };
+                        // Only a predecessor on this same physical queue is
+                        // guaranteed to execute before its firmware wait. A
+                        // public queue may cross owners at rollover/rebinding:
+                        // publishing its new head with a wait on the old owner
+                        // can occupy CS before the old owner's final dispatch.
+                        // Await only those genuine dependencies; independent
+                        // nodes/owners continue through the normal scan.
+                        if previous.is_some_and(|p| p.0 != grid) {
+                            if let Some(point) = &node.previous {
+                                if Point::ordered(point,true)?.is_none() { return Ok(None); }
+                            }
+                        }
+                        if dependencies[1].is_some_and(|p| p.0 != grid) {
+                            if let Some(point) = &node.dependencies[1] {
+                                if point.dependency(1,true,true)?.is_none() { return Ok(None); }
+                            }
+                        }
+                        // Retirement can satisfy an earlier observed point.
+                        // Re-read dependencies before encoding any GPU waits;
+                        // never carry a retired owner's stale milestone forward.
+                        let Some((previous,dependencies)) = Self::dependencies(node,&prepared.parameters[index])? else { return Ok(None); };
                         let mut waits = KVec::with_capacity(3,GFP_KERNEL)?;
                         for point in [previous,dependencies[0],dependencies[1]].into_iter().flatten() {
                             if !waits.contains(&point) { waits.push(point,GFP_KERNEL)?; }
                         }
-                        let key=prepared.queue_key; let priority=prepared.queue_priority;
-                        if !runtime.session.can_stage_independent_compute(&runtime.image,key,snapshot.client(),parameters,priority)? {
+                        let (ready,control_waiting) = runtime.session.can_stage_independent_compute(&runtime.image,key,snapshot.client(),parameters,priority)
+                            .inspect_err(|e| kernel::dev_err!(dev.as_ref(),"G17P: compute admission key {:?} failed {:?}\n",key,e))?;
+                        if !ready {
+                            self.control_waiting |= control_waiting;
                             return Ok(None);
                         }
                         let old=runtime.session.independent_compute_client(key,snapshot.client(),parameters,priority);
@@ -356,6 +392,12 @@ impl Schedule {
             })();
             match result {
                 Ok(Some(receipt)) => {
+                    if let (Some(start), Receipt::Render(render)) = (profile_started.as_ref(), &receipt) {
+                        if render.ordinal % 16 == 0 {
+                            kernel::dev_info!(dev.as_ref(),"G17P: render schedule timing ordinal {} seed_us {} poll_us {} total_us {}\n",
+                                render.ordinal,seed_us,poll_us,start.elapsed().as_nanos()/1000);
+                        }
+                    }
                     *node.point.receipt.lock() = Some(receipt);
                     node.staged = true;
                     *cursor += 1;
