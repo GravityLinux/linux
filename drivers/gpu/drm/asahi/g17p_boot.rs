@@ -173,6 +173,10 @@ pub(crate) struct Session {
     compute_contexts: Option<super::g17p_context::NativeComputeContexts>,
     render_contexts: Option<super::g17p_context::NativeRenderContexts>,
     render_clients: KVec<compute::Client>,
+    // Each ordinary pool has an independently installed root and ASID.
+    // The selected pool's client is in render.client; others stay parked.
+    render_pool_clients: KVec<(u32, compute::Client)>,
+    render_pool_asids: [u16; super::g17p_render_lifecycle::POOL_SLOTS as usize],
     render_gate: Option<kernel::dma_fence::Fence>,
     render: Option<render::Submission>,
     dormant_render: Option<render::Submission>,
@@ -395,6 +399,8 @@ impl Session {
                 compute_contexts: None,
                 render_contexts: None,
                 render_clients: KVec::new(),
+                render_pool_clients: KVec::new(),
+                render_pool_asids: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
                 render_gate: None,
                 render: None,
                 dormant_render: None,
@@ -688,6 +694,11 @@ impl Session {
             if work.client.owner == owner {
                 work.client
                     .unbind(start, size, expected, true, &[work.layout.context as u16])?;
+            }
+        }
+        for (pair, client) in &mut self.render_pool_clients {
+            if client.owner == owner {
+                client.unbind(start, size, expected, true, &[self.render_pool_asids[*pair as usize]])?;
             }
         }
         if let Some(client) = self.render_clients.iter_mut().find(|c| c.owner == owner) {
@@ -1034,7 +1045,9 @@ impl Session {
         p.completion_control = u64::from(self.compute.is_some() && !self.independent_compute_enabled());
         let Some(pair) = self.next_render_pool()? else { return Ok(None); };
         let Some(storage) = self.next_render_storage()? else { return Ok(None); };
-        work.preparation_seed(&p, ahead, pair, storage)
+        let client = self.render_pool_clients.iter().find(|(pool, client)|
+            *pool == pair && Self::same_client(client, &work.client)).map(|(_, client)| client);
+        work.preparation_seed(&p, ahead, pair, storage, client)
     }
     /// Registered private pool owners are the current live-resource bound.
     /// Descriptor/status/context/ring conflicts remain separate checks.
@@ -1068,8 +1081,8 @@ impl Session {
     }
 
     /// Nonmutating admission: one live owner per pool; special and mixed
-    /// lifetimes keep their qualified serial profile. Caller replacement is
-    /// separately forbidden while any ticket is live.
+    /// lifetimes keep their qualified serial profile. Independent ordinary
+    /// pools may retain different caller snapshots while other tickets live.
     pub(crate) fn can_append_render(&self, p: &super::g17p_render::Parameters) -> Result<bool> {
         if self.phase != Phase::Running || self.render_control.is_some() { return Ok(false); }
         if matches!(self.pending, Some(PendingWork::Control(_) | PendingWork::Native)) {
@@ -1086,6 +1099,9 @@ impl Session {
         Ok(self.next_render_pool()?.is_some() && self.next_render_storage()?.is_some())
     }
     fn next_render_pool(&self) -> Result<Option<u32>> {
+        self.next_render_pool_for(None)
+    }
+    fn next_render_pool_for(&self, incoming: Option<&compute::Client>) -> Result<Option<u32>> {
         let work = self.render.as_ref().ok_or(EINVAL)?;
         let next = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let count = if work.layout.independent && !work.layout.native
@@ -1096,8 +1112,24 @@ impl Session {
             Some(PendingWork::Render(wave)) => &wave.frames[wave.next..],
             _ => &[],
         };
-        Ok((0..count).map(|offset| (next + offset) % count).find(|pair|
-            frames.iter().all(|frame| frame.ticket.item.layout.pair != *pair)))
+        let available = |pair: &u32| frames.iter().all(|frame| frame.ticket.item.layout.pair != *pair)
+            && (!self.independent_render_roots() || *pair == 0
+                || self.render_pool_asids[*pair as usize] != 0
+                || self.independent_compute.asid_mask() != u64::MAX);
+        if self.independent_render_roots() {
+            let desired = incoming.unwrap_or(&work.client);
+            // Reuse an idle exact snapshot before rebuilding caller mappings
+            // in another pool. A live matching pool never blocks a free pool.
+            if let Some(pair) = (0..count).map(|offset| (next + offset) % count).find(|pair| {
+                available(pair) && if *pair == work.layout.pair {
+                    Self::same_client(desired, &work.client)
+                } else {
+                    self.render_pool_clients.iter().any(|(pool, client)|
+                        pool == pair && Self::same_client(desired, client))
+                }
+            }) { return Ok(Some(pair)); }
+        }
+        Ok((0..count).map(|offset| (next + offset) % count).find(available))
     }
 
     fn next_render_storage(&self) -> Result<Option<u32>> {
@@ -1145,16 +1177,22 @@ impl Session {
         if self.live_render_count() != 0 {
             // Changing caller PTE ownership while a ticket executes requires
             // a distinct root lease, not the retained-root rebind path.
-            if replacement.is_some() || compute_replacement.is_some() { return Err(EBUSY); }
+            if (!self.independent_render_roots() && replacement.is_some()) || compute_replacement.is_some() { return Err(EBUSY); }
             // Existing owners route their records; unread primary reports
             // are not proof that an independent private pool is unavailable.
             self.service_owned_render_reports(dev, image)?;
         }
         self.restore_owned_render_fault()?;
+        let private_pair = if self.independent_render_roots() {
+            Some(self.next_render_pool_for(replacement.as_ref())?.ok_or(EBUSY)?)
+        } else { None };
         if *crate::module_parameters::native_render_vms.value() == 1 {
             self.prepare_native_render_context(dev, replacement, p)?;
         } else if self.native.is_some() {
             self.refresh_native_render(replacement, compute_replacement, p)?;
+        } else if self.independent_render_roots() {
+            let pair = private_pair.ok_or(EIO)?;
+            self.prepare_pool_render_context(dev, pair, replacement, p)?;
         } else if let Some(client) = replacement {
             self.prepare_logical_render_context(dev, client, p)?;
             dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
@@ -1170,7 +1208,10 @@ impl Session {
             && *crate::module_parameters::native_render_vms.value() == 0
             && *crate::module_parameters::partial_independent_owner.value() == 1
         {
-            let pair = self.next_render_pool()?.ok_or(EBUSY)?;
+            let pair = match private_pair {
+                Some(pair) => pair,
+                None => self.next_render_pool()?.ok_or(EBUSY)?,
+            };
             let storage = self.next_render_storage()?.ok_or(EBUSY)?;
             let work = self.render.as_mut().ok_or(EINVAL)?;
             work.select_pair(pair)?;
@@ -1575,8 +1616,8 @@ impl Session {
     /// staged ticket or quiesce the selected unpublished inner queue.
     fn service_owned_render_reports(&mut self, dev: &kernel::device::Device,
                                     _image: &Image) -> Result {
-        // A bounded prefix handles coalesced growth notifications while
-        // retaining the runtime lock and the sole active root owner.
+        // A bounded prefix handles coalesced growth notifications under the
+        // runtime lock. Growth selects its retained pool's exact root.
         for _ in 0..32 {
             use super::g17p_growth_runtime::Action;
             let work = self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EINVAL)?;
@@ -1588,12 +1629,17 @@ impl Session {
                     self.ttbs,
                 )?
             } else {
-                work.growth.as_mut().ok_or(EINVAL)?.step_ordinary(
-                    self.memory.as_mut().ok_or(EINVAL)?,
-                    self.vm.as_ref().ok_or(EINVAL)?,
-                    &mut work.client.root,
-                    self.ttbs,
-                )?
+                let memory = self.memory.as_mut().ok_or(EINVAL)?;
+                let vm = self.vm.as_ref().ok_or(EINVAL)?;
+                let service = work.growth.as_mut().ok_or(EINVAL)?;
+                let Some(requested) = service.requested_root(memory, vm)? else { break; };
+                let root = if requested.is_none_or(|root| root == work.client.root.root()) {
+                    &mut work.client.root
+                } else {
+                    &mut self.render_pool_clients.iter_mut().find(|(_, client)|
+                        Some(client.root.root()) == requested).ok_or(EIO)?.1.root
+                };
+                service.step_ordinary(memory, vm, root, self.ttbs)?
             };
             match action {
                 Action::Idle => break,
@@ -1714,7 +1760,13 @@ impl Session {
         }
         self.service_owned_render_reports(dev, image)?;
         let work = self.render.as_ref().ok_or(EINVAL)?;
-        pending.ticket.client.refresh_root(&work.client).inspect_err(|e| dev_err!(dev,"G17P: render fail site refresh_root {:?}\n",e))?;
+        let owner = if pending.ticket.client.root.root() == work.client.root.root() {
+            &work.client
+        } else {
+            &self.render_pool_clients.iter().find(|(_, client)|
+                client.root.root() == pending.ticket.client.root.root()).ok_or(EIO)?.1
+        };
+        pending.ticket.client.refresh_root(owner).inspect_err(|e| dev_err!(dev,"G17P: render fail site refresh_root {:?}\n",e))?;
         let ticket = &pending.ticket;
         let memory = self.memory.as_ref().ok_or(EINVAL)?;
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
@@ -2422,7 +2474,8 @@ impl Session {
             if values[0] != values[2] || values[1] != values[2] { return Ok(false); }
         }
         if let (Some(next), Some(work)) = (next, self.render.as_ref()) {
-            if !Self::same_client(next, &work.client) && self.live_render_count() != 0 { return Ok(false); }
+            if !Self::same_client(next, &work.client) && self.live_render_count() != 0
+                && !self.independent_render_roots() { return Ok(false); }
         }
         Ok(true)
     }
@@ -2909,6 +2962,7 @@ impl Drop for Session {
             core::mem::forget(self.compute_contexts.take());
             core::mem::forget(self.render_contexts.take());
             core::mem::forget(core::mem::replace(&mut self.render_clients, KVec::new()));
+            core::mem::forget(core::mem::replace(&mut self.render_pool_clients, KVec::new()));
             core::mem::forget(self.render.take());
             core::mem::forget(self.dormant_render.take());
             core::mem::forget(self.timestamps.take());

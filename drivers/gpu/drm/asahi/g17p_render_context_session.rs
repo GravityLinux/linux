@@ -17,6 +17,11 @@ fn retire_render_fallbacks(
     memory: &super::super::g17p_memory::Memory,
     vm: &super::super::g17p_vm::Vm,
 ) -> Result {
+    retire_render_fallbacks_slot(previous, caller, memory, vm, 1)
+}
+fn retire_render_fallbacks_slot(previous: &mut compute::Client, caller: &compute::Client,
+    memory: &super::super::g17p_memory::Memory, vm: &super::super::g17p_vm::Vm, slot: u16,
+) -> Result {
     const PAGE: u64 = 0x4000;
     let address = |base: u64| if base < 0x1000000000 { base + 0x1000000000 } else { base };
     let mut changes = KVec::new();
@@ -49,7 +54,7 @@ fn retire_render_fallbacks(
     if !changes.is_empty() {
         // Admission holds the exclusive, retired render owner. Original
         // backing stays Memory-owned; no physical page is returned here.
-        previous.root.rebind(&changes, &[1])?;
+        previous.root.rebind(&changes, &[slot])?;
     }
     Ok(())
 }
@@ -445,5 +450,116 @@ impl Session {
         if let Some(contexts) = self.render_contexts.as_mut() {
             contexts.fail_pending(error);
         }
+    }
+}
+
+/// Copy only table DATA and ownership references; never read mapped leaves.
+fn clone_render_client(client: &compute::Client) -> Result<compute::Client> {
+    let (root, _) = client.root.clone_low_tables()?;
+    let mut buffers = KVec::with_capacity(client.buffers.len(), GFP_KERNEL)?;
+    for bo in &client.buffers { buffers.push(bo.clone(), GFP_KERNEL)?; }
+    let mut bindings = KVec::new();
+    bindings.extend_from_slice(&client.bindings, GFP_KERNEL)?;
+    Ok(compute::Client { root, buffers, bindings, owner: client.owner,
+        cpu_maps: crate::g17p_compute_runtime::CpuMaps::new()?, primer_aliases: None })
+}
+/// The pool's own retirement was checked before this owner transfer. Preserve
+/// old metadata/GEM ownership if rebind preflight fails; its commit cannot fail.
+fn rebind_retired_pool(client: &mut compute::Client, desired: compute::Client, asid: u16) -> Result {
+    let previous = client.owner;
+    client.owner = desired.owner;
+    let result = client.rebind_contexts(desired, true, &[asid]);
+    if result.is_err() { client.owner = previous; }
+    result
+}
+
+// Ordinary source pools retain private execution roots. Only an idle pool is
+// rebound; the remaining pools' roots, tickets and growth readers stay live.
+impl Session {
+    pub(super) fn independent_render_roots(&self) -> bool {
+        self.independent_compute_enabled()
+            && *crate::module_parameters::partial_independent_owner.value() == 1
+            && *crate::module_parameters::alternate_queue_pairs.value() == 1
+    }
+    pub(super) fn prepare_pool_render_context(
+        &mut self, dev: &kernel::device::Device, pair: u32,
+        mut replacement: Option<compute::Client>, p: &Parameters,
+    ) -> Result {
+        use super::super::g17p_user_vm::UserVm;
+        if !self.independent_render_roots() || pair >= super::super::g17p_render_lifecycle::POOL_SLOTS {
+            return Err(EINVAL);
+        }
+        let work = self.render.as_mut().ok_or(EINVAL)?;
+        let service = work.growth.as_ref().ok_or(EINVAL)?;
+        if !service.pools.get(pair as usize).ok_or(EIO)?.retired { return Err(EBUSY); }
+        render::validate_client(replacement.as_ref().unwrap_or(&work.client), p)?;
+        self.render_pool_clients.reserve(1, GFP_KERNEL)?;
+        self.render_pool_asids[0] = 1;
+        if self.render_pool_asids[pair as usize] == 0 {
+            // Render grows downwards, compute upwards; reservations are shared.
+            // Neither engine overwrites a slot retained by the other engine.
+            let asid = (4..64).rev().find(|asid|
+                self.independent_compute.asid_mask() & (1u64 << asid) == 0).ok_or(EBUSY)?;
+            self.independent_compute.reserve_render_asid(asid)?;
+            self.render_pool_asids[pair as usize] = asid;
+        }
+        let asid = self.render_pool_asids[pair as usize];
+        let memory = self.memory.as_mut().ok_or(EINVAL)?;
+        let vm = self.vm.as_ref().ok_or(EINVAL)?;
+        if pair == work.layout.pair {
+            if let Some(desired) = replacement.take() {
+                if !Self::same_client(&desired, &work.client) {
+                    retire_render_fallbacks_slot(&mut work.client, &desired, memory, vm, asid)?;
+                    rebind_retired_pool(&mut work.client, desired, asid)?;
+                }
+            }
+        } else {
+            let index = if let Some(index) = self.render_pool_clients.iter().position(|(pool, _)| *pool == pair) {
+                index
+            } else {
+                // The clone already has the selected caller's exact snapshot.
+                // It is retained before any fallible rebind or publication.
+                let next = clone_render_client(&work.client)?;
+                let index = self.render_pool_clients.len();
+                self.render_pool_clients.push((pair, next), GFP_KERNEL)?;
+                index
+            };
+            let next = &mut self.render_pool_clients[index].1;
+            if !Self::same_client(next, replacement.as_ref().unwrap_or(&work.client)) {
+                let desired = match replacement.take() {
+                    Some(client) => client,
+                    None => clone_render_client(&work.client)?,
+                };
+                retire_render_fallbacks_slot(next, &desired, memory, vm, asid)?;
+                rebind_retired_pool(next, desired, asid)?;
+            }
+            service.mirror_pool_mappings(pair, &mut next.root)?;
+            // Both roots stay Session-owned throughout transport selection.
+            core::mem::swap(&mut work.client, next);
+            self.render_pool_clients[index].0 = work.layout.pair;
+            work.select_pair(pair)?;
+        }
+        work.layout.context = u32::from(asid);
+        let at = self.ttbs + u64::from(asid) * 16;
+        let upper = memory.read64(self.ttbs + 24)? & 0x000003ffffffc000;
+        let low = (u64::from(asid) << 48) | work.client.root.root() | 1;
+        if memory.read64(at)? != low {
+            // A newly reserved slot must be empty. An installed pool keeps
+            // its root identity across retired mapping refreshes.
+            if memory.read64(at)? != 0 { return Err(EIO); }
+            memory.write64(at + 8, (u64::from(asid) << 48) | upper | 1)?;
+            memory.write64(at, low)?;
+            memory.clean(at, 16)?;
+        } else if memory.read64(at + 8)? != ((u64::from(asid) << 48) | upper | 1) {
+            return Err(EIO);
+        }
+        UserVm::invalidate(asid);
+        work.growth.as_mut().ok_or(EINVAL)?.bind_pool_root(memory, self.ttbs, pair,
+            &work.client.root, asid, u32::from(asid))?;
+        if *crate::module_parameters::submission_log.value() != 0 {
+            dev_info!(dev, "G17P: render pool {} owner {:?} ASID {} root {:#x} independently installed\n",
+                pair, work.client.owner, asid, work.client.root.root());
+        }
+        Ok(())
     }
 }

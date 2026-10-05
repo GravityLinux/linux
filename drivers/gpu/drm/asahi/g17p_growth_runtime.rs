@@ -219,6 +219,20 @@ impl Service {
         )?;
         Ok(())
     }
+    /// None means empty: the caller must stop, because firmware can append
+    /// before step_ordinary reads the tail again. A published nonempty head
+    /// remains immutable until our consumer advances. Some(None) needs no
+    /// particular root; Some(Some(root)) is this head's growth owner.
+    pub(crate) fn requested_root(&self, memory: &Memory, vm: &Vm) -> Result<Option<Option<u64>>> {
+        let tail = word(memory, vm, self.report.states[0] + 0x20)?;
+        if tail >= 256 { return Err(EIO); }
+        if tail == self.cursor { return Ok(None); }
+        let mut body = [0; 0x48];
+        read(memory, vm, self.report.states[1] + self.cursor as u64 * 0x48, &mut body)?;
+        if u32::from_le_bytes(body[..4].try_into().unwrap()) != 6 { return Ok(Some(None)); }
+        let pool = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        Ok(Some(Some(self.pools.iter().find(|p| p.identity.pool == pool).ok_or(EIO)?.root)))
+    }
     /// Retained driver growth pages are shared by logical render roots. A
     /// returning root may predate an allocation made while another VM ran.
     /// Install only absent owned pages; a different physical owner is fatal.
@@ -242,6 +256,20 @@ impl Service {
         }
         Ok(())
     }
+    /// An incoming independently retained pool root needs only that pool's
+    /// immutable growth leaves. Never modify another live root or TVB owner.
+    pub(crate) fn mirror_pool_mappings(&self, pool_id: u32, root: &mut UserVm) -> Result {
+        let pool = self.pools.iter().find(|p| p.identity.pool == pool_id).ok_or(EINVAL)?;
+        if self.failed.is_some() || !pool.retired { return Err(EBUSY); }
+        let mut missing = KVec::new();
+        for &(va, pa) in &pool.mappings {
+            let leaf = root.pte(va)?;
+            if leaf == 0 { missing.push((va, pa), GFP_KERNEL)?; }
+            else if leaf & 0x000003ffffffc003 != pa | 3 { return Err(EIO); }
+        }
+        if !missing.is_empty() { root.grow(&missing)?; }
+        Ok(())
+    }
     pub(crate) fn bind_pool_root(
         &mut self,
         memory: &Memory,
@@ -262,7 +290,7 @@ impl Service {
         };
         if self.failed.is_some()
             || !pool.retired
-            || ![1, 2].contains(&slot)
+            || !(1..64).contains(&slot)
             || !identity.valid()
             || (identity != pool.identity && pool.counter != 0)
         {

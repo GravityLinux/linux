@@ -38,7 +38,7 @@ struct Layout {
     asid: u16,
 }
 impl Layout {
-    fn new(index: usize) -> Result<Self> {
+    fn new(index: usize, asid: u16) -> Result<Self> {
         if index >= CONTEXTS {
             return Err(EBUSY);
         }
@@ -46,7 +46,7 @@ impl Layout {
             high: FW_BASE + index as u64 * STRIDE,
             low: LOW_BASE + index as u64 * STRIDE,
             grid: FIRST_GRID + index as u8,
-            asid: FIRST_ASID + index as u16,
+            asid,
         })
     }
     fn queue(self) -> u64 {
@@ -139,12 +139,25 @@ pub(crate) struct Queue {
 }
 pub(crate) struct Queues {
     owners: KVec<Queue>,
+    reserved_asids: u64,
 }
 impl Queues {
     pub(crate) fn new() -> Self {
         Self {
             owners: KVec::new(),
+            reserved_asids: 0xf,
         }
+    }
+    pub(crate) fn asid_mask(&self) -> u64 {
+        self.owners.iter().fold(self.reserved_asids, |mask, q| mask | (1u64 << q.layout.asid))
+    }
+    pub(crate) fn reserve_render_asid(&mut self, asid: u16) -> Result {
+        if asid >= 64 || self.asid_mask() & (1u64 << asid) != 0 { return Err(EBUSY); }
+        self.reserved_asids |= 1u64 << asid;
+        Ok(())
+    }
+    fn free_asid(&self) -> Option<u16> {
+        (FIRST_ASID..64).find(|asid| self.asid_mask() & (1u64 << asid) == 0)
     }
     pub(crate) fn any(&self) -> bool {
         !self.owners.is_empty()
@@ -205,7 +218,7 @@ impl Queues {
             // backing pool. Live owners never block another queue: allocate
             // another owner when none can be reused safely.
             .or_else(|| self.owners.iter().position(Queue::idle))
-            .or_else(|| (self.owners.len() < CONTEXTS).then_some(self.owners.len()))
+            .or_else(|| (self.owners.len() < CONTEXTS && self.free_asid().is_some()).then_some(self.owners.len()))
     }
     pub(crate) fn can_stage(
         &self,
@@ -251,7 +264,7 @@ impl Queues {
             let queue = Queue::new(
                 memory,
                 vm,
-                Layout::new(index)?,
+                Layout::new(index, self.free_asid().ok_or(EBUSY)?)?,
                 key,
                 client.take().ok_or(EINVAL)?,
                 p,

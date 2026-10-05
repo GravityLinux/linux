@@ -225,7 +225,7 @@ impl Submission {
             ta_timestamp_end: a + 8, fragment_timestamp_start: a,
             fragment_timestamp_end: a + 8, ..p }
     }
-    pub(crate) fn preparation_seed(&self, p: &Parameters, ahead: u32, pair: u32, storage: u32) -> Result<Option<KBox<PreparationSeed>>> {
+    pub(crate) fn preparation_seed(&self, p: &Parameters, ahead: u32, pair: u32, storage: u32, client: Option<&Client>) -> Result<Option<KBox<PreparationSeed>>> {
         if storage >= life::STORAGE_SUBMISSIONS { return Err(EINVAL); }
         if ahead == 0 { return Err(EINVAL); }
         if ahead != 1 { return Ok(None); }
@@ -251,9 +251,10 @@ impl Submission {
         let mut item = life::Item::retained(ordinal, index, layout).map_err(|_| EINVAL)?;
         item.storage = storage;
         p = self.ticket_parameters(item.storage, p);
+        let client = client.unwrap_or(&self.client);
         let mut bindings = KVec::new();
-        bindings.extend_from_slice(&self.client.bindings, GFP_KERNEL)?;
-        Ok(Some(KBox::new(PreparationSeed { item, parameters: p, client: self.client.lease()?, bindings }, GFP_KERNEL)?))
+        bindings.extend_from_slice(&client.bindings, GFP_KERNEL)?;
+        Ok(Some(KBox::new(PreparationSeed { item, parameters: p, client: client.lease()?, bindings }, GFP_KERNEL)?))
     }
     pub(crate) fn set_priority(&self, memory: &mut Memory, vm: &Vm, priority: u32) -> Result {
         let profile = q::priority_profile(priority).map_err(|_| EINVAL)?;

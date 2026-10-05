@@ -35,8 +35,7 @@ pub(crate) struct Owner {
 }
 impl Owner {
     pub(crate) fn valid(self) -> bool {
-        (self.vm == 1 && self.pool < super::g17p_render_lifecycle::POOL_SLOTS)
-            || (self.vm == 2 && self.pool == 1)
+        (1..64).contains(&self.vm) && self.pool < super::g17p_render_lifecycle::POOL_SLOTS
     }
     pub(crate) fn request(self, body: &[u8], counter: u32) -> bool {
         if !self.valid() || body.len() != 0x48 {
