@@ -285,7 +285,7 @@ impl Parameters {
             || self.status_queue_pair.is_some_and(|v| v > 3)
             || self
                 .native_context_slot
-                .is_some_and(|v| !matches!(v, 1 | 2))
+                .is_some_and(|v| !(1..64).contains(&v))
             || self.tvb_pool_id.is_some_and(|v| v >= super::g17p_render_lifecycle::POOL_SLOTS as u64)
             || ((self.native_item_fields || self.native_status_registers)
                 && self.status_queue_pair.unwrap_or(self.queue_pair) > 3)
@@ -806,7 +806,7 @@ impl Descriptor<'_> {
             return Err(Error::Invalid);
         }
         let native_slot = parameters.and_then(|p| p.native_context_slot);
-        if native_slot.is_some_and(|slot| !matches!((self.context, slot), (1, 1) | (1, 2) | (2, 2)))
+        if native_slot.is_some_and(|slot| !(slot == u64::from(self.context) && (1..64).contains(&slot) || (self.context, slot) == (1, 2)))
         {
             return Err(Error::Invalid);
         }

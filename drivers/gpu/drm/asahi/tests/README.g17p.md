@@ -101,6 +101,44 @@ available context capacity, rather than a global completion wait. Backing
 pages stay retained.
 
 
+Render address-space integration (`partial_independent_owner=1`,
+`alternate_queue_pairs=1`, ordinary `compute_queues=1`):
+
+```sh
+gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-render-roots drivers/gpu/drm/asahi/tests/g17p_drm_render_roots.c
+g17p-drm-render-roots 1024
+g17p-drm-render-roots 32 --same-vm
+```
+
+Use the unchanged `g17p_drm_render_batch_workload.h` generated above. The first
+case submits two public queues in different files/VMs at identical DVAs with
+distinct GEMs, alternating submission order. Each pair checks all 16 active
+output images and 16 inactive image guards, both exported sync-file statuses,
+every GPU timestamp, and timestamp guards. Every pair after initial allocation
+must overlap according to GPU timestamps. `--allow-serial` retains all output
+checks for the old-kernel baseline; it does not qualify the new behavior.
+
+`--same-vm` uses two queues in one VM. It unbinds the second stream's original
+output mappings while idle, submits the first render, then binds those outputs
+before submitting the second render. The first ioctl retains an earlier mapping
+snapshot; the second must execute through its newer one while the first is
+pending. Both original GPU streams remain unchanged. All 16 outputs, both own
+fences and all timestamp guards must pass, with retained overlap.
+
+Each ordinary render pool retains its root and ASID. Only that pool's own
+retirement permits mapping replacement; other pools remain installed. Completion
+refresh and growth requests use the ticket/pool's exact root. Render and compute
+reserve from the same 64-slot hardware ASID budget. Prefer an idle exact caller
+snapshot before rebuilding mappings in another pool; a live matching owner does
+not prevent using another available pool. Physical backing is retained.
+
+Qualify these cases together with the complete compute/mixed/dependency/error/
+teardown/pressure/90-image MSAA/after-compute/dirty-timestamp integration sequence.
+An isolated render or queue-retirement pass is insufficient. No unit tests are
+required. Validation uses all six CPUs and the existing HV setup with AGX
+tracing disabled; it establishes overlap, not absolute native-EL2 performance.
+
+
 `g17p_drm_wait.h` adds explicit output-fence waits to the older integration
 programs. `g17p-drm-async` bypasses that adapter for submission and proves
 unsignaled acceptance, copied commands, same-queue ordering, independent-queue
