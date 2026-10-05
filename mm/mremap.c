@@ -1017,7 +1017,7 @@ static void vrm_uncharge(struct vma_remap_struct *vrm)
 	if (!vma_test(vrm->vma, VMA_ACCOUNT_BIT))
 		return;
 
-	vm_unacct_memory(vrm->charged);
+	vm_unacct_memory_mm(current->mm, vrm->charged);
 	vrm->charged = 0;
 }
 
@@ -1238,7 +1238,7 @@ static void unmap_source_vma(struct vma_remap_struct *vrm)
 	vrm->vmi_needs_invalidate = true;
 	if (err) {
 		/* OOM: unable to split vma, just get accounts right */
-		vm_acct_memory(len >> PAGE_SHIFT);
+		vm_acct_memory_mm(mm, len >> PAGE_SHIFT);
 		return;
 	}
 

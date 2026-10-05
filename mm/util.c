@@ -912,7 +912,7 @@ unsigned long vm_commit_limit(void)
 	unsigned long allowed;
 
 	if (sysctl_overcommit_kbytes)
-		allowed = sysctl_overcommit_kbytes >> (PAGE_SHIFT - 10);
+		allowed = sysctl_overcommit_kbytes >> (PAGE_SHIFT_KERNEL - 10);
 	else
 		allowed = ((totalram_pages() - hugetlb_total_pages())
 			   * sysctl_overcommit_ratio / 100);
@@ -942,7 +942,8 @@ struct percpu_counter vm_committed_as ____cacheline_aligned_in_smp;
  */
 unsigned long vm_memory_committed(void)
 {
-	return percpu_counter_sum_positive(&vm_committed_as);
+	return DIV_ROUND_UP(percpu_counter_sum_positive(&vm_committed_as),
+			    vm_commit_native_pages(1));
 }
 EXPORT_SYMBOL_GPL(vm_memory_committed);
 
@@ -967,7 +968,8 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
 	long allowed;
 	unsigned long bytes_failed;
 
-	vm_acct_memory(pages);
+	pages = vm_commit_mm_pages(mm, pages);
+	vm_acct_memory_units(pages);
 
 	/*
 	 * Sometimes we want to use more memory than we have
@@ -976,34 +978,38 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
 		return 0;
 
 	if (sysctl_overcommit_memory == OVERCOMMIT_GUESS) {
-		if (pages > totalram_pages() + total_swap_pages)
+		if (pages > vm_commit_native_pages(totalram_pages() +
+						      total_swap_pages))
 			goto error;
 		return 0;
 	}
 
-	allowed = vm_commit_limit();
+	allowed = vm_commit_native_pages(vm_commit_limit());
 	/*
 	 * Reserve some for root
 	 */
 	if (!cap_sys_admin)
-		allowed -= sysctl_admin_reserve_kbytes >> (PAGE_SHIFT - 10);
+		allowed -= sysctl_admin_reserve_kbytes >>
+			   (VM_COMMIT_SHIFT - 10);
 
 	/*
 	 * Don't let a single process grow so big a user can't recover
 	 */
 	if (mm) {
-		long reserve = sysctl_user_reserve_kbytes >> (PAGE_SHIFT - 10);
+		long reserve = sysctl_user_reserve_kbytes >>
+			       (VM_COMMIT_SHIFT - 10);
 
-		allowed -= min_t(long, mm->total_vm / 32, reserve);
+		allowed -= min_t(long, vm_commit_mm_pages(mm, mm->total_vm) / 32,
+				 reserve);
 	}
 
 	if (percpu_counter_read_positive(&vm_committed_as) < allowed)
 		return 0;
 error:
-	bytes_failed = pages << PAGE_SHIFT;
+	bytes_failed = pages << VM_COMMIT_SHIFT;
 	pr_warn_ratelimited("%s: pid: %d, comm: %s, bytes: %lu not enough memory for the allocation\n",
 			    __func__, current->pid, current->comm, bytes_failed);
-	vm_unacct_memory(pages);
+	vm_acct_memory_units(-pages);
 
 	return -ENOMEM;
 }

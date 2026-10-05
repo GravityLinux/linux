@@ -846,7 +846,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 
 	if (vma_flags_test(&old_vma_flags, VMA_ACCOUNT_BIT) &&
 	    !vma_flags_test(&new_vma_flags, VMA_ACCOUNT_BIT))
-		vm_unacct_memory(nrpages);
+		vm_unacct_memory_mm(mm, nrpages);
 
 	/*
 	 * Private VMA_LOCKED_BIT VMA becoming writable: trigger COW to avoid
@@ -864,7 +864,7 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	return 0;
 
 fail:
-	vm_unacct_memory(charged);
+	vm_unacct_memory_mm(mm, charged);
 	return error;
 }
 

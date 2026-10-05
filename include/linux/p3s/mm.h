@@ -12,6 +12,8 @@ struct task_struct;
 
 #ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
 
+#define VM_COMMIT_SHIFT PAGE_SHIFT_4KB
+
 /*
  * Boot-time command-line 4KB mode (p3s=):
  * P3S_4K_MODE_OFF:       Standard behavior (controlled via personality)
@@ -100,6 +102,8 @@ static inline unsigned long mm_reader_pages(const struct mm_struct *mm,
 }
 
 #else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
+
+#define VM_COMMIT_SHIFT PAGE_SHIFT_KERNEL
 
 static inline unsigned int mm_pte_shift(const struct mm_struct *mm)
 {
@@ -218,6 +222,24 @@ static inline unsigned long mm_kernel_pages(const struct mm_struct *mm,
 					    unsigned long nr)
 {
 	return DIV_ROUND_UP(nr, mm_slices_per_page(mm));
+}
+
+/* Convert native-page counts to the units used by @mm. */
+static inline unsigned long mm_pages_from_kernel(const struct mm_struct *mm,
+						 unsigned long nr)
+{
+	return nr * mm_slices_per_page(mm);
+}
+
+/* Global commitment counters use the smallest supported process page size. */
+static inline long vm_commit_mm_pages(const struct mm_struct *mm, long pages)
+{
+	return pages * (1L << (mm_pte_shift(mm) - VM_COMMIT_SHIFT));
+}
+
+static inline long vm_commit_native_pages(long pages)
+{
+	return pages * (1L << (PAGE_SHIFT_KERNEL - VM_COMMIT_SHIFT));
 }
 
 static inline unsigned long mm_offset_in_page(const struct mm_struct *mm,
