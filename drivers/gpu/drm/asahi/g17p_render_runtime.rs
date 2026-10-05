@@ -1438,6 +1438,13 @@ pub(crate) fn stage_next_prepared(
     }
     let queued = work.layout.independent && !work.layout.native && pool_count() > 2
         && work.growth.as_ref().is_some_and(|service| !service.pools[work.layout.pair as usize].retired);
+    // A dormant pool's old outer publication can be over 256 messages old.
+    // Its completed proof must remain monotonic across global channel wrap.
+    // retire_token latches this only after every owned ticket has passed its
+    // inner/outer, status, terminal and control retirement gates. Current
+    // pointer readiness and the outer free slot are still checked below.
+    let retired_pool = work.layout.independent && !work.layout.native && pool_count() > 2
+        && work.growth.as_ref().is_some_and(|service| service.pools[work.layout.pair as usize].retired);
     let mut counters = [q::Counters::new([0; 3]).map_err(|_| EIO)?; 2];
     let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
     // Source scheduler_publication_values: firmware retains +0x0c across
@@ -1463,7 +1470,7 @@ pub(crate) fn stage_next_prepared(
             word(channel.states[2])?,
         ])
         .map_err(|_| EIO)?;
-        if !queued && !work.fresh_pair && !work.publications[index].completed(previous, counters[index]) {
+        if !queued && !work.fresh_pair && !retired_pool && !work.publications[index].completed(previous, counters[index]) {
             return Err(EBUSY);
         }
         counters[index].slot().map_err(|_| EBUSY)?;
