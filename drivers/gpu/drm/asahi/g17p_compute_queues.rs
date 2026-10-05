@@ -136,6 +136,16 @@ pub(crate) struct Queue {
     transport: TransportPool,
     fences: KVec<Fence>,
     upper: u64,
+    needs_optional: bool,
+    needs_first: bool,
+    reconfiguration: Option<Maintenance>,
+}
+struct Maintenance {
+    target: Key,
+    next: u32,
+    published: Option<([u8; 2], u8)>,
+    acknowledged: [bool; 2],
+    started: kernel::time::Instant<kernel::time::Monotonic>,
 }
 pub(crate) struct Queues {
     owners: KVec<Queue>,
@@ -210,15 +220,20 @@ impl Queues {
         }
     }
     fn choose(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<usize> {
-        self.owners
+        let eligible = |q: &Queue| q.reconfiguration.as_ref().is_none_or(|m| m.target == key);
+        self.owners.iter().position(|q| q.reconfiguration.as_ref().is_some_and(|m| m.target == key))
+            .or_else(|| self.owners
             .iter()
-            .position(|q| q.matches(key, client, p, priority) && q.window < WINDOW)
-            .or_else(|| self.owners.iter().position(|q| q.key == key && q.idle()))
+            .position(|q| eligible(q) && q.matches(key, client, p, priority) && q.window < WINDOW))
+            .or_else(|| self.owners.iter().position(|q| eligible(q) && q.key == key && q.idle()))
             // Rebind a fully retired owner before growing the permanent
             // backing pool. Live owners never block another queue: allocate
             // another owner when none can be reused safely.
-            .or_else(|| self.owners.iter().position(Queue::idle))
+            .or_else(|| self.owners.iter().position(|q| eligible(q) && q.idle()))
             .or_else(|| (self.owners.len() < CONTEXTS && self.free_asid().is_some()).then_some(self.owners.len()))
+    }
+    pub(crate) fn selected_grid(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<u8> {
+        self.choose(key, client, p, priority).map(|index| FIRST_GRID + index as u8)
     }
     pub(crate) fn can_stage(
         &self,
@@ -243,6 +258,51 @@ impl Queues {
             .get(index)
             .filter(|q| q.matches(key, client, p, priority))
             .map(|q| &q.client)
+    }
+    /// Only the retired owner being reassigned waits for its exact, live
+    /// ownership-checked cleanup receipt. Backing remains pinned and unrelated
+    /// owners are selectable throughout this nonblocking handoff.
+    pub(crate) fn prepare_reconfiguration(
+        &mut self, memory: &mut Memory, vm: &Vm, channel: Channel,
+        key: Key, client: &Client, p: &Parameters, priority: u32,
+    ) -> Result<(bool, bool)> {
+        let Some(index) = self.choose(key, client, p, priority) else { return Ok((false, false)); };
+        let Some(queue) = self.owners.get_mut(index) else { return Ok((true, false)); };
+        if queue.matches(key, client, p, priority) && queue.reconfiguration.is_none() {
+            return Ok((true, false));
+        }
+        if !queue.idle() { pr_err!("G17P: compute admission nonidle grid {} key {:?} target {:?}\n",queue.layout.grid,queue.key,key); return Err(EIO); }
+        let maintenance = queue.reconfiguration.get_or_insert_with(|| Maintenance {
+            target: key, next: 0, published: None, acknowledged: [false; 2],
+            started: kernel::time::Instant::now(),
+        });
+        if maintenance.started.elapsed().as_millis() > 10000 { return Err(ETIMEDOUT); }
+        let mut values = [0; 3];
+        for (value, address) in values.iter_mut().zip(channel.states) {
+            *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
+        }
+        let counters = q::Counters::new(values).inspect_err(|e| pr_err!("G17P: compute control counters {:?} error {:?}\n",values,e)).map_err(|_| EIO)?;
+        if let Some((before, target)) = maintenance.published {
+            for i in 0..2 {
+                maintenance.acknowledged[i] |= q::reached(before[i], values[i] as u8, target);
+            }
+            if !maintenance.acknowledged.iter().all(|v| *v) { return Ok((false, false)); }
+            maintenance.next += 1;
+            maintenance.published = None;
+        }
+        if maintenance.next == 1 { return Ok((true, false)); }
+        if counters.available() == 0 { return Ok((false, false)); }
+        let mut live = [0; 0x40];
+        runtime::read_owned(memory,vm,queue.layout.control(),&mut live)?;
+        let body = super::g17p_lifecycle::build_live_context_cleanup(queue.layout.control(),&live)?;
+        let target = ((values[2] + 1) & 255) as u8;
+        vm.write(memory, 2, channel.ring + u64::from(values[2]) * 0x40, &body)?;
+        g17p_memory::sync();
+        vm.write(memory, 2, channel.states[2], &u32::from(target).to_le_bytes())?;
+        g17p_memory::sync();
+        maintenance.published = Some(([values[0] as u8, values[1] as u8], target));
+        maintenance.acknowledged = [false; 2];
+        Ok((false, true))
     }
     pub(crate) fn stage(
         &mut self,
@@ -274,6 +334,16 @@ impl Queues {
             self.owners[index].install(memory, ttbs)?;
         } else {
             let queue = &mut self.owners[index];
+            if let Some(receipt) = &queue.reconfiguration {
+                if receipt.target != key || receipt.next != 1 || !queue.idle() { return Err(EBUSY); }
+                // A first registration starts with an empty inner transport.
+                // Switch while the old source header still mirrors its retired
+                // read index; resetting that header first loses rollover proof.
+                // Both finite backing slots and logical counters stay retained.
+                queue.rotate(memory,vm).inspect_err(|e| pr_err!("G17P: compute cleanup rotate grid {} error {:?}\n",queue.layout.grid,e))?;
+                queue.reset_registration(memory,vm).inspect_err(|e| pr_err!("G17P: compute reset registration grid {} error {:?}\n",queue.layout.grid,e))?;
+                queue.reconfiguration = None;
+            }
             if !queue.matches(key, reference, p, priority) {
                 if !queue.idle() {
                     return Err(EBUSY);
@@ -286,13 +356,14 @@ impl Queues {
                     client.take().ok_or(EINVAL)?,
                     p,
                     priority,
-                )?;
+                ).inspect_err(|e| pr_err!("G17P: compute replace client grid {} error {:?}\n",queue.layout.grid,e))?;
             }
             if queue.window == WINDOW {
-                queue.rotate(memory, vm)?;
+                queue.rotate(memory, vm).inspect_err(|e| pr_err!("G17P: compute rotate grid {} error {:?}\n",queue.layout.grid,e))?;
             }
         }
         self.owners[index].stage(memory, vm, channel, index, p, dependencies, fence)
+            .inspect_err(|e| pr_err!("G17P: compute build grid {} error {:?}\n",self.owners[index].layout.grid,e))
     }
 }
 impl Queue {
@@ -417,6 +488,9 @@ impl Queue {
             transport: TransportPool::new(layout.high + 0x190000),
             fences: KVec::new(),
             upper,
+            needs_optional: true,
+            needs_first: false,
+            reconfiguration: None,
         })
     }
     // Session owns the complete root before either TTB becomes visible.
@@ -432,6 +506,29 @@ impl Queue {
         )?;
         memory.clean(at, 16)?;
         UserVm::invalidate(self.layout.asid);
+        Ok(())
+    }
+    fn reset_registration(&mut self, memory: &mut Memory, vm: &Vm) -> Result {
+        // Cleanup consumed the exact firmware owner identity, after all its
+        // fences completed. Rebuild source-authored registration metadata;
+        // never return, repurpose or zero any caller/GPU executable pages.
+        for offset in (0..8 * PAGE).step_by(PAGE) {
+            let pa = vm.physical(memory,2,self.layout.context() + offset as u64)?;
+            memory.zero(pa,PAGE)?;
+            memory.clean(pa,PAGE)?;
+        }
+        vm.write(memory,2,self.layout.control(),&super::g17p_dependency::channel_control())?;
+        vm.write(memory,2,self.layout.job_list(),&q::job_list(self.layout.job_list()))?;
+        let mut record = q::Record {
+            pointers:self.pointers,ring:self.ring,job_list:self.layout.job_list(),
+            context:self.layout.control(),uuid:0x200+u32::from(self.layout.grid),
+            priority:self.priority,prio5:self.priority,unk_2c:self.priority,
+            unk_38:0,unk_30:None,unk_94:0,sentinel_size:2,
+        }.build().map_err(|_|EINVAL)?;
+        record[0x28..0x48].copy_from_slice(&q::priority_profile(self.priority).map_err(|_|EINVAL)?);
+        vm.write(memory,2,self.layout.queue(),&record)?;
+        self.needs_optional = true;
+        self.needs_first = true;
         Ok(())
     }
     fn replace_client(
@@ -452,6 +549,10 @@ impl Queue {
         if memory.read64(at)? != ((u64::from(self.layout.asid) << 48) | self.client.root.root() | 1)
             || memory.read64(at + 8)? != ((u64::from(self.layout.asid) << 48) | self.upper | 1)
         {
+            pr_err!("G17P: compute rebind TTB grid {} actual [{:#x},{:#x}] expected [{:#x},{:#x}]\n",
+                self.layout.grid,memory.read64(at)?,memory.read64(at+8)?,
+                (u64::from(self.layout.asid)<<48)|self.client.root.root()|1,
+                (u64::from(self.layout.asid)<<48)|self.upper|1);
             return Err(EIO);
         }
         // Reuse this owner's allocator and private backing. A changed reserved
@@ -470,6 +571,7 @@ impl Queue {
                 let old = self.preempt + offset;
                 let leaf = self.client.root.pte(old)?;
                 if leaf == 0 {
+                    pr_err!("G17P: compute rebind missing private leaf grid {} preempt {:#x} new {:#x} offset {:#x}\n",self.layout.grid,self.preempt,p.preempt,offset);
                     return Err(EIO);
                 }
                 leaves.push(leaf, GFP_KERNEL)?;
@@ -498,7 +600,12 @@ impl Queue {
             .prepare_rebind(&client, false, &[self.layout.asid], &private)?
             .commit();
         self.client.adopt_rebound(client);
-        vm.write(memory, 2, self.layout.queue() + 0x28, &profile)?;
+        self.needs_optional = true;
+        // Retained firmware queues keep their established scheduling state
+        // when another caller requests the same priority family.
+        if self.priority != priority {
+            vm.write(memory, 2, self.layout.queue() + 0x28, &profile)?;
+        }
         self.key = key;
         self.preempt = p.preempt;
         self.priority = priority;
@@ -646,8 +753,8 @@ impl Queue {
         .map_err(|_| EINVAL)?;
         c::context_dependencies(&mut page[..0x200], dependencies).map_err(|_| EINVAL)?;
         let context = l.context() + c::context_offset(ordinal, RECORDS).map_err(|_| EINVAL)? as u64;
-        runtime::write_context_item(memory, vm, context, &page[..0x200], ordinal >= RECORDS)?;
-        if ordinal == 0 {
+        runtime::write_context_item(memory, vm, context, &page[..0x200], ordinal >= RECORDS - 1)?;
+        if self.needs_optional {
             let optional = c::Optional {
                 context_low: l.context_low(),
                 context_high: l.context(),
@@ -661,8 +768,8 @@ impl Queue {
                 field_32: u32::from(l.asid),
                 field_56: 2,
                 field_5e: 2,
-                first: true,
-                item_index: 0,
+                first: ordinal == 0 || self.needs_first,
+                item_index: ordinal,
             }
             .build();
             vm.write(memory, 2, l.optional(), &optional)?;
@@ -692,11 +799,11 @@ impl Queue {
             channel_producer: channel.states[2],
             counters,
             slot: None,
-            items: if ordinal == 0 { &initial } else { &retained },
+            items: if self.needs_optional { &initial } else { &retained },
             group: ordinal + 1,
             grid: u32::from(l.grid),
             kind: q::Kind::Compute,
-            first: ordinal == 0,
+            first: ordinal == 0 || self.needs_first,
             in_place: false,
             announce: false,
             defer_inner: true,
@@ -712,6 +819,8 @@ impl Queue {
         })?;
         self.fences.push(fence, GFP_KERNEL)?;
         self.publication = Some(publication);
+        self.needs_optional = false;
+        self.needs_first = false;
         self.count += 1;
         self.window += 1;
         Ok(Ticket {

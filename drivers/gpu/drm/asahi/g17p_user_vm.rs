@@ -28,14 +28,14 @@ impl RootLease {
     /// releasing its execution owner so every newly reachable table is pinned.
     pub(crate) fn refresh(&mut self, owner: &UserVm) -> Result {
         if self.root != owner.root() { return Err(EIO); }
-        let missing = owner.tables.iter()
-            .filter(|page| !self.tables.iter().any(|old| old.phys() == page.phys())).count();
-        self.tables.reserve(missing, GFP_KERNEL)?;
-        for page in &owner.tables {
-            if !self.tables.iter().any(|old| old.phys() == page.phys()) {
-                self.tables.push(page.clone(), GFP_KERNEL)?;
-            }
-        }
+        // UserVm table ownership is append-only after its root is installed.
+        // Validate the pinned prefix once, then retain only new growth pages.
+        // Avoid two quadratic membership scans on every live render poll.
+        if self.tables.len() > owner.tables.len() || self.tables.iter().zip(&owner.tables)
+            .any(|(old, page)| old.phys() != page.phys()) { return Err(EIO); }
+        let first = self.tables.len();
+        self.tables.reserve(owner.tables.len() - first, GFP_KERNEL)?;
+        for page in &owner.tables[first..] { self.tables.push(page.clone(), GFP_KERNEL)?; }
         Ok(())
     }
 }
@@ -198,12 +198,19 @@ impl UserVm {
             if active.contains(&pa) {
                 return Err(EINVAL);
             }
-            source.page(pa)?;
+            let page = source.page(pa)?;
             active.push(pa, GFP_KERNEL)?;
             let mut body = KVVec::with_capacity(2048, GFP_KERNEL)?;
-            for index in 0..2048 {
-                body.push(source.read(pa, index)?, GFP_KERNEL)?;
-            }
+            body.resize(2048, 0u64, GFP_KERNEL)?;
+            page.with_page_mapped(|pointer| {
+                // SAFETY: The runtime lock excludes host PTE mutation. The
+                // firmware accesses mapped leaves, never these owned tables.
+                // Copy only table DATA into distinct unpublished storage.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(pointer.cast::<u64>(), body.as_mut_ptr(), 2048);
+                }
+            });
+            for word in body.iter_mut() { *word = u64::from_le(*word); }
             if depth < 2 {
                 for index in 0..if depth == 0 { 64 } else { 2048 } {
                     let word = body[index];
@@ -229,9 +236,15 @@ impl UserVm {
                 Some(copy) => copy,
                 None => destination.table()?,
             };
-            for (index, word) in body.into_iter().enumerate() {
-                destination.write(copy, index, word)?;
-            }
+            let page = destination.page(copy)?;
+            page.with_page_mapped(|pointer| {
+                for (index, word) in body.iter().enumerate() {
+                    // SAFETY: The new table owns all 2048 words. Child links
+                    // already refer to separately retained, cleaned copies.
+                    unsafe { pointer.cast::<u64>().add(index).write(word.to_le()); }
+                }
+            });
+            UserVm::clean(page);
             copies.push((pa, depth, copy), GFP_KERNEL)?;
             active.pop();
             Ok(copy)

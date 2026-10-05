@@ -83,6 +83,8 @@ struct Transport {
     deferred: [KVec<Deferred>; 2],
     transports: [super::g17p_compute_runtime::TransportPool; 2],
     fresh: bool,
+    queue_owner: Option<(u64, u32)>,
+    scratch_key: Option<ScratchKey>,
 }
 /// Short-lock seed for CPU-only preparation. It owns the exact immutable
 /// caller identities and executable root pages; construction does not read
@@ -204,7 +206,8 @@ pub(crate) struct Submission {
     others: KVec<Transport>,
     fresh_pair: bool,
     scratch_layout: (u64, u64, u64),
-    scratch_key: ScratchKey,
+    queue_owner: Option<(u64, u32)>,
+    scratch_key: Option<ScratchKey>,
     scratch_leases: KVec<ScratchLease>,
     scratch_cursor: u64,
     firmware_timestamps: Option<u64>,
@@ -212,7 +215,27 @@ pub(crate) struct Submission {
 }
 impl Submission {
     pub(crate) fn same_geometry(&self, p: &Parameters) -> bool {
-        self.scratch_key == ScratchKey::of(p)
+        self.scratch_key == Some(ScratchKey::of(p))
+    }
+    pub(crate) fn pair_next_index(&self, pair: u32) -> Result<u32> {
+        let (fresh, index) = if self.layout.pair == pair {
+            (self.fresh_pair, self.item_index)
+        } else {
+            let other = self.others.iter().find(|other| other.layout.pair == pair).ok_or(EINVAL)?;
+            (other.fresh, other.item_index)
+        };
+        if fresh { Ok(0) } else { index.checked_add(1).ok_or(EOVERFLOW) }
+    }
+    pub(crate) fn pair_queue_owner(&self, pair: u32) -> Option<(u64, u32)> {
+        if self.layout.pair == pair { self.queue_owner } else {
+            self.others.iter().find(|other| other.layout.pair == pair).and_then(|other| other.queue_owner)
+        }
+    }
+    pub(crate) fn pair_same_geometry(&self, pair: u32, p: &Parameters) -> bool {
+        let key = if self.layout.pair == pair { self.scratch_key } else {
+            self.others.iter().find(|other| other.layout.pair == pair).and_then(|other| other.scratch_key)
+        };
+        key == Some(ScratchKey::of(p))
     }
     fn ticket_parameters(&self, storage: u32, p: Parameters) -> Parameters {
         let Some(base) = self.firmware_timestamps else { return p; };
@@ -258,6 +281,10 @@ impl Submission {
     }
     pub(crate) fn set_priority(&self, memory: &mut Memory, vm: &Vm, priority: u32) -> Result {
         let profile = q::priority_profile(priority).map_err(|_| EINVAL)?;
+        // A live retained queue already in this family needs no mutation.
+        if self.layout.queues.iter().all(|queue| {
+            vm.physical(memory,2,queue+0x28).and_then(|pa| memory.read_firmware32(pa)) == Ok(priority)
+        }) { return Ok(()); }
         for pointers in self.layout.pointers {
             let mut values = [0; 3];
             for (value, offset) in
@@ -939,7 +966,8 @@ pub(crate) fn build(
         transports: transport_pools(0),
         fresh_pair: false,
         scratch_layout: p.scratch_layout().map_err(|_| EINVAL)?,
-        scratch_key: ScratchKey::of(p),
+        queue_owner: p.queue_owner,
+        scratch_key: Some(ScratchKey::of(p)),
         scratch_leases,
         scratch_cursor,
         firmware_timestamps: None,
@@ -1123,6 +1151,8 @@ impl Submission {
             deferred: [KVec::new(), KVec::new()],
             transports: transport_pools(layout.pair),
             fresh: true,
+            queue_owner: None,
+            scratch_key: None,
         }, GFP_KERNEL)?;
         self.layout.independent = true;
         Ok(())
@@ -1214,7 +1244,7 @@ impl Submission {
         let empty = q::Publication { slot: 0, producer: 0, consumers_before: [0; 2],
             write_before: 0, write_after: 0, deferred_inner: None, deferred_outer: None };
         self.others.push(Transport { layout, item_index: 0, publications: [empty; 2],
-            deferred: [KVec::new(), KVec::new()], transports: transport_pools(pair), fresh: true }, GFP_KERNEL)?;
+            deferred: [KVec::new(), KVec::new()], transports: transport_pools(pair), fresh: true, queue_owner: None, scratch_key: None }, GFP_KERNEL)?;
         pr_info!("G17P: independent render pool {} grids {:?} firmware {:#x} private {:#x}\n",
             pair, layout.grids, arena, delta);
         Ok(())
@@ -1230,6 +1260,8 @@ impl Submission {
         core::mem::swap(&mut self.deferred, &mut other.deferred);
         core::mem::swap(&mut self.fresh_pair, &mut other.fresh);
         core::mem::swap(&mut self.transports, &mut other.transports);
+        core::mem::swap(&mut self.scratch_key, &mut other.scratch_key);
+        core::mem::swap(&mut self.queue_owner, &mut other.queue_owner);
         Ok(())
     }
     pub(crate) fn after_control(&self, memory: &mut Memory, vm: &Vm, ttbs: u64) -> Result {
@@ -1404,6 +1436,8 @@ pub(crate) fn stage_next_prepared(
         if storage >= life::STORAGE_SUBMISSIONS { return Err(EINVAL); }
         item.storage = storage;
     }
+    let queued = work.layout.independent && !work.layout.native && pool_count() > 2
+        && work.growth.as_ref().is_some_and(|service| !service.pools[work.layout.pair as usize].retired);
     let mut counters = [q::Counters::new([0; 3]).map_err(|_| EIO)?; 2];
     let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
     // Source scheduler_publication_values: firmware retains +0x0c across
@@ -1416,11 +1450,12 @@ pub(crate) fn stage_next_prepared(
         .map_err(|_| EIO)?;
     for index in 0..2 {
         let previous = work.publications[index].write_after;
-        for at in [0, 0x30, 0x40] {
-            if word(work.layout.pointers[index] + at)? != previous {
-                return Err(EBUSY);
-            }
-        }
+        let counts = [word(work.layout.pointers[index])?,
+            word(work.layout.pointers[index] + 0x30)?, word(work.layout.pointers[index] + 0x40)?];
+        if counts[2] != previous || counts[0] > counts[1] || counts[1] > counts[2]
+            || (!queued && (counts[0] != previous || counts[1] != previous)) { return Err(EBUSY); }
+        let capacity = word(work.layout.pointers[index] + 0x60)?.min(0x2870 / 8);
+        if queued && previous.checked_add(3).ok_or(EOVERFLOW)? > capacity { return Err(EBUSY); }
         let channel = work.channels[index];
         counters[index] = q::Counters::new([
             word(channel.states[0])?,
@@ -1428,27 +1463,35 @@ pub(crate) fn stage_next_prepared(
             word(channel.states[2])?,
         ])
         .map_err(|_| EIO)?;
-        if !work.fresh_pair && !work.publications[index].completed(previous, counters[index]) {
+        if !queued && !work.fresh_pair && !work.publications[index].completed(previous, counters[index]) {
             return Err(EBUSY);
         }
         counters[index].slot().map_err(|_| EBUSY)?;
     }
-    if counters[0].0 != counters[1].0 {
+    if (!work.layout.independent || work.layout.native || pool_count() <= 2)
+        && counters[0].0 != counters[1].0 {
         pr_err!("G17P: append fail site stage_counters ordinal {} pair {} TA {:?} FR {:?}\n",item.ordinal,item.layout.pair,counters[0].0,counters[1].0);
         return Err(EIO);
     }
+    let profile = (*crate::module_parameters::submission_log.value() >= 3 && item.ordinal % 16 == 0)
+        .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
     let configured = select_scratch(memory, &mut work.client,
         &mut work.scratch_leases, &mut work.scratch_cursor, p)?;
     let configured = work.ticket_parameters(item.storage, configured);
     let p = &configured;
     validate_scratch_backing(&work.client, p)?;
+    if let Some(start) = profile.as_ref() { pr_info!("G17P: render detail ordinal {} scratch_us {}\n",item.ordinal,start.elapsed().as_nanos()/1000); }
     let next_scratch = p.scratch_layout().map_err(|_| EINVAL)?;
     let next_key = ScratchKey::of(p);
-    // All preceding GPU readers retired before geometry input is cleared.
-    if work.scratch_key != next_key {
+    // This selected pool is retired. Other live pools retain their own
+    // geometry namespace and must never be cleared by this preparation.
+    if work.scratch_key != Some(next_key) {
         let (_, stride, tpc) = next_scratch;
         let pairs = pool_count();
-        for pair in 0..pairs {
+        let selected = work.layout.independent && !work.layout.native && pool_count() > 2;
+        let first = if selected { work.layout.pair as u64 } else { 0 };
+        let end = if selected { first + 1 } else { pairs };
+        for pair in first..end {
         let delta = pair * p.scratch_pair_stride;
         for (base, len) in [(p.tilemap + delta, stride * 8), (p.tpc + delta, tpc)] {
             let mut offset = 0;
@@ -1465,7 +1508,7 @@ pub(crate) fn stage_next_prepared(
         }
         }
         work.scratch_layout = next_scratch;
-        work.scratch_key = next_key;
+        work.scratch_key = Some(next_key);
     }
     // Both stages and both channel consumers have retired. Replace only
     // their finite pointer/item backing; retain queue identities and logical
@@ -1495,20 +1538,24 @@ pub(crate) fn stage_next_prepared(
     // demand. Do not expose the late fragment range during cold startup: its
     // low DVAs overlap earlier context-zero operand backing.
     if item.ordinal >= 128 {
+        let mut remapped = false;
         for kind in [Kind::Tiling, Kind::Fragment] {
-            vm.alias_firmware(
-                memory,
-                item.descriptor_address(kind),
-                item.descriptor_alias(kind),
-                kind.size(),
-            )?;
+            let high = item.descriptor_address(kind);
+            let low = item.descriptor_alias(kind);
+            if !vm.firmware_alias_matches(memory, high, low, kind.size())? {
+                vm.alias_firmware(memory, high, low, kind.size())?;
+                remapped = true;
+            }
         }
-        vm.flush_tables(memory)?;
-        tlbi();
+        if remapped {
+            vm.flush_tables(memory)?;
+            tlbi();
+        }
     }
     let word = |address| memory.read_firmware32(vm.physical(memory, 2, address)?);
     // Allocate/build the entire append before editing any live resource state.
     // Every destination was mapped and retained before the first publication.
+    if let Some(start) = profile.as_ref() { pr_info!("G17P: render detail ordinal {} maps_us {}\n",item.ordinal,start.elapsed().as_nanos()/1000); }
     let mut objects = if let Some(plan) = prepared.filter(|plan| plan.matches(work, item, p)) {
         KBox::into_inner(plan).objects
     } else {
@@ -1560,6 +1607,7 @@ pub(crate) fn stage_next_prepared(
             item.pool_b_mirrors(kind, &mut objects[index][0].body, b00, b28);
         }
     }
+    if let Some(start) = profile.as_ref() { pr_info!("G17P: render detail ordinal {} objects_us {}\n",item.ordinal,start.elapsed().as_nanos()/1000); }
     let inner = word(work.layout.inner)?;
     if inner > 2 * (item.ordinal + 1) {
         pr_err!("G17P: append fail site inner_progress ordinal {} pair {} inner {}\n",item.ordinal,item.layout.pair,inner);
@@ -1597,12 +1645,13 @@ pub(crate) fn stage_next_prepared(
     }
     work.client.cache(false)?;
     if let Some(service) = work.growth.as_mut() {
-        service.bind_pool_work(
+        service.bind_pool_work_owned(
             work.layout.pair,
             [0xfffffc2000000100, 0xfffffc2000000200],
             item.descriptor_address(Kind::Fragment),
             work.layout.grids[1],
             item.ordinal,
+            queued,
         )?;
     } else if !work.layout.native {
         return Err(EINVAL);
@@ -1626,7 +1675,8 @@ pub(crate) fn stage_next_prepared(
         &1u32.to_le_bytes(),
     )?;
     // Source lifecycle before -> fragment -> tiling. No producer yet visible.
-    write(memory, work.layout.leaves[4] + 0x60, &1u32.to_le_bytes())?;
+    if let Some(start) = profile.as_ref() { pr_info!("G17P: render detail ordinal {} tilemap_us {}\n",item.ordinal,start.elapsed().as_nanos()/1000); }
+    if !queued { write(memory, work.layout.leaves[4] + 0x60, &1u32.to_le_bytes())?; }
     write(memory, item.slot(), &phases[0].to_le_bytes())?;
     for index in [1, 0] {
         for object in &objects[index] {
@@ -1661,7 +1711,9 @@ pub(crate) fn stage_next_prepared(
             }
         }
     }
-    // Retired prior PB release, then the same retained owner is selected again.
+    // Only idle pool admission changes the shared PB registration. Queued
+    // descriptors retain the existing owner until that pool fully retires.
+    if !queued {
     write(
         memory,
         work.layout.shared[0] + 0x0c,
@@ -1673,6 +1725,7 @@ pub(crate) fn stage_next_prepared(
         &work.layout.pair.to_le_bytes(),
     )?;
     write(memory, work.layout.shared[0], &item.index.to_le_bytes())?;
+    }
     let count = memory.read_firmware32(vm.physical(memory, 2, work.layout.shared[0] + 0x34)?)?;
     let pa = vm.physical(memory, 2, work.layout.shared[0] + 0x28)?;
     memory.invalidate(pa, 8)?;
@@ -1684,6 +1737,7 @@ pub(crate) fn stage_next_prepared(
             write(memory, at, &body)?;
         }
     }
+    if let Some(start) = profile.as_ref() { pr_info!("G17P: render detail ordinal {} data_us {}\n",item.ordinal,start.elapsed().as_nanos()/1000); }
     g17p_memory::sync();
     for index in 0..2 {
         let kind = if index == 0 {
@@ -1738,6 +1792,7 @@ pub(crate) fn stage_next_prepared(
         work.deferred[index].clear();
     }
     work.firmware_completion = p.fragment_timestamp_end;
+    work.queue_owner = p.queue_owner;
     work.ordinal = item.ordinal;
     work.storage = item.storage;
     work.next_storage = None;

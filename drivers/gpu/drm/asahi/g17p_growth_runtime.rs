@@ -53,7 +53,7 @@ pub(crate) struct Pool {
 }
 /// Exact accepted render identity inside a retained pool. A different pool's
 /// report or a later generation must never retire this publication.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkToken {
     pool: u32,
     root: u64,
@@ -61,7 +61,14 @@ pub(crate) struct WorkToken {
     fragment: u64,
     event: u32,
 }
+struct WorkOwner {
+    token: WorkToken,
+    work: [u64; 2],
+    counter_baseline: u32,
+    limit_report: Option<[u8; 0x48]>,
+}
 pub(crate) struct Service {
+    work_owners: KVec<WorkOwner>,
     command: Channel,
     report: Channel,
     cursor: u32,
@@ -256,6 +263,16 @@ impl Service {
         }
         Ok(())
     }
+    /// A retired clone may still borrow a different pool's grown leaves.
+    /// Their exact backing stays owned by that pool; the clone need not keep
+    /// its aliases when admitting caller BOs at those otherwise valid DVAs.
+    pub(crate) fn foreign_growth_leaf(&self, selected: u32, va: u64, pte: u64) -> bool {
+        self.pools.iter().any(|pool| pool.identity.pool != selected
+            && va >= pool.growth_base
+            && va - pool.growth_base < u64::from(pool.counter) * g::INCREMENT as u64 * 0x28000
+            && pool.mappings.iter().any(|&(address, pa)| address == va
+                && pte == (pa | 0x00c0000000000c8b)))
+    }
     /// An incoming independently retained pool root needs only that pool's
     /// immutable growth leaves. Never modify another live root or TVB owner.
     pub(crate) fn mirror_pool_mappings(&self, pool_id: u32, root: &mut UserVm) -> Result {
@@ -329,6 +346,12 @@ impl Service {
         event: u32,
         generation: u32,
     ) -> Result {
+        self.bind_pool_work_owned(pool_id, work, fragment, event, generation, false)
+    }
+    pub(crate) fn bind_pool_work_owned(
+        &mut self, pool_id: u32, work: [u64; 2], fragment: u64,
+        event: u32, generation: u32, append: bool,
+    ) -> Result {
         if self.failed.is_some() || fragment == 0 || work.contains(&0) {
             return Err(EINVAL);
         }
@@ -338,18 +361,25 @@ impl Service {
             .position(|p| p.identity.pool == pool_id)
             .ok_or(EINVAL)?;
         let pool = &mut self.pools[index];
-        if !pool.retired {
-            return Err(EBUSY);
-        }
+        if !pool.retired && !append { return Err(EBUSY); }
         if event != pool.fragment_event {
             return Err(EINVAL);
         }
+        self.work_owners.reserve(2, GFP_KERNEL)?;
+        if !pool.retired && !self.work_owners.iter().any(|w| w.token.pool == pool_id) {
+            self.work_owners.push(WorkOwner { token: WorkToken { pool: pool_id,
+                root: pool.root, generation: pool.generation, fragment: pool.fragment,
+                event: pool.fragment_event }, work: pool.work,
+                counter_baseline: pool.counter_baseline, limit_report: pool.limit_report }, GFP_KERNEL)?;
+        }
+        self.work_owners.push(WorkOwner { token: WorkToken { pool: pool_id,
+            root: pool.root, generation, fragment, event }, work,
+            counter_baseline: pool.counter, limit_report: None }, GFP_KERNEL)?;
+        let was_retired = pool.retired;
         pool.generation = generation;
         pool.counter_baseline = pool.counter;
         pool.retired = false;
-        pool.refused = false;
-        pool.limited = false;
-        pool.limit_report = None;
+        if was_retired { pool.refused = false; pool.limited = false; pool.limit_report = None; }
         pool.work = work;
         pool.fragment = fragment;
         pool.fragment_event = event;
@@ -368,8 +398,9 @@ impl Service {
             .ok_or(EIO)?;
         let pool = &self.pools[index];
         if self.failed.is_some() || pool.retired || pool.root != token.root
-            || pool.generation != token.generation || pool.fragment != token.fragment
-            || pool.fragment_event != token.event {
+            || (!self.work_owners.iter().any(|w| w.token == token)
+                && (pool.generation != token.generation || pool.fragment != token.fragment
+                    || pool.fragment_event != token.event)) {
             return Err(EIO);
         }
         Ok(index)
@@ -378,11 +409,16 @@ impl Service {
         Ok(self.pools[self.token_index(token)?].terminals)
     }
     pub(crate) fn token_limited(&self, token: WorkToken) -> Result<bool> {
-        Ok(self.pools[self.token_index(token)?].limit_report.is_some())
+        let index = self.token_index(token)?;
+        Ok(self.work_owners.iter().find(|w| w.token == token)
+            .map_or(self.pools[index].limit_report.is_some(), |w| w.limit_report.is_some()))
     }
     pub(crate) fn retire_token(&mut self, token: WorkToken) -> Result {
         let index = self.token_index(token)?;
-        self.pools[index].retired = true;
+        if let Some(owner) = self.work_owners.iter().position(|w| w.token == token) {
+            self.work_owners.remove(owner).map_err(|_| EIO)?;
+        }
+        self.pools[index].retired = !self.work_owners.iter().any(|w| w.token.pool == token.pool);
         Ok(())
     }
     pub(crate) fn retire_work(&mut self) -> Result {
@@ -390,7 +426,11 @@ impl Service {
         if pool.retired || self.failed.is_some() {
             return Err(EIO);
         }
+        let pool_id = pool.identity.pool;
         pool.retired = true;
+        while let Some(index) = self.work_owners.iter().position(|owner| owner.token.pool == pool_id) {
+            self.work_owners.remove(index).map_err(|_| EIO)?;
+        }
         Ok(())
     }
     pub(crate) fn limit_report(&self) -> Option<&[u8; 0x48]> {
@@ -535,6 +575,7 @@ impl Service {
             GFP_KERNEL,
         )?;
         Ok(Self {
+            work_owners: KVec::new(),
             command,
             report,
             cursor,
@@ -757,13 +798,13 @@ impl Service {
             let mut matched = None;
             for (index, pool) in self.pools.iter().enumerate() {
                 if !pool.retired
-                    && pool.counter > pool.counter_baseline
                     && pool.refused
-                    && !pool.limited
-                    && pool
-                        .identity
-                        .limit(&body, &pool.work, pool.fragment, pool.fragment_event)
-                        .is_some()
+                    && (self.work_owners.iter().any(|w| w.token.pool == pool.identity.pool
+                        && w.limit_report.is_none() && pool.counter > w.counter_baseline
+                        && pool.identity.limit(&body, &w.work, w.token.fragment, w.token.event).is_some())
+                        || (!self.work_owners.iter().any(|w| w.token.pool == pool.identity.pool)
+                            && pool.counter > pool.counter_baseline && !pool.limited
+                            && pool.identity.limit(&body, &pool.work, pool.fragment, pool.fragment_event).is_some()))
                 {
                     if matched.replace(index).is_some() {
                         return Err(EIO);
@@ -771,6 +812,13 @@ impl Service {
                 }
             }
             let index = matched.ok_or(EIO)?;
+            let pool = &self.pools[index];
+            for owner in &mut self.work_owners {
+                if owner.token.pool == pool.identity.pool && owner.limit_report.is_none()
+                    && pool.identity.limit(&body, &owner.work, owner.token.fragment, owner.token.event).is_some() {
+                    owner.limit_report = Some(body);
+                }
+            }
             self.pools[index].limited = true;
             self.pools[index].limit_report = Some(body);
             // Qualified consume-only closure: no command or doorbell.

@@ -107,6 +107,7 @@ Render address-space integration (`partial_independent_owner=1`,
 ```sh
 gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -Iinclude/uapi/drm -Iinclude/uapi -o g17p-drm-render-roots drivers/gpu/drm/asahi/tests/g17p_drm_render_roots.c
 g17p-drm-render-roots 1024
+g17p-drm-render-roots 256 --geometry
 g17p-drm-render-roots 32 --same-vm
 ```
 
@@ -720,3 +721,30 @@ but that diagnostic omits render-vm and does not satisfy stage completion.
 The full suite on that session still fails the later retained-wave pressure
 render. Artifact-only partial-load-to-clear diagnostics do not alter the
 required complete-image integration oracle or count as qualification.
+
+
+Queued render ownership integration (the ordinary async profile above):
+
+```sh
+make ARCH=arm64 headers_install INSTALL_HDR_PATH=/tmp/g17p-uapi
+python3 drivers/gpu/drm/asahi/tests/make_g17p_render_pending_workload.py /path/to/m1n1 /tmp/g17p_drm_render_pending_workload.h
+aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -Wno-unused-function -static -I/tmp -I/tmp/g17p-uapi/include/drm -I/tmp/g17p-uapi/include -o g17p-drm-render-pending drivers/gpu/drm/asahi/tests/g17p_drm_render_pending.c
+g17p-drm-render-pending 128 --require-overlap --cold
+g17p-drm-render-pending 128 --require-overlap
+```
+
+The fixture submits 32 independently addressed, long renders on four public
+queues before waiting. Each wave checks all 256 complete output images,
+32 exported sync-file statuses, four GPU timestamps per job and timestamp
+guard pages. Every wave must have at least three GPU-live renders, including
+transport rollover; a successful ioctl or retired queue is insufficient. The
+cold variant skips serial preflight and must run first on a fresh boot. Run
+the preflight variant again after the retained compute/mixed/Mesa regression
+suite. Firmware publication diagnostics additionally report how many older
+uncompleted render tickets share the selected pool. All physical backing
+remains retained. No unit tests are needed.
+
+`g17p-drm-render-roots --geometry` alternates distinct width and utile height
+while the other application's render remains pending. Independent pool-local
+scratch leases permit the geometry change without clearing live scratch.
+The same full-image/fence/timestamp and retained overlap checks apply.
