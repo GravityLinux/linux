@@ -497,7 +497,10 @@ impl Bootstrap {
             // renders. Their Work/scratch leases survive until the final
             // notifier/driver stamp, including intervening partial runs.
             // Compute remains non-preemptible, matching the M1/M2 driver.
-            if stage == 2 {
+            // Preemptible renders can wedge the firmware when a compressed
+            // render is timesliced against other contexts (Dota 2 with two
+            // compositors, 2026-10-06), so they are off by default.
+            if stage == 2 || crate::module_parameters::render_preempt.value() == 0 {
                 descriptor[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
                 descriptor[0x48..0x4c].copy_from_slice(&1u32.to_le_bytes());
             }
@@ -1574,6 +1577,7 @@ impl Bootstrap {
             .ok_or(EBUSY)?;
         if existing.is_none() {
             self.set_context(slot, Some(roots))?;
+            pr_info!("G16: context {} bound to root {:#x}\n", slot, roots.low);
         }
         self.context_users[slot] += 1;
         Ok(slot as u32)

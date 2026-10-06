@@ -395,19 +395,41 @@ impl File {
             },
             (inner.id, id),
         )?;
+        let space = Arc::pin_init(
+            kernel::new_mutex!(crate::g16_vm::AddressSpace::new()?),
+            GFP_KERNEL,
+        )?;
+        let compute_space = Arc::pin_init(
+            kernel::new_mutex!(crate::g16_vm::AddressSpace::new()?),
+            GFP_KERNEL,
+        )?;
+        // Debug: name the process behind each VM so firmware context slots in
+        // hang reports (logged by root) can be traced to a client.
+        {
+            let task = kernel::current!();
+            let leader = task.group_leader();
+            // SAFETY: comm is a NUL-padded fixed array; a concurrent rename
+            // can at worst tear this debug string.
+            let comm = unsafe { (*leader.as_ptr()).comm };
+            let comm: [u8; 16] = core::array::from_fn(|i| comm[i] as u8);
+            let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+            pr_info!(
+                "G16: file {} vm {} by tgid {} ({}): render root {:#x} compute root {:#x}\n",
+                inner.id,
+                id,
+                leader.pid(),
+                core::str::from_utf8(&comm[..len]).unwrap_or("?"),
+                space.lock().roots().low,
+                compute_space.lock().roots().low
+            );
+        }
         state.vms.push(
             Vm {
                 id,
                 visible: true,
                 kernel: data.kernel_start..data.kernel_end,
-                space: Arc::pin_init(
-                    kernel::new_mutex!(crate::g16_vm::AddressSpace::new()?),
-                    GFP_KERNEL,
-                )?,
-                compute_space: Arc::pin_init(
-                    kernel::new_mutex!(crate::g16_vm::AddressSpace::new()?),
-                    GFP_KERNEL,
-                )?,
+                space,
+                compute_space,
                 mappings: KVVec::new(),
                 snapshot: None,
                 pending: KVec::new(),
