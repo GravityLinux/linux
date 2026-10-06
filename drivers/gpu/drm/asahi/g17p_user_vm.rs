@@ -76,6 +76,17 @@ pub(crate) struct RebindPlan<'a> {
     generation: &'a AtomicU64,
 }
 impl RebindPlan<'_> {
+    /// Only a separately allocated, unpublished table copy may use this path.
+    /// It prepares DATA for a later version-checked executable-root commit;
+    /// it must not invalidate the ASID belonging to the installed root.
+    pub(crate) fn commit_unpublished(self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        for depth in [2, 1, 0] {
+            for &(_, page, index, _, new) in self.stores.iter().filter(|r| r.0 == depth) {
+                UserVm::store(page, index, new);
+            }
+        }
+    }
     pub(crate) fn commit(self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         for &(depth, page, index, old, _) in &self.stores {
@@ -122,6 +133,157 @@ pub(crate) struct TableSnapshot {
     generation: u64,
     rows: KVec<(u64, KVVec<u64>)>,
 }
+
+/// Immutable table DATA and actual backing ownership captured under the
+/// device lock. All mapping walks, collision checks and allocation can then
+/// operate on a separate copy without touching an installed executable root.
+pub(crate) struct RebindSnapshot {
+    snapshot: TableSnapshot,
+    lease: RootLease,
+}
+pub(crate) struct RebindRelocation {
+    source: RebindSnapshot,
+    copies: KVec<(u64, u32, u64)>,
+}
+pub(crate) struct PreparedRebind {
+    source: RebindSnapshot,
+    tables: KVec<Arc<Owned<Page>>>,
+    stores: KVec<(usize, Arc<Owned<Page>>, usize, u64, u64)>,
+    contexts: KVec<u16>,
+}
+impl RebindSnapshot {
+    pub(crate) fn clone_tree(self) -> Result<(UserVm, RebindRelocation)> {
+        let (root, copies) = self.snapshot.clone_with_addresses()?;
+        Ok((root, RebindRelocation { source: self, copies }))
+    }
+}
+impl RebindRelocation {
+    /// Translate a completed unpublished table copy back to the original root
+    /// identity. Only parent-table links are relocated; caller/program DATA
+    /// leaves retain their exact physical addresses and attributes.
+    pub(crate) fn prepare(self, shadow: &UserVm, contexts: &[u16]) -> Result<PreparedRebind> {
+        if contexts.is_empty() || contexts.iter().enumerate().any(|(i, &c)|
+            c == 0 || c >= 64 || contexts[..i].contains(&c)) { return Err(EINVAL); }
+        let mut levels = KVec::new();
+        levels.push((shadow.root(), 0usize), GFP_KERNEL)?;
+        let mut cursor = 0;
+        while cursor < levels.len() {
+            let (pa, depth) = levels[cursor]; cursor += 1;
+            if depth == 2 { continue; }
+            for index in 0..if depth == 0 { 64 } else { 2048 } {
+                let word = shadow.read(pa, index)?;
+                if word == 0 { continue; }
+                if word & 3 != 3 { return Err(EINVAL); }
+                let child = word & ADDRESS;
+                if let Some(&(_, prior)) = levels.iter().find(|row| row.0 == child) {
+                    if prior != depth + 1 { return Err(EINVAL); }
+                } else { levels.push((child, depth + 1), GFP_KERNEL)?; }
+            }
+        }
+        let original_child = |word: u64| {
+            if word & 3 != 3 { return word; }
+            self.copies.iter().find(|row| row.2 == word & ADDRESS)
+                .map_or(word, |row| (word & !ADDRESS) | row.0)
+        };
+        let capacity = self.source.lease.tables.len().checked_add(levels.len()).ok_or(EOVERFLOW)?;
+        let mut tables = KVec::with_capacity(capacity, GFP_KERNEL)?;
+        for page in &self.source.lease.tables { tables.push(page.clone(), GFP_KERNEL)?; }
+        let mut stores = KVec::new();
+        for &(pa, depth) in &levels {
+            let count = if depth == 0 { 64 } else { 2048 };
+            if let Some(&(original, level, _)) = self.copies.iter().find(|row| row.2 == pa) {
+                if level as usize != depth { return Err(EINVAL); }
+                let old = self.source.snapshot.rows.iter().find(|row| row.0 == original).ok_or(EIO)?;
+                let page = self.source.lease.tables.iter().find(|page| page.phys() == original).ok_or(EIO)?;
+                for index in 0..count {
+                    let before = u64::from_le(old.1[index]);
+                    let mut after = shadow.read(pa, index)?;
+                    if depth < 2 { after = original_child(after); }
+                    if before != after { stores.push((depth, page.clone(), index, before, after), GFP_KERNEL)?; }
+                }
+            } else {
+                // This parent table was allocated only in the speculative
+                // copy. It becomes owned by the installed root at commit.
+                let page = shadow.tables.iter().find(|page| page.phys() == pa).ok_or(EIO)?;
+                if depth < 2 {
+                    page.with_page_mapped(|pointer| {
+                        for index in 0..count {
+                            // SAFETY: This unpublished page is exclusively
+                            // owned by this preparation, with checked indices.
+                            unsafe {
+                                let at = pointer.cast::<u64>().add(index);
+                                at.write(original_child(u64::from_le(at.read())).to_le());
+                            }
+                        }
+                    });
+                    UserVm::clean(page);
+                }
+                tables.push(page.clone(), GFP_KERNEL)?;
+            }
+        }
+        sort_by_key(&mut stores, |row| (row.0, row.1.phys(), row.2));
+        if stores.windows(2).any(|rows| rows[0].1.phys() == rows[1].1.phys()
+            && rows[0].2 == rows[1].2) { return Err(EINVAL); }
+        let mut held_contexts = KVec::new(); held_contexts.extend_from_slice(contexts, GFP_KERNEL)?;
+        Ok(PreparedRebind { source: self.source, tables, stores, contexts: held_contexts })
+    }
+}
+impl PreparedRebind {
+    pub(crate) fn matches(&self, root: &UserVm) -> bool { self.source.snapshot.matches(root) }
+    /// The caller additionally proves this pool is retired and exclusively
+    /// selected. All allocation and preflight already completed off-lock.
+    /// Keep this plan owned by the worker so host storage drops off-lock.
+    pub(crate) fn commit(&mut self, root: &mut UserVm) -> Result {
+        if !self.matches(root) { return Err(EBUSY); }
+        core::mem::swap(&mut root.tables, &mut self.tables);
+        root.generation.fetch_add(1, Ordering::Relaxed);
+        self.store_batch(2, true);
+        for &context in &self.contexts { UserVm::invalidate(context); }
+        for depth in [2, 1, 0] {
+            self.store_batch(depth, false);
+        }
+        for &context in &self.contexts { UserVm::invalidate(context); }
+        Ok(())
+    }
+    /// Sort/grouping was prepared off-lock. Map each table once and publish
+    /// each modified cache line once, with a barrier before the next TLBI or
+    /// parent-link level. This preserves break-before-make without a system
+    /// barrier for every individual PTE.
+    fn store_batch(&self, depth: usize, clear: bool) {
+        let mut cursor = 0;
+        while cursor < self.stores.len() {
+            let first = cursor;
+            let page = &self.stores[first].1;
+            cursor += 1;
+            while cursor < self.stores.len() && self.stores[cursor].0 == self.stores[first].0
+                && self.stores[cursor].1.phys() == page.phys() { cursor += 1; }
+            if self.stores[first].0 != depth { continue; }
+            page.with_page_mapped(|pointer| {
+                let mut line: Option<usize> = None;
+                for &(_, _, index, before, after) in &self.stores[first..cursor] {
+                    if clear && before == 0 { continue; }
+                    let next = index & !7;
+                    if line != Some(next) {
+                        if let Some(previous) = line {
+                            // SAFETY: A checked 64-byte line in this retained
+                            // table page; all its stores precede this clean.
+                            unsafe { core::arch::asm!("dc civac, {p}",p=in(reg)pointer.add(previous*8),options(nostack,preserves_flags)); }
+                        }
+                        line = Some(next);
+                    }
+                    // SAFETY: The off-lock plan checked all owned indices;
+                    // the exclusive retired owner was revalidated at commit.
+                    unsafe { pointer.cast::<u64>().add(index).write_volatile(if clear { 0 } else { after.to_le() }); }
+                }
+                if let Some(last) = line {
+                    // SAFETY: Same checked, retained table cache line.
+                    unsafe { core::arch::asm!("dc civac, {p}",p=in(reg)pointer.add(last*8),options(nostack,preserves_flags)); }
+                }
+            });
+        }
+        super::g17p_memory::sync();
+    }
+}
 impl TableStorage {
     pub(crate) fn new(count: usize) -> Result<Self> {
         let mut rows = KVec::with_capacity(count, GFP_KERNEL)?;
@@ -159,6 +321,9 @@ impl TableSnapshot {
                 .find(|&&(old, level, _)| old == pa && level == depth)
             {
                 return Ok(copy);
+            }
+            if copies.iter().any(|&(old, level, _)| old == pa && level != depth) {
+                return Err(EINVAL);
             }
             if active.contains(&pa) {
                 return Err(EINVAL);
@@ -349,6 +514,10 @@ impl UserVm {
         }
         Ok(Some(TableSnapshot { root: self.root(),
             generation: self.generation.load(Ordering::Relaxed), rows: storage.rows }))
+    }
+    pub(crate) fn capture_rebind(&self, storage: TableStorage) -> Result<Option<RebindSnapshot>> {
+        let Some(snapshot) = self.capture_tables(storage)? else { return Ok(None); };
+        Ok(Some(RebindSnapshot { snapshot, lease: self.lease()? }))
     }
     pub(crate) fn clone_low_tables(&self) -> Result<(Self, KVec<(u64, u32, u64)>)> {
         let storage = TableStorage::new(self.table_count())?;

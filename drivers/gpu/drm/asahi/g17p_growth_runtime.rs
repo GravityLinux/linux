@@ -273,6 +273,24 @@ impl Service {
             && pool.mappings.iter().any(|&(address, pa)| address == va
                 && pte == (pa | 0x00c0000000000c8b)))
     }
+    /// Snapshot only the Source-owned leaf identities, never backing bytes.
+    /// The selected pool is retired/reserved before this seed leaves locking.
+    pub(crate) fn render_rebind_leaves(&self, selected: u32)
+        -> Result<(KVec<(u64, u64)>, KVec<(u64, u64)>)> {
+        let own = self.pools.iter().find(|pool| pool.identity.pool == selected).ok_or(EINVAL)?;
+        if self.failed.is_some() || !own.retired { return Err(EBUSY); }
+        let mut own_leaves = KVec::new(); own_leaves.extend_from_slice(&own.mappings, GFP_KERNEL)?;
+        let mut foreign = KVec::new();
+        for pool in self.pools.iter().filter(|pool| pool.identity.pool != selected) {
+            for &(va, pa) in &pool.mappings {
+                if va >= pool.growth_base && va - pool.growth_base
+                    < u64::from(pool.counter) * g::INCREMENT as u64 * 0x28000 {
+                    foreign.push((va, pa | 0x00c0000000000c8b), GFP_KERNEL)?;
+                }
+            }
+        }
+        Ok((own_leaves, foreign))
+    }
     /// An incoming independently retained pool root needs only that pool's
     /// immutable growth leaves. Never modify another live root or TVB owner.
     pub(crate) fn mirror_pool_mappings(&self, pool_id: u32, root: &mut UserVm) -> Result {

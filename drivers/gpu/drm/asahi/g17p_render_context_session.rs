@@ -24,6 +24,8 @@ fn retire_render_fallbacks_slot(previous: &mut compute::Client, caller: &compute
     foreign: Option<(&super::super::g17p_growth_runtime::Service, u32)>,
 ) -> Result {
     const PAGE: u64 = 0x4000;
+    let started = (*crate::module_parameters::submission_log.value() >= 3)
+        .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
     let address = |base: u64| if base < 0x1000000000 { base + 0x1000000000 } else { base };
     let mut changes = KVec::new();
     for &(base, size, _, _) in &caller.bindings {
@@ -55,6 +57,10 @@ fn retire_render_fallbacks_slot(previous: &mut compute::Client, caller: &compute
         // Admission holds the exclusive, retired render owner. Original
         // backing stays Memory-owned; no physical page is returned here.
         previous.root.rebind(&changes, &[slot])?;
+    }
+    if let Some(started) = started {
+        pr_info!("G17P: RENDER_FALLBACK_PLAN slot {} bindings {} leaves {} elapsed_us {}\n",
+            slot, caller.bindings.len(), changes.len(), started.elapsed().as_nanos()/1000);
     }
     Ok(())
 }
@@ -678,5 +684,143 @@ impl Session {
                 pair, work.client.owner, asid, work.client.root.root());
         }
         Ok(())
+    }
+}
+
+/// All reachable table DATA is pinned and copied before leaving locking.
+/// The installed root identity remains unchanged across the final commit.
+pub(crate) struct PoolRebindSeed {
+    pair: u32,
+    context: u16,
+    snapshot: super::super::g17p_user_vm::RebindSnapshot,
+    buffers: KVec<kernel::sync::aref::ARef<super::super::g17p_drm::Object>>,
+    bindings: KVec<(u64,u64,u64,u32)>,
+    owner: (u64,u32),
+    cpu_maps: compute::CpuMaps,
+    primer_aliases: Option<[(u64,u64);2]>,
+    fallback: kernel::sync::Arc<KVec<(u64,u64)>>,
+    own_growth: KVec<(u64,u64)>,
+    foreign_growth: KVec<(u64,u64)>,
+}
+pub(crate) struct PreparedPoolRebind {
+    pair: u32,
+    context: u16,
+    root: super::super::g17p_user_vm::PreparedRebind,
+    old_owner: (u64,u32),
+    old_bindings: KVec<(u64,u64,u64,u32)>,
+    old_buffers: KVec<kernel::sync::aref::ARef<super::super::g17p_drm::Object>>,
+    new_owner: (u64,u32),
+    new_bindings: KVec<(u64,u64,u64,u32)>,
+    new_buffers: KVec<kernel::sync::aref::ARef<super::super::g17p_drm::Object>>,
+    primer_aliases: Option<[(u64,u64);2]>,
+}
+impl PoolRebindSeed {
+    pub(crate) fn prepare(self, desired: &compute::Client) -> Result<PreparedPoolRebind> {
+        let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+        let (root, relocation) = self.snapshot.clone_tree()?;
+        let mut shadow = compute::Client { root, buffers: self.buffers, bindings: self.bindings,
+            owner: desired.owner, cpu_maps: self.cpu_maps, primer_aliases: self.primer_aliases };
+        let address = |va:u64| if va < 0x1000000000 { va + 0x1000000000 } else { va };
+        let mut changes = KVec::new();
+        for &(base,size,_,_) in &desired.bindings {
+            for offset in (0..size).step_by(0x4000) {
+                let va = address(base) + offset;
+                if shadow.bindings.iter().any(|&(old,length,_,_)|
+                    address(old) <= va && va < address(old) + length) { continue; }
+                let before = shadow.root.pte(va)?;
+                if before == 0 { continue; }
+                let fallback = self.fallback.iter().any(|&(leaf,pa)| leaf == va
+                    && before & 0x000003ffffffc000 == pa);
+                let foreign = self.foreign_growth.iter().any(|&(leaf,pte)| leaf == va && pte == before);
+                if fallback || foreign { changes.push((va,before,0),GFP_KERNEL)?; }
+            }
+        }
+        if !changes.is_empty() {
+            shadow.root.prepare_rebind(&changes,&[self.context])?.commit_unpublished();
+        }
+        shadow.prepare_rebind(desired,true,&[self.context],&[])?.commit_unpublished();
+        let mut missing = KVec::new();
+        for &(va,pa) in &self.own_growth {
+            let leaf = shadow.root.pte(va)?;
+            if leaf == 0 { missing.push((va,pa),GFP_KERNEL)?; }
+            else if leaf & 0x000003ffffffc003 != pa | 3 { return Err(EIO); }
+        }
+        if !missing.is_empty() { shadow.root.grow(&missing)?; }
+        let mut new_bindings = KVec::new(); new_bindings.extend_from_slice(&desired.bindings,GFP_KERNEL)?;
+        let mut new_buffers = KVec::with_capacity(desired.buffers.len(),GFP_KERNEL)?;
+        for bo in &desired.buffers { new_buffers.push(bo.clone(),GFP_KERNEL)?; }
+        let root = relocation.prepare(&shadow.root,&[self.context])?;
+        if *crate::module_parameters::submission_log.value() >= 3 {
+            pr_info!("G17P: RENDER_ROOT_PREPARED pair {} context {} bindings {} elapsed_us {} outside_runtime_lock\n",
+                self.pair,self.context,new_bindings.len(),started.elapsed().as_nanos()/1000);
+        }
+        Ok(PreparedPoolRebind { pair:self.pair,context:self.context,root,
+            old_owner:self.owner,old_bindings:shadow.bindings,old_buffers:shadow.buffers,
+            new_owner:desired.owner,new_bindings,new_buffers,primer_aliases:desired.primer_aliases })
+    }
+}
+impl PreparedPoolRebind {
+    fn same_buffers(a:&[kernel::sync::aref::ARef<super::super::g17p_drm::Object>],
+        b:&[kernel::sync::aref::ARef<super::super::g17p_drm::Object>]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(a,b)| core::ptr::eq(&**a,&**b))
+    }
+    fn matches(&self, installed:&compute::Client, incoming:&compute::Client) -> bool {
+        self.root.matches(&installed.root) && self.old_owner == installed.owner
+            && self.old_bindings == installed.bindings && Self::same_buffers(&self.old_buffers,&installed.buffers)
+            && self.new_owner == incoming.owner && self.new_bindings == incoming.bindings
+            && Self::same_buffers(&self.new_buffers,&incoming.buffers)
+    }
+    fn commit(&mut self, client:&mut compute::Client) -> Result {
+        self.root.commit(&mut client.root)?;
+        core::mem::swap(&mut client.bindings,&mut self.new_bindings);
+        core::mem::swap(&mut client.buffers,&mut self.new_buffers);
+        client.owner=self.new_owner;
+        client.primer_aliases=self.primer_aliases;
+        Ok(())
+    }
+}
+impl Session {
+    fn render_rebind_context(&self,pair:u32) -> Result<u16> {
+        let slot = self.render_pool_asids[pair as usize];
+        if slot != 0 { return Ok(slot); }
+        (4..64).rev().find(|slot| self.independent_compute.asid_mask() & (1u64 << slot) == 0)
+            .map(|slot|slot as u16).ok_or(EBUSY)
+    }
+    pub(crate) fn render_rebind_size(&self,incoming:&compute::Client,p:&Parameters) -> Result<Option<usize>> {
+        if !self.independent_render_roots() { return Ok(None); }
+        let Some(installed) = self.render_selected_client(incoming,p)? else { return Ok(None); };
+        Ok((!Self::same_client(installed,incoming)).then(||installed.root.table_count()))
+    }
+    /// Outer None requests a retry after a competing owner changed selection.
+    pub(crate) fn capture_render_rebind(&self,incoming:&compute::Client,p:&Parameters,
+        storage:Option<super::super::g17p_user_vm::TableStorage>) -> Result<Option<Option<PoolRebindSeed>>> {
+        if self.render_rebind_size(incoming,p)?.is_none() { return Ok(Some(None)); }
+        let Some(storage) = storage else { return Ok(None); };
+        let pair = self.next_render_pool_for_geometry(Some(incoming),p)?.ok_or(EIO)?;
+        let client = self.render_selected_client(incoming,p)?.ok_or(EIO)?;
+        let Some(snapshot) = client.root.capture_rebind(storage)? else { return Ok(None); };
+        let (own_growth,foreign_growth) = self.render.as_ref().ok_or(EIO)?.growth.as_ref().ok_or(EIO)?
+            .render_rebind_leaves(pair)?;
+        let mut buffers=KVec::with_capacity(client.buffers.len(),GFP_KERNEL)?;
+        for bo in &client.buffers { buffers.push(bo.clone(),GFP_KERNEL)?; }
+        let mut bindings=KVec::new(); bindings.extend_from_slice(&client.bindings,GFP_KERNEL)?;
+        Ok(Some(Some(PoolRebindSeed { pair,context:self.render_rebind_context(pair)?,snapshot,
+            buffers,bindings,owner:client.owner,cpu_maps:client.cpu_maps.clone(),primer_aliases:client.primer_aliases,
+            fallback:self.render_fallback_leaves.as_ref().ok_or(EIO)?.clone(),own_growth,foreign_growth })))
+    }
+    pub(crate) fn install_render_rebind(&mut self,plan:&mut PreparedPoolRebind,
+        incoming:&compute::Client,p:&Parameters) -> Result<bool> {
+        if self.next_render_pool_for_geometry(Some(incoming),p)? != Some(plan.pair)
+            || self.render_rebind_context(plan.pair)? != plan.context { return Ok(false); }
+        let work=self.render.as_mut().ok_or(EIO)?;
+        if !work.growth.as_ref().ok_or(EIO)?.pools.get(plan.pair as usize).ok_or(EIO)?.retired {
+            return Ok(false);
+        }
+        let target = if work.layout.pair == plan.pair { &mut work.client } else {
+            &mut self.render_pool_clients.iter_mut().find(|(pair,_)| *pair==plan.pair).ok_or(EIO)?.1
+        };
+        if !plan.matches(target,incoming) { return Ok(false); }
+        plan.commit(target)?;
+        Ok(true)
     }
 }
