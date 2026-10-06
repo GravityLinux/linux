@@ -101,7 +101,7 @@ static struct linux_binfmt elf_format = {
 	.load_binary	= load_elf_binary,
 #ifdef CONFIG_COREDUMP
 	.core_dump	= elf_core_dump,
-	.min_coredump	= PAGE_SIZE_KERNEL,
+	.min_coredump	= ELF_EXEC_PAGESIZE,
 #endif
 };
 
