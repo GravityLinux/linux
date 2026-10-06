@@ -937,8 +937,9 @@ impl Service {
             }
             self.pools[index].limited = true;
             self.pools[index].limit_report = Some(body);
-            // Default remains the qualified consume-only closure. The
-            // observed native type9 diagnostic publishes only an owned reply.
+            // Consume only this owned report, then publish its native type9
+            // reply. The exact token retains both reader credits until the
+            // reply is retired; consume-only remains a diagnostic fallback.
             self.consume(memory, vm, next)?;
             if let Some((queue, stamp, slot)) = reply {
                 vm.write(memory, 2, self.command.states[2], &((slot + 1) & 255).to_le_bytes())?;
