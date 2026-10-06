@@ -1008,7 +1008,9 @@ impl File {
                 history: QueueHistory::new()?,
                 id,
                 vm: data.vm_id,
-                priority: data.priority,
+                // Match Asahi's UAPI-to-firmware ordering: LOW/MEDIUM
+                // are firmware 3/2, while 0/1 are the reserved higher classes.
+                priority: uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME - data.priority,
             },
             GFP_KERNEL,
         )?;

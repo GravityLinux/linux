@@ -1168,6 +1168,10 @@ impl Submission {
             vm.transport_backing_with_attributes(memory, address, attributes)?;
         }
         let layout = life::SECOND;
+        // Native independent render queues own separate mutable control
+        // records. Seed only before either producer becomes visible; retain
+        // firmware updates throughout this owner's subsequent submissions.
+        vm.write(memory, 2, layout.control, &opening::channel_control())?;
         for index in 0..2 {
             for (address, size) in [
                 (layout.queues[index], 0xc0),
@@ -1355,6 +1359,10 @@ impl Submission {
             vm.transport_backing_with_attributes(memory, arena + offset,
                 if normal { 0x00c0000000000443 } else { 0x00c000000000044b })?;
         }
+        // The two rollover banks occupy arena+d0000..f0000. Keep this
+        // control disjoint from both, including banks allocated later.
+        vm.transport_backing_with_attributes(memory, layout.control, 0x00c0000000000443)?;
+        vm.write(memory, 2, layout.control, &opening::channel_control())?;
         for index in 0..2 {
             let (high, low) = layout.contexts[index];
             vm.alias_firmware(memory, high, low, 8 * PAGE)?;
