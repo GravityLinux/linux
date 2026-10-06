@@ -128,3 +128,95 @@
 	mtp {
 	};
 };
+
+/*
+ * J713 has two USB-C ports (ATC0, ATC1). ATC2/ATC3 don't exist: the ADT lists
+ * their power states without PS registers, so turning them on only fails.
+ */
+&dwc3_2 {
+	status = "disabled";
+};
+
+&dwc3_2_dart_0 {
+	status = "disabled";
+};
+
+&dwc3_2_dart_1 {
+	status = "disabled";
+};
+
+&atcphy2 {
+	status = "disabled";
+};
+
+&dwc3_3 {
+	status = "disabled";
+};
+
+&dwc3_3_dart_0 {
+	status = "disabled";
+};
+
+&dwc3_3_dart_1 {
+	status = "disabled";
+};
+
+&atcphy3 {
+	status = "disabled";
+};
+
+&ps_atc2_common {
+	status = "disabled";
+};
+
+&ps_atc2_pcie {
+	status = "disabled";
+};
+
+&ps_atc2_cio {
+	status = "disabled";
+};
+
+&ps_atc2_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc2_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc2_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc2_usb {
+	status = "disabled";
+};
+
+&ps_atc3_common {
+	status = "disabled";
+};
+
+&ps_atc3_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio {
+	status = "disabled";
+};
+
+&ps_atc3_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc3_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc3_usb {
+	status = "disabled";
+};
