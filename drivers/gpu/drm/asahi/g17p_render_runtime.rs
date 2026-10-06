@@ -1820,11 +1820,11 @@ pub(crate) fn stage_next_prepared(
             queued,
         )?;
         if *crate::module_parameters::native_limit_reply.value() == 1 {
-            let fragment = &objects[1][0].body;
-            let stamp = u32::from_le_bytes(fragment[0x470..0x474].try_into().unwrap());
-            if stamp != u32::from_le_bytes(fragment[0x47c..0x480].try_into().unwrap()) {
-                return Err(EIO);
-            }
+            // Bind the exact future event preimage before either producer.
+            // Native repeated errors distinguish this counter from FR tags.
+            let event = q::event(item.index + 1, work.layout.grids[1],
+                q::Kind::Fragment, None, None, 0).map_err(|_| EINVAL)?;
+            let stamp = u32::from_le_bytes(event[8..12].try_into().unwrap()) & !0xff;
             service.bind_limit_reply(item.descriptor_address(Kind::Fragment),
                 work.layout.queues[1], stamp)?;
         }
