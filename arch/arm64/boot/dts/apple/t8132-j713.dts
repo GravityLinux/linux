@@ -22,6 +22,13 @@
 		keyboard = &keyboard;
 		/* m1n1 maps the iBoot-provided MTP segments through this alias. */
 		mtp = &mtp;
+		/*
+		 * No external display support yet. m1n1 enables every DCP behind a
+		 * dcpextN alias that the ADT lists, but not its DARTs or mailbox;
+		 * appledrm then never finishes init and boot blocks before userspace.
+		 */
+		/delete-property/ dcpext0;
+		/delete-property/ dcpext1;
 	};
 
 	led-controller {
