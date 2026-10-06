@@ -13,6 +13,33 @@ const PAGE: u64 = 0x4000;
 const ADDRESS: u64 = 0x000003ffffffc000;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Mapping batches can contain arbitrarily many leaves. Keep sorting stack
+/// usage constant even in the deep render-publication call path: the standard
+/// recursive slice sort overflowed a kernel worker's stack on Mesa images.
+#[inline(never)]
+pub(crate) fn sort_by_key<T, K: Ord>(rows: &mut [T], key: impl Fn(&T) -> K) {
+    fn sift_down<T, K: Ord>(rows: &mut [T], mut root: usize, end: usize,
+        key: &impl Fn(&T) -> K) {
+        // This bound also prevents overflow in the child-index calculation.
+        while root < end / 2 {
+            let mut child = root * 2 + 1;
+            if child + 1 < end && key(&rows[child]) < key(&rows[child + 1]) {
+                child += 1;
+            }
+            if key(&rows[root]) >= key(&rows[child]) { break; }
+            rows.swap(root, child);
+            root = child;
+        }
+    }
+    for root in (0..rows.len() / 2).rev() {
+        sift_down(rows, root, rows.len(), &key);
+    }
+    for end in (1..rows.len()).rev() {
+        rows.swap(0, end);
+        sift_down(rows, 0, end, &key);
+    }
+}
+
 pub(crate) struct UserVm {
     tables: KVec<Arc<Owned<Page>>>,
     generation: AtomicU64,
@@ -524,7 +551,7 @@ impl UserVm {
         }
         // Distinct VAs can alias a table leaf; retain the original rejection
         // rule without scanning every previous write for every changed page.
-        leaf_keys.sort_unstable();
+        sort_by_key(&mut leaf_keys, |row| *row);
         if leaf_keys.windows(2).any(|rows| rows[0] == rows[1]) { return Err(EINVAL); }
         writes.extend_from_slice(&parents, GFP_KERNEL)?;
         // Resolve every owned page reference before publication. The following

@@ -251,7 +251,7 @@ impl Client {
                 rows.push((va, 2, self.root.pte(va)?, new), GFP_KERNEL)?;
             }
         }
-        rows.sort_unstable_by_key(|row| (row.0, row.1));
+        super::g17p_user_vm::sort_by_key(&mut rows, |row| (row.0, row.1));
         let mut changes: KVec<(u64, u64, u64)> = KVec::with_capacity(rows.len(), GFP_KERNEL)?;
         let mut first = 0;
         while first < rows.len() {
