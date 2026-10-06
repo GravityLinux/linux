@@ -80,7 +80,13 @@ impl Owner {
             && u32_at(body, 4) == 0
             && u32_at(body, 8) == 1
             && u32_at(body, 12) == event
-            && work.contains(&u64_at(body, 16))
+            // The directly authored identity is the event's 32-bit counter.
+            // Native type9 echoes that counter, not a report-supplied pointer.
+            // Treat the adjacent upper word as retained report data: the
+            // synthetic slab+counter qword is not an allocated work address.
+            // Exact descriptor/event/VM/pool/refusal/root/generation checks
+            // still establish the owner before any acknowledgement.
+            && work.iter().any(|node| *node as u32 == u32_at(body, 16))
             && u64_at(body, 24) != 0
             && u64_at(body, 32) == 0
             && u64_at(body, 40) == fragment
