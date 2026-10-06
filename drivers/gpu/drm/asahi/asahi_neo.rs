@@ -183,12 +183,12 @@ kernel::module_platform_driver! {
             description: "Integration diagnostic: pause one retired CPU visibility task on this firmware grid for 2 seconds; 128 disables",
         },
         firmware_dependencies: u32 {
-            default: 0,
-            description: "Qualification diagnostic: publish cross-owner command dependencies in firmware; zero retains qualified error handling",
+            default: 1,
+            description: "Publish render/compute command dependencies in firmware; zero selects the CPU-wait diagnostic",
         },
         native_limit_reply: u32 {
-            default: 0,
-            description: "Qualification diagnostic: reply to an owned render memory-limit report with the observed native type9 command",
+            default: 1,
+            description: "Acknowledge owned render memory-limit reports with native type9; zero selects consume-only diagnostics",
         },
         first_render_fragment_sync_grow: u32 {
             default: 2,

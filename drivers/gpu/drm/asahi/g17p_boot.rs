@@ -2140,10 +2140,27 @@ impl Session {
                 return Ok(false);
             }
             if limited {
+                if self.native.is_none()
+                    && !service.token_reply_retired(ticket.growth.ok_or(EIO)?, memory, vm)? {
+                    return Ok(false);
+                }
                 // The consumed report replaces only this owner's ordinary
                 // terminal. Its own queue, status and fresh report gates
                 // above still apply. Preserve BOs and scheduler state.
                 self.acknowledge_reports(image, &after).inspect_err(|e| dev_err!(dev,"G17P: render fail site report_ack {:?}\n",e))?;
+                if self.native.is_none() {
+                    render::complete_ticket_leaf_publication(
+                        self.memory.as_mut().ok_or(EINVAL)?,
+                        self.vm.as_ref().ok_or(EINVAL)?, ticket.item,
+                    )?;
+                    let quiesced = render::quiesce_failed_ticket(
+                        self.memory.as_mut().ok_or(EINVAL)?,
+                        self.vm.as_ref().ok_or(EINVAL)?, ticket,
+                    )?;
+                    if quiesced && *crate::module_parameters::submission_log.value() != 0 {
+                        dev_info!(dev,"G17P: failed render pool {} scheduler list quiesced\n",ticket.item.layout.pair);
+                    }
+                }
                 if !pending.control_done {
                     self.peers[0]
                         .rtkit

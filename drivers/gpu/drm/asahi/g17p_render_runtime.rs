@@ -493,9 +493,30 @@ pub(crate) fn quiesce(memory: &mut Memory, vm: &Vm, work: &Submission) -> Result
             }
         }
     }
-    let tail = vm.physical(memory, 2, work.layout.job_list + 8)?;
+    reset_retired_job_list(memory, vm, work.layout.job_list)
+}
+
+/// A failed ticket has passed the same queue/status/report retirement gates
+/// as a successful one. Python quiesce_submission(semantic_failed=True)
+/// releases its stale list too. Check this ticket's own physical pair: newer
+/// appended work keeps the list live, while unrelated pairs need no drain.
+pub(crate) fn quiesce_failed_ticket(memory: &mut Memory, vm: &Vm, ticket: &Ticket) -> Result<bool> {
+    for stage in 0..2 {
+        for offset in [q::POINTER_DONE, q::POINTER_READ, q::POINTER_WRITE] {
+            if memory.read_firmware32(vm.physical(
+                memory, 2, ticket.item.layout.pointers[stage] + offset,
+            )?)? != ticket.publications[stage].write_after {
+                return Ok(false);
+            }
+        }
+    }
+    reset_retired_job_list(memory, vm, ticket.item.layout.job_list)
+}
+
+fn reset_retired_job_list(memory: &mut Memory, vm: &Vm, job_list: u64) -> Result<bool> {
+    let tail = vm.physical(memory, 2, job_list + 8)?;
     memory.invalidate(tail, 8)?;
-    if memory.read64(tail)? == work.layout.job_list {
+    if memory.read64(tail)? == job_list {
         return Ok(false);
     }
     // Both halves name this one retained head. Never clear pool records or
@@ -503,12 +524,12 @@ pub(crate) fn quiesce(memory: &mut Memory, vm: &Vm, work: &Submission) -> Result
     vm.write(
         memory,
         2,
-        work.layout.job_list,
-        &q::job_list(work.layout.job_list),
+        job_list,
+        &q::job_list(job_list),
     )?;
     g17p_memory::sync();
     memory.invalidate(tail, 8)?;
-    if memory.read64(tail)? != work.layout.job_list {
+    if memory.read64(tail)? != job_list {
         return Err(EIO);
     }
     Ok(true)
