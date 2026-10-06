@@ -315,12 +315,6 @@ impl Schedule {
             };
             let slot = if engine == 0 { &mut prepared.render_client } else { &mut prepared.compute_client };
             if slot.is_none() && needed {
-                if *crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
-                    && !PREPARATION_PAUSED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-                    pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} outside_runtime_lock\n", prepared.queue_key);
-                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
-                    pr_info!("G17P: CPU_PREPARE_PAUSE_END queue {:?} outside_runtime_lock\n", prepared.queue_key);
-                }
                 let mut client = snapshot.deferred_client()?;
                 snapshot.materialize(&mut client, engine == 0)?;
                 let extra = match command {
@@ -385,7 +379,7 @@ impl Schedule {
         Ok(Some((previous,dependencies)))
     }
     fn prepare_render(&self, dev: &Device, prepared: &Prepared)
-        -> Option<(usize,KBox<super::super::g17p_render_runtime::PreparedAppend>)> {
+        -> Option<(usize,KBox<super::super::g17p_render_runtime::PreparedAppend>, Option<super::super::g17p_boot::PreparedPoolRebind>)> {
         for (index,node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
@@ -394,20 +388,47 @@ impl Schedule {
             parameters.prior_queue_ta=previous;
             parameters.vdm_dependency=dependencies[0];
             parameters.cdm_dependency=dependencies[1];
-            let seed = {
+            let count = {
+                let held = dev.runtime.lock();
+                let runtime = Option::as_ref(&*held)?;
+                runtime.session.render_rebind_size(prepared.render_snapshot.as_ref()?.client(),&parameters).ok()?
+            };
+            let storage = match count {
+                Some(count) => match super::super::g17p_user_vm::TableStorage::new(count) {
+                    Ok(storage) => Some(storage),
+                    Err(error) => { node.point.finish(Some(error)); continue; }
+                },
+                None => None,
+            };
+            let (seed,rebind) = {
                 let preparation_wait = RuntimeInterval::waiting();
                 let mut held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
                 let runtime = Option::as_mut(&mut *held)?;
                 let snapshot = prepared.render_snapshot.as_ref()?;
                 if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
-                runtime.session.claim_render_preparation(&parameters,snapshot.client()).ok()??
+                let Some(rebind) = runtime.session.capture_render_rebind(snapshot.client(),&parameters,storage).ok()? else { continue; };
+                let Some(seed) = runtime.session.claim_render_preparation(&parameters,snapshot.client()).ok()? else { continue; };
+                (seed,rebind)
             };
+            let rebind = if let Some(rebind) = rebind {
+                let Some(desired) = prepared.render_client.as_ref() else { continue; };
+                if *crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
+                    && !PREPARATION_PAUSED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                    pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} render_root_plan outside_runtime_lock\n",prepared.queue_key);
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
+                    pr_info!("G17P: CPU_PREPARE_PAUSE_END queue {:?} render_root_plan outside_runtime_lock\n",prepared.queue_key);
+                }
+                match rebind.prepare(desired) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => { node.point.finish(Some(error)); continue; }
+                }
+            } else { None };
             // CPU allocation/serialization holds neither the device mutex nor
             // a hardware reservation. Commit revalidates the full seed and
             // rebuilds it if another job changed the next item in the meantime.
             match super::super::g17p_render_runtime::PreparationSeed::prepare(seed) {
-                Ok(objects) => return Some((index, objects)),
+                Ok(objects) => return Some((index, objects, rebind)),
                 Err(error) => { node.point.finish(Some(error)); continue; },
             }
         }
@@ -427,7 +448,7 @@ impl Schedule {
         }
     }
     fn prepare_compute(&self, dev: &Device, prepared: &Prepared)
-        -> Result<Option<(usize, KBox<super::super::g17p_compute_queues::PreparedWork>)>> {
+        -> Result<Option<(usize, KBox<super::super::g17p_compute_queues::PreparedWork>, Option<super::super::g17p_compute_queues::PreparedComputeRebind>)>> {
         for (index, node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Compute(parameters) = &prepared.parameters[index] else { continue; };
@@ -438,7 +459,14 @@ impl Schedule {
             for point in [previous, dependencies[0], dependencies[1]].into_iter().flatten() {
                 if !waits[..count].contains(&point) { waits[count] = point; count += 1; }
             }
-            let (seed, stamps) = {
+            let table_count = {
+                let held=dev.runtime.lock();
+                let runtime=Option::as_ref(&*held).ok_or(ENODEV)?;
+                let snapshot=prepared.compute_snapshot.as_ref().ok_or(EIO)?;
+                runtime.session.compute_rebind_size(prepared.queue_key,snapshot.client(),parameters,prepared.queue_priority)
+            };
+            let storage=if let Some(count)=table_count {Some(super::super::g17p_user_vm::TableStorage::new(count)?)} else {None};
+            let (seed, stamps, rebind) = {
                 let preparation_wait = RuntimeInterval::waiting();
                 let held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
@@ -447,15 +475,31 @@ impl Schedule {
                 let snapshot = prepared.compute_snapshot.as_ref().ok_or(EIO)?;
                 (runtime.session.compute_preparation_seed(prepared.queue_key, snapshot.client(),
                     parameters, prepared.queue_priority, &waits[..count])?,
-                 runtime.session.timestamp_cache_seed(&parameters.timestamps)?)
+                 runtime.session.timestamp_cache_seed(&parameters.timestamps)?,
+                 runtime.session.capture_compute_rebind(prepared.queue_key,snapshot.client(),parameters,
+                    prepared.queue_priority,storage)?)
             };
+            let Some(rebind)=rebind else {continue;};
+            let rebind=if let Some(seed)=rebind {
+                let Some(client)=prepared.compute_client.as_ref() else {continue;};
+                if *crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
+                    && !PREPARATION_PAUSED.swap(true,core::sync::atomic::Ordering::AcqRel) {
+                    pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} compute_root_plan outside_runtime_lock\n",prepared.queue_key);
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
+                    pr_info!("G17P: CPU_PREPARE_PAUSE_END queue {:?} compute_root_plan outside_runtime_lock\n",prepared.queue_key);
+                }
+                match seed.prepare(client) {
+                    Ok(plan)=>Some(plan),
+                    Err(error)=>{node.point.finish(Some(error));continue;}
+                }
+            } else {None};
             if let Some(seed) = seed {
                 if let Err(error) = prepared.compute_snapshot.as_ref().ok_or(EIO)?.client().cache(false)
                     .and_then(|()| stamps.run(false)) {
                     node.point.finish(Some(error)); continue;
                 }
                 match seed.prepare() {
-                    Ok(objects) => return Ok(Some((index, objects))),
+                    Ok(objects) => return Ok(Some((index, objects, rebind))),
                     Err(error) => { node.point.finish(Some(error)); continue; },
                 }
             }
@@ -566,8 +610,14 @@ impl Schedule {
         self.prepare_render_scratch(dev, prepared)?;
         self.prepare_render_templates(dev, prepared)?;
         self.prepare_clients(dev, prepared)?;
-        let mut prepared_compute = self.prepare_compute(dev, prepared)?;
-        let mut prepared_append = self.prepare_render(dev, prepared);
+        let (mut prepared_compute, mut prepared_compute_rebind)=match self.prepare_compute(dev,prepared)? {
+            Some((index,objects,rebind))=>(Some((index,objects)),rebind.map(|plan|(index,plan))),
+            None=>(None,None),
+        };
+        let (mut prepared_append, mut prepared_rebind) = match self.prepare_render(dev, prepared) {
+            Some((index,objects,rebind)) => (Some((index,objects)),rebind.map(|plan|(index,plan))),
+            None => (None,None),
+        };
         let seed_us = profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         let lock_started = RuntimeInterval::waiting();
         let mut held = dev.runtime.lock();
@@ -648,6 +698,12 @@ impl Schedule {
                         } else { false };
                         if !valid { self.control_waiting = true; return Ok(None); }
                     }
+                    if runtime.session.render_rebind_size(snapshot.client(),&parameters)?.is_some() {
+                        let valid = if let Some((i,plan)) = &mut prepared_rebind {
+                            *i == index && runtime.session.install_render_rebind(plan,snapshot.client(),&parameters)?
+                        } else { false };
+                        if !valid { self.control_waiting = true; return Ok(None); }
+                    }
                     // A matching inactive pool still needs the incoming caller
                     // identity when another VM is currently selected. Omitting
                     // it would route the command back to the current caller.
@@ -713,6 +769,10 @@ impl Schedule {
                                 snapshot.client(), parameters, priority, &waits)?
                         } else { false };
                         if !valid { self.control_waiting = true; return Ok(None); }
+                        let rebind=prepared_compute_rebind.as_mut().filter(|(i,_)|*i==index).map(|(_,plan)|plan);
+                        if !runtime.session.compute_rebind_matches(rebind.as_deref(),key,snapshot.client(),parameters,priority) {
+                            self.control_waiting=true;return Ok(None);
+                        }
                         let objects = prepared_compute.take().ok_or(EIO)?.1;
                         let old=runtime.session.independent_compute_client(key,snapshot.client(),parameters,priority);
                         let (ready, client)=Self::replacement(snapshot,old, &mut prepared.compute_client)?;
@@ -721,7 +781,7 @@ impl Schedule {
                             for point in &waits { runtime.session.retain_dependency(*point, &node.point.completion)?; }
                         }
                         return runtime.session.stage_independent_compute(dev.as_ref(),&runtime.image,
-                            key,snapshot.client(),client,prepared.compute_storage.take(),objects,parameters,priority,&waits)
+                            key,snapshot.client(),client,prepared.compute_storage.take(),rebind,objects,parameters,priority,&waits)
                             .map(|r|Some(Receipt::Compute(r)));
                     }
                     if !Self::preferred(runtime,1,node) { return Ok(None); }

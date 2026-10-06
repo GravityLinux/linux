@@ -154,6 +154,7 @@ mod native;
 mod relocation;
 #[path = "g17p_render_context_session.rs"]
 mod render_contexts;
+pub(crate) use render_contexts::PreparedPoolRebind;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -181,6 +182,7 @@ pub(crate) struct Session {
     // The selected pool's client is in render.client; others stay parked.
     render_pool_clients: KVec<(u32, compute::Client)>,
     render_pool_asids: [u16; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+    render_fallback_leaves: Option<Arc<KVec<(u64, u64)>>>,
     render_gate: Option<kernel::dma_fence::Fence>,
     render: Option<render::Submission>,
     dormant_render: Option<render::Submission>,
@@ -442,6 +444,7 @@ impl Session {
                 render_clients: KVec::new(),
                 render_pool_clients: KVec::new(),
                 render_pool_asids: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+                render_fallback_leaves: None,
                 render_gate: None,
                 render: None,
                 dormant_render: None,
@@ -590,6 +593,7 @@ impl Session {
             super::g17p_abi::compute_dispatch(&mut dispatch).map_err(|_|EINVAL)?;
             vm.write(memory,2,0xfffffc20015e8020,&dispatch)?;
         }
+        session.render_fallback_leaves = Some(Arc::new(vm.render_fallback_leaves(memory)?, GFP_KERNEL)?);
         session.vm = Some(vm);
         Ok(session)
     }
@@ -3303,6 +3307,19 @@ impl Session {
         -> Result<Option<super::g17p_compute_queues::PreparationSeed>> {
         self.independent_compute.preparation_seed(key, client, p, priority, waits)
     }
+    pub(crate) fn compute_rebind_size(&self,key:super::g17p_compute_queues::Key,client:&compute::Client,
+        p:&compute::Parameters,priority:u32) -> Option<usize> {
+        self.independent_compute.rebind_size(key,client,p,priority)
+    }
+    pub(crate) fn capture_compute_rebind(&self,key:super::g17p_compute_queues::Key,client:&compute::Client,
+        p:&compute::Parameters,priority:u32,storage:Option<super::g17p_user_vm::TableStorage>)
+        -> Result<Option<Option<super::g17p_compute_queues::ComputeRebindSeed>>> {
+        self.independent_compute.capture_rebind(key,client,p,priority,storage)
+    }
+    pub(crate) fn compute_rebind_matches(&self,plan:Option<&super::g17p_compute_queues::PreparedComputeRebind>,
+        key:super::g17p_compute_queues::Key,client:&compute::Client,p:&compute::Parameters,priority:u32) -> bool {
+        self.independent_compute.rebind_matches(plan,key,client,p,priority)
+    }
     pub(crate) fn timestamp_cache_seed(&self, addresses: &[u64]) -> Result<super::g17p_timestamp::Cache> {
         self.timestamps.as_ref().ok_or(EIO)?.cache_seed(addresses)
     }
@@ -3380,11 +3397,12 @@ impl Session {
     }
     pub(crate) fn stage_independent_compute(&mut self,dev:&kernel::device::Device,image:&Image,
         key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
-        storage: Option<Memory>, prepared: KBox<super::g17p_compute_queues::PreparedWork>,
+        storage: Option<Memory>, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
+        prepared: KBox<super::g17p_compute_queues::PreparedWork>,
         p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
         let private_prepared = storage.is_some();
         if let Some(storage) = storage { self.memory.as_mut().ok_or(EIO)?.absorb(storage)?; }
-        let result=self.stage_independent_compute_inner(dev,image,key,reference,client,private_prepared,prepared,p,priority,dependencies);
+        let result=self.stage_independent_compute_inner(dev,image,key,reference,client,private_prepared,rebind,prepared,p,priority,dependencies);
         if let Err(error)=result.as_ref() {
             dev_err!(dev,"G17P: compute stage key {:?} failed {:?}\n",key,error);
             self.phase=Phase::Failed;self.fail_owned_receipts(*error);self.events.fail(*error);
@@ -3393,7 +3411,8 @@ impl Session {
     }
     fn stage_independent_compute_inner(&mut self,dev:&kernel::device::Device,image:&Image,
         key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
-        private_prepared: bool, prepared: KBox<super::g17p_compute_queues::PreparedWork>, p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
+        private_prepared: bool, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
+        prepared: KBox<super::g17p_compute_queues::PreparedWork>, p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
         self.independent_pending.reserve(1,GFP_KERNEL)?;
         let ordinal=self.independent_count.checked_add(1).ok_or(EOVERFLOW)?;
         let receipt=ComputeReceipt::new(ordinal)?;
@@ -3417,7 +3436,7 @@ impl Session {
         self.service_owned_render_reports(dev,image)?;
         let ticket=self.independent_compute.stage(self.memory.as_mut().ok_or(EIO)?,
             self.vm.as_mut().ok_or(EIO)?,self.ttbs,image.graph.channels[0][queue::COMPUTE_CHANNEL],
-            key,client,private_prepared,prepared,reference,p,priority,dependencies,receipt.fence.clone())?;
+            key,client,private_prepared,rebind,prepared,reference,p,priority,dependencies,receipt.fence.clone())?;
         for bo in ticket.client.buffers() {self.retain_source_backing(bo)?;}
         self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EIO)?.growth.as_mut().ok_or(EIO)?
             .register_independent_compute(self.independent_compute.grid_mask());

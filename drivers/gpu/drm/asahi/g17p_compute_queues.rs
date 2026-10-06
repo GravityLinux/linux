@@ -468,6 +468,7 @@ impl Queues {
         key: Key,
         mut client: Option<Client>,
         private_prepared: bool,
+        rebind: Option<&mut PreparedComputeRebind>,
         prepared: KBox<PreparedWork>,
         reference: &Client,
         p: &Parameters,
@@ -512,6 +513,7 @@ impl Queues {
                     ttbs,
                     key,
                     client.take().ok_or(EINVAL)?,
+                    rebind,
                     p,
                     priority,
                 ).inspect_err(|e| pr_err!("G17P: compute replace client grid {} error {:?}\n",queue.layout.grid,e))?;
@@ -698,7 +700,8 @@ impl Queue {
         vm: &Vm,
         ttbs: u64,
         key: Key,
-        mut client: Client,
+        client: Client,
+        rebind: Option<&mut PreparedComputeRebind>,
         p: &Parameters,
         priority: u32,
     ) -> Result {
@@ -718,49 +721,9 @@ impl Queue {
         }
         // Reuse this owner's allocator and private backing. A changed reserved
         // aperture moves the same save/robustness leaves after this owner retires.
-        let mut private: KVec<(u64, u64, u64)> = KVec::new();
-        if self.preempt != p.preempt {
-            let mut offsets = KVec::with_capacity(256 * 3 + 2, GFP_KERNEL)?;
-            for slot in 0..256u64 {
-                for page in [0, 0x4000, 0x8000] {
-                    offsets.push(slot * 0x78000 + page, GFP_KERNEL)?;
-                }
-            }
-            for offset in [0x100000, 0x108000] {offsets.push(offset, GFP_KERNEL)?;}
-            let mut leaves = KVec::with_capacity(offsets.len(), GFP_KERNEL)?;
-            for &offset in &offsets {
-                let old = self.preempt + offset;
-                let leaf = self.client.root.pte(old)?;
-                if leaf == 0 {
-                    pr_err!("G17P: compute rebind missing private leaf grid {} preempt {:#x} new {:#x} offset {:#x}\n",self.layout.grid,self.preempt,p.preempt,offset);
-                    return Err(EIO);
-                }
-                leaves.push(leaf, GFP_KERNEL)?;
-                private.push((old, leaf, 0), GFP_KERNEL)?;
-            }
-            for (&offset, &leaf) in offsets.iter().zip(leaves.iter()) {
-                let address = p.preempt + offset;
-                if let Some(row) = private.iter_mut().find(|r| r.0 == address) {
-                    row.2 = leaf;
-                } else {
-                    let old = self.client.root.pte(address)?;
-                    if old != 0
-                        && !self
-                            .client
-                            .bindings
-                            .iter()
-                            .any(|b| address >= b.0 && address < b.0 + b.1)
-                    {
-                        return Err(EBUSY);
-                    }
-                    private.push((address, old, leaf), GFP_KERNEL)?;
-                }
-            }
-        }
-        self.client.root.absorb_spare_tables(&mut client.root)?;
-        self.client
-            .prepare_rebind(&client, false, &[self.layout.asid], &private)?
-            .commit();
+        let plan = rebind.ok_or(EIO)?;
+        if !plan.matches(self, key, &client, p, priority) { return Err(EBUSY); }
+        plan.root.commit(&mut self.client.root)?;
         self.client.adopt_rebound(client);
         self.needs_optional = true;
         // Retained firmware queues keep their established scheduling state
@@ -934,5 +897,131 @@ impl q::Writer for Writer<'_> {
     type Error = Error;
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result {
         self.vm.write(self.memory, 2, address, bytes)
+    }
+}
+
+/// Retired compute-owner preparation pins DATA/BO ownership, never save bodies.
+pub(crate) struct ComputeRebindSeed {
+    layout: Layout,
+    old_key: Key,
+    old_preempt: u64,
+    new_preempt: u64,
+    old_priority: u32,
+    snapshot: super::g17p_user_vm::RebindSnapshot,
+    buffers: KVec<kernel::sync::aref::ARef<super::g17p_drm::Object>>,
+    bindings: KVec<(u64,u64,u64,u32)>,
+    owner: (u64,u32),
+    cpu_maps: runtime::CpuMaps,
+    primer_aliases: Option<[(u64,u64);2]>,
+    new_key: Key,
+    new_priority: u32,
+}
+pub(crate) struct PreparedComputeRebind {
+    layout: Layout,
+    old_key: Key,
+    old_preempt: u64,
+    new_preempt: u64,
+    old_priority: u32,
+    root: super::g17p_user_vm::PreparedRebind,
+    new_key: Key,
+    new_priority: u32,
+    owner: (u64,u32),
+    bindings: KVec<(u64,u64,u64,u32)>,
+    buffers: KVec<kernel::sync::aref::ARef<super::g17p_drm::Object>>,
+}
+impl ComputeRebindSeed {
+    pub(crate) fn prepare(self, client:&Client) -> Result<PreparedComputeRebind> {
+        let started=kernel::time::Instant::<kernel::time::Monotonic>::now();
+        let (root,relocation)=self.snapshot.clone_tree()?;
+        let mut shadow=Client { root,buffers:self.buffers,bindings:self.bindings,owner:self.owner,
+            cpu_maps:self.cpu_maps,primer_aliases:self.primer_aliases };
+        let mut private: KVec<(u64, u64, u64)> = KVec::new();
+        if self.old_preempt != self.new_preempt {
+            let mut offsets = KVec::with_capacity(256 * 3 + 2, GFP_KERNEL)?;
+            for slot in 0..256u64 {
+                for page in [0, 0x4000, 0x8000] {
+                    offsets.push(slot * 0x78000 + page, GFP_KERNEL)?;
+                }
+            }
+            for offset in [0x100000, 0x108000] {offsets.push(offset, GFP_KERNEL)?;}
+            let mut leaves = KVec::with_capacity(offsets.len(), GFP_KERNEL)?;
+            for &offset in &offsets {
+                let old = self.old_preempt + offset;
+                let leaf = shadow.root.pte(old)?;
+                if leaf == 0 {
+                    pr_err!("G17P: compute rebind missing private leaf grid {} preempt {:#x} new {:#x} offset {:#x}\n",self.layout.grid,self.old_preempt,self.new_preempt,offset);
+                    return Err(EIO);
+                }
+                leaves.push(leaf, GFP_KERNEL)?;
+                private.push((old, leaf, 0), GFP_KERNEL)?;
+            }
+            for (&offset, &leaf) in offsets.iter().zip(leaves.iter()) {
+                let address = self.new_preempt + offset;
+                if let Some(row) = private.iter_mut().find(|r| r.0 == address) {
+                    row.2 = leaf;
+                } else {
+                    let old = shadow.root.pte(address)?;
+                    if old != 0
+                        && !shadow
+                            .bindings
+                            .iter()
+                            .any(|b| address >= b.0 && address < b.0 + b.1)
+                    {
+                        return Err(EBUSY);
+                    }
+                    private.push((address, old, leaf), GFP_KERNEL)?;
+                }
+            }
+        }
+
+        shadow.prepare_rebind(client,false,&[self.layout.asid],&private)?.commit_unpublished();
+        let mut bindings=KVec::new();bindings.extend_from_slice(&client.bindings,GFP_KERNEL)?;
+        let mut buffers=KVec::with_capacity(client.buffers.len(),GFP_KERNEL)?;
+        for bo in &client.buffers { buffers.push(bo.clone(),GFP_KERNEL)?; }
+        let root=relocation.prepare(&shadow.root,&[self.layout.asid])?;
+        if *crate::module_parameters::submission_log.value() >= 3 {
+            pr_info!("G17P: COMPUTE_ROOT_PREPARED grid {} bindings {} elapsed_us {} outside_runtime_lock\n",
+                self.layout.grid,bindings.len(),started.elapsed().as_nanos()/1000);
+        }
+        Ok(PreparedComputeRebind { layout:self.layout,old_key:self.old_key,old_preempt:self.old_preempt,
+            new_preempt:self.new_preempt,old_priority:self.old_priority,root,new_key:self.new_key,
+            new_priority:self.new_priority,owner:client.owner,bindings,buffers })
+    }
+}
+impl PreparedComputeRebind {
+    fn matches(&self,queue:&Queue,key:Key,client:&Client,p:&Parameters,priority:u32) -> bool {
+        self.layout==queue.layout && self.old_key==queue.key && self.old_preempt==queue.preempt
+            && self.old_priority==queue.priority && self.root.matches(&queue.client.root) && queue.idle()
+            && self.new_preempt==p.preempt && self.new_key==key && self.new_priority==priority
+            && self.owner==client.owner && self.bindings==client.bindings
+            && self.buffers.len()==client.buffers.len()
+            && self.buffers.iter().zip(&client.buffers).all(|(a,b)|core::ptr::eq(&**a,&**b))
+    }
+}
+impl Queues {
+    pub(crate) fn rebind_size(&self,key:Key,client:&Client,p:&Parameters,priority:u32) -> Option<usize> {
+        let queue=self.owners.get(self.choose(key,client,p,priority)?)?;
+        (!queue.matches(key,client,p,priority) && queue.idle()).then(||queue.client.root.table_count())
+    }
+    pub(crate) fn capture_rebind(&self,key:Key,client:&Client,p:&Parameters,priority:u32,
+        storage:Option<super::g17p_user_vm::TableStorage>) -> Result<Option<Option<ComputeRebindSeed>>> {
+        if self.rebind_size(key,client,p,priority).is_none() { return Ok(Some(None)); }
+        let Some(storage)=storage else {return Ok(None);};
+        let queue=self.owners.get(self.choose(key,client,p,priority).ok_or(EBUSY)?).ok_or(EIO)?;
+        let Some(snapshot)=queue.client.root.capture_rebind(storage)? else {return Ok(None);};
+        let mut buffers=KVec::with_capacity(queue.client.buffers.len(),GFP_KERNEL)?;
+        for bo in &queue.client.buffers {buffers.push(bo.clone(),GFP_KERNEL)?;}
+        let mut bindings=KVec::new();bindings.extend_from_slice(&queue.client.bindings,GFP_KERNEL)?;
+        Ok(Some(Some(ComputeRebindSeed {layout:queue.layout,old_key:queue.key,old_preempt:queue.preempt,
+            new_preempt:p.preempt,old_priority:queue.priority,snapshot,buffers,bindings,owner:queue.client.owner,
+            cpu_maps:queue.client.cpu_maps.clone(),primer_aliases:queue.client.primer_aliases,
+            new_key:key,new_priority:priority})))
+    }
+    pub(crate) fn rebind_matches(&self,plan:Option<&PreparedComputeRebind>,key:Key,client:&Client,
+        p:&Parameters,priority:u32) -> bool {
+        let Some(index)=self.choose(key,client,p,priority) else {return false;};
+        let Some(queue)=self.owners.get(index) else {return plan.is_none();};
+        if queue.matches(key,client,p,priority) {return true;}
+        plan.is_some_and(|plan|plan.matches(queue,key,client,p,priority))
     }
 }

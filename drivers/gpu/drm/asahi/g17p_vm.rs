@@ -289,6 +289,18 @@ impl Vm {
         let offset = va & (PAGE - 1);
         Ok((self.lookup(memory, group, va - offset)?.ok_or(EINVAL)? & ADDRESS) + offset)
     }
+    /// Ordinary independent render roots only borrow these immutable cold
+    /// Source leaves. Capture once at boot; no executable leaf is read.
+    pub(crate) fn render_fallback_leaves(&self, memory: &Memory) -> Result<KVec<(u64, u64)>> {
+        let mut leaves = KVec::new();
+        for &(base, count, _) in topology::RENDER_RUNS {
+            for index in 0..count {
+                let va = base + index as u64 * PAGE;
+                leaves.push((va, self.physical(memory, 1, va)?), GFP_KERNEL)?;
+            }
+        }
+        Ok(leaves)
+    }
 
     /// Live source-owned leaf, including its attributes. Never substitute a
     /// bootstrap placement table for this lookup after a mapping transition.

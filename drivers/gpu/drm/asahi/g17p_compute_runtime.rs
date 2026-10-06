@@ -213,6 +213,8 @@ impl Client {
         contexts: &[u16],
         private: &[(u64, u64, u64)],
     ) -> Result<super::g17p_user_vm::RebindPlan<'a>> {
+        let started = (*crate::module_parameters::submission_log.value() >= 3)
+            .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         if render && self.owner != next.owner {
             return Err(EINVAL);
         }
@@ -252,6 +254,7 @@ impl Client {
             }
         }
         super::g17p_user_vm::sort_by_key(&mut rows, |row| (row.0, row.1));
+        let sorted_us = started.as_ref().map(|t| t.elapsed().as_nanos()/1000).unwrap_or(0);
         let mut changes: KVec<(u64, u64, u64)> = KVec::with_capacity(rows.len(), GFP_KERNEL)?;
         let mut first = 0;
         while first < rows.len() {
@@ -295,7 +298,14 @@ impl Client {
         // Execution is quiescent here. Reuse exact Object mappings across
         // binding generations; only next.buffers are maintained by cache().
         next.cache_with(false, &self.cpu_maps)?;
-        self.root.prepare_rebind(&changes, contexts)
+        let merged_us = started.as_ref().map(|t| t.elapsed().as_nanos()/1000).unwrap_or(0);
+        let plan = self.root.prepare_rebind(&changes, contexts)?;
+        if let Some(started) = started {
+            pr_info!("G17P: REBIND_CPU_PLAN owner {:?} next {:?} rows {} leaves {} sorted_us {} merged_us {} total_us {}\n",
+                self.owner, next.owner, rows.len(), changes.len(), sorted_us, merged_us,
+                started.elapsed().as_nanos()/1000);
+        }
+        Ok(plan)
     }
     pub(crate) fn cache(&self, invalidate: bool) -> Result {
         self.cache_with(invalidate, &self.cpu_maps)
