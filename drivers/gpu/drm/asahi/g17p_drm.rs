@@ -168,7 +168,8 @@ impl DriverObject for Bo {
     fn close(obj: &Object, file: &DrmFile) {
         let inner = file.inner();
         let mut state = inner.state.lock();
-        if inner.pending.load(Ordering::Acquire) != 0 {
+        let snapshots = scheduling::Schedule::enabled();
+        if !snapshots && inner.pending.load(Ordering::Acquire) != 0 {
             return;
         }
         for vm in &mut state.vms {
@@ -185,17 +186,19 @@ impl DriverObject for Bo {
             for binding in &vm.bindings {
                 if core::ptr::eq(&*binding.bo, obj) {
                     let result = (|| -> Result {
-                        let mut expected = KVec::new();
-                        for address in (binding.start..binding.end()).step_by(PAGE as usize) {
-                            let pte = vm.tree.pte(address)?;
-                            if pte != 0 {
-                                expected.push((address, pte), GFP_KERNEL)?;
+                        if !snapshots {
+                            let mut expected = KVec::new();
+                            for address in (binding.start..binding.end()).step_by(PAGE as usize) {
+                                let pte = vm.tree.pte(address)?;
+                                if pte != 0 {
+                                    expected.push((address, pte), GFP_KERNEL)?;
+                                }
                             }
+                            Option::as_mut(&mut *inner.runtime.lock())
+                                .ok_or(ENODEV)?
+                                .session
+                                .unbind_vm((inner.id, vm.id), binding.start, binding.size, &expected)?;
                         }
-                        Option::as_mut(&mut *inner.runtime.lock())
-                            .ok_or(ENODEV)?
-                            .session
-                            .unbind_vm((inner.id, vm.id), binding.start, binding.size, &expected)?;
                         vm.tree.unmap(binding.start, binding.size)
                     })();
                     if result.is_err() {
@@ -508,11 +511,30 @@ struct Prepared {
     barriers: KVec<[u16; 2]>,
     render_client: Option<super::g17p_compute_runtime::Client>,
     compute_client: Option<super::g17p_compute_runtime::Client>,
+    compute_storage: Option<super::g17p_memory::Memory>,
     render_snapshot: Option<Arc<admission::Snapshot>>,
     compute_snapshot: Option<Arc<admission::Snapshot>>,
     buffers: KVec<ARef<Object>>,
 }
 impl Prepared {
+    fn timestamp_addresses(&self) -> Result<KVec<u64>> {
+        let mut addresses = KVec::new();
+        for command in &self.parameters {
+            match command {
+                Command::Render(p) => {
+                    for address in [p.ta_user_timestamp_start, p.ta_user_timestamp_end,
+                        p.fragment_user_timestamp_start, p.fragment_user_timestamp_end] {
+                        addresses.push(address, GFP_KERNEL)?;
+                    }
+                }
+                Command::Compute(p) => {
+                    for address in p.timestamps { addresses.push(address, GFP_KERNEL)?; }
+                }
+            }
+        }
+        Ok(addresses)
+    }
+
     fn pipeline_render(&self) -> bool {
         *crate::module_parameters::native_render_vms.value() == 0
             && *crate::module_parameters::native_compute_vms.value() == 0
@@ -797,13 +819,14 @@ impl File {
                 return Err(EINVAL);
             }
             if op.flags & UNBIND != 0 {
-                if vm.pending.load(Ordering::Acquire) != 0 {
+                let snapshots = scheduling::Schedule::enabled();
+                if !snapshots && vm.pending.load(Ordering::Acquire) != 0 {
                     return Err(EBUSY);
                 }
                 if op.flags != UNBIND || op.handle != 0 || op.offset != 0 {
                     return Err(EINVAL);
                 }
-                {
+                if !snapshots {
                     let mut expected = KVec::new();
                     for address in (op.addr..end).step_by(PAGE as usize) {
                         let pte = vm.tree.pte(address)?;
@@ -816,6 +839,10 @@ impl File {
                         .session
                         .unbind_vm((inner.id, vm.id), op.addr, op.range, &expected)?;
                 }
+                // Ordinary jobs own immutable admission trees and installed
+                // per-owner roots. Logical unbind must never edit those live
+                // roots. A later mapping generation replaces only its selected
+                // retired owner's caller leaves, with the normal ASID TLBI.
                 vm.unbind(op.addr, end)?;
                 continue;
             }
@@ -903,9 +930,6 @@ impl File {
         let inner = file.inner();
         let mut state = inner.state.lock();
         if data.op == uapi::drm_asahi_bind_object_op_DRM_ASAHI_BIND_OBJECT_OP_UNBIND {
-            if inner.pending.load(Ordering::Acquire) != 0 {
-                return Err(EBUSY);
-            }
             if data.flags != 0 || data.handle != 0 || data.offset != 0 || data.range != 0 {
                 return Err(EINVAL);
             }
@@ -1323,6 +1347,8 @@ impl File {
         Ok((commands, command_barriers))
     }
     fn submit(dev: &Device, data: &uapi::drm_asahi_submit, file: &DrmFile) -> Result<u32> {
+        let submission_started = (*crate::module_parameters::submission_log.value() >= 3)
+            .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         dev.events.healthy()?;
         if data.flags != 0
             || data.pad != 0
@@ -1413,14 +1439,15 @@ impl File {
             vm_pending,
             parameters,
             barriers,
-            render_client,
-            compute_client,
+            render_client: if scheduling::Schedule::enabled() { None } else { render_client },
+            compute_client: if scheduling::Schedule::enabled() { None } else { compute_client },
+            compute_storage: None,
             render_snapshot,
             compute_snapshot,
             buffers,
         };
         let schedule = if scheduling::Schedule::enabled() {
-            Some(scheduling::Schedule::new(&prepared.parameters,&prepared.barriers,accepted.clone())?)
+            Some(scheduling::Schedule::new(&prepared.parameters,&prepared.barriers,accepted.clone(),submission_started)?)
         } else { None };
         let next_accepted = schedule.as_ref().map(scheduling::Schedule::tail).unwrap_or(accepted);
         let ordinary = schedule.is_some();
@@ -1468,6 +1495,7 @@ impl File {
             barriers: _,
             render_client,
             compute_client,
+            compute_storage: _,
             render_snapshot,
             compute_snapshot,
             buffers,

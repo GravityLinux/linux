@@ -202,7 +202,8 @@ int main(int argc, char **argv)
          * GPU execution time; accepted fences stay pending beyond two seconds. */
         struct drm_asahi_gem_bind_op unmap={.addr=batch_workloads[4].output,.range=PAGE,.flags=DRM_ASAHI_BIND_UNBIND};
         struct drm_asahi_vm_bind unbind={.vm_id=vm,.num_binds=1,.stride=sizeof(unmap),.userptr=(uintptr_t)&unmap};
-        BAD(fd,DRM_IOCTL_ASAHI_VM_BIND,&unbind,EBUSY);
+        OK(fd,DRM_IOCTL_ASAHI_VM_BIND,&unbind);
+        /* Accepted jobs retain their original output mappings after unbind. */
         for(unsigned i=4;i<52;i++)bo_close(fd,output_handles[i]);
         struct sigaction action={.sa_handler=interrupt_wait},old_action;
         sigemptyset(&action.sa_mask);CHECK(sigaction(SIGUSR1,&action,&old_action)==0);

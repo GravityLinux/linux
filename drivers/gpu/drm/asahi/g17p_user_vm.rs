@@ -11,9 +11,12 @@ use kernel::{
 };
 const PAGE: u64 = 0x4000;
 const ADDRESS: u64 = 0x000003ffffffc000;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) struct UserVm {
     tables: KVec<Arc<Owned<Page>>>,
+    generation: AtomicU64,
+    spare_tables: KVec<Arc<Owned<Page>>>,
 }
 /// Pins the actual executable root and its current child tables. A live root
 /// owner remains responsible for mapping/growth writes; this lease only keeps
@@ -43,9 +46,11 @@ impl RootLease {
 pub(crate) struct RebindPlan<'a> {
     stores: KVec<(usize, &'a Page, usize, u64, u64)>,
     contexts: KVec<u16>,
+    generation: &'a AtomicU64,
 }
 impl RebindPlan<'_> {
     pub(crate) fn commit(self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         for &(depth, page, index, old, _) in &self.stores {
             if depth == 2 && old != 0 {
                 UserVm::store(page, index, 0);
@@ -68,6 +73,7 @@ impl RebindPlan<'_> {
 pub(crate) struct TableWord<'a> {
     page: &'a Page,
     index: usize,
+    generation: &'a AtomicU64,
 }
 impl TableWord<'_> {
     pub(crate) fn load(&self) -> u64 {
@@ -77,108 +83,40 @@ impl TableWord<'_> {
         })
     }
     pub(crate) fn store(&self, value: u64) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         UserVm::store(self.page, self.index, value);
     }
 }
-impl UserVm {
-    pub(crate) fn table_word(&self, address: u64) -> Result<TableWord<'_>> {
-        if address & 7 != 0 {
-            return Err(EINVAL);
+/// Allocated by the worker before acquiring shared state. Capture performs
+/// only bounded table DATA copies into this already-owned host storage.
+pub(crate) struct TableStorage { rows: KVec<(u64, KVVec<u64>)> }
+pub(crate) struct TableSnapshot {
+    root: u64,
+    generation: u64,
+    rows: KVec<(u64, KVVec<u64>)>,
+}
+impl TableStorage {
+    pub(crate) fn new(count: usize) -> Result<Self> {
+        let mut rows = KVec::with_capacity(count, GFP_KERNEL)?;
+        for _ in 0..count {
+            let mut body = KVVec::with_capacity(2048, GFP_KERNEL)?;
+            body.resize(2048, 0, GFP_KERNEL)?;
+            rows.push((0, body), GFP_KERNEL)?;
         }
-        Ok(TableWord {
-            page: self.page(address & !(PAGE - 1))?,
-            index: ((address & (PAGE - 1)) / 8) as usize,
-        })
+        Ok(Self { rows })
     }
-    /// Retain the old root and all child tables while creating its exact data
-    /// copy. Publication is separate so both TTB words can be checked first.
-    pub(crate) fn clone_root_page(&mut self) -> Result<(usize, u64)> {
-        let old = self.root();
-        let copy = self.table()?;
-        for index in 0..2048 {
-            self.write(copy, index, self.read(old, index)?)?;
-        }
-        Ok((self.tables.len() - 1, copy))
+}
+impl TableSnapshot {
+    pub(crate) fn matches(&self, root: &UserVm) -> bool {
+        self.root == root.root() && self.generation == root.generation.load(Ordering::Relaxed)
+            && self.rows.len() == root.tables.len()
     }
-    pub(crate) fn publish_root_clone(&mut self, index: usize) {
-        self.tables.swap(0, index);
+    pub(crate) fn clone_tree(&self) -> Result<UserVm> {
+        self.clone_with_addresses().map(|(root, _)| root)
     }
-    pub(crate) fn new() -> Result<Self> {
-        if page::PAGE_SIZE != PAGE as usize {
-            return Err(EINVAL);
-        }
-        let mut vm = Self {
-            tables: KVec::new(),
-        };
-        vm.table()?;
-        Ok(vm)
-    }
-    pub(crate) fn root(&self) -> u64 {
-        self.tables[0].phys()
-    }
-    pub(crate) fn lease(&self) -> Result<RootLease> {
-        let mut lease = RootLease { root: self.root(), tables: KVec::new() };
-        lease.refresh(self)?;
-        Ok(lease)
-    }
-    fn table(&mut self) -> Result<u64> {
-        self.tables.reserve(1, GFP_KERNEL)?;
-        let page = Arc::new(Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?, GFP_KERNEL)?;
-        let pa = page.phys();
-        if pa & !ADDRESS != 0 {
-            return Err(EINVAL);
-        }
-        Self::clean(&page);
-        self.tables.push(page, GFP_KERNEL)?;
-        Ok(pa)
-    }
-    fn page(&self, pa: u64) -> Result<&Page> {
-        self.tables
-            .iter()
-            .find(|p| p.phys() == pa)
-            .map(|p| &***p)
-            .ok_or(EINVAL)
-    }
-    fn clean(page: &Page) {
-        page.with_page_mapped(|p| {
-            for offset in (0..PAGE as usize).step_by(64) {
-                // SAFETY: Every complete line lies inside this owned page.
-                unsafe {core::arch::asm!("dc civac, {p}",p=in(reg)p.add(offset),options(nostack,preserves_flags))};
-            }
-        });
-        super::g17p_memory::sync();
-    }
-    fn read(&self, pa: u64, index: usize) -> Result<u64> {
-        if index >= 2048 {
-            return Err(EINVAL);
-        }
-        Ok(self.page(pa)?.with_page_mapped(|p| {
-            // SAFETY: Aligned qword within the owned table, serialized by File.
-            u64::from_le(unsafe { p.cast::<u64>().add(index).read_volatile() })
-        }))
-    }
-    fn write(&mut self, pa: u64, index: usize, word: u64) -> Result {
-        if index >= 2048 {
-            return Err(EINVAL);
-        }
-        let page = self.page(pa)?;
-        Self::store(page, index, word);
-        Ok(())
-    }
-    // Only checked, owned table pages and indices reach the publication pass.
-    fn store(page: &Page, index: usize, word: u64) {
-        page.with_page_mapped(|p| {
-            // SAFETY: Exclusive VM access and checked aligned table index.
-            unsafe {p.cast::<u64>().add(index).write_volatile(word.to_le());
-                core::arch::asm!("dc civac, {p}",p=in(reg)p.add(index*8),options(nostack,preserves_flags));}
-        });
-        super::g17p_memory::sync();
-    }
-    /// g17p_context.clone_low_tables: clone table DATA only. Data/code leaves
-    /// retain their exact physical owners and attributes; none is dereferenced.
-    pub(crate) fn clone_low_tables(&self) -> Result<(Self, KVec<(u64, u32, u64)>)> {
+    fn clone_with_addresses(&self) -> Result<(UserVm, KVec<(u64, u32, u64)>)> {
         fn clone(
-            source: &UserVm,
+            source: &TableSnapshot,
             destination: &mut UserVm,
             pa: u64,
             depth: u32,
@@ -198,18 +136,11 @@ impl UserVm {
             if active.contains(&pa) {
                 return Err(EINVAL);
             }
-            let page = source.page(pa)?;
+            let row = source.rows.iter().find(|row| row.0 == pa).ok_or(EINVAL)?;
             active.push(pa, GFP_KERNEL)?;
             let mut body = KVVec::with_capacity(2048, GFP_KERNEL)?;
             body.resize(2048, 0u64, GFP_KERNEL)?;
-            page.with_page_mapped(|pointer| {
-                // SAFETY: The runtime lock excludes host PTE mutation. The
-                // firmware accesses mapped leaves, never these owned tables.
-                // Copy only table DATA into distinct unpublished storage.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(pointer.cast::<u64>(), body.as_mut_ptr(), 2048);
-                }
-            });
+            body.copy_from_slice(&row.1);
             for word in body.iter_mut() { *word = u64::from_le(*word); }
             if depth < 2 {
                 for index in 0..if depth == 0 { 64 } else { 2048 } {
@@ -249,20 +180,152 @@ impl UserVm {
             active.pop();
             Ok(copy)
         }
-        let mut destination = Self::new()?;
+        let mut destination = UserVm::new()?;
         let mut copies = KVec::new();
         let mut active = KVec::new();
         let root = destination.root();
-        clone(
-            self,
-            &mut destination,
-            self.root(),
-            0,
-            &mut copies,
-            &mut active,
-            Some(root),
-        )?;
+        clone(self, &mut destination, self.root, 0, &mut copies, &mut active, Some(root))?;
         Ok((destination, copies))
+    }
+}
+
+impl UserVm {
+    pub(crate) fn table_word(&self, address: u64) -> Result<TableWord<'_>> {
+        if address & 7 != 0 {
+            return Err(EINVAL);
+        }
+        Ok(TableWord {
+            page: self.page(address & !(PAGE - 1))?,
+            index: ((address & (PAGE - 1)) / 8) as usize,
+            generation: &self.generation,
+        })
+    }
+    /// Retain the old root and all child tables while creating its exact data
+    /// copy. Publication is separate so both TTB words can be checked first.
+    pub(crate) fn clone_root_page(&mut self) -> Result<(usize, u64)> {
+        let old = self.root();
+        let copy = self.table()?;
+        for index in 0..2048 {
+            self.write(copy, index, self.read(old, index)?)?;
+        }
+        Ok((self.tables.len() - 1, copy))
+    }
+    pub(crate) fn publish_root_clone(&mut self, index: usize) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.tables.swap(0, index);
+    }
+    pub(crate) fn new() -> Result<Self> {
+        if page::PAGE_SIZE != PAGE as usize {
+            return Err(EINVAL);
+        }
+        let mut vm = Self {
+            tables: KVec::new(),
+            generation: AtomicU64::new(0),
+            spare_tables: KVec::new(),
+        };
+        vm.table()?;
+        Ok(vm)
+    }
+    pub(crate) fn root(&self) -> u64 {
+        self.tables[0].phys()
+    }
+    pub(crate) fn lease(&self) -> Result<RootLease> {
+        let mut lease = RootLease { root: self.root(), tables: KVec::new() };
+        lease.refresh(self)?;
+        Ok(lease)
+    }
+    fn table(&mut self) -> Result<u64> {
+        self.tables.reserve(1, GFP_KERNEL)?;
+        let (page, prepared) = if let Some(page) = self.spare_tables.pop() { (page, true) } else {
+            (Arc::new(Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?, GFP_KERNEL)?, false)
+        };
+        let pa = page.phys();
+        if pa & !ADDRESS != 0 {
+            return Err(EINVAL);
+        }
+        if !prepared { Self::clean(&page); }
+        self.tables.push(page, GFP_KERNEL)?;
+        Ok(pa)
+    }
+    /// Prepare zeroed parent tables without borrowing an installed owner.
+    /// The caller's complete sparse tree bounds its missing parent count.
+    pub(crate) fn prepare_spare_tables(&mut self, count: usize) -> Result {
+        while self.spare_tables.len() < count {
+            let page = Arc::new(Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?, GFP_KERNEL)?;
+            if page.phys() & !ADDRESS != 0 { return Err(EINVAL); }
+            Self::clean(&page);
+            self.spare_tables.push(page, GFP_KERNEL)?;
+        }
+        Ok(())
+    }
+    /// Transfer unpublished table ownership before the first PTE publication.
+    pub(crate) fn absorb_spare_tables(&mut self, other: &mut Self) -> Result {
+        self.spare_tables.reserve(other.spare_tables.len(), GFP_KERNEL)?;
+        for page in other.spare_tables.drain(..) { self.spare_tables.push(page, GFP_KERNEL)?; }
+        Ok(())
+    }
+    fn page(&self, pa: u64) -> Result<&Page> {
+        self.tables
+            .iter()
+            .find(|p| p.phys() == pa)
+            .map(|p| &***p)
+            .ok_or(EINVAL)
+    }
+    fn clean(page: &Page) {
+        page.with_page_mapped(|p| {
+            for offset in (0..PAGE as usize).step_by(64) {
+                // SAFETY: Every complete line lies inside this owned page.
+                unsafe {core::arch::asm!("dc civac, {p}",p=in(reg)p.add(offset),options(nostack,preserves_flags))};
+            }
+        });
+        super::g17p_memory::sync();
+    }
+    fn read(&self, pa: u64, index: usize) -> Result<u64> {
+        if index >= 2048 {
+            return Err(EINVAL);
+        }
+        Ok(self.page(pa)?.with_page_mapped(|p| {
+            // SAFETY: Aligned qword within the owned table, serialized by File.
+            u64::from_le(unsafe { p.cast::<u64>().add(index).read_volatile() })
+        }))
+    }
+    fn write(&mut self, pa: u64, index: usize, word: u64) -> Result {
+        if index >= 2048 {
+            return Err(EINVAL);
+        }
+        let page = self.page(pa)?;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Self::store(page, index, word);
+        Ok(())
+    }
+    // Only checked, owned table pages and indices reach the publication pass.
+    fn store(page: &Page, index: usize, word: u64) {
+        page.with_page_mapped(|p| {
+            // SAFETY: Exclusive VM access and checked aligned table index.
+            unsafe {p.cast::<u64>().add(index).write_volatile(word.to_le());
+                core::arch::asm!("dc civac, {p}",p=in(reg)p.add(index*8),options(nostack,preserves_flags));}
+        });
+        super::g17p_memory::sync();
+    }
+    /// g17p_context.clone_low_tables: clone table DATA only. Data/code leaves
+    /// retain their exact physical owners and attributes; none is dereferenced.
+    pub(crate) fn table_count(&self) -> usize { self.tables.len() }
+    pub(crate) fn capture_tables(&self, mut storage: TableStorage) -> Result<Option<TableSnapshot>> {
+        if storage.rows.len() != self.tables.len() { return Ok(None); }
+        for (row, page) in storage.rows.iter_mut().zip(&self.tables) {
+            row.0 = page.phys();
+            page.with_page_mapped(|pointer| {
+                // SAFETY: The runtime mutex excludes host writes. Firmware
+                // only reads these tables; the destination is distinct storage.
+                unsafe { core::ptr::copy_nonoverlapping(pointer.cast::<u64>(), row.1.as_mut_ptr(), 2048); }
+            });
+        }
+        Ok(Some(TableSnapshot { root: self.root(),
+            generation: self.generation.load(Ordering::Relaxed), rows: storage.rows }))
+    }
+    pub(crate) fn clone_low_tables(&self) -> Result<(Self, KVec<(u64, u32, u64)>)> {
+        let storage = TableStorage::new(self.table_count())?;
+        self.capture_tables(storage)?.ok_or(EIO)?.clone_with_addresses()
     }
     /// Copy an immutable, unpublished caller-only admission tree. Child
     /// table links point to independently owned copies; caller data leaves
@@ -415,7 +478,12 @@ impl UserVm {
         {
             return Err(EINVAL);
         }
-        let mut writes: KVec<(usize, u64, usize, u64)> = KVec::new();
+        let mut writes: KVec<(usize, u64, usize, u64)> = KVec::with_capacity(changes.len(), GFP_KERNEL)?;
+        // Only newly created parent links participate in a later walk. Keep
+        // them separate: searching all preceding leaf writes made retired-root
+        // reassignment quadratic in the caller's mapped page count.
+        let mut parents: KVec<(usize, u64, usize, u64)> = KVec::new();
+        let mut leaf_keys: KVec<(u64, usize)> = KVec::with_capacity(changes.len(), GFP_KERNEL)?;
         for &(va, old, new) in changes {
             if va >= 1 << 42
                 || va & (PAGE - 1) != 0
@@ -435,14 +503,14 @@ impl UserVm {
                 .enumerate()
             {
                 let mut entry =
-                    if let Some(row) = writes.iter().find(|r| r.1 == table && r.2 == index) {
+                    if let Some(row) = parents.iter().find(|r| r.1 == table && r.2 == index) {
                         row.3
                     } else {
                         self.read(table, index)?
                     };
                 if entry == 0 {
                     entry = self.table()? | 3;
-                    writes.push((depth, table, index, entry), GFP_KERNEL)?;
+                    parents.push((depth, table, index, entry), GFP_KERNEL)?;
                 }
                 if entry & 3 != 3 {
                     return Err(EINVAL);
@@ -451,11 +519,14 @@ impl UserVm {
                 self.page(table)?;
             }
             let index = ((va >> 14) & 2047) as usize;
-            if writes.iter().any(|r| r.1 == table && r.2 == index) {
-                return Err(EINVAL);
-            }
+            leaf_keys.push((table, index), GFP_KERNEL)?;
             writes.push((2, table, index, new), GFP_KERNEL)?;
         }
+        // Distinct VAs can alias a table leaf; retain the original rejection
+        // rule without scanning every previous write for every changed page.
+        leaf_keys.sort_unstable();
+        if leaf_keys.windows(2).any(|rows| rows[0] == rows[1]) { return Err(EINVAL); }
+        writes.extend_from_slice(&parents, GFP_KERNEL)?;
         // Resolve every owned page reference before publication. The following
         // two store passes have no allocation, lookup or other fallible step.
         let mut stores = KVec::new();
@@ -467,7 +538,7 @@ impl UserVm {
         }
         let mut held_contexts = KVec::new();
         held_contexts.extend_from_slice(contexts, GFP_KERNEL)?;
-        Ok(RebindPlan { stores, contexts: held_contexts })
+        Ok(RebindPlan { stores, contexts: held_contexts, generation: &self.generation })
     }
     fn leaf(&mut self, va: u64, create: bool) -> Result<Option<(u64, usize)>> {
         if va >= 1 << 42 || va & (PAGE - 1) != 0 {

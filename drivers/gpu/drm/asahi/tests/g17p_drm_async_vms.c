@@ -96,11 +96,11 @@ static void async_unrelated_vm_mutation(int fd, uint32_t pending_vm)
     uint32_t other=vm_new(fd),bo=bo_new(fd,PAGE,DRM_ASAHI_GEM_WRITEBACK,0);
     const uint64_t address=0x18000;
     bind(fd,other,bo,address,PAGE,0,DRM_ASAHI_BIND_READ|DRM_ASAHI_BIND_WRITE,0);
-    bind(fd,pending_vm,0,batch_workloads[0].output,PAGE,0,DRM_ASAHI_BIND_UNBIND,EBUSY);
+    bind(fd,pending_vm,0,batch_workloads[0].output,PAGE,0,DRM_ASAHI_BIND_UNBIND,0);
     bind(fd,other,0,address,PAGE,0,DRM_ASAHI_BIND_UNBIND,0);
     vm_destroy(fd,other,0);
     bo_close(fd,bo);
-    printf("G17P_ASYNC_UNRELATED_VM_PASS pending owner protected; unrelated bind/unbind/destroy succeeds\n");
+    printf("G17P_ASYNC_UNRELATED_VM_PASS pending snapshot retained; same/unrelated VM unbind succeeds\n");
 }
 static volatile sig_atomic_t wait_interrupted;
 static void interrupt_wait(int signal_number){(void)signal_number;wait_interrupted=1;}
@@ -220,7 +220,8 @@ int main(int argc, char **argv)
          * GPU execution time; accepted fences stay pending beyond two seconds. */
         struct drm_asahi_gem_bind_op unmap={.addr=batch_workloads[4].output,.range=PAGE,.flags=DRM_ASAHI_BIND_UNBIND};
         struct drm_asahi_vm_bind unbind={.vm_id=vm,.num_binds=1,.stride=sizeof(unmap),.userptr=(uintptr_t)&unmap};
-        BAD(fd,DRM_IOCTL_ASAHI_VM_BIND,&unbind,EBUSY);
+        OK(fd,DRM_IOCTL_ASAHI_VM_BIND,&unbind);
+        /* Accepted jobs retain their original output mappings after unbind. */
         for(unsigned i=4;i<52;i++)bo_close(fd,output_handles[i]);
         struct sigaction action={.sa_handler=interrupt_wait},old_action;
         sigemptyset(&action.sa_mask);CHECK(sigaction(SIGUSR1,&action,&old_action)==0);

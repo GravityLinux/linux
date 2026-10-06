@@ -200,6 +200,22 @@ impl Job {
             }
         }
         job.events.add(job.clone())?;
+        // The caller still holds FileState.state, so the exact timestamp
+        // tokens validated at admission cannot be unbound concurrently. Do
+        // this after all other fallible allocations: an ioctl which fails
+        // admission must not leave an unsignaled alias lease behind.
+        let admission = (|| -> Result {
+            let held = job.execution.lock();
+            let e = Option::as_ref(&*held).ok_or(EIO)?;
+            let addresses = e.prepared.timestamp_addresses()?;
+            let mut runtime = e.dev.runtime.lock();
+            Option::as_mut(&mut *runtime).ok_or(ENODEV)?
+                .session.admit_timestamps(&e.sync.fence(), &addresses)
+        })();
+        if let Err(error) = admission {
+            job.events.remove(&job);
+            return Err(error);
+        }
         Ok(job)
     }
     pub(super) fn publication_fence(&self) -> dma_fence::Fence {

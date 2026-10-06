@@ -475,7 +475,77 @@ fn rebind_retired_pool(client: &mut compute::Client, desired: compute::Client, a
 
 // Ordinary source pools retain private execution roots. Only an idle pool is
 // rebound; the remaining pools' roots, tickets and growth readers stay live.
+pub(crate) struct PoolTemplateSeed {
+    pair: u32,
+    snapshot: super::super::g17p_user_vm::TableSnapshot,
+    buffers: KVec<kernel::sync::aref::ARef<super::super::g17p_drm::Object>>,
+    bindings: KVec<(u64, u64, u64, u32)>,
+    owner: (u64, u32),
+    table_budget: usize,
+}
+pub(crate) struct PreparedPoolTemplate {
+    pair: u32,
+    snapshot: super::super::g17p_user_vm::TableSnapshot,
+    client: compute::Client,
+}
+impl PoolTemplateSeed {
+    pub(crate) fn prepare(self) -> Result<PreparedPoolTemplate> {
+        let mut root = self.snapshot.clone_tree()?;
+        root.prepare_spare_tables(self.table_budget)?;
+        if *crate::module_parameters::submission_log.value() >= 3 {
+            pr_info!("G17P: RENDER_TEMPLATE_PREPARED pair {} outside_runtime_lock\n", self.pair);
+        }
+        let client = compute::Client { root, buffers: self.buffers,
+            bindings: self.bindings, owner: self.owner,
+            cpu_maps: crate::g17p_compute_runtime::CpuMaps::new()?, primer_aliases: None };
+        Ok(PreparedPoolTemplate { pair: self.pair, snapshot: self.snapshot, client })
+    }
+}
 impl Session {
+    pub(crate) fn render_selected_client(&self, incoming: &compute::Client, p: &Parameters)
+        -> Result<Option<&compute::Client>> {
+        let Some(work) = self.render.as_ref() else { return Ok(None); };
+        if !self.independent_render_roots() { return Ok(Some(&work.client)); }
+        let Some(pair) = self.next_render_pool_for_geometry(Some(incoming), p)? else { return Ok(None); };
+        Ok(if pair == work.layout.pair { Some(&work.client) } else {
+            self.render_pool_clients.iter().find(|(pool, _)| *pool == pair).map(|(_, client)| client)
+        })
+    }
+    pub(crate) fn render_template_size(&self, incoming: &compute::Client, p: &Parameters)
+        -> Result<Option<usize>> {
+        let Some(work) = self.render.as_ref() else { return Ok(None); };
+        if !self.independent_render_roots() { return Ok(None); }
+        let Some(pair) = self.next_render_pool_for_geometry(Some(incoming), p)? else { return Ok(None); };
+        if pair == work.layout.pair || self.render_pool_clients.iter().any(|(pool, _)| *pool == pair) {
+            return Ok(None);
+        }
+        Ok(Some(work.client.root.table_count()))
+    }
+    pub(crate) fn capture_render_template(&self, incoming: &compute::Client, p: &Parameters,
+        storage: super::super::g17p_user_vm::TableStorage) -> Result<Option<PoolTemplateSeed>> {
+        if self.render_template_size(incoming, p)?.is_none() { return Ok(None); }
+        let work = self.render.as_ref().ok_or(EIO)?;
+        let pair = self.next_render_pool_for_geometry(Some(incoming), p)?.ok_or(EIO)?;
+        let Some(snapshot) = work.client.root.capture_tables(storage)? else { return Ok(None); };
+        let mut buffers = KVec::with_capacity(work.client.buffers.len(), GFP_KERNEL)?;
+        for bo in &work.client.buffers { buffers.push(bo.clone(), GFP_KERNEL)?; }
+        let mut bindings = KVec::new();
+        bindings.extend_from_slice(&work.client.bindings, GFP_KERNEL)?;
+        let table_budget = work.client.root.table_count()
+            .checked_add(render::scratch_table_budget(p)?).ok_or(EOVERFLOW)?;
+        Ok(Some(PoolTemplateSeed { pair, snapshot, buffers, bindings, owner: work.client.owner, table_budget }))
+    }
+    pub(crate) fn commit_render_template(&mut self, incoming: &compute::Client, p: &Parameters,
+        prepared: PreparedPoolTemplate) -> Result<bool> {
+        let work = self.render.as_ref().ok_or(EIO)?;
+        if self.next_render_pool_for_geometry(Some(incoming), p)? != Some(prepared.pair)
+            || !prepared.snapshot.matches(&work.client.root)
+            || !Self::same_client(&prepared.client, &work.client) { return Ok(false); }
+        if prepared.pair == work.layout.pair
+            || self.render_pool_clients.iter().any(|(pool, _)| *pool == prepared.pair) { return Ok(true); }
+        self.render_pool_clients.push((prepared.pair, prepared.client), GFP_KERNEL)?;
+        Ok(true)
+    }
     pub(super) fn independent_render_roots(&self) -> bool {
         self.independent_compute_enabled()
             && *crate::module_parameters::partial_independent_owner.value() == 1
@@ -491,6 +561,13 @@ impl Session {
         }
         let work = self.render.as_mut().ok_or(EINVAL)?;
         let service = work.growth.as_ref().ok_or(EINVAL)?;
+        if let Some(incoming) = &mut replacement {
+            if pair == work.layout.pair {
+                work.client.root.absorb_spare_tables(&mut incoming.root)?;
+            } else if let Some((_, installed)) = self.render_pool_clients.iter_mut().find(|(pool,_)| *pool == pair) {
+                installed.root.absorb_spare_tables(&mut incoming.root)?;
+            }
+        }
         let queued = !service.pools.get(pair as usize).ok_or(EIO)?.retired;
         if queued {
             let desired = replacement.as_ref().unwrap_or(&work.client);

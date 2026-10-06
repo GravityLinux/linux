@@ -150,7 +150,8 @@ programs. `g17p-drm-async` bypasses that adapter for submission and proves
 unsignaled acceptance, copied commands, same-queue ordering, independent-queue
 progress, binary/timeline completion and dependency error recovery. Its backend
 mode holds 16 accepted jobs beyond two seconds, destroys their queues, closes
-output GEM handles, checks pending VM_UNBIND returns EBUSY, interrupts a UAPI
+output GEM handles, checks logical VM_UNBIND succeeds while accepted work retains its immutable
+mapping snapshot, interrupts a UAPI
 wait, then verifies every output and independent completion fence. The close
 mode closes the DRM file before signaling the accepted job's imported input.
 
@@ -748,3 +749,73 @@ remains retained. No unit tests are needed.
 while the other application's render remains pending. Independent pool-local
 scratch leases permit the geometry change without clearing live scratch.
 The same full-image/fence/timestamp and retained overlap checks apply.
+
+### Logical unbind and CPU concurrency qualification
+
+`g17p-drm-unbind-pending 256` keeps an accepted command behind an imported
+input fence while unbinding its mapping and timestamp alias, partially unbinding
+a second BO alias and rebinding the same DVA to distinct backing. Independent
+work and the new mapping must complete first; the original command then writes
+only its old backing. All output, guard, timestamp, binary and timeline values
+are checked. `--input-error` closes the unsignaled producer instead: the old
+command must fail with ENOENT and leave every old output/timestamp unchanged.
+
+`g17p-drm-render-unbind 32` removes eight output mappings and the timestamp
+alias while a render fence is pending, admits a second queue with different
+backing at the same DVAs, and checks both complete old/new images and all four
+GPU timestamps and guards. GPU timestamp overlap is reported per round.
+
+`g17p-drm-cpu-parallel prepare` uses three independent queues/VMs. With boot
+parameter `asahi_neo.cpu_prepare_pause_queue=2`, one queue's private preparation
+is deliberately paused for two seconds outside the device mutex. Queue 3 must
+complete within 1.5 seconds while queue 2's fence remains pending. `cache` uses
+`asahi_neo.cpu_cache_pause_grid=32` to pause CPU visibility after GPU retirement;
+another owner must complete before the first fence can signal. Both compare
+complete output and timestamp/guard regions. These diagnostic parameters are
+disabled by default. Render-owner and contention measurements supplement these
+fixtures before the runtime-mutex checklist item can be marked complete.
+
+
+`render-prepare` and `render-cache` extend the same pause test to render
+owners. The first uses `asahi_neo.cpu_prepare_pause_queue=2`; the second uses
+`asahi_neo.cpu_cache_pause_grid=1` for the fragment owner. Complete old/new
+images, owned timestamps and guards must pass alongside independent compute
+completion before the two-second pause ends.
+
+`g17p-drm-submission-contention` runs the retained 48-job pressure oracle
+without logical unbind so that a driver with broad unbind guards can run the
+identical workload. Use fresh matching baseline/candidate boots with
+`asahi_neo.submission_log=3`. Compare all `RUNTIME_INTERVAL` phases together
+and `SUBMIT_PUBLICATION` latency; the latter includes the deliberate imported
+input-fence delay. The 48-job publication span measures only the released
+burst. Keep the one-time cold firmware bootstrap separate when interpreting
+the bulk-work comparison. Every own output/image/guard and binary/timeline
+fence must pass; timing without those checks is not qualification.
+
+`g17p-drm-compute-reconfiguration` alternates 320 submissions between two
+DRM files at colliding DVAs. It checks every own and inactive output, guard,
+sentinel and retained timestamp across repeated owner cleanup/re-registration,
+context reuse and finite transport rollover. It uses the same generated
+`g17p_drm_workload.h` as `g17p-drm-compute-vm`; GPU programs are unchanged.
+
+`g17p-drm-gpu-dependencies rcrc 16` and `rrcc 16`, with optional `--split`,
+queue 32 long prefix renders with distinct output backing before the mixed
+tail. Every complete image, owned fence/timestamp and guard is checked; an
+unrelated ready compute must finish while the final producer remains pending.
+With `asahi_neo.firmware_dependencies=1`, publication logs must additionally
+prove native dependent publication before producer retirement. That parameter
+is diagnostic and disabled by default. `error 1` requires `tvb_max_blocks=8`
+and both `first_render_fragment_sync_grow=1` and `repeat_fragment_sync_grow=1`:
+an actual owned type7 must fail producer/consumer fences and leave consumer
+output/timestamps untouched. This cancellation oracle currently fails; do
+not treat correct fence errors or normal-only passes as completion of native
+dependency qualification. Independent compute context receiver slots must be distinct from render pools.
+The old fixed slot2 collided with render pool2. Using compute grids32..91
+as receiver slots passes fresh RRCC/RCRC combined/split runs (80 strict rounds)
+and accumulated contention48 twice plus compute320 and mixed48. Engine bits,
+event-record counter kind, firmware milestones and physical backing are unchanged.
+This fixes the normal mixed failure; the cancellation oracle remains open.
+
+`g17p-drm-gpu-dependencies-control` is an output-only diagnostic variant. It
+records missing overlap without aborting, while preserving every data/fence/
+timestamp assertion. Its passes do not qualify strict asynchronous scheduling.

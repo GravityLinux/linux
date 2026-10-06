@@ -503,6 +503,13 @@ impl Item {
                 count += 1;
             }
         }
+        // Keep the native queue/value-list order: foreign waits precede
+        // the receiving grid's own previous-value point.
+        let own_grid = self.layout.grids[kind.index() as usize] as u8;
+        let own = points[..count].iter().position(|point| point.0 == own_grid).ok_or(c::Error::Invalid)?;
+        let own_point = points[own];
+        points[own..count].rotate_left(1);
+        points[count - 1] = own_point;
         graph::Context {
             kind,
             descriptor: self.descriptor_address(kind),

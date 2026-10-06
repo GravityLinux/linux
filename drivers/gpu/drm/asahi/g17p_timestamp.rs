@@ -28,6 +28,35 @@ struct Alias {
     fences: KVec<Fence>,
     unbound: bool,
 }
+/// Exact BO/cache-line ownership, detached from mutable alias registration.
+/// The accepted command fence keeps the firmware alias leased until this
+/// CPU visibility work finishes, including logical unbind and GEM close.
+pub(crate) struct Cache {
+    lines: KVec<(ARef<Object>, usize)>,
+}
+impl Cache {
+    pub(crate) fn run(&self, invalidate: bool) -> Result {
+        super::g17p_memory::sync();
+        for (bo, offset) in &self.lines {
+            let map = bo.vmap::<u8>()?;
+            if map.is_iomem() { return Err(EINVAL); }
+            let pointer = map.ptr_from_index(*offset)?;
+            // SAFETY: The pinned GEM owns this checked complete cache line.
+            // Invalidation occurs only after this command's verified GPU
+            // retirement; no unsubmitted or unrelated BO line is discarded.
+            unsafe {
+                if invalidate {
+                    core::arch::asm!("dc ivac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
+                } else {
+                    core::arch::asm!("dc civac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
+                }
+            }
+        }
+        super::g17p_memory::sync();
+        Ok(())
+    }
+}
+
 pub(crate) struct Registry {
     aliases: KVec<Alias>,
 }
@@ -153,8 +182,18 @@ impl Registry {
         Ok(())
     }
 
-    /// Retain the actual command's fence before either producer is exposed.
+    /// Acquire the alias lease while the frontend still owns its bound token.
+    pub(crate) fn admit(&mut self, addresses: &[u64], fence: &Fence) -> Result {
+        self.retain_checked(addresses, fence, true)
+    }
+
+    /// Accepted work may register after logical unbind. Its admission fence
+    /// prevents this alias from being removed or recycled in the meantime.
     pub(crate) fn retain(&mut self, addresses: &[u64], fence: &Fence) -> Result {
+        self.retain_checked(addresses, fence, false)
+    }
+
+    fn retain_checked(&mut self, addresses: &[u64], fence: &Fence, bound: bool) -> Result {
         let mut indices = KVec::new();
         for &address in addresses {
             if address == 0 {
@@ -164,7 +203,7 @@ impl Registry {
                 .aliases
                 .iter()
                 .position(|a| {
-                    !a.unbound
+                    (!bound || !a.unbound)
                         && address >= a.address
                         && address
                             .checked_add(8)
@@ -179,7 +218,9 @@ impl Registry {
             self.aliases[index].fences.reserve(1, GFP_KERNEL)?;
         }
         for index in indices {
-            self.aliases[index].fences.push(fence.clone(), GFP_KERNEL)?;
+            if !self.aliases[index].fences.iter().any(|f| f.raw() == fence.raw()) {
+                self.aliases[index].fences.push(fence.clone(), GFP_KERNEL)?;
+            }
         }
         Ok(())
     }
@@ -196,40 +237,22 @@ impl Registry {
         }
     }
 
-    pub(crate) fn cache(&self, addresses: [u64; 2], invalidate: bool) -> Result {
-        super::g17p_memory::sync();
-        for address in addresses {
-            if address == 0 {
-                continue;
-            }
-            let alias = self
-                .aliases
-                .iter()
-                .find(|a| {
-                    address >= a.address
-                        && address
-                            .checked_add(8)
-                            .is_some_and(|e| e <= a.address + a.size)
-                })
+    pub(crate) fn cache_seed(&self, addresses: &[u64]) -> Result<Cache> {
+        let mut lines = KVec::with_capacity(addresses.len(), GFP_KERNEL)?;
+        for &address in addresses {
+            if address == 0 { continue; }
+            let alias = self.aliases.iter().find(|a| address >= a.address
+                && address.checked_add(8).is_some_and(|e| e <= a.address + a.size))
                 .ok_or(EINVAL)?;
-            let map = alias.bo.vmap::<u8>()?;
-            if map.is_iomem() {
-                return Err(EINVAL);
-            }
             let offset = (alias.offset + address - alias.address) as usize & !63;
-            let pointer = map.ptr_from_index(offset)?;
-            // SAFETY: The selected complete cache line lies in pinned,
-            // page-aligned GEM RAM. Invalidate only after a clean and verified
-            // GPU completion. Unrelated BO lines are not discarded.
-            unsafe {
-                if invalidate {
-                    core::arch::asm!("dc ivac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
-                } else {
-                    core::arch::asm!("dc civac, {p}", p=in(reg)pointer, options(nostack,preserves_flags));
-                }
+            if !lines.iter().any(|(bo, at): &(ARef<Object>, usize)|
+                core::ptr::eq(&**bo, &*alias.bo) && *at == offset) {
+                lines.push((alias.bo.clone(), offset), GFP_KERNEL)?;
             }
         }
-        super::g17p_memory::sync();
-        Ok(())
+        Ok(Cache { lines })
+    }
+    pub(crate) fn cache(&self, addresses: [u64; 2], invalidate: bool) -> Result {
+        self.cache_seed(&addresses)?.run(invalidate)
     }
 }
