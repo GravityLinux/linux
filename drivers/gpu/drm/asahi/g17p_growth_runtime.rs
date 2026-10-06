@@ -26,6 +26,7 @@ pub(crate) enum Action {
         refused: bool,
     },
     Limit,
+    LimitReply { queue: u64, stamp: u32 },
 }
 /// Owned analogue of GrowthService's pool_counters, pool_storage and work_owners.
 pub(crate) struct Pool {
@@ -48,6 +49,7 @@ pub(crate) struct Pool {
     fragment: u64,
     fragment_event: u32,
     terminal_mask: u32,
+    initial_limit_reply: Option<(u64, u32)>,
     // Every retained initial and newly allocated TVB leaf, for root admission.
     mappings: KVec<(u64, u64)>,
 }
@@ -66,6 +68,7 @@ struct WorkOwner {
     work: [u64; 2],
     counter_baseline: u32,
     limit_report: Option<[u8; 0x48]>,
+    limit_reply: Option<(u64, u32)>,
 }
 pub(crate) struct Service {
     work_owners: KVec<WorkOwner>,
@@ -220,6 +223,7 @@ impl Service {
                 fragment: 0,
                 fragment_event: layout.grids[1],
                 terminal_mask: (1 << layout.grids[0]) | (1 << layout.grids[1]),
+                initial_limit_reply: None,
                 mappings: Self::initial_mappings(memory, vm, list, root)?,
             },
             GFP_KERNEL,
@@ -388,11 +392,12 @@ impl Service {
             self.work_owners.push(WorkOwner { token: WorkToken { pool: pool_id,
                 root: pool.root, generation: pool.generation, fragment: pool.fragment,
                 event: pool.fragment_event }, work: pool.work,
-                counter_baseline: pool.counter_baseline, limit_report: pool.limit_report }, GFP_KERNEL)?;
+                counter_baseline: pool.counter_baseline, limit_report: pool.limit_report,
+                limit_reply: pool.initial_limit_reply }, GFP_KERNEL)?;
         }
         self.work_owners.push(WorkOwner { token: WorkToken { pool: pool_id,
             root: pool.root, generation, fragment, event }, work,
-            counter_baseline: pool.counter, limit_report: None }, GFP_KERNEL)?;
+            counter_baseline: pool.counter, limit_report: None, limit_reply: None }, GFP_KERNEL)?;
         let was_retired = pool.retired;
         pool.generation = generation;
         pool.counter_baseline = pool.counter;
@@ -401,7 +406,28 @@ impl Service {
         pool.work = work;
         pool.fragment = fragment;
         pool.fragment_event = event;
+        pool.initial_limit_reply = None;
         self.active_pool = index;
+        Ok(())
+    }
+    /// Bind the Source queue and descriptor stamp before publishing either
+    /// render half. Reports may identify this owner, never select its storage.
+    pub(crate) fn bind_limit_reply(&mut self, fragment: u64, queue: u64, stamp: u32) -> Result {
+        g::limit_reply(queue, stamp).ok_or(EINVAL)?;
+        let token = self.work_token()?;
+        if token.fragment != fragment { return Err(EINVAL); }
+        if let Some(owner) = self.work_owners.iter_mut().find(|owner| owner.token == token) {
+            if owner.limit_reply.is_some() || owner.limit_report.is_some() { return Err(EIO); }
+            owner.limit_reply = Some((queue, stamp));
+        } else {
+            // Cold G17PFirstRender retains its identity directly in Pool.
+            // Appended work uses WorkOwner and may never take this fallback.
+            let pool = &mut self.pools[self.active_pool];
+            if pool.generation != 0 || pool.counter != 0 || pool.limit_report.is_some()
+                || self.work_owners.iter().any(|owner| owner.token.pool == pool.identity.pool)
+                || pool.initial_limit_reply.is_some() { return Err(EIO); }
+            pool.initial_limit_reply = Some((queue, stamp));
+        }
         Ok(())
     }
     pub(crate) fn work_token(&self) -> Result<WorkToken> {
@@ -579,6 +605,7 @@ impl Service {
                 fragment: super::g17p_render_lifecycle::DESCRIPTORS[1],
                 fragment_event: 1,
                 terminal_mask: 3,
+                initial_limit_reply: None,
                 generation: 0,
                 counter_baseline: 0,
                 retired: false,
@@ -831,6 +858,27 @@ impl Service {
             }
             let index = matched.ok_or(EIO)?;
             let pool = &self.pools[index];
+            let reply = if *crate::module_parameters::native_limit_reply.value() == 1 {
+                let mut identity = None;
+                for owner in &self.work_owners {
+                    if owner.token.pool == pool.identity.pool && owner.limit_report.is_none()
+                        && pool.identity.limit(&body, &owner.work, owner.token.fragment, owner.token.event).is_some() {
+                        if identity.replace(owner.limit_reply.ok_or(EIO)?).is_some() { return Err(EIO); }
+                    }
+                }
+                if identity.is_none() && !self.work_owners.iter().any(|owner| owner.token.pool == pool.identity.pool)
+                    && pool.identity.limit(&body, &pool.work, pool.fragment, pool.fragment_event).is_some() {
+                    identity = pool.initial_limit_reply;
+                }
+                let (queue, stamp) = identity.ok_or(EIO)?;
+                let head = word(memory, vm, self.command.states[0])?;
+                let slot = word(memory, vm, self.command.states[2])?;
+                if head >= 256 || slot >= 256 { return Err(EIO); }
+                if (slot + 1) & 255 == head { return Ok(Action::Idle); }
+                let command = g::limit_reply(queue, stamp).ok_or(EIO)?;
+                vm.write(memory, 2, self.command.ring + slot as u64 * 0x40, &command)?;
+                Some((queue, stamp, slot))
+            } else { None };
             for owner in &mut self.work_owners {
                 if owner.token.pool == pool.identity.pool && owner.limit_report.is_none()
                     && pool.identity.limit(&body, &owner.work, owner.token.fragment, owner.token.event).is_some() {
@@ -839,8 +887,14 @@ impl Service {
             }
             self.pools[index].limited = true;
             self.pools[index].limit_report = Some(body);
-            // Qualified consume-only closure: no command or doorbell.
+            // Default remains the qualified consume-only closure. The
+            // observed native type9 diagnostic publishes only an owned reply.
             self.consume(memory, vm, next)?;
+            if let Some((queue, stamp, slot)) = reply {
+                vm.write(memory, 2, self.command.states[2], &((slot + 1) & 255).to_le_bytes())?;
+                g17p_memory::sync();
+                return Ok(Action::LimitReply { queue, stamp });
+            }
             return Ok(Action::Limit);
         }
         if opcode == 4 {

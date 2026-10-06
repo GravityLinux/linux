@@ -1211,7 +1211,7 @@ impl Session {
         };
         let available = |pair: &u32| !self.render_preparing(*pair) && frames.iter().all(|frame| frame.ticket.item.layout.pair != *pair)
             && !self.render_cpu_leases.iter().any(|(pool, fence)| pool == pair
-                && unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } <= 0)
+                && unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0)
             && (!self.independent_render_roots() || *pair == 0
                 || self.render_pool_asids[*pair as usize] != 0
                 || self.independent_compute.asid_mask() != u64::MAX);
@@ -1792,6 +1792,17 @@ impl Session {
                 self.memory.as_mut().ok_or(EINVAL)?, self.vm.as_mut().ok_or(EINVAL)?)?;
         }
         self.inject_owned_render_fault(parameters)?;
+        if self.native.is_none() && *crate::module_parameters::native_limit_reply.value() == 1 {
+            let work = self.render.as_mut().ok_or(EIO)?;
+            if work.ordinal == 0 {
+                let memory = self.memory.as_ref().ok_or(EIO)?;
+                let vm = self.vm.as_ref().ok_or(EIO)?;
+                let fragment = super::g17p_render_lifecycle::DESCRIPTORS[1];
+                let stamp = memory.read_firmware32(vm.physical(memory, 2, fragment + 0x470)?)?;
+                if stamp != memory.read_firmware32(vm.physical(memory, 2, fragment + 0x47c)?)? { return Err(EIO); }
+                work.growth.as_mut().ok_or(EIO)?.bind_limit_reply(fragment, work.layout.queues[1], stamp)?;
+            }
+        }
         ticket = render::Ticket::capture(self.render.as_ref().ok_or(EINVAL)?, self.native.is_none())?;
         for bo in ticket.client.buffers() {
             self.retain_source_backing(bo)?;
@@ -1898,6 +1909,11 @@ impl Session {
             match action {
                 Action::Idle => break,
                 Action::Consumed => (),
+                Action::LimitReply { queue, stamp } => {
+                    self.peers[0].rtkit.as_mut().ok_or(EINVAL)?.as_mut()
+                        .send_message(0x21, 0x0084000000000011)?;
+                    dev_info!(dev, "G17P: native render error reply queue {:#x} stamp {:#x}\n", queue, stamp);
+                }
                 Action::Limit => {
                     dev_info!(
                         dev,
@@ -2867,8 +2883,12 @@ impl Session {
     /// The caller must release the device mutex before executing this list.
     pub(crate) fn poll_work_deferred(&mut self, dev: &kernel::device::Device,
         image: &Image) -> (Result<bool>, KVec<Completion>) {
+        // Both successful and errored signaled fences release this scheduling
+        // lease. These are already-retired GPU tickets or joined consumer
+        // completions; keeping a negative fence exhausts all render pools.
+        // Physical published backing remains Memory-owned until shutdown.
         self.render_cpu_leases.retain(|(_, fence)|
-            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } <= 0);
+            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0);
         self.defer_cache = true;
         let result = self.poll_work(dev, image);
         self.defer_cache = false;

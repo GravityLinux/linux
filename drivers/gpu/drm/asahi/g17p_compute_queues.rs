@@ -528,9 +528,14 @@ impl Queues {
 }
 impl Queue {
     fn idle(&self) -> bool {
+        // Own receipt fences signal after transport/status retirement. A
+        // consumer Point signals after its own receipt retires (including
+        // joined producer errors), or after rejection before publication.
+        // Session-wide failure prevents further publication separately.
+        // Match stage() reaping: a terminal negative lease is not pending.
         self.fences
             .iter()
-            .all(|f| unsafe { kernel::bindings::dma_fence_get_status(f.raw()) } > 0)
+            .all(|f| unsafe { kernel::bindings::dma_fence_get_status(f.raw()) } != 0)
     }
     fn matches(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> bool {
         self.key == key

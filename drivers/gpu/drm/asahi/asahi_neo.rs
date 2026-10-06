@@ -186,6 +186,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Qualification diagnostic: publish cross-owner command dependencies in firmware; zero retains qualified error handling",
         },
+        native_limit_reply: u32 {
+            default: 0,
+            description: "Qualification diagnostic: reply to an owned render memory-limit report with the observed native type9 command",
+        },
         first_render_fragment_sync_grow: u32 {
             default: 2,
             description: "Source first-render fragment sync-grow diagnostic: 0 or 1, 2 retains the caller default",
