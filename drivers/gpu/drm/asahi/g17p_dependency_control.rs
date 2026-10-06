@@ -120,6 +120,10 @@ impl<'a, N: Notifications> Host<'a, N> {
                 Action::Limit => {
                     self.limit_seen = true;
                 }
+                Action::LimitReply { .. } => {
+                    self.limit_seen = true;
+                    self.notifications.send(release::CONTROL_DOORBELL)?;
+                }
                 Action::Reply { .. } => {
                     self.notifications.send(release::CONTROL_DOORBELL)?;
                 }

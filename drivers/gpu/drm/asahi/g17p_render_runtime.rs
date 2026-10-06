@@ -1819,6 +1819,15 @@ pub(crate) fn stage_next_prepared(
             item.ordinal,
             queued,
         )?;
+        if *crate::module_parameters::native_limit_reply.value() == 1 {
+            let fragment = &objects[1][0].body;
+            let stamp = u32::from_le_bytes(fragment[0x470..0x474].try_into().unwrap());
+            if stamp != u32::from_le_bytes(fragment[0x47c..0x480].try_into().unwrap()) {
+                return Err(EIO);
+            }
+            service.bind_limit_reply(item.descriptor_address(Kind::Fragment),
+                work.layout.queues[1], stamp)?;
+        }
     } else if !work.layout.native {
         return Err(EINVAL);
     }

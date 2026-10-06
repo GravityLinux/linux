@@ -95,6 +95,20 @@ pub(crate) fn fatal(body: &[u8]) -> bool {
     body.len() == 0x48 && u32_at(body, 0) == 4 && body[4..].iter().all(|v| *v == 0)
 }
 
+/// Native RID1 type9, observed for separate- and combined-command-buffer
+/// memoryless failures. Queue/stamp come from the retained Source descriptor;
+/// the report callback cookie is never dereferenced or echoed. This replies
+/// to a render error and does not promise cancellation of dependent work.
+pub(crate) fn limit_reply(queue: u64, stamp: u32) -> Option<[u8; 64]> {
+    if queue == 0 || queue & 0xf != 0 || stamp == 0 { return None; }
+    let mut out = [0; 64];
+    out[..4].copy_from_slice(&9u32.to_le_bytes());
+    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[8..16].copy_from_slice(&queue.to_le_bytes());
+    out[16..24].copy_from_slice(&u64::from(stamp).to_le_bytes());
+    Some(out)
+}
+
 pub(crate) fn block_id(va: u64) -> Option<u64> {
     if va < CONTEXT_BASE || va % UNIT != 0 || va.checked_add(BLOCK)? > 1 << 42 {
         return None;

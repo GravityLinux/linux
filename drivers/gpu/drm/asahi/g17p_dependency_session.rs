@@ -380,6 +380,10 @@ impl Session {
                 Action::Limit => {
                     native.limited = true;
                 }
+                Action::LimitReply { .. } => {
+                    native.limited = true;
+                    transport.send(release::CONTROL_DOORBELL)?;
+                }
                 Action::Reply { .. } => {
                     transport.send(release::CONTROL_DOORBELL)?;
                 }
