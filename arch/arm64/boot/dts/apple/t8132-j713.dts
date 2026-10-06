@@ -19,6 +19,8 @@
 
 	aliases {
 		keyboard = &keyboard;
+		/* m1n1 maps the iBoot-provided MTP segments through this alias. */
+		mtp = &mtp;
 	};
 
 	led-controller {
@@ -63,7 +65,13 @@
 	status = "okay";
 };
 
+/*
+ * The firmware-owned display CPU domain is locked on T8132; referencing it
+ * holds simpledrm back until the deferred-probe timeout. Use the managed
+ * display FE domain, as J773g does.
+ */
 &framebuffer0 {
+	power-domains = <&ps_disp_fe>, <&ps_dptx_phy>;
 	panel = <&panel>;
 	post-init-providers = <&panel>;
 };
