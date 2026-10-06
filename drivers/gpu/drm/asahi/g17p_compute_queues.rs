@@ -30,7 +30,7 @@ const LOW_BASE: u64 = 0x7200000000;
 const STRIDE: u64 = 0x200000;
 
 pub(crate) type Key = (u64, u32);
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Layout {
     high: u64,
     low: u64,
@@ -111,6 +111,131 @@ impl Layout {
     }
 }
 
+/// Immutable physical-owner/ordinal seed. Descriptor serialization takes
+/// no firmware or caller memory borrow, and runs outside the runtime mutex.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparationSeed {
+    layout: Layout,
+    key: Key,
+    ordinal: u32,
+    parameters: Parameters,
+    priority: u32,
+    dependencies: [(u8, u32); 3],
+    dependency_count: usize,
+    optional: bool,
+    first: bool,
+}
+pub(crate) struct PreparedWork {
+    seed: PreparationSeed,
+    descriptor: KVVec<u8>,
+    context: KVVec<u8>,
+    optional: Option<[u8; 0xc0]>,
+}
+impl PreparationSeed {
+    pub(crate) fn prepare(self) -> Result<KBox<PreparedWork>> {
+        let l = self.layout;
+        let ordinal = self.ordinal;
+        let slot = ordinal % RECORDS;
+        let p = &self.parameters;
+        let dependencies = &self.dependencies[..self.dependency_count];
+        let descriptor = l.descriptor(ordinal % 240);
+        let low = l.descriptor_low(ordinal % 240);
+        let dispatch = l.dispatch(slot);
+        let status = [l.status(slot), l.status(slot) + 8];
+        let regs = c::Program {
+            preempt: p.preempt + u64::from(slot) * 0x78000,
+            cdm: p.cdm,
+            identity: 0x0200020803000247u64 + u64::from(ordinal) * 0x200000001,
+            context: u32::from(l.asid),
+            ordinal,
+            robustness: p.preempt + 0x100000 + u64::from(slot) * 0x40,
+            // The operand allocator state belongs to this queue/root,
+            // not to the alternating per-command preemption save areas.
+            operand_state: 0x7000220000,
+            usc_exec_base: c::USC_EXEC_BASE,
+            helper_binary: 0,
+            helper_data: 0,
+            helper_cfg: 0,
+            execution_gate: 1,
+        }
+        .build()
+        .map_err(|_| EINVAL)?;
+        let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
+        page.resize(PAGE, 0, GFP_KERNEL)?;
+        c::Descriptor {
+            scheduler: l.scheduler(slot),
+            low_alias: low,
+            cdm_terminator: p.end.checked_sub(4).ok_or(EINVAL)?,
+            sequence: u64::from(ordinal),
+            context: u32::from(l.asid),
+            grid: u32::from(l.grid),
+            dispatch,
+            status,
+            timestamps: p.timestamps,
+            shared_control: l.support(),
+            zero_page: l.completion_scratch(slot),
+            support_control: 0xe0a00001,
+            support_flags: 0,
+            ordinal,
+            queue_submission: ordinal + 1,
+            queue_ordinal: 0,
+            submission_index: ordinal + 1,
+            sampler_array: p.sampler,
+            sampler_count: p.sampler_count,
+        }
+        .build(&mut page, &regs)
+        .map_err(|_| EINVAL)?;
+        let descriptor_body = page;
+        let mut page = KVVec::with_capacity(0x200, GFP_KERNEL)?;
+        page.resize(0x200, 0, GFP_KERNEL)?;
+        c::Context {
+            descriptor,
+            queue: l.queue(),
+            grid: u32::from(l.grid),
+            flags: 0x1000000000000000,
+            // Keep receiver slots disjoint from all render pools. Compute grids begin
+            // at 32; use the corresponding free event slot instead of the
+            // legacy fixed slot 2 shared by every independent compute owner.
+            // This is the receiver event slot, separate from the root ASID.
+            word_220: 0xffff080000000001 | (u64::from(l.grid) << 32),
+            word_330: 0,
+            word_338: 8,
+            word_350: 0x0001100000000000 | ((low + 0x40) >> 5),
+            word_358: 0x0000200000000000 | ((low + 0x760) >> 5),
+            word_378: 0x003fffffffffffff,
+            item_index: ordinal,
+            points: None,
+            event_slot: None,
+            completion: None,
+        }
+        .build(&mut page[..0x200])
+        .map_err(|_| EINVAL)?;
+        c::context_dependencies(&mut page[..0x200], dependencies).map_err(|_| EINVAL)?;
+        let context_body = page;
+        let optional_body = if self.optional {
+            Some(c::Optional {
+                context_low: l.context_low(),
+                context_high: l.context(),
+                grid: u32::from(l.grid),
+                ordinal: 0x29,
+                shared_control: l.support(),
+                channel_control: l.control(),
+                uuid: 0x200 + u32::from(l.grid),
+                field_46: 0,
+                field_1e: 2,
+                field_32: u32::from(l.asid),
+                field_56: 2,
+                field_5e: 2,
+                first: self.first,
+                item_index: ordinal,
+            }
+            .build())
+        } else { None };
+        Ok(KBox::new(PreparedWork { seed: self, descriptor: descriptor_body,
+            context: context_body, optional: optional_body }, GFP_KERNEL)?)
+    }
+}
+
 pub(crate) struct Ticket {
     pub(crate) client: ClientLease,
     pub(crate) publication: q::Publication,
@@ -180,6 +305,13 @@ impl Queues {
     pub(crate) fn pending(&self) -> bool {
         self.owners.iter().any(|q| !q.idle())
     }
+    pub(crate) fn retain_dependency(&mut self, grid: u8, fence: &Fence) -> Result<bool> {
+        let Some(queue) = self.owners.iter_mut().find(|queue| queue.layout.grid == grid) else { return Ok(false); };
+        if !queue.fences.iter().any(|held| held.raw() == fence.raw()) {
+            queue.fences.push(fence.clone(), GFP_KERNEL)?;
+        }
+        Ok(true)
+    }
     pub(crate) fn require_owner_idle(&self, owner: (u64, u32)) -> Result {
         if self
             .owners
@@ -234,6 +366,29 @@ impl Queues {
     }
     pub(crate) fn selected_grid(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<u8> {
         self.choose(key, client, p, priority).map(|index| FIRST_GRID + index as u8)
+    }
+    pub(crate) fn preparation_seed(&self, key: Key, client: &Client,
+        p: &Parameters, priority: u32, dependencies: &[(u8, u32)]) -> Result<Option<PreparationSeed>> {
+        if dependencies.len() > 3 { return Err(EINVAL); }
+        let Some(index) = self.choose(key, client, p, priority) else { return Ok(None); };
+        let (layout, ordinal, optional, first) = if let Some(q) = self.owners.get(index) {
+            (q.layout, q.count, q.needs_optional || !q.matches(key, client, p, priority),
+                q.count == 0 || q.needs_first || q.reconfiguration.is_some())
+        } else {
+            (Layout::new(index, self.free_asid().ok_or(EBUSY)?)?, 0, true, true)
+        };
+        let mut points = [(0, 0); 3];
+        points[..dependencies.len()].copy_from_slice(dependencies);
+        Ok(Some(PreparationSeed { layout, key, ordinal, parameters: *p, priority,
+            dependencies: points, dependency_count: dependencies.len(), optional, first }))
+    }
+    pub(crate) fn prepared_matches(&self, plan: &PreparedWork, key: Key, client: &Client,
+        p: &Parameters, priority: u32, dependencies: &[(u8,u32)]) -> Result<bool> {
+        Ok(self.preparation_seed(key, client, p, priority, dependencies)? == Some(plan.seed))
+    }
+    pub(crate) fn needs_private(&self, key: Key, client: &Client, p: &Parameters,
+        priority: u32) -> bool {
+        self.choose(key, client, p, priority).is_some_and(|i| i == self.owners.len())
     }
     pub(crate) fn can_stage(
         &self,
@@ -312,6 +467,8 @@ impl Queues {
         channel: Channel,
         key: Key,
         mut client: Option<Client>,
+        private_prepared: bool,
+        prepared: KBox<PreparedWork>,
         reference: &Client,
         p: &Parameters,
         priority: u32,
@@ -329,6 +486,7 @@ impl Queues {
                 client.take().ok_or(EINVAL)?,
                 p,
                 priority,
+                private_prepared,
             )?;
             self.owners.push(queue, GFP_KERNEL)?;
             self.owners[index].install(memory, ttbs)?;
@@ -362,7 +520,7 @@ impl Queues {
                 queue.rotate(memory, vm).inspect_err(|e| pr_err!("G17P: compute rotate grid {} error {:?}\n",queue.layout.grid,e))?;
             }
         }
-        self.owners[index].stage(memory, vm, channel, index, p, dependencies, fence)
+        self.owners[index].stage(memory, vm, channel, index, p, dependencies, prepared, fence)
             .inspect_err(|e| pr_err!("G17P: compute build grid {} error {:?}\n",self.owners[index].layout.grid,e))
     }
 }
@@ -391,11 +549,14 @@ impl Queue {
         vm: &mut Vm,
         layout: Layout,
         key: Key,
-        mut client: Client,
+        client: Client,
         p: &Parameters,
         priority: u32,
+        private_prepared: bool,
     ) -> Result<Self> {
-        runtime::build_independent_client(memory, &mut client, p)?;
+        // The ordinary worker constructs the large operand/save allocations
+        // outside publication locking, then transfers their retained ownership.
+        if !private_prepared { return Err(EIO); }
         for (address, size) in [
             (layout.queue(), PAGE),
             (layout.pointers(), PAGE),
@@ -537,7 +698,7 @@ impl Queue {
         vm: &Vm,
         ttbs: u64,
         key: Key,
-        client: Client,
+        mut client: Client,
         p: &Parameters,
         priority: u32,
     ) -> Result {
@@ -596,6 +757,7 @@ impl Queue {
                 }
             }
         }
+        self.client.root.absorb_spare_tables(&mut client.root)?;
         self.client
             .prepare_rebind(&client, false, &[self.layout.asid], &private)?
             .commit();
@@ -637,6 +799,7 @@ impl Queue {
         index: usize,
         p: &Parameters,
         dependencies: &[(u8, u32)],
+        prepared: KBox<PreparedWork>,
         fence: Fence,
     ) -> Result<Ticket> {
         self.fences
@@ -689,90 +852,16 @@ impl Queue {
             vm.write(memory, 2, address, &[0; 8])?;
         }
         vm.write(memory, 2, status[0], &[0; 16])?;
-        let regs = c::Program {
-            preempt: p.preempt + u64::from(slot) * 0x78000,
-            cdm: p.cdm,
-            identity: 0x0200020803000247u64 + u64::from(ordinal) * 0x200000001,
-            context: u32::from(l.asid),
-            ordinal,
-            robustness: p.preempt + 0x100000 + u64::from(slot) * 0x40,
-            // The operand allocator state belongs to this queue/root,
-            // not to the alternating per-command preemption save areas.
-            operand_state: 0x7000220000,
-            usc_exec_base: c::USC_EXEC_BASE,
-            helper_binary: 0,
-            helper_data: 0,
-            helper_cfg: 0,
-            execution_gate: 1,
-        }
-        .build()
-        .map_err(|_| EINVAL)?;
-        let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
-        page.resize(PAGE, 0, GFP_KERNEL)?;
-        c::Descriptor {
-            scheduler: l.scheduler(slot),
-            low_alias: low,
-            cdm_terminator: p.end.checked_sub(4).ok_or(EINVAL)?,
-            sequence: u64::from(ordinal),
-            context: u32::from(l.asid),
-            grid: u32::from(l.grid),
-            dispatch,
-            status,
-            timestamps: p.timestamps,
-            shared_control: l.support(),
-            zero_page: l.completion_scratch(slot),
-            support_control: 0xe0a00001,
-            support_flags: 0,
-            ordinal,
-            queue_submission: ordinal + 1,
-            queue_ordinal: 0,
-            submission_index: ordinal + 1,
-            sampler_array: p.sampler,
-            sampler_count: p.sampler_count,
-        }
-        .build(&mut page, &regs)
-        .map_err(|_| EINVAL)?;
-        vm.write(memory, 2, descriptor, &page[..0x1000])?;
-        c::Context {
-            descriptor,
-            queue: l.queue(),
-            grid: u32::from(l.grid),
-            flags: 0x1000000000000000,
-            word_220: 0xffff080200000001,
-            word_330: 0,
-            word_338: 8,
-            word_350: 0x0001100000000000 | ((low + 0x40) >> 5),
-            word_358: 0x0000200000000000 | ((low + 0x760) >> 5),
-            word_378: 0x003fffffffffffff,
-            item_index: ordinal,
-            points: None,
-            event_slot: None,
-            completion: None,
-        }
-        .build(&mut page[..0x200])
-        .map_err(|_| EINVAL)?;
-        c::context_dependencies(&mut page[..0x200], dependencies).map_err(|_| EINVAL)?;
+        let seed = &prepared.seed;
+        if seed.layout != l || seed.key != self.key || seed.ordinal != ordinal
+            || seed.parameters != *p || seed.priority != self.priority
+            || seed.optional != self.needs_optional || seed.first != (ordinal == 0 || self.needs_first)
+            || &seed.dependencies[..seed.dependency_count] != dependencies { return Err(EIO); }
+        vm.write(memory, 2, descriptor, &prepared.descriptor[..0x1000])?;
         let context = l.context() + c::context_offset(ordinal, RECORDS).map_err(|_| EINVAL)? as u64;
-        runtime::write_context_item(memory, vm, context, &page[..0x200], ordinal >= RECORDS - 1)?;
-        if self.needs_optional {
-            let optional = c::Optional {
-                context_low: l.context_low(),
-                context_high: l.context(),
-                grid: u32::from(l.grid),
-                ordinal: 0x29,
-                shared_control: l.support(),
-                channel_control: l.control(),
-                uuid: 0x200 + u32::from(l.grid),
-                field_46: 0,
-                field_1e: 2,
-                field_32: u32::from(l.asid),
-                field_56: 2,
-                field_5e: 2,
-                first: ordinal == 0 || self.needs_first,
-                item_index: ordinal,
-            }
-            .build();
-            vm.write(memory, 2, l.optional(), &optional)?;
+        runtime::write_context_item(memory, vm, context, &prepared.context, ordinal >= RECORDS - 1)?;
+        if let Some(optional) = &prepared.optional {
+            vm.write(memory, 2, l.optional(), optional)?;
         }
         vm.flush_tables(memory)?;
         // New firmware aliases are global mappings in context zero.
@@ -785,7 +874,8 @@ impl Queue {
                 options(nostack, preserves_flags)
             );
         }
-        self.client.cache(false)?;
+        // Caller vmap validation and timestamp visibility were prepared
+        // outside the runtime lock before seed revalidation above.
         let client = self.client.lease()?;
         let initial = [descriptor, l.optional(), l.event(slot)];
         let retained = [descriptor, l.event(slot)];

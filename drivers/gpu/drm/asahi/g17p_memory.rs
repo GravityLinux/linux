@@ -4,7 +4,7 @@
 //! Does not treat firmware physical addresses as kernel direct-map pointers.
 
 use super::{g17p_platform::Platform, g17p_topology};
-use kernel::{bindings, c_str, device, io::mem, io::resource::Resource, page, prelude::*, rbtree::{RBTree, RBTreeNodeReservation}};
+use kernel::{bindings, c_str, device, io::mem, io::resource::Resource, page, prelude::*, rbtree::{RBTree, RBTreeNodeReservation}, sync::Arc};
 
 const PAGE: usize = 0x4000;
 
@@ -13,6 +13,45 @@ struct Allocation {
     base: u64,
     size: usize,
     order: u32,
+}
+
+// SAFETY: Allocation metadata is immutable. Page access is performed only
+// through checked spans whose runtime owner excludes overlapping GPU/CPU use.
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
+
+/// Pins allocated scratch backing for a CPU task outside the session lock.
+/// Construction checks physical ownership; the render preparation reservation
+/// separately proves this exact span has no live firmware reader or writer.
+pub(crate) struct ZeroSpan {
+    _allocation: Arc<Allocation>,
+    address: u64,
+    size: usize,
+}
+impl ZeroSpan {
+    pub(crate) fn clear(&mut self) {
+        let base = self.address & !(PAGE as u64 - 1);
+        // SAFETY: The Arc retains the allocation and the checked one-page span.
+        let page = unsafe { page::Page::borrow_phys_unchecked(&base) };
+        page.with_page_mapped(|p| {
+            // SAFETY: zero_span checked offset and size within this page.
+            let start = unsafe { p.add((self.address - base) as usize) };
+            sync();
+            for at in ((start as usize) & !63..start as usize + self.size).step_by(64) {
+                // SAFETY: Checked cache lines lie in this owned RAM page.
+                unsafe { core::arch::asm!("dc ivac, {at}", at=in(reg)at, options(nostack,preserves_flags)); }
+            }
+            sync();
+            // SAFETY: The selected render reservation exclusively owns these
+            // retired scratch bytes until publication revalidation completes.
+            unsafe { start.write_bytes(0, self.size); }
+            for at in ((start as usize) & !63..start as usize + self.size).step_by(64) {
+                // SAFETY: Same owned RAM lines as above; publish the zeroes.
+                unsafe { core::arch::asm!("dc civac, {at}", at=in(reg)at, options(nostack,preserves_flags)); }
+            }
+            sync();
+        });
+    }
 }
 
 impl Drop for Allocation {
@@ -33,10 +72,14 @@ pub(crate) struct Memory {
     // Match the M1/M2/M4 firmware heap policy: backing only grows while the
     // session is live. Retiring objects or reusing ring slots never removes
     // allocations here. Pages are released only after session shutdown.
-    allocations: KVec<Allocation>,
+    allocations: KVec<Arc<Allocation>>,
     // Exclusive physical ends index the permanently retained, disjoint
     // allocations. Access checks remain exact while avoiding a heap scan.
     allocation_ends: RBTree<u64, usize>,
+    prepared_blocks: KVec<(usize,u64)>,
+    prepared_growth: bool,
+    growth_refused: bool,
+    growth_waiting: bool,
 }
 
 /// A checked aligned word in RAM retained by this Memory owner. The immutable
@@ -152,12 +195,51 @@ impl Memory {
         })
     }
 
+    pub(crate) fn zero_span(&self, address: u64, size: usize) -> Result<ZeroSpan> {
+        if size == 0 || (address as usize & (PAGE - 1)) + size > PAGE { return Err(EINVAL); }
+        let end = address.checked_add(size as u64).ok_or(EOVERFLOW)?;
+        let cursor = self.allocation_ends.cursor_lower_bound(&end).ok_or(EINVAL)?;
+        let allocation = &self.allocations[*cursor.current().1];
+        if address < allocation.base || end > allocation.base + allocation.size as u64 { return Err(EINVAL); }
+        Ok(ZeroSpan { _allocation: allocation.clone(), address, size })
+    }
+
+    /// Private, unpublished storage can be constructed by an independent
+    /// worker without borrowing the session heap or its shared mappings.
+    pub(crate) fn detached() -> Self {
+        Self { mappings: KVec::new(), allocations: KVec::new(), allocation_ends: RBTree::new(),
+            prepared_blocks: KVec::new(), prepared_growth: false, growth_refused: false, growth_waiting: false }
+    }
+    /// Transfer all backing before publishing a root that references it.
+    /// Retain physical pages for the rest of the session, as with its other
+    /// GPU allocations. Reuse the detached ownership-index nodes verbatim.
+    pub(crate) fn absorb(&mut self, mut other: Self) -> Result {
+        if !other.mappings.is_empty() { return Err(EINVAL); }
+        self.prepared_blocks.reserve(other.prepared_blocks.len(), GFP_KERNEL)?;
+        let offset = self.allocations.len();
+        offset.checked_add(other.allocations.len()).ok_or(EOVERFLOW)?;
+        self.allocations.reserve(other.allocations.len(), GFP_KERNEL)?;
+        for allocation in other.allocations.drain(..) {
+            self.allocations.push(allocation, GFP_KERNEL).expect("reserved allocation transfer");
+        }
+        for block in other.prepared_blocks.drain(..) {
+            self.prepared_blocks.push(block, GFP_KERNEL).expect("reserved prepared-block transfer");
+        }
+        while let Some(cursor) = other.allocation_ends.cursor_front_mut() {
+            let (&end, &index) = cursor.current();
+            let (_, node) = cursor.remove_current();
+            self.allocation_ends.insert(node.into_reservation().into_node(end, index + offset));
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(dev: &device::Device, platform: &Platform) -> Result<Self> {
         let node = dev.of_node().ok_or(ENODEV)?;
         let mut memory = Self {
             mappings: KVec::new(),
             allocations: KVec::new(),
             allocation_ends: RBTree::new(),
+            prepared_blocks: KVec::new(), prepared_growth: false, growth_refused: false, growth_waiting: false,
         };
         for (index, name) in [
             c_str!("ttbs"),
@@ -229,7 +311,35 @@ impl Memory {
         }))
     }
 
+    pub(crate) fn prepared_count(&self, size: usize) -> usize {
+        self.prepared_blocks.iter().filter(|(bytes,_)| *bytes == size).count()
+    }
+    pub(crate) fn prepare_blocks(&mut self, size: usize, count: usize) -> Result {
+        self.prepared_blocks.reserve(count, GFP_KERNEL)?;
+        for _ in 0..count {
+            // Newly allocated blocks are zeroed and cleaned off-lock. Only
+            // the ownership transfer and checked PTE publication remain.
+            let pa = self.allocate_new(size)?;
+            self.clean(pa, size)?;
+            self.prepared_blocks.push((size,pa), GFP_KERNEL)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_growth_mode(&mut self) { self.prepared_growth = true; self.growth_waiting = false; }
+    pub(crate) fn refuse_growth(&mut self, refused: bool) { self.growth_refused = refused; }
+    pub(crate) fn growth_waiting(&self) -> bool { self.growth_waiting }
     pub(crate) fn allocate(&mut self, size: usize) -> Result<u64> {
+        if let Some(index) = self.prepared_blocks.iter().position(|(bytes,_)| *bytes == size) {
+            return Ok(self.prepared_blocks.remove(index).map_err(|_| EIO)?.1);
+        }
+        if self.prepared_growth && size == super::g17p_growth::INCREMENT * super::g17p_growth::BLOCK as usize {
+            if self.growth_refused { return Err(ENOMEM); }
+            self.growth_waiting = true;
+            return Err(EAGAIN);
+        }
+        self.allocate_new(size)
+    }
+    fn allocate_new(&mut self, size: usize) -> Result<u64> {
         if page::PAGE_SIZE != PAGE || size == 0 || size % PAGE != 0 {
             return Err(EINVAL);
         }
@@ -239,19 +349,24 @@ impl Memory {
         let node = RBTreeNodeReservation::new(GFP_KERNEL)?;
         // SAFETY: Standard allocator call; the resulting owner frees exactly
         // this order. All pages are cleared before any firmware publication.
-        let ptr = unsafe { bindings::alloc_pages(bindings::GFP_KERNEL, order) };
+        // GPU backing has a normal ENOMEM path. Do not invoke the OOM
+        // killer while immutable snapshots pin every candidate page; this
+        // remains true for speculative off-lock private preparations.
+        let flags = bindings::GFP_KERNEL | bindings::__GFP_NOWARN
+            | (1 << bindings::___GFP_NORETRY_BIT);
+        let ptr = unsafe { bindings::alloc_pages(flags, order) };
         if ptr.is_null() {
             return Err(ENOMEM);
         }
         // SAFETY: Successful alloc_pages returned a live page descriptor.
         let base = unsafe { bindings::page_to_phys(ptr) };
         self.allocations.push(
-            Allocation {
+            Arc::new(Allocation {
                 page: ptr,
                 base,
                 size: pages * PAGE,
                 order,
-            },
+            }, GFP_KERNEL)?,
             GFP_KERNEL,
         )?;
         // Node and vector capacity were reserved before acquiring pages;

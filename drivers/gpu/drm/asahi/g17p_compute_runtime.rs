@@ -71,6 +71,10 @@ pub(crate) struct ClientLease {
     cpu_maps: CpuMaps,
 }
 impl ClientLease {
+    pub(crate) fn matches_lease(&self, other: &Self) -> bool {
+        self.buffers.len() == other.buffers.len()
+            && self.buffers.iter().zip(&other.buffers).all(|(a,b)| core::ptr::eq(&**a, &**b))
+    }
     pub(crate) fn buffers(&self) -> &[ARef<Object>] { &self.buffers }
     pub(crate) fn matches_buffers(&self, owner: &Client) -> bool {
         self.buffers.len() == owner.buffers.len() && self.buffers.iter()
@@ -190,7 +194,8 @@ impl Client {
     pub(crate) fn rebind(&mut self, next: Self, render: bool) -> Result {
         self.rebind_contexts(next, render, if render { &[1] } else { &[1, 2, 3] })
     }
-    pub(crate) fn rebind_contexts(&mut self, next: Self, render: bool, contexts: &[u16]) -> Result {
+    pub(crate) fn rebind_contexts(&mut self, mut next: Self, render: bool, contexts: &[u16]) -> Result {
+        self.root.absorb_spare_tables(&mut next.root)?;
         self.prepare_rebind(&next, render, contexts, &[])?.commit();
         self.adopt_rebound(next);
         Ok(())
@@ -218,68 +223,74 @@ impl Client {
                 base
             }
         };
-        let mut changes: KVec<(u64, u64, u64)> = KVec::new();
+        // Group old caller leaves, private transfers and incoming caller
+        // leaves by VA. The previous per-leaf linear searches made a mapping
+        // replacement quadratic in the number of pages while holding shared
+        // publication state. The sorted merge keeps every collision check.
+        let mut rows: KVec<(u64, u8, u64, u64)> = KVec::new();
         for &(base, size, _, _) in &self.bindings {
             for offset in (0..size).step_by(PAGE) {
                 let va = address(base) + offset;
                 let old = self.root.pte(va)?;
-                if old == 0 {
-                    pr_err!("G17P: rebind missing old caller owner {:?} next {:?} va {:#x}\n",self.owner,next.owner,va);
-                    return Err(EIO);
-                }
-                changes.push((va, old, 0), GFP_KERNEL)?;
+                if old == 0 { return Err(EIO); }
+                rows.push((va, 0, old, 0), GFP_KERNEL)?;
             }
         }
-        // Source _mirror_compute_vm replaces completed bootstrap mappings.
-        // Robustness state already has its retained reserved-aperture aliases;
-        // retire only the two recorded primer leaves before caller admission.
-        // Their backing remains owned by Session through the final ASID flush.
         if let Some(aliases) = self.primer_aliases {
             for (va, expected) in aliases {
-                if expected == 0 || self.root.pte(va)? != expected {
-                    pr_err!("G17P: rebind primer mismatch owner {:?} va {:#x} expected {:#x} actual {:#x}\n",self.owner,va,expected,self.root.pte(va)?);
-                    return Err(EIO);
-                }
-                changes.push((va, expected, 0), GFP_KERNEL)?;
+                if expected == 0 || self.root.pte(va)? != expected { return Err(EIO); }
+                rows.push((va, 0, expected, 0), GFP_KERNEL)?;
             }
         }
-        // Merge a checked private transfer with removal of the previous
-        // caller. A new reserved leaf may replace a retiring old caller leaf;
-        // a new caller may occupy a retired private VA, never its new VA.
-        for &(va, old, new) in private {
-            if let Some(row) = changes.iter_mut().find(|r| r.0 == va) {
-                if row.1 != old || row.2 != 0 {
-                    return Err(EBUSY);
-                }
-                row.2 = new;
-            } else {
-                changes.push((va, old, new), GFP_KERNEL)?;
-            }
-        }
+        for &(va, old, new) in private { rows.push((va, 1, old, new), GFP_KERNEL)?; }
         for &(base, size, _, _) in &next.bindings {
             for offset in (0..size).step_by(PAGE) {
                 let va = address(base) + offset;
                 let new = next.root.pte(va)?;
-                if new == 0 {
-                    pr_err!("G17P: rebind missing new caller owner {:?} next {:?} va {:#x}\n",self.owner,next.owner,va);
-                    return Err(EIO);
-                }
-                if let Some(row) = changes.iter_mut().find(|r| r.0 == va) {
-                    if row.2 != 0 {
-                        return Err(EINVAL);
-                    }
-                    row.2 = new;
-                } else {
-                    // Never replace a private/growth leaf on an addition.
-                    let prior = self.root.pte(va)?;
-                    if prior != 0 {
-                        pr_err!("G17P: caller rebind collision owner {:?} next {:?} render {} contexts {:?} va {:#x} prior {:#x} new {:#x}\n",
-                            self.owner, next.owner, render, contexts, va, prior, new);
-                        return Err(EBUSY);
-                    }
-                    changes.push((va, 0, new), GFP_KERNEL)?;
+                if new == 0 { return Err(EIO); }
+                rows.push((va, 2, self.root.pte(va)?, new), GFP_KERNEL)?;
+            }
+        }
+        rows.sort_unstable_by_key(|row| (row.0, row.1));
+        let mut changes: KVec<(u64, u64, u64)> = KVec::with_capacity(rows.len(), GFP_KERNEL)?;
+        let mut first = 0;
+        while first < rows.len() {
+            let va = rows[first].0;
+            let mut end = first + 1;
+            while end < rows.len() && rows[end].0 == va { end += 1; }
+            let mut merged: Option<(u64, u64)> = None;
+            for &(_, kind, old, new) in &rows[first..end] {
+                match kind {
+                    0 => { if merged.is_some() { return Err(EINVAL); } merged = Some((old, 0)); }
+                    1 => match &mut merged {
+                        Some(row) => {
+                            if row.0 != old || row.1 != 0 { return Err(EBUSY); }
+                            row.1 = new;
+                        }
+                        None => merged = Some((old, new)),
+                    },
+                    2 => match &mut merged {
+                        Some(row) => {
+                            if row.0 != old || row.1 != 0 { return Err(EINVAL); }
+                            row.1 = new;
+                        }
+                        None => {
+                            // New caller mappings must not overwrite any
+                            // retained private/growth leaf.
+                            if old != 0 {
+                                pr_err!("G17P: caller rebind collision owner {:?} next {:?} render {} contexts {:?} va {:#x} prior {:#x} new {:#x}\n",
+                                    self.owner, next.owner, render, contexts, va, old, new);
+                                return Err(EBUSY);
+                            }
+                            merged = Some((0, new));
+                        }
+                    },
+                    _ => return Err(EIO),
                 }
             }
+            let (old, new) = merged.ok_or(EIO)?;
+            changes.push((va, old, new), GFP_KERNEL)?;
+            first = end;
         }
         // Execution is quiescent here. Reuse exact Object mappings across
         // binding generations; only next.buffers are maintained by cache().
@@ -329,6 +340,7 @@ fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps
         Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Parameters {
     pub(crate) preempt: u64,
     pub(crate) cdm: u64,

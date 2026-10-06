@@ -8,6 +8,38 @@ use super::{admission, Command, Device, Prepared, Runtime};
 use super::super::{g17p_boot::{ComputeReceipt, RenderReceipt}, g17p_sync};
 use kernel::{bindings, dma_fence::{Fence, RawDmaFence}, new_mutex, prelude::*, sync::{Arc, Mutex}};
 
+static PREPARATION_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Source timing is opt-in; default execution performs no timing/logging.
+// Every interval starts only after its corresponding device-lock acquisition.
+struct RuntimeInterval {
+    started: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+    wait_ns: i64,
+    key: super::super::g17p_compute_queues::Key,
+    phase: &'static str,
+}
+impl RuntimeInterval {
+    fn waiting() -> Option<kernel::time::Instant<kernel::time::Monotonic>> {
+        (*crate::module_parameters::submission_log.value() >= 3)
+            .then(kernel::time::Instant::now)
+    }
+    fn acquired(before: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+        key: super::super::g17p_compute_queues::Key, phase: &'static str) -> Self {
+        Self { wait_ns: before.as_ref().map(|t| t.elapsed().as_nanos()).unwrap_or(0),
+            started: before.map(|_| kernel::time::Instant::now()), key, phase }
+    }
+}
+impl Drop for RuntimeInterval {
+    fn drop(&mut self) {
+        if let Some(started) = &self.started {
+            pr_info!("G17P: RUNTIME_INTERVAL queue {:?} phase {} wait_ns {} hold_ns {}\n",
+                self.key, self.phase, self.wait_ns, started.elapsed().as_nanos());
+        }
+    }
+}
+
+static SUBMISSION_PROFILE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 pub(super) type History = [Option<Arc<Point>>; 2];
 
 fn status(fence: &Fence) -> i32 {
@@ -40,6 +72,10 @@ pub(super) struct Point {
     previous: Mutex<Option<Arc<Point>>>,
     publication: Fence,
     completion: Fence,
+    // Fence references preserve producer errors without a recursive Point DAG.
+    // Hardware publication uses milestones; CPU completion joins only the
+    // dependency results before authorizing a successful userspace fence.
+    dependencies: [Option<Fence>; 2],
     #[pin]
     receipt: Mutex<Option<Receipt>>,
 }
@@ -62,10 +98,10 @@ impl PinnedDrop for Point {
     }
 }
 impl Point {
-    fn new(previous: Option<Arc<Point>>) -> Result<Arc<Self>> {
+    fn new(previous: Option<Arc<Point>>, dependencies: [Option<Fence>; 2]) -> Result<Arc<Self>> {
         Arc::pin_init(try_pin_init!(Self {
             previous<-new_mutex!(previous), publication:g17p_sync::work_fence()?, completion:g17p_sync::work_fence()?,
-            receipt<-new_mutex!(None),
+            dependencies, receipt<-new_mutex!(None),
         }),GFP_KERNEL)
     }
     fn finish(&self, error: Option<Error>) {
@@ -80,8 +116,24 @@ impl Point {
         let held = self.receipt.lock();
         if let Some(receipt) = held.as_ref() {
             let completed = status(receipt.fence());
-            if completed != 0 {
-                self.finish((completed < 0).then(|| Error::from_errno(completed)));
+            if completed < 0 {
+                self.finish(Some(Error::from_errno(completed)));
+            } else if completed > 0 {
+                let mut pending = false;
+                let mut error = None;
+                for fence in self.dependencies.iter().flatten() {
+                    let state = status(fence);
+                    pending |= state == 0;
+                    if state < 0 { error.get_or_insert(Error::from_errno(state)); }
+                }
+                if error.is_some() || !pending { self.finish(error); }
+                else {
+                    // The GPU consumer retired, but producer error attribution
+                    // may still be making CPU-visible results available. Do
+                    // not turn an unresolved/failed producer into success.
+                    self.previous.lock().take();
+                    self.publication.signal();
+                }
             } else if receipt.published() {
                 self.previous.lock().take();
                 self.publication.signal();
@@ -123,6 +175,13 @@ impl Point {
         if completed != 0 { return Ok(Some(None)); }
         if retire { return Ok(None); }
         let held = self.receipt.lock();
+        // A Point can remain unresolved while its own GPU receipt has already
+        // retired: userspace success still joins producer error attribution.
+        // That join does not pin this Point's retired firmware context. Never
+        // encode its old grid/value after the physical owner can be reused.
+        if held.as_ref().is_some_and(|r| status(r.fence()) > 0) {
+            return Ok(Some(None));
+        }
         Ok(held.as_ref().filter(|r| r.published()).and_then(|r| r.milestone(stage)).map(Some))
     }
 }
@@ -137,6 +196,8 @@ pub(super) struct Schedule {
     nodes: KVec<Node>,
     tail: History,
     control_waiting: bool,
+    submission_started: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+    profile_id: u64,
 }
 impl Schedule {
     pub(super) fn enabled() -> bool {
@@ -144,7 +205,7 @@ impl Schedule {
             && *crate::module_parameters::native_compute_vms.value() == 0
             && *crate::module_parameters::native_barriers.value() == 0
     }
-    pub(super) fn new(commands: &[Command], barriers: &[[u16;2]], seed: History) -> Result<Self> {
+    pub(super) fn new(commands: &[Command], barriers: &[[u16;2]], seed: History, submission_started: Option<kernel::time::Instant<kernel::time::Monotonic>>) -> Result<Self> {
         let seed = seed.map(Point::accepted_history);
         let mut nodes: KVec<Node> = KVec::with_capacity(commands.len(),GFP_KERNEL)?;
         let mut tail = seed.clone();
@@ -163,11 +224,13 @@ impl Schedule {
                     }
                 };
             }
-            let point = Point::new(tail[engine].clone())?;
+            let dependency_fences = dependencies.each_ref().map(|point|
+                point.as_ref().map(|point| point.completion.clone()));
+            let point = Point::new(tail[engine].clone(), dependency_fences)?;
             nodes.push(Node {point:point.clone(),previous:tail[engine].clone(),dependencies,staged:false},GFP_KERNEL)?;
             tail[engine] = Some(point);
         }
-        Ok(Self {nodes,tail,control_waiting:false})
+        Ok(Self {nodes,tail,control_waiting:false,submission_started,profile_id: if submission_started.is_some() { SUBMISSION_PROFILE_ID.fetch_add(1,core::sync::atomic::Ordering::Relaxed) } else { 0 }})
     }
     pub(super) fn control_waiting(&self) -> bool { self.control_waiting }
     pub(super) fn tail(&self) -> History { self.tail.clone() }
@@ -208,12 +271,94 @@ impl Schedule {
         runtime.session.begin_submission(&sync.fence(),&addresses)
     }
     fn replacement(snapshot: &admission::Snapshot,
-                   old: Option<&super::super::g17p_compute_runtime::Client>, render: bool)
-                   -> Result<Option<super::super::g17p_compute_runtime::Client>> {
-        if snapshot.same_client(old) { return Ok(None); }
-        let mut client = snapshot.deferred_client()?;
-        snapshot.materialize(&mut client,render)?;
-        Ok(Some(client))
+                   old: Option<&super::super::g17p_compute_runtime::Client>,
+                   prepared: &mut Option<super::super::g17p_compute_runtime::Client>)
+                   -> Result<(bool, Option<super::super::g17p_compute_runtime::Client>)> {
+        // Another worker may have changed the selected owner since the seed
+        // was captured. Recheck under publication locking. A missing private
+        // preparation retries only this node; never allocate/copy a tree here.
+        if snapshot.same_client(old) { return Ok((true, None)); }
+        let Some(client) = prepared.take() else { return Ok((false, None)); };
+        if !snapshot.same_client(Some(&client)) { return Err(EIO); }
+        Ok((true, Some(client)))
+    }
+    fn prepare_clients(&self, dev: &Device, prepared: &mut Prepared) -> Result {
+        let mut considered = [false; 2];
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.staged || status(&node.point.completion) != 0 { continue; }
+            let command = &prepared.parameters[index];
+            let engine = usize::from(matches!(command, Command::Compute(_)));
+            if considered[engine] { continue; }
+            if !matches!(Self::dependencies(node, command), Ok(Some(_))) { continue; }
+            considered[engine] = true;
+            let snapshot = if engine == 0 { prepared.render_snapshot.as_ref() } else { prepared.compute_snapshot.as_ref() }
+                .ok_or(EIO)?;
+            let (needed, private, cache) = {
+                let preparation_wait = RuntimeInterval::waiting();
+                let held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                let runtime = Option::as_ref(&*held).ok_or(ENODEV)?;
+                let (old, private) = match command {
+                    Command::Render(_) => (runtime.session.render_client()?, false),
+                    Command::Compute(p) if runtime.session.independent_compute_enabled() =>
+                        (runtime.session.independent_compute_client(prepared.queue_key, snapshot.client(), p, prepared.queue_priority),
+                         runtime.session.compute_needs_private(prepared.queue_key, snapshot.client(), p, prepared.queue_priority)),
+                    Command::Compute(_) => (runtime.session.compute_client()?, false),
+                };
+                let selected = if let Command::Render(p) = command {
+                    let mut parameters = *p;
+                    parameters.queue_owner = Some(prepared.queue_key);
+                    runtime.session.render_selected_client(snapshot.client(), &parameters)?
+                } else { old };
+                (!snapshot.same_client(old) || !snapshot.same_client(selected), private,
+                    selected.map(|client| client.cpu_maps.clone()))
+            };
+            let slot = if engine == 0 { &mut prepared.render_client } else { &mut prepared.compute_client };
+            if slot.is_none() && needed {
+                if *crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
+                    && !PREPARATION_PAUSED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                    pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} outside_runtime_lock\n", prepared.queue_key);
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
+                    pr_info!("G17P: CPU_PREPARE_PAUSE_END queue {:?} outside_runtime_lock\n", prepared.queue_key);
+                }
+                let mut client = snapshot.deferred_client()?;
+                snapshot.materialize(&mut client, engine == 0)?;
+                let extra = match command {
+                    Command::Render(p) => super::super::g17p_render_runtime::scratch_table_budget(p)?,
+                    // The fixed Source private save-state shape, including
+                    // an unaligned aperture and its upper parent table.
+                    Command::Compute(_) => (256 * 0x78000 + (1 << 25) - 1) / (1 << 25) + 2,
+                };
+                client.root.prepare_spare_tables(client.root.table_count().checked_add(extra).ok_or(EOVERFLOW)?)?;
+                client.cache(false)?;
+                *slot = Some(client);
+            }
+            if needed {
+                if let (Some(client), Some(cache)) = (slot.as_ref(), cache.as_ref()) {
+                    // Populate the selected installed owner's retained maps
+                    // before its short PTE commit. Rebind then needs no vmap
+                    // allocation while holding the device mutex.
+                    client.cache_with(false, cache)?;
+                }
+            }
+            if engine == 1 && !private && prepared.compute_storage.is_some() {
+                // A competing worker may have installed/released an owner
+                // while this job built speculative private backing. Neither
+                // the pages nor their scratch PTEs were published. Drop both
+                // outside locking; a later new-owner plan rematerializes its
+                // immutable caller tree before allocating private leaves.
+                drop(slot.take());
+                drop(prepared.compute_storage.take());
+            }
+            if private && prepared.compute_storage.is_none() {
+                let Command::Compute(parameters) = command else { return Err(EIO); };
+                let mut memory = super::super::g17p_memory::Memory::detached();
+                super::super::g17p_compute_runtime::build_independent_client(&mut memory,
+                    slot.as_mut().ok_or(EIO)?, parameters)?;
+                prepared.compute_storage = Some(memory);
+            }
+        }
+        Ok(())
     }
     fn dependencies(node: &Node, command: &Command) -> Result<Option<(Option<(u8,u32)>,[Option<(u8,u32)>;2])>> {
         let previous = if let Some(point) = &node.previous {
@@ -232,7 +377,8 @@ impl Schedule {
                 // Keep such chains queued instead of round-tripping through
                 // CPU completion for every short compute command.
                 let queued_compute = matches!(command,Command::Compute(_)) && engine == 1;
-                let Some(value) = point.dependency(1,true,!(early_fragment || queued_compute))? else { return Ok(None); };
+                let queued_firmware = *crate::module_parameters::firmware_dependencies.value() == 1;
+                let Some(value) = point.dependency(1,true,!(early_fragment || queued_compute || queued_firmware))? else { return Ok(None); };
                 dependencies[engine] = value;
             }
         }
@@ -249,18 +395,21 @@ impl Schedule {
             parameters.vdm_dependency=dependencies[0];
             parameters.cdm_dependency=dependencies[1];
             let seed = {
-                let held = dev.runtime.lock();
-                let runtime = Option::as_ref(&*held)?;
+                let preparation_wait = RuntimeInterval::waiting();
+                let mut held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                let runtime = Option::as_mut(&mut *held)?;
                 let snapshot = prepared.render_snapshot.as_ref()?;
-                if !snapshot.same_client(runtime.session.render_client().ok()?) { return None; }
                 if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
-                runtime.session.render_preparation_seed(&parameters,1).ok()??
+                runtime.session.claim_render_preparation(&parameters,snapshot.client()).ok()??
             };
             // CPU allocation/serialization holds neither the device mutex nor
             // a hardware reservation. Commit revalidates the full seed and
             // rebuilds it if another job changed the next item in the meantime.
-            return super::super::g17p_render_runtime::PreparationSeed::prepare(seed)
-                .ok().map(|objects| (index,objects));
+            match super::super::g17p_render_runtime::PreparationSeed::prepare(seed) {
+                Ok(objects) => return Some((index, objects)),
+                Err(error) => { node.point.finish(Some(error)); continue; },
+            }
         }
         None
     }
@@ -277,15 +426,152 @@ impl Schedule {
             runtime.engine_handoff[engine]=Some(node.point.publication.clone());
         }
     }
+    fn prepare_compute(&self, dev: &Device, prepared: &Prepared)
+        -> Result<Option<(usize, KBox<super::super::g17p_compute_queues::PreparedWork>)>> {
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.staged || status(&node.point.completion) != 0 { continue; }
+            let Command::Compute(parameters) = &prepared.parameters[index] else { continue; };
+            // Per-command dependency errors are handled by publication's
+            // scan; one failed dependency must not abort independent nodes.
+            let Ok(Some((previous, dependencies))) = Self::dependencies(node, &prepared.parameters[index]) else { continue; };
+            let mut waits = [(0, 0); 3]; let mut count = 0;
+            for point in [previous, dependencies[0], dependencies[1]].into_iter().flatten() {
+                if !waits[..count].contains(&point) { waits[count] = point; count += 1; }
+            }
+            let (seed, stamps) = {
+                let preparation_wait = RuntimeInterval::waiting();
+                let held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                let runtime = Option::as_ref(&*held).ok_or(ENODEV)?;
+                if !runtime.session.independent_compute_enabled() { return Ok(None); }
+                let snapshot = prepared.compute_snapshot.as_ref().ok_or(EIO)?;
+                (runtime.session.compute_preparation_seed(prepared.queue_key, snapshot.client(),
+                    parameters, prepared.queue_priority, &waits[..count])?,
+                 runtime.session.timestamp_cache_seed(&parameters.timestamps)?)
+            };
+            if let Some(seed) = seed {
+                if let Err(error) = prepared.compute_snapshot.as_ref().ok_or(EIO)?.client().cache(false)
+                    .and_then(|()| stamps.run(false)) {
+                    node.point.finish(Some(error)); continue;
+                }
+                match seed.prepare() {
+                    Ok(objects) => return Ok(Some((index, objects))),
+                    Err(error) => { node.point.finish(Some(error)); continue; },
+                }
+            }
+        }
+        Ok(None)
+    }
+    fn prepare_render_scratch(&self, dev: &Device, prepared: &Prepared) -> Result {
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.staged || status(&node.point.completion) != 0 { continue; }
+            let Command::Render(parameters) = &prepared.parameters[index] else { continue; };
+            if !matches!(Self::dependencies(node, &prepared.parameters[index]), Ok(Some(_))) { continue; }
+            let seed = {
+                let preparation_wait = RuntimeInterval::waiting();
+                let held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                Option::as_ref(&*held).ok_or(ENODEV)?.session.render_scratch_seed(parameters)?
+            };
+            if let Some(seed) = seed {
+                let scratch = match seed.prepare() {
+                    Ok(scratch) => scratch,
+                    Err(error) => { node.point.finish(Some(error)); continue; },
+                };
+                let preparation_wait = RuntimeInterval::waiting();
+                let mut held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                Option::as_mut(&mut *held).ok_or(ENODEV)?.session.commit_render_scratch(scratch)?;
+            }
+        }
+        Ok(())
+    }
+    fn prepare_render_templates(&self, dev: &Device, prepared: &Prepared) -> Result {
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.staged || status(&node.point.completion) != 0 { continue; }
+            let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
+            parameters.queue_owner = Some(prepared.queue_key);
+            if !matches!(Self::dependencies(node, &prepared.parameters[index]), Ok(Some(_))) { continue; }
+            let snapshot = prepared.render_snapshot.as_ref().ok_or(EIO)?;
+            let count = {
+                let preparation_wait = RuntimeInterval::waiting();
+                let held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                Option::as_ref(&*held).ok_or(ENODEV)?.session.render_template_size(snapshot.client(), &parameters)?
+            };
+            let Some(count) = count else { continue; };
+            let storage = super::super::g17p_user_vm::TableStorage::new(count)?;
+            let seed = {
+                let preparation_wait = RuntimeInterval::waiting();
+                let held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                Option::as_ref(&*held).ok_or(ENODEV)?.session.capture_render_template(snapshot.client(), &parameters, storage)?
+            };
+            if let Some(seed) = seed {
+                let template = match seed.prepare() {
+                    Ok(template) => template,
+                    Err(error) => { node.point.finish(Some(error)); continue; },
+                };
+                let preparation_wait = RuntimeInterval::waiting();
+                let mut held = dev.runtime.lock();
+                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                Option::as_mut(&mut *held).ok_or(ENODEV)?.session.commit_render_template(snapshot.client(), &parameters, template)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_shared_backing(&self, dev: &Device) -> Result {
+        let plan = {
+            let preparation_wait = RuntimeInterval::waiting();
+            let held = dev.runtime.lock();
+            let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+            Option::as_ref(&*held).ok_or(ENODEV)?.session.shared_backing_plan()?
+        };
+        if !plan.iter().any(|(_, count)| *count != 0) { return Ok(()); }
+        let mut memory = super::super::g17p_memory::Memory::detached();
+        for (size, count) in plan {
+            if let Err(error) = memory.prepare_blocks(size, count) {
+                if error == ENOMEM {
+                    // Attribute a real backing shortage through the owned
+                    // growth refusal/report protocol; it does not fail an
+                    // unrelated worker that happened to notice the request.
+                    let preparation_wait = RuntimeInterval::waiting();
+                    let mut held = dev.runtime.lock();
+                    let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                    Option::as_mut(&mut *held).ok_or(ENODEV)?.session.shared_backing_refused()?;
+                    drop(_preparation_interval); drop(held); drop(memory); return Ok(());
+                }
+                return Err(error);
+            }
+        }
+        let unused = {
+            let preparation_wait = RuntimeInterval::waiting();
+            let mut held = dev.runtime.lock();
+            let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+            Option::as_mut(&mut *held).ok_or(ENODEV)?.session.commit_shared_backing(memory)?
+        };
+        drop(unused); // Never free unpublished speculative blocks under locking.
+        Ok(())
+    }
+
     pub(super) fn progress(&mut self, dev: &Device, prepared: &mut Prepared,
         sync: &g17p_sync::Plan, initialized: &mut bool, cursor: &mut usize,
         publication: &Fence) -> Result<Option<Option<Error>>> {
         self.control_waiting = false;
         let profile_started = (*crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
-        let mut prepared_append = if *initialized { self.prepare_render(dev,prepared) } else { None };
+        self.prepare_shared_backing(dev)?;
+        self.prepare_clients(dev, prepared)?;
+        self.prepare_render_scratch(dev, prepared)?;
+        self.prepare_render_templates(dev, prepared)?;
+        self.prepare_clients(dev, prepared)?;
+        let mut prepared_compute = self.prepare_compute(dev, prepared)?;
+        let mut prepared_append = self.prepare_render(dev, prepared);
         let seed_us = profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
+        let lock_started = RuntimeInterval::waiting();
         let mut held = dev.runtime.lock();
+        let interval = RuntimeInterval::acquired(lock_started, prepared.queue_key, "retirement");
         let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
         if !*initialized {
             // Experimental native profiles retain their exclusive hardware
@@ -297,14 +583,35 @@ impl Schedule {
             *initialized = true;
             // Metadata lives in immutable snapshots. Per-command activation
             // clones only when the installed engine root actually changes.
-            prepared.render_client = None;
-            prepared.compute_client = None;
         }
         let poll_started = profile_started.as_ref().map(|_| kernel::time::Instant::<kernel::time::Monotonic>::now());
-        if let Err(error) = runtime.session.poll_work(dev.as_ref(),&runtime.image) {
+        let (poll_result, mut completions) = runtime.session.poll_work_deferred(dev.as_ref(), &runtime.image);
+        self.control_waiting |= runtime.session.backing_waiting();
+        if let Err(error) = poll_result {
             runtime.session.notify_failure(error);
             self.fail_unstaged(error);
         }
+        // An independent worker can publish and retire while this worker is
+        // mapping caller BOs or making timestamp writes visible to the CPU.
+        // Owned roots/BOs/alias fences survive both unlock and logical unbind.
+        drop(interval);
+        drop(held);
+        let mut cache_error = None;
+        for completion in &mut completions {
+            if let Err(error) = completion.cache() { cache_error.get_or_insert(error); }
+        }
+        let lock_started = RuntimeInterval::waiting();
+        let mut held = dev.runtime.lock();
+        let _interval = RuntimeInterval::acquired(lock_started, prepared.queue_key, "publication");
+        let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
+        // Release only this worker's private preparation claim under the
+        // publication lock; selection and full plan validation follow here.
+        if let Some((_, plan)) = &mut prepared_append { plan.release_reservation(); }
+        if let Some(error) = cache_error {
+            runtime.session.fail_cpu_completion(error);
+            self.fail_unstaged(error);
+        }
+        for completion in completions { completion.signal(); }
         let poll_us = poll_started.map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         for index in 0..self.nodes.len() {
             let node = &mut self.nodes[index];
@@ -326,11 +633,35 @@ impl Schedule {
                         Self::handoff(runtime,0,node,replacing);
                         return Ok(None);
                     }
-                    let mut client = Self::replacement(snapshot,runtime.session.render_client()?,true)
+                    if runtime.session.render_scratch_seed(&parameters)?.is_some() {
+                        self.control_waiting = true; return Ok(None);
+                    }
+                    if runtime.session.render_template_size(snapshot.client(), &parameters)?.is_some() {
+                        self.control_waiting = true; return Ok(None);
+                    }
+                    // Every ordinary append has an exact off-lock descriptor
+                    // plan. Another worker may change its next ordinal/pool;
+                    // retry this node rather than building bulk objects here.
+                    if runtime.session.render_client()?.is_some() {
+                        let valid = if let Some((i, plan)) = &prepared_append {
+                            *i == index && runtime.session.render_prepared_matches(plan, snapshot.client(), &parameters)?
+                        } else { false };
+                        if !valid { self.control_waiting = true; return Ok(None); }
+                    }
+                    // A matching inactive pool still needs the incoming caller
+                    // identity when another VM is currently selected. Omitting
+                    // it would route the command back to the current caller.
+                    let (ready, mut client) = Self::replacement(snapshot,runtime.session.render_client()?, &mut prepared.render_client)
                         .inspect_err(|e| kernel::dev_err!(dev.as_ref(),"G17P: render fail site replacement {:?}\n",e))?;
+                    if !ready { self.control_waiting = true; return Ok(None); }
                     let objects = if prepared_append.as_ref().is_some_and(|(i,_)| *i==index) {
                         prepared_append.take().map(|(_,objects)| objects)
                     } else { None };
+                    if *crate::module_parameters::firmware_dependencies.value() == 1 {
+                        for point in [previous, dependencies[0], dependencies[1]].into_iter().flatten() {
+                            runtime.session.retain_dependency(point, &node.point.completion)?;
+                        }
+                    }
                     Ok(runtime.session.stage_render_ticket(dev.as_ref(),&runtime.image,&mut client,&parameters,objects)?
                         .map(Receipt::Render))
                 } else {
@@ -346,12 +677,12 @@ impl Schedule {
                         // can occupy CS before the old owner's final dispatch.
                         // Await only those genuine dependencies; independent
                         // nodes/owners continue through the normal scan.
-                        if previous.is_some_and(|p| p.0 != grid) {
+                        if *crate::module_parameters::firmware_dependencies.value() != 1 && previous.is_some_and(|p| p.0 != grid) {
                             if let Some(point) = &node.previous {
                                 if Point::ordered(point,true)?.is_none() { return Ok(None); }
                             }
                         }
-                        if dependencies[1].is_some_and(|p| p.0 != grid) {
+                        if *crate::module_parameters::firmware_dependencies.value() != 1 && dependencies[1].is_some_and(|p| p.0 != grid) {
                             if let Some(point) = &node.dependencies[1] {
                                 if point.dependency(1,true,true)?.is_none() { return Ok(None); }
                             }
@@ -370,10 +701,28 @@ impl Schedule {
                             self.control_waiting |= control_waiting;
                             return Ok(None);
                         }
+                        if runtime.session.compute_needs_private(key, snapshot.client(), parameters, priority)
+                            != prepared.compute_storage.is_some() {
+                            // Re-enter off-lock preparation to allocate or
+                            // discard speculative backing. Never retain an
+                            // unused private heap in the published session.
+                            self.control_waiting = true; return Ok(None);
+                        }
+                        let valid = if let Some((i, objects)) = &prepared_compute {
+                            *i == index && runtime.session.compute_prepared_matches(objects, key,
+                                snapshot.client(), parameters, priority, &waits)?
+                        } else { false };
+                        if !valid { self.control_waiting = true; return Ok(None); }
+                        let objects = prepared_compute.take().ok_or(EIO)?.1;
                         let old=runtime.session.independent_compute_client(key,snapshot.client(),parameters,priority);
-                        let client=Self::replacement(snapshot,old,false)?;
+                        let (ready, client)=Self::replacement(snapshot,old, &mut prepared.compute_client)?;
+                        if !ready { self.control_waiting = true; return Ok(None); }
+                        if *crate::module_parameters::firmware_dependencies.value() == 1 {
+                            for point in &waits { runtime.session.retain_dependency(*point, &node.point.completion)?; }
+                        }
                         return runtime.session.stage_independent_compute(dev.as_ref(),&runtime.image,
-                            key,snapshot.client(),client,parameters,priority,&waits).map(|r|Some(Receipt::Compute(r)));
+                            key,snapshot.client(),client,prepared.compute_storage.take(),objects,parameters,priority,&waits)
+                            .map(|r|Some(Receipt::Compute(r)));
                     }
                     if !Self::preferred(runtime,1,node) { return Ok(None); }
                     if !runtime.session.can_stage_compute(Some(snapshot.client()),parameters)? {
@@ -385,7 +734,8 @@ impl Schedule {
                     for point in [previous,dependencies[0],dependencies[1]].into_iter().flatten() {
                         if !waits.contains(&point) { waits.push(point,GFP_KERNEL)?; }
                     }
-                    let mut client = Self::replacement(snapshot,runtime.session.compute_client()?,false)?;
+                    let (ready, mut client) = Self::replacement(snapshot,runtime.session.compute_client()?, &mut prepared.compute_client)?;
+                    if !ready { self.control_waiting = true; return Ok(None); }
                     Ok(runtime.session.stage_compute_ticket(dev.as_ref(),&runtime.image,&mut client,parameters,&waits)?
                         .map(Receipt::Compute))
                 }
@@ -397,6 +747,10 @@ impl Schedule {
                             kernel::dev_info!(dev.as_ref(),"G17P: render schedule timing ordinal {} seed_us {} poll_us {} total_us {}\n",
                                 render.ordinal,seed_us,poll_us,start.elapsed().as_nanos()/1000);
                         }
+                    }
+                    if let Some(started) = self.submission_started.as_ref() {
+                        pr_info!("G17P: SUBMIT_PUBLICATION id {} queue {:?} node {} latency_ns {}\n",
+                            self.profile_id, prepared.queue_key, index, started.elapsed().as_nanos());
                     }
                     *node.point.receipt.lock() = Some(receipt);
                     node.staged = true;

@@ -342,10 +342,11 @@ pub(crate) fn context_dependencies(out: &mut [u8], dependencies: &[(u8, u32)]) -
     let header = qword(out, 0x20);
     let previous = qword(out, 0x28);
     let mut merged = [(0u8, 0u32); 4];
-    merged[0] = ((previous >> 40) as u8, previous as u32);
-    let mut count = 1;
+    let mut own = ((previous >> 40) as u8, previous as u32);
+    let mut count = 0;
     for &(grid, value) in dependencies {
         if grid >= 128 || value == 0 || value >= 1 << 30 { return Err(Error::Invalid); }
+        if grid == own.0 { own.1 = own.1.max(value); continue; }
         if let Some(existing) = merged[..count].iter_mut().find(|point| point.0 == grid) {
             existing.1 = existing.1.max(value);
         } else {
@@ -353,6 +354,10 @@ pub(crate) fn context_dependencies(out: &mut [u8], dependencies: &[(u8, u32)]) -
             count += 1;
         }
     }
+    // Native consumer-first captures place the receiver's previous-value
+    // point last, after every foreign grid dependency.
+    merged[count] = own;
+    count += 1;
     points(&mut out[0x20..0x130], 8, (header >> 32) as u8, &merged[..count])
 }
 

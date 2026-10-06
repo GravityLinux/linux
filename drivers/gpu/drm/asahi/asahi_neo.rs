@@ -174,6 +174,18 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Successful render/compute submission logs: 0 off for benchmarking, nonzero retains diagnostic evidence",
         },
+        cpu_prepare_pause_queue: u32 {
+            default: 0,
+            description: "Integration diagnostic: pause one private preparation on this public queue for 2 seconds; zero disables",
+        },
+        cpu_cache_pause_grid: u32 {
+            default: 128,
+            description: "Integration diagnostic: pause one retired CPU visibility task on this firmware grid for 2 seconds; 128 disables",
+        },
+        firmware_dependencies: u32 {
+            default: 0,
+            description: "Qualification diagnostic: publish cross-owner command dependencies in firmware; zero retains qualified error handling",
+        },
         first_render_fragment_sync_grow: u32 {
             default: 2,
             description: "Source first-render fragment sync-grow diagnostic: 0 or 1, 2 retains the caller default",

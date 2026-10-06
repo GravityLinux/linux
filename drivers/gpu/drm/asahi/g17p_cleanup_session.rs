@@ -154,6 +154,12 @@ impl Session {
         Ok(())
     }
 
+    /// Frontend admission pins timestamp aliases before ioctl commitment,
+    /// including jobs whose imported input fences are not yet signaled.
+    pub(crate) fn admit_timestamps(&mut self, fence: &Fence, timestamps: &[u64]) -> Result {
+        self.timestamps.as_mut().ok_or(EINVAL)?.admit(timestamps, fence)
+    }
+
     pub(crate) fn begin_submission(&mut self, fence: &Fence, timestamps: &[u64]) -> Result {
         self.cleanup.require_idle()?;
         self.cleanup.failed.reserve(

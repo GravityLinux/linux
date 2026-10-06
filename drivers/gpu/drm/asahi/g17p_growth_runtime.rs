@@ -917,6 +917,10 @@ impl Service {
         }
         let (new, refused) = match self.allocate(memory, vm, root, old, index) {
             Ok(new) => (new, false),
+            // No report credit, command body, counter or producer changes.
+            // An ordinary worker replenishes detached backing off-lock and
+            // retries this exact owned report; independent owners still run.
+            Err(e) if e == EAGAIN => return Ok(Action::Idle),
             Err(e) if e == ENOMEM => (old, true),
             Err(e) => return Err(e),
         };
