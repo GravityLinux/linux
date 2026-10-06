@@ -70,8 +70,14 @@ struct WorkOwner {
     limit_report: Option<[u8; 0x48]>,
     limit_reply: Option<(u64, u32)>,
 }
+struct ErrorReply {
+    token: WorkToken,
+    consumers_before: [u8; 2],
+    producer: u8,
+}
 pub(crate) struct Service {
     work_owners: KVec<WorkOwner>,
+    error_replies: KVec<ErrorReply>,
     command: Channel,
     report: Channel,
     cursor: u32,
@@ -457,10 +463,35 @@ impl Service {
         Ok(self.work_owners.iter().find(|w| w.token == token)
             .map_or(self.pools[index].limit_report.is_some(), |w| w.limit_report.is_some()))
     }
+    /// Retiring a render must also retire its own type9 reply. Other control
+    /// traffic may remain queued; do not require a globally empty channel.
+    pub(crate) fn token_reply_retired(&self, token: WorkToken, memory: &Memory, vm: &Vm) -> Result<bool> {
+        self.token_index(token)?;
+        let Some(reply) = self.error_replies.iter().find(|r| r.token == token) else {
+            return Ok(*crate::module_parameters::native_limit_reply.value() != 1
+                || !self.token_limited(token)?);
+        };
+        let counters = super::g17p_queue::Counters::new([
+            word(memory, vm, self.command.states[0])?,
+            word(memory, vm, self.command.states[1])?,
+            word(memory, vm, self.command.states[2])?,
+        ]).map_err(|_| EIO)?;
+        let retired = (0..2).all(|i| super::g17p_queue::reached(
+            reply.consumers_before[i], counters.0[i], reply.producer,
+        ));
+        if retired && *crate::module_parameters::submission_log.value() != 0 {
+            pr_info!("G17P: render error reply retired pool {} generation {} consumers {:?} before {:?} target {}\n",
+                token.pool, token.generation, [counters.0[0], counters.0[1]], reply.consumers_before, reply.producer);
+        }
+        Ok(retired)
+    }
     pub(crate) fn retire_token(&mut self, token: WorkToken) -> Result {
         let index = self.token_index(token)?;
         if let Some(owner) = self.work_owners.iter().position(|w| w.token == token) {
             self.work_owners.remove(owner).map_err(|_| EIO)?;
+        }
+        if let Some(reply) = self.error_replies.iter().position(|r| r.token == token) {
+            self.error_replies.remove(reply).map_err(|_| EIO)?;
         }
         self.pools[index].retired = !self.work_owners.iter().any(|w| w.token.pool == token.pool);
         Ok(())
@@ -474,6 +505,9 @@ impl Service {
         pool.retired = true;
         while let Some(index) = self.work_owners.iter().position(|owner| owner.token.pool == pool_id) {
             self.work_owners.remove(index).map_err(|_| EIO)?;
+        }
+        while let Some(index) = self.error_replies.iter().position(|r| r.token.pool == pool_id) {
+            self.error_replies.remove(index).map_err(|_| EIO)?;
         }
         Ok(())
     }
@@ -621,6 +655,7 @@ impl Service {
         )?;
         Ok(Self {
             work_owners: KVec::new(),
+            error_replies: KVec::with_capacity(super::g17p_render_lifecycle::POOL_SLOTS as usize, GFP_KERNEL)?,
             command,
             report,
             cursor,
@@ -860,23 +895,38 @@ impl Service {
             let pool = &self.pools[index];
             let reply = if *crate::module_parameters::native_limit_reply.value() == 1 {
                 let mut identity = None;
+                let mut token = None;
                 for owner in &self.work_owners {
                     if owner.token.pool == pool.identity.pool && owner.limit_report.is_none()
                         && pool.identity.limit(&body, &owner.work, owner.token.fragment, owner.token.event).is_some() {
                         if identity.replace(owner.limit_reply.ok_or(EIO)?).is_some() { return Err(EIO); }
+                        token = Some(owner.token);
                     }
                 }
                 if identity.is_none() && !self.work_owners.iter().any(|owner| owner.token.pool == pool.identity.pool)
                     && pool.identity.limit(&body, &pool.work, pool.fragment, pool.fragment_event).is_some() {
                     identity = pool.initial_limit_reply;
+                    token = Some(WorkToken { pool: pool.identity.pool, root: pool.root,
+                        generation: pool.generation, fragment: pool.fragment, event: pool.fragment_event });
                 }
                 let (queue, stamp) = identity.ok_or(EIO)?;
-                let head = word(memory, vm, self.command.states[0])?;
-                let slot = word(memory, vm, self.command.states[2])?;
-                if head >= 256 || slot >= 256 { return Err(EIO); }
-                if (slot + 1) & 255 == head { return Ok(Action::Idle); }
+                let token = token.ok_or(EIO)?;
+                if self.error_replies.iter().any(|r| r.token == token) { return Err(EIO); }
+                let counters = super::g17p_queue::Counters::new([
+                    word(memory, vm, self.command.states[0])?,
+                    word(memory, vm, self.command.states[1])?,
+                    word(memory, vm, self.command.states[2])?,
+                ]).map_err(|_| EIO)?;
+                let slot = match counters.slot() {
+                    Ok(slot) => u32::from(slot),
+                    Err(super::g17p_queue::Error::Full) => return Ok(Action::Idle),
+                    Err(_) => return Err(EIO),
+                };
+                self.error_replies.reserve(1, GFP_KERNEL)?;
                 let command = g::limit_reply(queue, stamp).ok_or(EIO)?;
                 vm.write(memory, 2, self.command.ring + slot as u64 * 0x40, &command)?;
+                self.error_replies.push(ErrorReply { token, consumers_before: [counters.0[0], counters.0[1]],
+                    producer: (slot as u8).wrapping_add(1) }, GFP_KERNEL)?;
                 Some((queue, stamp, slot))
             } else { None };
             for owner in &mut self.work_owners {

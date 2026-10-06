@@ -36,7 +36,8 @@ static void dep_image(unsigned char *image,unsigned target,unsigned triangles)
 int main(int argc,char **argv)
 {
     setbuf(stdout,NULL);CHECK(argc>=2&&argc<=4);
-    int rr=!strcmp(argv[1],"rrcc"),error=!strcmp(argv[1],"error");
+    int rr=!strcmp(argv[1],"rrcc"),retirement=!strcmp(argv[1],"error-retirement");
+    int error=!strcmp(argv[1],"error")||retirement;
     CHECK(rr||error||!strcmp(argv[1],"rcrc"));
     unsigned rounds=argc>=3?(unsigned)strtoul(argv[2],NULL,0):1;CHECK(rounds&&rounds<=64);
     int split=argc==4&&!strcmp(argv[3],"--split");CHECK(argc<4||split);
@@ -100,8 +101,33 @@ int main(int argc,char **argv)
             OK(fd,DRM_IOCTL_SYNCOBJ_WAIT,&w);printf("GPU_DEPENDENCY_ERROR_PRODUCER status=%d\n",status(fd,fences[0]));CHECK(status(fd,fences[0])==-ENOMEM);
             uint32_t consumer=tail_fences[0];w.handles=(uintptr_t)&consumer;w.timeout_nsec=now_ns()+15000000000ULL;
             OK(fd,DRM_IOCTL_SYNCOBJ_WAIT,&w);printf("GPU_DEPENDENCY_ERROR_CONSUMER status=%d\n",status(fd,consumer));CHECK(status(fd,consumer)==-ENOMEM);
-            for(unsigned byte=0;byte<PAGE;byte++)CHECK(((unsigned char *)slow.output[0])[byte]==0xa5);
-            for(unsigned byte=64+count*32;byte<64+count*32+16;byte++)CHECK(slow.ts.map[PAGE+byte]==0xa5);
+            if(!retirement){
+                /* Retain the original cancellation probe. It also fails on
+                 * stock macOS: completion barriers do not promise cancellation. */
+                for(unsigned byte=0;byte<PAGE;byte++)CHECK(((unsigned char *)slow.output[0])[byte]==0xa5);
+                for(unsigned byte=64+count*32;byte<64+count*32+16;byte++)CHECK(slow.ts.map[PAGE+byte]==0xa5);
+            }else{
+                /* A consumer published before a recoverable producer error
+                 * may execute, as observed in both native Metal arrangements.
+                 * If it executes, its authored independent inputs still have
+                 * an exact output oracle; partial writes are never accepted. */
+                int executed=memcmp(slow.output[0],"\xa5\xa5\xa5\xa5",4)!=0;
+                for(unsigned byte=0;byte<PAGE;byte++){
+                    unsigned char want=0xa5;
+                    if(executed&&byte<256){float v=1000.25f+byte/4;unsigned char b[4];memcpy(b,&v,4);want=b[byte%4];}
+                    CHECK(((unsigned char *)slow.output[0])[byte]==want);
+                    CHECK(((unsigned char *)slow.output[1])[byte]==0xa5);
+                }
+                volatile uint64_t *t=(void *)(slow.ts.map+PAGE+64+count*32);
+                if(executed){CHECK(t[0]&&t[0]!=0xa5a5a5a5a5a5a5a5ULL&&t[1]>t[0]);}
+                else for(unsigned byte=0;byte<16;byte++)CHECK(((unsigned char *)t)[byte]==0xa5);
+                for(unsigned byte=0;byte<PAGE*3;byte++){
+                    int producer=byte>=PAGE+64&&byte<PAGE+64+count*32;
+                    int consumer=executed&&byte>=PAGE+64+count*32&&byte<PAGE+64+count*32+16;
+                    if(!producer&&!consumer)CHECK(slow.ts.map[byte]==0xa5);
+                }
+                printf("GPU_DEPENDENCY_ERROR_RETIREMENT round=%u consumer_executed=%d exact_output_and_guards=1 error_fences=1\n",round,executed);
+            }
         }else{
             CHECK(pending==0);
             for(unsigned n=0;n<count;n++)wait_success(fd,fences[n]);
