@@ -108,7 +108,7 @@ impl Platform {
                 $(putf(out, $offset, $value)?;)*
             };
         }
-        let max_scaled = 100 * (self.freq_a.len() as u32 - 1);
+        let max_scaled = 100 * self.max_pstate();
         let maximum = F32::from(self.maximum_power);
         let duty = uint!("gpu-pwr-min-duty-cycle", 40);
         let minimum = uint!("gpu-pwr-integral-min-clamp", 0);
@@ -123,7 +123,7 @@ impl Platform {
             out[0x6f6f + i * 2..0x6f71 + i * 2].copy_from_slice(&i16::MAX.to_le_bytes());
         }
         ints!(0x5384 => self.period_clocks, 0x5388 => self.period_clocks, 0x5d38 => 625);
-        for i in 0..11 {
+        for i in 0..self.states() {
             put32(out, 0x5440 + i * 4, f32!(1.02).to_bits());
         }
         let (alpha, inverse) = coefficients(uint!("gpu-pwr-filter-time-constant", 313))?;
@@ -140,7 +140,7 @@ impl Platform {
         ints!(0x7fc0 => duty, 0x7fc4 => max_scaled);
         floats!(0x7570 => f32!(65536.0), 0x7574 => F32::from(duty), 0x7578 => F32::from(max_scaled),
             0x7598 => f32!(100.0));
-        ints!(0x757c => self.freq_a[10], 0x7590 => duty, 0x759c => max_scaled, 0x7bf0 => max_scaled);
+        ints!(0x757c => self.max_frequency(), 0x7590 => duty, 0x759c => max_scaled, 0x7bf0 => max_scaled);
         let (alpha, inverse) = coefficients(5)?;
         floats!(0x75a4 => alpha, 0x75a8 => inverse);
 
@@ -162,7 +162,7 @@ impl Platform {
         let boost = uint!("gpu-perf-boost-min-util", 95);
         let integral_minimum = uint!("gpu-perf-integral-min-clamp", 0);
         if base == 0
-            || base >= 11
+            || base >= self.max_pstate() + 1
             || utilization > 100
             || dead_zone > utilization
             || boost > 100

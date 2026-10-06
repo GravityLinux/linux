@@ -37,9 +37,17 @@ pub(crate) fn adt_word(node: &of::Node, name: &CStr, default: Option<u32>) -> Re
     }
 }
 
-fn ladder(node: &of::Node, name: &CStr) -> Result<[u32; 11]> {
+/// Most performance states the firmware tables have room for (0x40-byte rows).
+const MAX_STATES: usize = 16;
+
+/// A per-state ladder from the loader. Index 0 is the off state; every ladder
+/// of a platform has the same length (validated in `Platform::new`).
+fn ladder(node: &of::Node, name: &CStr) -> Result<KVec<u32>> {
     let values: KVec<u32> = node.get_property(name)?;
-    values.as_slice().try_into().map_err(|_| EINVAL)
+    if values.len() < 2 || values.len() > MAX_STATES {
+        return Err(EINVAL);
+    }
+    Ok(values)
 }
 
 pub(crate) struct Register {
@@ -54,14 +62,14 @@ pub(crate) struct Register {
 
 pub(crate) struct Platform {
     pub(crate) node: of::Node,
-    pub(crate) freq_a: [u32; 11],
-    pub(crate) freq_b: [u32; 11],
-    core_voltage: [u32; 11],
-    memory_voltage: [u32; 11],
-    index_a: [u32; 11],
-    index_b: [u32; 11],
-    relative_a: [u32; 11],
-    relative_b: [u32; 11],
+    pub(crate) freq_a: KVec<u32>,
+    pub(crate) freq_b: KVec<u32>,
+    core_voltage: KVec<u32>,
+    memory_voltage: KVec<u32>,
+    index_a: KVec<u32>,
+    index_b: KVec<u32>,
+    relative_a: KVec<u32>,
+    relative_b: KVec<u32>,
     pub(crate) maximum_power: u32,
     pub(crate) core_mask: u32,
     revision: u32,
@@ -85,7 +93,7 @@ impl Platform {
                 if power[0] != 0 || power.windows(2).any(|w| w[0] > w[1]) {
                     return Err(EINVAL);
                 }
-                power[10]
+                power[power.len() - 1]
             }
         };
         let freq_a = ladder(&node, c_str!("apple,m4-freq-a"))?;
@@ -137,6 +145,21 @@ impl Platform {
             registers: KVec::new(),
             mcc: KVec::new(),
         };
+        let states = this.freq_a.len();
+        if [
+            &this.freq_b,
+            &this.core_voltage,
+            &this.memory_voltage,
+            &this.index_a,
+            &this.index_b,
+            &this.relative_a,
+            &this.relative_b,
+        ]
+        .iter()
+        .any(|ladder| ladder.len() != states)
+        {
+            return Err(EINVAL);
+        }
         this.build_registers()?;
         Ok(this)
     }
@@ -275,7 +298,7 @@ impl Platform {
             put32(&mut out, off + 0x20, r.flags);
         }
         for (base, repeats, frequencies) in [(0xfc8, 16, &self.freq_a), (0x1cdc, 1, &self.freq_b)] {
-            for state in 0..11 {
+            for state in 0..frequencies.len() {
                 put32(&mut out, base + state * 4, frequencies[state]);
                 for word in 0..repeats {
                     put32(
@@ -302,7 +325,7 @@ impl Platform {
                 put32(&mut out, off + i * 4, *value);
             }
         }
-        for i in 0..11 {
+        for i in 0..self.states() {
             put32(&mut out, 0x1848 + i * 4, 1.02f32.to_bits());
         }
         for (off, value) in [
@@ -317,8 +340,8 @@ impl Platform {
             (0xee0, 1),
             (0xee4, 1),
             (0xee8, 1),
-            (0xfc4, 10),
-            (0x1cd8, 10),
+            (0xfc4, self.max_pstate()),
+            (0x1cd8, self.max_pstate()),
             (0x2604, 1),
         ] {
             put32(&mut out, off, value);
@@ -393,5 +416,22 @@ impl Platform {
             }
         }
         Ok(out)
+    }
+}
+
+impl Platform {
+    /// Number of performance states, including the off state at index 0.
+    pub(crate) fn states(&self) -> usize {
+        self.freq_a.len()
+    }
+
+    /// Index of the top performance state.
+    pub(crate) fn max_pstate(&self) -> u32 {
+        (self.states() - 1) as u32
+    }
+
+    /// Frequency of the top performance state in MHz.
+    pub(crate) fn max_frequency(&self) -> u32 {
+        self.freq_a[self.states() - 1]
     }
 }

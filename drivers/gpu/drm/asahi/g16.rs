@@ -679,7 +679,7 @@ impl Bootstrap {
             opening_notification_pending: true,
             gpu_revision,
             core_mask: platform.core_mask,
-            maximum_frequency_khz: platform.freq_a[10] * 1000,
+            maximum_frequency_khz: platform.max_frequency() * 1000,
             tvb_pools: KVec::new(),
             render_publication: crate::module_parameters::fw_counter_start.value(),
             next_work_va: 0xffff_fc22_0000_0000,

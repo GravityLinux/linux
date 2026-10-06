@@ -95,7 +95,7 @@ impl platform::Driver for M4Gpu {
         let bundle = platform.bundle(0)?;
         dev_info!(dev,
             "M4 source configuration: {} register windows, mask={:#x}, max-frequency={} MHz, max-power={} mW, period={}/{} ms/clocks, objects={}/{}/{} bytes\n",
-            platform.registers.len(), platform.core_mask, platform.freq_a[10],
+            platform.registers.len(), platform.core_mask, platform.max_frequency(),
             platform.maximum_power, platform.period_ms, platform.period_clocks,
             hwdata.len(), region_c.len(), bundle.len());
         Ok(M4GpuData {
