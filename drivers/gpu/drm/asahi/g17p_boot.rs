@@ -1795,11 +1795,12 @@ impl Session {
         if self.native.is_none() && *crate::module_parameters::native_limit_reply.value() == 1 {
             let work = self.render.as_mut().ok_or(EIO)?;
             if work.ordinal == 0 {
-                let memory = self.memory.as_ref().ok_or(EIO)?;
-                let vm = self.vm.as_ref().ok_or(EIO)?;
                 let fragment = super::g17p_render_lifecycle::DESCRIPTORS[1];
-                let stamp = memory.read_firmware32(vm.physical(memory, 2, fragment + 0x470)?)?;
-                if stamp != memory.read_firmware32(vm.physical(memory, 2, fragment + 0x47c)?)? { return Err(EIO); }
+                // build() withholds this event in memory until restore().
+                // Use its exact Source preimage, not a descriptor tag.
+                let event = queue::event(1, work.layout.grids[1],
+                    queue::Kind::Fragment, None, None, 2).map_err(|_| EINVAL)?;
+                let stamp = u32::from_le_bytes(event[8..12].try_into().unwrap()) & !0xff;
                 work.growth.as_mut().ok_or(EIO)?.bind_limit_reply(fragment, work.layout.queues[1], stamp)?;
             }
         }

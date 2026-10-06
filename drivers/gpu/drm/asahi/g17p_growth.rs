@@ -96,11 +96,13 @@ pub(crate) fn fatal(body: &[u8]) -> bool {
 }
 
 /// Native RID1 type9, observed for separate- and combined-command-buffer
-/// memoryless failures. Queue/stamp come from the retained Source descriptor;
+/// memoryless failures. Four queued native failures reply with the event
+/// counter's upper24 bits (0x100/0x200/0x300/0x400), not descriptor hardware
+/// tags (0x100/0x102/0x103/0x104). Queue/counter come from retained Source DATA;
 /// the report callback cookie is never dereferenced or echoed. This replies
 /// to a render error and does not promise cancellation of dependent work.
 pub(crate) fn limit_reply(queue: u64, stamp: u32) -> Option<[u8; 64]> {
-    if queue == 0 || queue & 0xf != 0 || stamp == 0 { return None; }
+    if queue == 0 || queue & 0xf != 0 || stamp == 0 || stamp & 0xff != 0 { return None; }
     let mut out = [0; 64];
     out[..4].copy_from_slice(&9u32.to_le_bytes());
     out[4..8].copy_from_slice(&1u32.to_le_bytes());
