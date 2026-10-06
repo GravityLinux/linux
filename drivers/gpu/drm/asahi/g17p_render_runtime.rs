@@ -1819,20 +1819,22 @@ pub(crate) fn stage_next_prepared(
     }
     if !work.caller_cache_prepared { work.client.cache(false)?; }
     if let Some(service) = work.growth.as_mut() {
+        // Native repeated errors and retained warm Linux contexts identify
+        // work by the queue-local event counter, not two fixed cold nodes.
+        // Bind the exact Source preimage before either producer is visible.
+        let event = q::event(item.index + 1, work.layout.grids[1],
+            q::Kind::Fragment, None, None, 0).map_err(|_| EINVAL)?;
+        let stamp = u32::from_le_bytes(event[8..12].try_into().unwrap()) & !0xff;
+        let node = life::JOB_LIST.checked_add(u64::from(stamp)).ok_or(EIO)?;
         service.bind_pool_work_owned(
             work.layout.pair,
-            [0xfffffc2000000100, 0xfffffc2000000200],
+            [node, node],
             item.descriptor_address(Kind::Fragment),
             work.layout.grids[1],
             item.ordinal,
             queued,
         )?;
         if *crate::module_parameters::native_limit_reply.value() == 1 {
-            // Bind the exact future event preimage before either producer.
-            // Native repeated errors distinguish this counter from FR tags.
-            let event = q::event(item.index + 1, work.layout.grids[1],
-                q::Kind::Fragment, None, None, 0).map_err(|_| EINVAL)?;
-            let stamp = u32::from_le_bytes(event[8..12].try_into().unwrap()) & !0xff;
             service.bind_limit_reply(item.descriptor_address(Kind::Fragment),
                 work.layout.queues[1], stamp)?;
         }
