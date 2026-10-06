@@ -42,6 +42,7 @@ pub(crate) fn extra_pool(pool: u32) -> Result<Layout> {
         leaves: [base + 0x50000, base + 0x60000, base + 0x68000,
                  base + 0x70000, base + 0x78000, base + 0x80000],
         contexts: [(base + 0x90000, low), (base + 0xb0000, low + 0x20000)],
+        control: base + 0xf0000,
         grids, pair: pool, ..SECOND
     })
 }
@@ -173,20 +174,22 @@ pub(crate) const NATIVE: Layout = {
 /// overlaps cold/post-render compute support, scheduler slots and job lists.
 /// Allocate each absent 32KiB span before any SECOND producer; no prior page
 /// is overwritten, adopted or returned. Low caller GPU resource VAs stay fixed.
-pub(crate) const SECOND_OWNED_STORAGE: [u64;5] = [
+pub(crate) const SECOND_OWNED_STORAGE: [u64;6] = [
     0xfffffc20cf060000, // Pool-B array + its shared object.
     0xfffffc20cf068000, // TA status slots.
     0xfffffc20cf070000, // Shared submission leaf.
     0xfffffc20cf078000, // Queue job list.
     0xfffffc20cf080000, // Initial FR item ring, distinct from compute c08aa870.
+    0xfffffc20cf088000, // Private firmware scheduling/control record.
 ];
 /// Match each old Source object's AttrIndex. PoolB/ring are firmware-only
 /// Normal; TA status/shared counts/joblist were outside c0000000 and Shared.
-pub(crate) const SECOND_OWNED_ATTRIBUTES: [u64;5] = [
+pub(crate) const SECOND_OWNED_ATTRIBUTES: [u64;6] = [
     0x00c0000000000443,
     0x00c000000000044b,
     0x00c000000000044b,
     0x00c000000000044b,
+    0x00c0000000000443,
     0x00c0000000000443,
 ];
 pub(crate) const SECOND: Layout = Layout {
@@ -212,7 +215,7 @@ pub(crate) const SECOND: Layout = Layout {
     job_list: SECOND_OWNED_STORAGE[3],
     support: opening::SUPPORT,
     inner: opening::STATE,
-    control: opening::CHANNEL_CONTROL,
+    control: SECOND_OWNED_STORAGE[5],
     uuid: 0x15,
     native: false,
     pair: 1,
