@@ -3463,6 +3463,9 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	unsigned long pfn;
 	int err;
 
+	if (vma_is_p3s_4k(vma))
+		return p3s_vm_iomap_memory(vma, start, len);
+
 	err = __simple_ioremap_prep(vma_kernel_pages(vma), vma_start_pgoff(vma),
 				    start, len, &pfn);
 	if (err)
