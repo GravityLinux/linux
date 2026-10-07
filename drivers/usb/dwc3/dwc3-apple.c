@@ -187,6 +187,12 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	if (ret)
 		return ret;
 
+	/*
+	 * Started interrupt IN transfers stop all IN traffic on this core
+	 * (seen on T8132, reported on M3); run interrupt endpoints as bulk.
+	 */
+	appledwc->dwc.int_as_bulk = 1;
+
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 	return 0;
 }
