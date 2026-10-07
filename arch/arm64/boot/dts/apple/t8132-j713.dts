@@ -220,3 +220,15 @@
 &ps_atc3_usb {
 	status = "disabled";
 };
+
+/*
+ * The J713 radio module is "garden" (ADT /arm-io/wlan module-instance).
+ * m1n1 adds the antenna SKU, MAC address and calibration from the ADT.
+ */
+&wifi0 {
+	brcm,board-type = "apple,garden";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,garden";
+};
