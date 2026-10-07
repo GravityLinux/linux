@@ -208,6 +208,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Work fields as macOS (debug): 1=no TVB growth request or fragment flags 0xba8/0xbdc, 2=render index rings, 4=completion control 3, 8=fragment gate 0xb5 after each 40-render cycle start",
         },
+        debug_ctx: u32 {
+            default: 0,
+            description: "Debug: 1 logs each VM's owning process and every firmware context slot rebind",
+        },
         micro_layout: u32 {
             default: 0,
             description: "Microsequence scene and Work counter fields: 0=original, 1=as macOS (scene slot, per-Work counters)",

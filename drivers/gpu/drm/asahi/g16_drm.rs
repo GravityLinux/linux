@@ -405,7 +405,7 @@ impl File {
         )?;
         // Debug: name the process behind each VM so firmware context slots in
         // hang reports (logged by root) can be traced to a client.
-        {
+        if crate::module_parameters::debug_ctx.value() != 0 {
             let task = kernel::current!();
             let leader = task.group_leader();
             // SAFETY: comm is a NUL-padded fixed array; a concurrent rename
