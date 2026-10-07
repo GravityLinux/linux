@@ -105,19 +105,19 @@ bool vmg_can_merge_offsets(struct vma_merge_struct *vmg, bool merge_next)
 
 		/*
 		 * Count pages the way next does (see vma_linear_page_index()):
-		 * 4KB pages if it is anonymous, else slices from vmg->slice_off.
+		 * 4KB pages without a file, else slices from vmg->slice_off.
 		 */
-		if (vma_is_anonymous(vmg->next))
+		if (!vmg->next->vm_ops && !vmg->next->vm_file)
 			return vmg->next->vm_pgoff ==
 			       vmg->pgoff + ((vmg->end - vmg->start) >> PAGE_SHIFT_4KB);
 
 		total_slices = vmg->slice_off + ((vmg->end - vmg->start) >> PAGE_SHIFT_4KB);
 
 		return vmg->next->vm_pgoff == vmg->pgoff + (total_slices >> P3S_SLICE_SHIFT) &&
-		       vma_slice_off(vmg->next) == (total_slices & P3S_SLICE_MASK);
+		       vma_slice_offset(vmg->next, vmg->end) ==
+		       (total_slices & P3S_SLICE_MASK);
 	}
 
 	return vma_can_merge_offsets(vmg->prev, vmg->pgoff, vmg->slice_off,
-				     vmg->start, vmg_is_p3s_4k(vmg),
-				     !vma_is_anonymous(vmg->prev));
+				     vmg->start, vmg_is_p3s_4k(vmg), !!vmg->file);
 }
