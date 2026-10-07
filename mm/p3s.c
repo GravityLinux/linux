@@ -135,15 +135,12 @@ int p3s_vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start,
 			unsigned long len)
 {
 	unsigned long vm_len = vma->vm_end - vma->vm_start;
-	u64 offset = vma_file_offset(vma);
-	u64 aligned_len;
 
 	if ((start & ~PAGE_MASK_KERNEL) && p3s_4k_unsupported(vma->vm_mm))
 		return -EOPNOTSUPP;
 	if (start + len < start)
 		return -EINVAL;
-	aligned_len = PAGE_ALIGN_4KB(len);
-	if (offset > aligned_len || vm_len > aligned_len - offset)
+	if (vma_exceeds_object(vma, len))
 		return -EINVAL;
 	return io_remap_pfn_range(vma, vma->vm_start,
 				 PHYS_PFN(start) + vma->vm_pgoff, vm_len,
