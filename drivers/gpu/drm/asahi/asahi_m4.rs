@@ -232,5 +232,13 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Experiment: firmware kind of render-to-render dependencies (1 normal, 0 as the internal TA-to-fragment wait)",
         },
+        fault_control: u32 {
+            default: 3,
+            description: "Firmware fault control word (region C +0xe28): 3 as macOS; 0 hard faults",
+        },
+        soft_faults: u32 {
+            default: 0,
+            description: "Debug: 1 advertises soft faults to userspace (needs fault_control=3)",
+        },
     },
 }

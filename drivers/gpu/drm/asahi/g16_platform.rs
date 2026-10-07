@@ -364,7 +364,7 @@ impl Platform {
             (0x78, 1),
             (0x7ec, 1),
             (0x7f0, 1),
-            (0xe28, 3),
+            (0xe28, crate::module_parameters::fault_control.value()),
             (0xe2c, 1),
             (0x24, 4096),
             (0x998, 32),

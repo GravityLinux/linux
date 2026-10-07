@@ -488,7 +488,14 @@ impl File {
         }
         let mut params = uapi::drm_asahi_params_global {
             features: u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIER)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES),
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES)
+                | if crate::module_parameters::fault_control.value() == 3
+                    && crate::module_parameters::soft_faults.value() != 0
+                {
+                    u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS)
+                } else {
+                    0
+                },
             gpu_generation: 16,
             gpu_variant: b'G' as u32,
             gpu_revision: device.gpu_revision,
