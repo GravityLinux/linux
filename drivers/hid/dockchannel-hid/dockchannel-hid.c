@@ -1455,7 +1455,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 			return -ENOMEM;
 		memset(dchid->ring, 0, DCHID_RING_SIZE);
 	}
-	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM, 0);
+	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
 	if (!dchid->new_iface_wq) {
 		ret = -ENOMEM;
 		goto free_ring;
