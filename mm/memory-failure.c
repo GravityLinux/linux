@@ -558,7 +558,7 @@ static void collect_procs_anon(const struct folio *folio,
 
 	pgoff = page_pgoff(folio, page);
 	pgoff_end = pgoff;
-	p3s_anon_rmap_range(folio, &pgoff, &pgoff_end);
+	p3s_anon_rmap_range(folio, av, &pgoff, &pgoff_end);
 	rcu_read_lock();
 	for_each_process(tsk) {
 		struct vm_area_struct *vma;
