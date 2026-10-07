@@ -460,11 +460,6 @@ impl Memory {
         })
     }
 
-    pub(crate) fn write8(&mut self, address: u64, value: u8) -> Result {
-        // SAFETY: Checked one-byte host-owned field in ordinary RAM.
-        self.access(address, 1, |p| unsafe { p.write_volatile(value) })
-    }
-
     pub(crate) fn zero(&mut self, address: u64, size: usize) -> Result {
         // SAFETY: The caller exclusively owns the unpublished range. Bounds
         // are checked against the reservation before any writes take place.
