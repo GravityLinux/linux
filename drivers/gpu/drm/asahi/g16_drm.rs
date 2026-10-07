@@ -1355,7 +1355,7 @@ impl sched::JobImpl for SubmissionJob {
         }
         if !engine.running {
             engine.running = true;
-            let _ = workqueue::system_unbound().enqueue(execution.clone());
+            let _ = workqueue::system_dfl().enqueue(execution.clone());
         }
         // A running worker may be asleep waiting for firmware on another
         // queue. New ready work must wake it even if no GPU event arrives.
