@@ -233,3 +233,18 @@
 &bluetooth0 {
 	brcm,board-type = "apple,garden";
 };
+
+/*
+ * The internal eDP panel is driven through the DPTX PHY. DCP needs it
+ * powered: without it the panel stays dark (backlight only), DPTX reports
+ * FIFO errors, and DCP crashes on power-off touching the PHY registers.
+ */
+&dptxphy {
+	status = "okay";
+};
+
+&dcp {
+	phys = <&dptxphy>;
+	phy-names = "dp-phy";
+	apple,dptx-phy = <4>;
+};
