@@ -1342,7 +1342,9 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
 	struct drm_gem_object *obj;
 	unsigned long ret;
 
-	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> PAGE_SHIFT);
+	obj = drm_gem_object_lookup_at_offset(filp,
+					      mm_mmap_pgoff(current->mm, pgoff),
+					      DIV_ROUND_UP(len, PAGE_SIZE));
 	if (IS_ERR(obj))
 		obj = NULL;
 
