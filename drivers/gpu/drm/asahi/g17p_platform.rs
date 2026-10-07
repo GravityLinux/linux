@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T8140 boot resources and live platform inputs for the synchronous shim port.
+//! T8140 boot resources and live platform inputs.
 //!
 //! The loader preserves the original SGX ADT properties as little-endian bytes.
 //! Its resource references and explicitly authored properties use DT endianness.

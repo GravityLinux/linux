@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T8140 / G17P firmware startup and native DRM memory support.
+//! T8140 / G17P asynchronous render and compute driver.
 //!
 //! Validates boot resources, constructs the unpublished firmware graph and
-//! boots both RTKit instances and registers the native Asahi memory UAPI.
+//! boots both RTKit instances and implements the Asahi memory, submission,
+//! and synchronization UAPIs.
 
 use kernel::{
     c_str, device::Core, devres::Devres, io::mem::IoMem, io::Io, of, platform, prelude::*,
@@ -11,7 +12,7 @@ use kernel::{
 
 mod g17p_abi;
 mod g17p_boot;
-// Current source serializers, connected as the submission port is completed.
+// Source serializers and retained queue/resource lifecycle helpers.
 #[allow(dead_code)]
 mod g17p_compute;
 #[allow(dead_code)]
@@ -48,10 +49,8 @@ mod g17p_opening;
 mod g17p_partial_runtime;
 mod g17p_platform;
 mod g17p_user_vm;
-// Core queue port is exercised by source differential tests until submit is wired.
 #[allow(dead_code)]
 mod g17p_queue;
-// Render serializers are checked against the shim before runtime integration.
 #[allow(dead_code)]
 mod g17p_render;
 #[allow(dead_code)]
