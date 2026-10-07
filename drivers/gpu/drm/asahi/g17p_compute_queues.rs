@@ -199,10 +199,7 @@ impl PreparationSeed {
             // This is the receiver event slot, separate from the root ASID.
             word_220: 0xffff080000000001 | (u64::from(l.grid) << 32),
             word_330: 0,
-            // Native +0x138 tracks the descriptor UAT ASID (1 << ASID).
-            // Independent owners reserve distinct roots; the legacy ASID3
-            // constant cannot describe each installed compute owner.
-            word_338: 1u64 << l.asid,
+            word_338: 8,
             word_350: 0x0001100000000000 | ((low + 0x40) >> 5),
             word_358: 0x0000200000000000 | ((low + 0x760) >> 5),
             word_378: 0x003fffffffffffff,
