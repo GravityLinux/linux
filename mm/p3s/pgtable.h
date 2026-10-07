@@ -70,21 +70,22 @@ static inline pte_t mm_frame_pte(const struct mm_struct *mm,
 				(frame & P3S_SLICE_MASK) << PAGE_SHIFT_4KB);
 }
 
-/*
- * vma_pfnmap_phys - Physical address of the frame a PFN mapping maps
- * @vma: Pointer to struct vm_area_struct
- * @addr: Virtual address within @vma
- * @pfn: Kernel page frame number found by follow_pfnmap_start()
+/**
+ * p3s_pfnmap_phys - Physical address selected by a PFN mapping
+ * @args: Lookup made by follow_pfnmap_start(), not yet ended
  *
- * Adds the slice that a 4KB compatibility VMA maps at @addr, as set up by
- * remap_pfn_range() and insert_pfn().
+ * A 4KB PTE can select a slice different from vma_slice_offset(), so
+ * read the slice from the PTE. Call before follow_pfnmap_end(), while
+ * the PTE is mapped and locked.
  */
-static inline phys_addr_t vma_pfnmap_phys(const struct vm_area_struct *vma,
-					  unsigned long addr,
-					  unsigned long pfn)
+static inline resource_size_t
+p3s_pfnmap_phys(const struct follow_pfnmap_args *args)
 {
-	return ((phys_addr_t)pfn << PAGE_SHIFT_KERNEL) +
-	       ((phys_addr_t)vma_slice_offset(vma, addr) << PAGE_SHIFT_4KB);
+	resource_size_t phys = (resource_size_t)args->pfn << PAGE_SHIFT_KERNEL;
+
+	if (vma_is_p3s_4k(args->vma) && args->ptep)
+		phys |= __pte_to_phys(ptep_get(args->ptep)) & ~PAGE_MASK_KERNEL;
+	return phys;
 }
 
 #endif /* __MM_P3S_PGTABLE_H */
