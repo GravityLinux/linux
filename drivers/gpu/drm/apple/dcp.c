@@ -1146,7 +1146,13 @@ int dcp_start(struct platform_device *pdev)
 						     "Failed to start EPIC25 endpoint\n");
 		}
 
-		ret = dptxep_init(dcp);
+		/*
+		 * An internal eDP panel driven through the DPTX PHY (M4 MacBook
+		 * Air) needs the PHY powered, but its firmware runs the panel as
+		 * disp0 and offers no dcpdptx-port services: waiting for them
+		 * only times out.
+		 */
+		ret = dcp_has_panel(dcp) ? 0 : dptxep_init(dcp);
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);
