@@ -505,9 +505,9 @@ struct bcm4377_data;
  *                               reserved bits of Primary/Secondary_PHY inside
  *                               LE Extended Advertising Report events which
  *                               have to be ignored
- * reprobe_on_resume: Set if the chip loses its firmware state across system
- *                    suspend, so that resume has to repeat the probe-time
- *                    function reset, firmware download and boot handshake
+ * reinit_on_resume: Set if the chip loses its firmware state across system
+ *                   suspend, so that resume has to repeat the probe-time
+ *                   function reset, firmware download and boot handshake
  * send_calibration: Optional callback to send calibration data
  * send_ptb: Callback to send "PTB" regulatory/calibration data
  */
@@ -528,7 +528,7 @@ struct bcm4377_hw {
 	unsigned long broken_mws_transport_config : 1;
 	unsigned long broken_le_coded : 1;
 	unsigned long broken_le_ext_adv_report_phy : 1;
-	unsigned long reprobe_on_resume : 1;
+	unsigned long reinit_on_resume : 1;
 
 	int (*send_calibration)(struct bcm4377_data *bcm4377);
 	int (*send_ptb)(struct bcm4377_data *bcm4377,
@@ -536,6 +536,7 @@ struct bcm4377_hw {
 };
 
 static const struct bcm4377_hw bcm4377_hw_variants[];
+static void bcm4377_resume_work(struct work_struct *work);
 static const struct dmi_system_id bcm4377_dmi_board_table[];
 
 /*
@@ -590,6 +591,10 @@ struct bcm4377_data {
 	const char *board_type;
 
 	struct completion event;
+
+	dma_addr_t peripheral_info_dma;
+	bool rings_lost;
+	struct work_struct resume_work;
 
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
@@ -1380,9 +1385,34 @@ destroy_hci_acl_ack:
 	return ret;
 }
 
+static void bcm4377_forget_rings(struct bcm4377_data *bcm4377)
+{
+	bcm4377->hci_h2d_ring.enabled = false;
+	bcm4377->hci_d2h_ring.enabled = false;
+	bcm4377->sco_h2d_ring.enabled = false;
+	bcm4377->sco_d2h_ring.enabled = false;
+	bcm4377->acl_h2d_ring.enabled = false;
+	bcm4377->acl_d2h_ring.enabled = false;
+	bcm4377->hci_acl_ack_ring.enabled = false;
+	bcm4377->hci_acl_event_ring.enabled = false;
+	bcm4377->sco_ack_ring.enabled = false;
+	bcm4377->sco_event_ring.enabled = false;
+}
+
 static int bcm4377_hci_close(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	if (bcm4377->rings_lost) {
+		/*
+		 * The firmware was booted again after resume; the rings that
+		 * were created on the old instance no longer exist, so don't
+		 * ask the new one to destroy them.
+		 */
+		bcm4377_forget_rings(bcm4377);
+		bcm4377->rings_lost = false;
+		return 0;
+	}
 
 	dev_dbg(&bcm4377->pdev->dev, "destroying rings in hci_close\n");
 
@@ -1605,37 +1635,19 @@ static int bcm4377_alloc_completion_ring(struct bcm4377_data *bcm4377,
 	return 0;
 }
 
-static int bcm4377_init_context(struct bcm4377_data *bcm4377)
+/*
+ * Fill the "Converged IPC" context from the already allocated rings. Called at
+ * probe and again when resume has to boot the firmware from scratch.
+ */
+static void bcm4377_fill_context(struct bcm4377_data *bcm4377)
 {
-	struct device *dev = &bcm4377->pdev->dev;
-	dma_addr_t peripheral_info_dma;
-
-	bcm4377->ctx = dmam_alloc_coherent(dev, sizeof(*bcm4377->ctx),
-					   &bcm4377->ctx_dma, GFP_KERNEL);
-	if (!bcm4377->ctx)
-		return -ENOMEM;
 	memset(bcm4377->ctx, 0, sizeof(*bcm4377->ctx));
-
-	bcm4377->ring_state =
-		dmam_alloc_coherent(dev, sizeof(*bcm4377->ring_state),
-				    &bcm4377->ring_state_dma, GFP_KERNEL);
-	if (!bcm4377->ring_state)
-		return -ENOMEM;
-	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
 
 	bcm4377->ctx->version = cpu_to_le16(1);
 	bcm4377->ctx->size = cpu_to_le16(sizeof(*bcm4377->ctx));
 	bcm4377->ctx->enabled_caps = cpu_to_le32(2);
-
-	/*
-	 * The BT device will write 0x20 bytes of data to this buffer but
-	 * the exact contents are unknown. It only needs to exist for BT
-	 * to work such that we can just allocate and then ignore it.
-	 */
-	if (!dmam_alloc_coherent(&bcm4377->pdev->dev, 0x20,
-				 &peripheral_info_dma, GFP_KERNEL))
-		return -ENOMEM;
-	bcm4377->ctx->peripheral_info_addr = cpu_to_le64(peripheral_info_dma);
+	bcm4377->ctx->peripheral_info_addr =
+		cpu_to_le64(bcm4377->peripheral_info_dma);
 
 	bcm4377->ctx->xfer_ring_heads_addr = cpu_to_le64(
 		bcm4377->ring_state_dma +
@@ -1673,6 +1685,37 @@ static int bcm4377_init_context(struct bcm4377_data *bcm4377)
 	bcm4377->ctx->control_xfer_ring_header_size = 0;
 	bcm4377->ctx->control_xfer_ring_footer_size =
 		bcm4377->control_h2d_ring.payload_size / 4;
+}
+
+static int bcm4377_init_context(struct bcm4377_data *bcm4377)
+{
+	struct device *dev = &bcm4377->pdev->dev;
+	dma_addr_t peripheral_info_dma;
+
+	bcm4377->ctx = dmam_alloc_coherent(dev, sizeof(*bcm4377->ctx),
+					   &bcm4377->ctx_dma, GFP_KERNEL);
+	if (!bcm4377->ctx)
+		return -ENOMEM;
+	memset(bcm4377->ctx, 0, sizeof(*bcm4377->ctx));
+
+	bcm4377->ring_state =
+		dmam_alloc_coherent(dev, sizeof(*bcm4377->ring_state),
+				    &bcm4377->ring_state_dma, GFP_KERNEL);
+	if (!bcm4377->ring_state)
+		return -ENOMEM;
+	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
+
+	/*
+	 * The BT device will write 0x20 bytes of data to this buffer but
+	 * the exact contents are unknown. It only needs to exist for BT
+	 * to work such that we can just allocate and then ignore it.
+	 */
+	if (!dmam_alloc_coherent(&bcm4377->pdev->dev, 0x20,
+				 &peripheral_info_dma, GFP_KERNEL))
+		return -ENOMEM;
+	bcm4377->peripheral_info_dma = peripheral_info_dma;
+
+	bcm4377_fill_context(bcm4377);
 
 	dev_dbg(&bcm4377->pdev->dev, "context initialized at IOVA %pad",
 		&bcm4377->ctx_dma);
@@ -2278,6 +2321,13 @@ static void bcm4377_hci_free_dev(void *data)
 	hci_free_dev(data);
 }
 
+static void bcm4377_cancel_resume_work(void *data)
+{
+	struct bcm4377_data *bcm4377 = data;
+
+	cancel_work_sync(&bcm4377->resume_work);
+}
+
 static void bcm4377_hci_unregister_dev(void *data)
 {
 	hci_unregister_dev(data);
@@ -2300,6 +2350,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bcm4377->pdev = pdev;
 	bcm4377->hw = &bcm4377_hw_variants[id->driver_data];
 	init_completion(&bcm4377->event);
+	INIT_WORK(&bcm4377->resume_work, bcm4377_resume_work);
 
 	ret = bcm4377_prepare_rings(bcm4377);
 	if (ret)
@@ -2407,6 +2458,9 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (bcm4377->hw->broken_le_ext_adv_report_phy)
 		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 
+	if (bcm4377->hw->reinit_on_resume)
+		hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
+
 	hci_set_brcm_capable(hdev);
 
 	pci_set_drvdata(pdev, bcm4377);
@@ -2424,8 +2478,13 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = hci_register_dev(hdev);
 	if (ret)
 		return ret;
-	return devm_add_action_or_reset(&pdev->dev, bcm4377_hci_unregister_dev,
-					hdev);
+	ret = devm_add_action_or_reset(&pdev->dev, bcm4377_hci_unregister_dev,
+				       hdev);
+	if (ret)
+		return ret;
+	/* runs before the unregister above: devm actions run in reverse */
+	return devm_add_action_or_reset(&pdev->dev, bcm4377_cancel_resume_work,
+					bcm4377);
 }
 
 static int bcm4377_suspend(struct device *dev)
@@ -2444,46 +2503,87 @@ static int bcm4377_suspend(struct device *dev)
 	return 0;
 }
 
-struct bcm4377_reprobe_work {
-	struct work_struct work;
-	struct pci_dev *pdev;
-};
-
-static void bcm4377_reprobe_work(struct work_struct *work)
+/*
+ * Boot the firmware again from scratch, as probe does: function reset, PCIe
+ * configuration, a fresh context and ring state, firmware download, boot and
+ * RTI handshakes. The rings themselves (DMA memory) are reused.
+ */
+static int bcm4377_hw_reinit(struct bcm4377_data *bcm4377)
 {
-	struct bcm4377_reprobe_work *rw =
-		container_of(work, struct bcm4377_reprobe_work, work);
+	struct pci_dev *pdev = bcm4377->pdev;
 	int ret;
 
-	ret = device_reprobe(&rw->pdev->dev);
+	ret = pci_try_reset_function(pdev);
 	if (ret)
-		dev_err(&rw->pdev->dev, "reprobe after resume failed: %d\n", ret);
-	pci_dev_put(rw->pdev);
-	kfree(rw);
+		dev_warn(&pdev->dev,
+			 "function level reset failed with %d; trying to continue anyway\n",
+			 ret);
+	/* see bcm4377_probe: BAR access sooner than ~50 ms crashes the device */
+	msleep(100);
+	pci_set_master(pdev);
+	if (bcm4377->hw->disable_aspm)
+		bcm4377_disable_aspm(bcm4377);
+
+	ret = bcm4377_init_cfg(bcm4377);
+	if (ret)
+		return ret;
+
+	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
+	bcm4377_fill_context(bcm4377);
+	bcm4377->control_h2d_ring.generation++;
+	bitmap_zero(bcm4377->control_h2d_ring.msgids, BCM4377_MAX_RING_SIZE);
+	bcm4377->control_ack_ring.enabled = false;
+	reinit_completion(&bcm4377->event);
+
+	ret = bcm4377_boot(bcm4377);
+	if (ret)
+		return ret;
+	return bcm4377_setup_rti(bcm4377);
+}
+
+static void bcm4377_resume_work(struct work_struct *work)
+{
+	struct bcm4377_data *bcm4377 =
+		container_of(work, struct bcm4377_data, resume_work);
+	struct hci_dev *hdev = bcm4377->hdev;
+	int ret;
+
+	ret = bcm4377_hw_reinit(bcm4377);
+	if (ret) {
+		dev_err(&bcm4377->pdev->dev,
+			"firmware reload after resume failed: %d\n", ret);
+		hci_resume_dev(hdev);
+		return;
+	}
+
+	/*
+	 * The controller now runs fresh firmware with none of the host's
+	 * configuration. Let the core close and reopen it (hardware-error
+	 * path): that recreates the rings, repeats the setup (calibration,
+	 * PTB; HCI_QUIRK_NON_PERSISTENT_SETUP) and the full HCI init. Then
+	 * finish the system resume on the reinitialized controller.
+	 */
+	bcm4377->rings_lost = true;
+	hci_reset_dev(hdev);
+	flush_work(&hdev->rx_work);
+	flush_work(&hdev->error_reset);
+	hci_resume_dev(hdev);
 }
 
 static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
-	struct bcm4377_reprobe_work *rw;
 
-	if (bcm4377->hw->reprobe_on_resume) {
+	if (bcm4377->hw->reinit_on_resume) {
 		/*
 		 * The firmware does not survive suspend on these chips: after
-		 * UNQUIESCE every HCI command times out. Unbinding and binding
-		 * the driver again (function reset, firmware download, boot
-		 * handshake, HCI setup) restores the controller, so do exactly
-		 * that. The work item is allocated separately because the
-		 * reprobe frees this device's devm state, including bcm4377.
+		 * UNQUIESCE every HCI command times out. Reload it once the
+		 * system has resumed (the firmware loader needs it), instead of
+		 * blocking resume.
 		 */
-		rw = kzalloc(sizeof(*rw), GFP_KERNEL);
-		if (!rw)
-			return -ENOMEM;
-		INIT_WORK(&rw->work, bcm4377_reprobe_work);
-		rw->pdev = pci_dev_get(pdev);
 		dev_info(dev, "reloading firmware after resume\n");
-		schedule_work(&rw->work);
+		schedule_work(&bcm4377->resume_work);
 		return 0;
 	}
 
@@ -2571,7 +2671,7 @@ static const struct bcm4377_hw bcm4377_hw_variants[] = {
 		.broken_mws_transport_config = true,
 		.broken_le_coded = true,
 		.broken_le_ext_adv_report_phy = true,
-		.reprobe_on_resume = true,
+		.reinit_on_resume = true,
 		.send_calibration = bcm4388_send_calibration,
 		.send_ptb = bcm4378_send_ptb,
 	},
