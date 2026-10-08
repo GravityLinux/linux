@@ -931,6 +931,34 @@ impl Bootstrap {
     /// firmware and driver stamps against their targets, and the newest
     /// firmware receive-ring entries.
     fn dump_hang_state(&self) -> Result {
+        // Device-wide transports: whether firmware consumed each channel's
+        // messages (read/done) up to what the driver published (tail).
+        {
+            let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+            if let Some(guard) = self._sgx.try_access() {
+                for (index, route) in config.channels.iter().enumerate().take(12) {
+                    let read = guard
+                        .try_read32(0xd64000 + (route.state[0] - 0xffff_fc20_0002_8000) as usize)
+                        .unwrap_or(u32::MAX);
+                    let done = guard
+                        .try_read32(0xd64000 + (route.state[1] - 0xffff_fc20_0002_8000) as usize)
+                        .unwrap_or(u32::MAX);
+                    let tail = guard
+                        .try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize)
+                        .unwrap_or(u32::MAX);
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G16: hang channel {} (priority {} stage {}) read={} done={} tail={}\n",
+                        index,
+                        index / 3,
+                        index % 3,
+                        read,
+                        done,
+                        tail
+                    );
+                }
+            }
+        }
         if let Some(guard) = self._sgx.try_access() {
             let read64 = |offset: usize| -> u64 {
                 let lo = guard.try_read32(offset).unwrap_or(0xdeadbeef);
