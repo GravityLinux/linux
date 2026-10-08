@@ -1811,6 +1811,7 @@ impl Bootstrap {
         result
     }
 
+    #[inline(never)]
     fn submit_render_pool(
         &mut self,
         client: &mut g16_vm::AddressSpace,
@@ -2353,6 +2354,7 @@ impl Bootstrap {
         result
     }
 
+    #[inline(never)]
     fn submit_compute_queue(
         &mut self,
         queue: &mut FirmwareQueues,
@@ -2857,6 +2859,7 @@ impl Bootstrap {
     /// dump_render_buffered keeps renders matching the shape filters;
     /// dump_render_recent keeps every render, for the stuck context's
     /// immediate predecessors.
+    #[inline(never)]
     fn dump_render(&mut self, a: &render::Addresses, tgid: (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64, pages: [(u32, u64, u64); 8], ta: &[u8], frag: &[u8]) {
         let recent = crate::module_parameters::dump_render_recent.value() as usize;
         if recent != 0 {
@@ -3052,6 +3055,7 @@ impl Bootstrap {
 
     /// Diagnostics: count waits whose event tag differs from the event the
     /// producing lane's queue currently holds ("stale tag at publish").
+    #[inline(never)]
     fn note_dependency_events(&mut self, dependencies: &[Option<Stamp>; 2], own: [u64; 3]) {
         for dep in dependencies.iter().flatten() {
             let Some(&(_, current)) = self.lane_events.iter().find(|e| e.0 == dep.address) else {
