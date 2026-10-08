@@ -956,6 +956,12 @@
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
 
+			smc_rtc: rtc {
+				compatible = "apple,smc-rtc";
+				nvmem-cells = <&rtc_offset>;
+				nvmem-cell-names = "rtc_offset";
+			};
+
 			smc_gpio: gpio {
 				compatible = "apple,smc-gpio";
 				gpio-controller;
@@ -977,6 +983,39 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_nub_spmi_a0>;
+		};
+
+		/*
+		 * The main PMU ("abbey", ADT /arm-io/nub-spmi0/pmu-main, reg 0xe) is on
+		 * this SPMI bus. Its scratch registers hold the RTC offset that
+		 * macsmc-rtc needs: ADT info-rtc_scrpad = 0x2100 and info-pm_setting =
+		 * 0x2001, the same layout as t8112's 0xf900/0xf801 shifted by -0xd800.
+		 */
+		nub_spmi0: spmi@388714000 {
+			compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+			reg = <0x3 0x88714000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			power-domains = <&ps_nub_spmi0>;
+
+			pmic1: pmic@e {
+				compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					pm_setting: pm-setting@2001 {
+						reg = <0x2001 0x1>;
+					};
+
+					rtc_offset: rtc-offset@2100 {
+						reg = <0x2100 0x6>;
+					};
+				};
+			};
 		};
 
 		nub_spmi_a1: spmi@388a08000 {
