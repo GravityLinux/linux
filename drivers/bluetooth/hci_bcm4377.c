@@ -2458,8 +2458,15 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (bcm4377->hw->broken_le_ext_adv_report_phy)
 		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
 
-	if (bcm4377->hw->reinit_on_resume)
+	if (bcm4377->hw->reinit_on_resume) {
 		hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
+		/*
+		 * Resume finishes from bcm4377_resume_work; the core's own PM
+		 * notifier would otherwise resume the controller concurrently,
+		 * while the firmware is still being reloaded.
+		 */
+		hci_set_quirk(hdev, HCI_QUIRK_NO_SUSPEND_NOTIFIER);
+	}
 
 	hci_set_brcm_capable(hdev);
 
