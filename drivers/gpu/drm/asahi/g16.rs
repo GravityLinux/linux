@@ -209,6 +209,10 @@ pub(crate) struct Bootstrap {
     pub(crate) maximum_frequency_khz: u32,
     tvb_pools: KVec<crate::g16_tvb::Tvb>,
     render_publication: u64,
+    /// A4 wedge detection state (check_wedge).
+    wedge_since: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+    wedge_signature: u64,
+    wedge_rung: u32,
     /// Debug (dump_render_buffered): the most recent submitted renders,
     /// printed only by the hang report.
     render_ring: render_runtime::RenderRing,
@@ -697,6 +701,9 @@ impl Bootstrap {
             maximum_frequency_khz: platform.max_frequency() * 1000,
             tvb_pools: KVec::new(),
             render_publication: crate::module_parameters::fw_counter_start.value(),
+            wedge_since: None,
+            wedge_signature: 0,
+            wedge_rung: 0,
             render_ring: render_runtime::RenderRing::new(),
             retire_log: KVec::new(),
             retire_next: 0,

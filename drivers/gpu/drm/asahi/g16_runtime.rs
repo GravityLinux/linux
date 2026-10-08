@@ -1353,6 +1353,7 @@ impl Bootstrap {
             let (id, limited) = self.retired.pop().ok_or(EIO)?;
             return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(()) })));
         }
+        self.check_wedge()?;
         if let Some(flight) = self
             .flights
             .iter()
@@ -1374,11 +1375,18 @@ impl Bootstrap {
     /// Notifications do not extend the watchdog. Only retirement progress
     /// resets it, so trace traffic cannot keep a stuck command alive.
     pub(crate) fn watchdog_remaining_ms(&self) -> u32 {
-        self.flights
+        let watchdog = self
+            .flights
             .iter()
             .map(|flight| (10000 - flight.started.elapsed().as_millis()).clamp(1, 10000) as u32)
             .min()
-            .unwrap_or(10000)
+            .unwrap_or(10000);
+        // Wedge detection samples render progress a few times per window.
+        if self.flights.iter().any(|f| f.render.is_some()) {
+            watchdog.min(250)
+        } else {
+            watchdog
+        }
     }
 }
 
@@ -3126,5 +3134,120 @@ impl Bootstrap {
         if !line.is_empty() {
             dev_err!(self.dev.as_ref(), "G16: hang lane events (stamp, event) {:x?}\n", &line[..]);
         }
+    }
+}
+
+impl Bootstrap {
+    /// A4 wedge (see tmp/kernel-73-validate/a4-recovery-design.md): a render
+    /// whose TA is done and whose waits are all satisfied, while its 3D never
+    /// starts, every channel is drained and no fragment stamp on any lane
+    /// moves for wedge_ms. Firmware reports nothing for this state, so the
+    /// kernel detects it. wedge_recover=0 only logs the detection; 1 also
+    /// walks the recovery ladder: R1 re-kicks the stuck render's 3D lane, R2
+    /// re-kicks the TA and 3D lanes of every live render queue.
+    fn check_wedge(&mut self) -> Result {
+        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        let mut stuck = None;
+        let mut signature = 0u64;
+        for (index, flight) in self.flights.iter().enumerate() {
+            let (Some(_), Some(tiling), Some(fragment)) = (&flight.render, flight.stamps[0], flight.stamps[1]) else {
+                continue;
+            };
+            let ta = fw.read_u32(tiling.address)?;
+            let frag = fw.read_u32(fragment.address)?;
+            signature = signature.wrapping_mul(0x100_0000_01b3).wrapping_add(u64::from(frag));
+            if stuck.is_none()
+                && g16_stamp::reached(ta, tiling.value)
+                && !g16_stamp::reached(frag, fragment.value)
+                && flight.dependencies.iter().flatten().all(|d| {
+                    fw.read_u32(d.address).is_ok_and(|v| g16_stamp::reached(v, d.value))
+                })
+            {
+                stuck = Some(index);
+            }
+        }
+        let drained = {
+            let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+            let guard = self._sgx.try_access().ok_or(ENODEV)?;
+            config.channels.iter().take(12).all(|route| {
+                let read = guard.try_read32(0xd64000 + (route.state[0] - 0xffff_fc20_0002_8000) as usize);
+                let done = guard.try_read32(0xd64000 + (route.state[1] - 0xffff_fc20_0002_8000) as usize);
+                let tail = guard.try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize);
+                matches!((read, done, tail), (Ok(r), Ok(d), Ok(t)) if r == d && d == t)
+            })
+        };
+        let Some(index) = stuck.filter(|_| drained) else {
+            self.wedge_since = None;
+            self.wedge_rung = 0;
+            return Ok(());
+        };
+        let now = Instant::now();
+        match self.wedge_since {
+            Some(since) if signature == self.wedge_signature => {
+                let wedge_ms = u64::from(crate::module_parameters::wedge_ms.value().max(100));
+                if (now - since).as_millis() < wedge_ms as i64 {
+                    return Ok(());
+                }
+            }
+            _ => {
+                // First sighting, or some fragment stamp moved: restart.
+                self.wedge_since = Some(now);
+                self.wedge_signature = signature;
+                return Ok(());
+            }
+        }
+        let flight = &self.flights[index];
+        let owner = flight.owner.clone();
+        let recover = crate::module_parameters::wedge_recover.value() != 0;
+        if self.wedge_rung < 3 {
+            dev_err!(self.dev.as_ref(),
+                "G16: A4 wedge: Work {:#x} context {} stream {:#x} ordinal {} age {} ms, no fragment progress for {} ms; {}\n",
+                flight.id, flight.context, flight.stream, flight.ordinal,
+                flight.started.elapsed().as_millis(), (now - self.wedge_since.unwrap_or(now)).as_millis(),
+                match (recover, self.wedge_rung) {
+                    (false, _) => "detection only (wedge_recover=0)",
+                    (true, 0) => "R1: re-kicking its 3D lane",
+                    (true, 1) => "R2: re-kicking every render queue's TA and 3D lanes",
+                    _ => "ladder exhausted, leaving it to the watchdog",
+                });
+        }
+        if !recover || self.wedge_rung >= 2 {
+            self.wedge_rung = 3;
+            return Ok(());
+        }
+        if self.wedge_rung == 0 {
+            self.rekick(&owner, &[1])?;
+        } else {
+            let mut owners = KVec::new();
+            for f in self.flights.iter().filter(|f| f.render.is_some()) {
+                if !owners.iter().any(|o: &Arc<Mutex<FirmwareQueues>>| Arc::ptr_eq(o, &f.owner)) {
+                    owners.push(f.owner.clone(), GFP_KERNEL)?;
+                }
+            }
+            for o in owners.iter() {
+                self.rekick(o, &[0, 1])?;
+            }
+        }
+        self.flush()?;
+        self.wedge_rung += 1;
+        self.wedge_since = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Re-send a render queue's channel messages at its current heads, as a
+    /// fresh publication with no new Work: firmware re-reads the lane.
+    fn rekick(&mut self, owner: &Arc<Mutex<FirmwareQueues>>, stages: &[usize]) -> Result {
+        let (lanes, priority, events) = {
+            let q = owner.lock();
+            let Some(lanes) = q.lanes else { return Ok(()) };
+            (lanes, q.priority, [q.event(0).ok(), q.event(1).ok()])
+        };
+        for &stage in stages {
+            let Some(event) = events[stage] else { continue };
+            let mut lane = lanes[stage];
+            lane.new = false;
+            self.stage_queue(priority as usize * 3 + stage, lane, event, self.render_publication)?;
+        }
+        Ok(())
     }
 }

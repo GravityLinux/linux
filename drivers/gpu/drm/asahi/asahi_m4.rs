@@ -160,6 +160,14 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Experiment: firmware event indices of idle queues. 0: an idle queue releases its index and takes the lowest free one when it next submits. 1: it retakes its previous index if free, else the next free index after the last one handed out (so a just-released index is not immediately given to another queue). 2: as 1, and a queue keeps its index while idle, for its whole lifetime (risks event exhaustion with more than 32 live queues; see backpressure logs)",
         },
+        wedge_ms: u32 {
+            default: 2000,
+            description: "A4 wedge detection window: a render with TA done and all waits met whose 3D never starts, with all channels drained and no fragment progress on any lane for this long",
+        },
+        wedge_recover: u32 {
+            default: 0,
+            description: "A4 wedge handling: 0 logs the detection only; 1 also re-kicks the stuck 3D lane (R1), then every render queue's TA and 3D lanes (R2), one rung per wedge_ms window, before the 10 s watchdog",
+        },
         render_deps: u32 {
             default: 0,
             description: "Experiment: 1 orders renders in the kernel (waits for other queues and for the previous fragment stamp a tiling stage needs, then submits with no firmware dependency items); 0 encodes firmware dependency items",
