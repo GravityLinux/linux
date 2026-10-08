@@ -38,7 +38,7 @@
 		compatible = "apple,sn201202x";
 		reg = <0x8 SPMI_USID>;
 		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
-			<64 IRQ_TYPE_EDGE_RISING>,
+			<65 IRQ_TYPE_EDGE_RISING>,
 			<69 IRQ_TYPE_EDGE_RISING>,
 			<71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
