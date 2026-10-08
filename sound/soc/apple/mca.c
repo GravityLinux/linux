@@ -26,6 +26,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/dmaengine.h>
 #include <linux/of.h>
 #include <linux/property.h>
 #include <linux/of_clk.h>
@@ -1450,6 +1451,26 @@ static int apple_mca_probe(struct platform_device *pdev)
 		if (!be->playback.stream_name || !be->capture.stream_name) {
 			ret = -ENOMEM;
 			goto err_release;
+		}
+	}
+
+	/*
+	 * The PCMs only request their DMA channels when a sound card binds.
+	 * ASoC turns -EPROBE_DEFER at that point into a parked card that is
+	 * retried only when another ASoC component registers, and "dmas" is an
+	 * optional fw_devlink supplier, so nothing orders this probe after the
+	 * DMA controller. If the controller comes up a little later, the card
+	 * never appears. Wait for it here instead, before the component exists.
+	 */
+	if (of_property_present(pdev->dev.of_node, "dmas")) {
+		struct dma_chan *chan = dma_request_chan(&pdev->dev, "tx0a");
+
+		if (IS_ERR(chan)) {
+			ret = PTR_ERR(chan);
+			if (ret == -EPROBE_DEFER)
+				goto err_release;
+		} else {
+			dma_release_channel(chan);
 		}
 	}
 
