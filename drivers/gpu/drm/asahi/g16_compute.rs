@@ -160,15 +160,17 @@ impl Parameters {
             && (self.sampler_count == 0) == (self.sampler == 0)
     }
 
-    pub(crate) fn work(&self, a: &Addresses) -> Option<[u8; 0x8c0]> {
+    pub(crate) fn work(&self, a: &Addresses, out: &mut [u8]) -> Option<()> {
         if !self.valid() {
             return None;
         }
-        let mut out = [0; 0x8c0];
-        u32_at(&mut out, 0, 3);
-        u64_at(&mut out, 4, a.counter);
-        u32_at(&mut out, 12, a.context);
-        u64_at(&mut out, 16, a.notifier);
+        if out.len() != 0x8c0 {
+            return None;
+        }
+        u32_at(&mut *out, 0, 3);
+        u64_at(&mut *out, 4, a.counter);
+        u32_at(&mut *out, 12, a.context);
+        u64_at(&mut *out, 16, a.notifier);
         let registers = [
             (0x1a510, self.save_area),
             (0x1a420, a.cdm_entry.unwrap_or(self.cdm)),
@@ -196,8 +198,8 @@ impl Parameters {
             (0x0a351, a.register_identity),
         ];
         for (index, (reg, value)) in registers.iter().enumerate() {
-            u32_at(&mut out, 0x20 + index * 12, *reg);
-            u64_at(&mut out, 0x24 + index * 12, *value);
+            u32_at(&mut *out, 0x20 + index * 12, *reg);
+            u64_at(&mut *out, 0x24 + index * 12, *value);
         }
         for (off, value) in [
             (0x720, a.register_table),
@@ -219,7 +221,7 @@ impl Parameters {
             (0x86a, a.support),
             (0x883, 0),
         ] {
-            u64_at(&mut out, off, value);
+            u64_at(&mut *out, off, value);
         }
         for (off, value) in [
             (0x728, 24 | (288 << 16)),
@@ -244,11 +246,11 @@ impl Parameters {
             (0x874, 0x21b00),
             (0x87c, 0x11700),
         ] {
-            u32_at(&mut out, off, value);
+            u32_at(&mut *out, off, value);
         }
         out[0x872] = 1;
         out[0x88b] = 1;
-        Some(out)
+        Some(())
     }
 
     pub(crate) fn microsequence(&self, a: &Addresses) -> [u8; 0x300] {

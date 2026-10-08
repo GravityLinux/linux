@@ -2417,7 +2417,9 @@ impl Bootstrap {
         let own = queue.lanes.map_or([0; 3], |l| l.map(|lane| lane.firmware_stamp()));
         self.note_dependency_events(dependencies, own);
         a.cdm_entry = Some(alias + compute::ENTRY_OFFSET);
-        let work = params.work(&a).ok_or(EINVAL)?;
+        let mut work = KVec::new();
+        work.extend_with(0x8c0, 0u8, GFP_KERNEL)?;
+        params.work(&a, &mut work).ok_or(EINVAL)?;
         // Timestamp's user destinations must lie in the validated special-
         // object aperture. Firmware writes nanoseconds directly, as on M1/M2.
         // Firmware consumes this pointer pair, so it lives in the Work's
