@@ -29,6 +29,70 @@ pub(crate) struct FirmwareQueues {
     /// Render Works counted into the queue's shared notifier (two per render).
     notified_works: u32,
     pub(crate) last: [Option<Stamp>; 2],
+    /// Kernel-side dependency resolution statistics (logged at teardown with
+    /// dep_stats=1).
+    deps: DependencyStats,
+}
+
+/// Cumulative per-queue counts of kernel-resolved dependencies.
+#[derive(Default)]
+struct DependencyStats {
+    /// Renders admitted whose tiling stage waited on an earlier fragment
+    /// stamp in the kernel (render_deps=1: the vertex-consumer order).
+    ta_ordered: u64,
+    /// Admission attempts deferred (EBUSY) because that fragment stamp was
+    /// not yet reached; retries are counted each time.
+    ta_held: u64,
+    /// Render admissions deferred on a compute or other-queue stamp.
+    cross_held: u64,
+    /// Fragment-stage waits on the queue's own fragment lane dropped as
+    /// already ordered by the lane.
+    lane_dropped: u64,
+    /// Compute admissions deferred on another queue's stamp.
+    compute_held: u64,
+    /// Works admitted after at least one deferral, and the total time from
+    /// their first deferral to admission.
+    held_works: u64,
+    held_us: u64,
+    /// First deferral of the Work currently waiting, if any.
+    hold_start: Option<Instant<Monotonic>>,
+}
+
+impl DependencyStats {
+    fn defer(&mut self) {
+        if self.hold_start.is_none() {
+            self.hold_start = Some(Instant::now());
+        }
+    }
+
+    fn admit(&mut self) {
+        if let Some(start) = self.hold_start.take() {
+            self.held_works += 1;
+            self.held_us += start.elapsed().as_micros_ceil() as u64;
+        }
+    }
+}
+
+impl Drop for FirmwareQueues {
+    fn drop(&mut self) {
+        let d = &self.deps;
+        if crate::module_parameters::dep_stats.value() != 0
+            && d.ta_ordered + d.ta_held + d.cross_held + d.lane_dropped + d.compute_held != 0
+        {
+            pr_info!(
+                "G16: queue deps renders={} computes={} ta_ordered={} ta_held={} cross_held={} lane_dropped={} compute_held={} held_works={} held_us={}\n",
+                self.render_count,
+                self.compute_count,
+                d.ta_ordered,
+                d.ta_held,
+                d.cross_held,
+                d.lane_dropped,
+                d.compute_held,
+                d.held_works,
+                d.held_us
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +178,7 @@ impl FirmwareQueues {
             compute_count: crate::module_parameters::fw_counter_start.value(),
             notified_works: 0,
             last: [None; 2],
+            deps: DependencyStats::default(),
         }
     }
 
@@ -1540,7 +1605,7 @@ impl Bootstrap {
     /// link is unchanged. render_deps=0 keeps the items.
     fn resolve_render_dependencies(
         &self,
-        queue: &FirmwareQueues,
+        queue: &mut FirmwareQueues,
         params: &render::Parameters,
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<[Option<Stamp>; 2]> {
@@ -1551,16 +1616,30 @@ impl Bootstrap {
             || crate::module_parameters::render_barrier.value() & 1 != 0;
         let own_fragment = queue.lanes.as_ref().map(|lanes| lanes[1].firmware_stamp());
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        let mut ta_ordered = false;
+        let mut lane_dropped = false;
         for (slot, dep) in dependencies.iter().enumerate() {
             let Some(dep) = dep else { continue };
             // Slot 0 is the render dependency: on the fragment stage with a
             // fragment barrier, else on the tiling stage. Slot 1 (compute) is
             // always a tiling-stage wait.
             let lane_ordered = slot == 0 && fragment_stage && own_fragment == Some(dep.address);
+            let ta_wait = slot == 0 && !fragment_stage && own_fragment == Some(dep.address);
             if !lane_ordered && !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value) {
+                if ta_wait {
+                    queue.deps.ta_held += 1;
+                } else {
+                    queue.deps.cross_held += 1;
+                }
+                queue.deps.defer();
                 return Err(EBUSY);
             }
+            ta_ordered |= ta_wait;
+            lane_dropped |= lane_ordered;
         }
+        queue.deps.ta_ordered += u64::from(ta_ordered);
+        queue.deps.lane_dropped += u64::from(lane_dropped);
+        queue.deps.admit();
         Ok([None; 2])
     }
 
@@ -1574,7 +1653,7 @@ impl Bootstrap {
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
-        let resolved = self.resolve_render_dependencies(&queue, params, dependencies)?;
+        let resolved = self.resolve_render_dependencies(&mut queue, params, dependencies)?;
         let dependencies = &resolved;
         let root = owner.lock().roots().low;
         let initbm = !self
@@ -2131,7 +2210,7 @@ impl Bootstrap {
     /// rest of this queue. compute_deps=0 keeps the firmware items.
     fn resolve_compute_dependencies(
         &self,
-        queue: &FirmwareQueues,
+        queue: &mut FirmwareQueues,
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<[Option<Stamp>; 2]> {
         if crate::module_parameters::compute_deps.value() == 0 {
@@ -2143,9 +2222,12 @@ impl Bootstrap {
             if own_lane != Some(dep.address)
                 && !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value)
             {
+                queue.deps.compute_held += 1;
+                queue.deps.defer();
                 return Err(EBUSY);
             }
         }
+        queue.deps.admit();
         Ok([None; 2])
     }
 
@@ -2159,7 +2241,7 @@ impl Bootstrap {
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
         let mut client = owner.lock();
-        let resolved = self.resolve_compute_dependencies(&queue, dependencies)?;
+        let resolved = self.resolve_compute_dependencies(&mut queue, dependencies)?;
         let dependencies = &resolved;
         self.reserve_flight(
             &queue,
