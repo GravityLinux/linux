@@ -1981,7 +1981,14 @@ impl Bootstrap {
             }
         }
         let vm_root = client.roots().low;
-        self.dump_render(&a, (params.tgid, params.comm), vm_root, params.encoder, queue_ordinal, &ta, &frag);
+        let pages = if crate::module_parameters::dump_render_recent.value() != 0
+            || crate::module_parameters::dump_render_buffered.value() != 0
+        {
+            resolve_pages(client, &frag)
+        } else {
+            [(0, 0, 0); 8]
+        };
+        self.dump_render(&a, (params.tgid, params.comm), vm_root, params.encoder, queue_ordinal, pages, &ta, &frag);
         if crate::module_parameters::fw_trace.value() & 32 != 0 && queue_ordinal == 10 {
             pr_info!(
                 "G16: work dump TA={:#x} 3D={:#x} queues={:#x}/{:#x} bm={:#x} thing={:#x} support={:#x} micro={:#x}/{:#x}\n",
@@ -2636,6 +2643,9 @@ const DUMP_FRAG: usize = 0xcc0;
 /// A render as submitted, for dump_render. The Work bytes live separately.
 #[derive(Clone, Copy)]
 pub(crate) struct RenderDump {
+    /// User-VA register values of the 3D table and the physical pages
+    /// they resolved to at submission: (register, VA, PA).
+    pages: [(u32, u64, u64); 8],
     /// Submission time, CLOCK_MONOTONIC ns (as dmesg's uptime).
     at_ns: i64,
     tgid: i32,
@@ -2653,8 +2663,9 @@ pub(crate) struct RenderDump {
 }
 
 impl RenderDump {
-    fn new(a: &render::Addresses, (tgid, comm): (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64) -> Self {
+    fn new(a: &render::Addresses, (tgid, comm): (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64, pages: [(u32, u64, u64); 8]) -> Self {
         Self {
+            pages,
             at_ns: monotonic_ns(),
             tgid,
             comm,
@@ -2686,6 +2697,10 @@ impl RenderDump {
             size & 0xffff_ffff, size >> 32, self.stamps.0, self.stamps.1,
             self.tiling_work, self.fragment_work, self.uuids.0, self.uuids.1
         );
+        if self.pages[0].1 != 0 {
+            let n = self.pages.iter().take_while(|p| p.1 != 0).count();
+            pr_info!("G16: {} render {} pages (reg, va, pa) {:x?}\n", tag, ordinal, &self.pages[..n]);
+        }
         let mut line = KVec::new();
         for i in 0..0x600 / 12 {
             let at = 0x80 + i * 12;
@@ -2832,10 +2847,10 @@ impl Bootstrap {
     /// dump_render_buffered keeps renders matching the shape filters;
     /// dump_render_recent keeps every render, for the stuck context's
     /// immediate predecessors.
-    fn dump_render(&mut self, a: &render::Addresses, tgid: (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64, ta: &[u8], frag: &[u8]) {
+    fn dump_render(&mut self, a: &render::Addresses, tgid: (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64, pages: [(u32, u64, u64); 8], ta: &[u8], frag: &[u8]) {
         let recent = crate::module_parameters::dump_render_recent.value() as usize;
         if recent != 0 {
-            self.recent_ring.record(recent, RenderDump::new(a, tgid, vm_root, stream, ordinal), ta, frag);
+            self.recent_ring.record(recent, RenderDump::new(a, tgid, vm_root, stream, ordinal, pages), ta, frag);
         }
         let ring = crate::module_parameters::dump_render_buffered.value() as usize;
         let enabled = ring != 0 || crate::module_parameters::dump_render_to.value() != 0;
@@ -2846,7 +2861,7 @@ impl Bootstrap {
             if crate::module_parameters::dump_render_to.value() != 0 && !dump_window(ordinal) {
                 return;
             }
-            self.render_ring.record(ring, RenderDump::new(a, tgid, vm_root, stream, ordinal), ta, frag);
+            self.render_ring.record(ring, RenderDump::new(a, tgid, vm_root, stream, ordinal, pages), ta, frag);
             return;
         }
         if !dump_window(ordinal) {
@@ -2856,7 +2871,7 @@ impl Bootstrap {
         if DUMPED_RENDERS.fetch_add(1, Ordering::Relaxed) >= max {
             return;
         }
-        RenderDump::new(a, tgid, vm_root, stream, ordinal).print("dump", ta, frag);
+        RenderDump::new(a, tgid, vm_root, stream, ordinal, pages).print("dump", ta, frag);
     }
 
     /// Hang report: the shape ring, then each stuck render context's
@@ -2977,3 +2992,31 @@ fn monotonic_ns() -> i64 {
     // SAFETY: ktime_get has no preconditions.
     unsafe { kernel::bindings::ktime_get() }
 }
+
+/// Diagnostics: resolve 3D register values that look like user VAs through
+/// the client's page tables, so ring entries can show which renders touch
+/// the same physical pages (e.g. one dma-buf under two VAs).
+fn resolve_pages(client: &mut g16_vm::AddressSpace, frag: &[u8]) -> [(u32, u64, u64); 8] {
+    let mut out = [(0, 0, 0); 8];
+    let mut n = 0;
+    let word = |at: usize| -> u32 {
+        frag.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    for i in 0..0x600 / 12 {
+        let at = 0x80 + i * 12;
+        let number = word(at);
+        let value = u64::from(word(at + 4)) | (u64::from(word(at + 8)) << 32);
+        if number == 0 && value == 0 {
+            break;
+        }
+        if !(0x10_0000_0000..1 << 42).contains(&value) || n == out.len() {
+            continue;
+        }
+        if let Ok(Some(pa)) = client.low.translate(value) {
+            out[n] = (number, value, pa + (value & 0x3fff));
+            n += 1;
+        }
+    }
+    out
+}
+
