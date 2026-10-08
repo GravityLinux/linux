@@ -118,7 +118,7 @@ kernel::module_platform_driver! {
         },
         fw_trace: u32 {
             default: 0,
-            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies, 16=retirement delays, 32=dump one render's Work structs, 64=firmware RX ring activity, 128=firmware mappings and configuration dump",
+            description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies, 16=retirement delays, 32=dump one render's Work structs, 64=firmware RX ring activity, 128=firmware mappings and configuration dump, 256=queue event index changes",
         },
         dep_stats: u32 {
             default: 0,
@@ -155,6 +155,10 @@ kernel::module_platform_driver! {
         dump_render_max: u32 {
             default: 400,
             description: "Debug: at most this many renders are dumped per boot",
+        },
+        event_affinity: u32 {
+            default: 0,
+            description: "Experiment: firmware event indices of idle queues. 0: an idle queue releases its index and takes the lowest free one when it next submits. 1: it retakes its previous index if free, else the next free index after the last one handed out (so a just-released index is not immediately given to another queue). 2: as 1, and a queue keeps its index while idle, for its whole lifetime (risks event exhaustion with more than 32 live queues; see backpressure logs)",
         },
         render_deps: u32 {
             default: 0,

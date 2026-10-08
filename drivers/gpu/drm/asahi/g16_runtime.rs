@@ -23,6 +23,8 @@ pub(crate) struct FirmwareQueues {
     storage: Option<QueueStorage>,
     priority: u32,
     events: Option<QueueEvents>,
+    /// The event index this queue held last (event_affinity).
+    last_event: Option<u32>,
     pending: usize,
     render_count: u64,
     compute_count: u64,
@@ -173,6 +175,7 @@ impl FirmwareQueues {
             storage: None,
             priority,
             events: None,
+            last_event: None,
             pending: 0,
             render_count: crate::module_parameters::fw_counter_start.value(),
             compute_count: crate::module_parameters::fw_counter_start.value(),
@@ -562,19 +565,42 @@ impl Bootstrap {
             }
         }
         if owner.events.is_none() {
-            let previous = self
-                .queue_events
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mask| {
-                    let free = !mask & 0xffff_ffff;
-                    (free != 0).then(|| mask | (1 << free.trailing_zeros()))
+            // Bits 0-31 are the event indices in use. With event_affinity,
+            // bits 32-36 are a next-fit cursor: a queue retakes the index it
+            // last held, and otherwise takes the next free index after the
+            // last one handed out, so an index a queue just released is not
+            // immediately given to a different queue.
+            let affinity = crate::module_parameters::event_affinity.value() != 0;
+            let last = owner.last_event;
+            let mut picked = 0u32;
+            self.queue_events
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    let free = !(value as u32);
+                    if free == 0 {
+                        return None;
+                    }
+                    let cursor = ((value >> 32) & 31) as u32;
+                    picked = if !affinity {
+                        free.trailing_zeros()
+                    } else if let Some(last) = last.filter(|&l| free & (1 << l) != 0) {
+                        last
+                    } else {
+                        (free.rotate_right(cursor).trailing_zeros() + cursor) % 32
+                    };
+                    let cursor = if affinity { u64::from((picked + 1) % 32) } else { u64::from(cursor) };
+                    Some((value & 0xffff_ffff) | (1 << picked) | (cursor << 32))
                 })
                 .map_err(|_| {
                     self.report_pressure(8, "events");
                     EBUSY
                 })?;
+            if crate::module_parameters::fw_trace.value() & 256 != 0 && owner.last_event != Some(picked) {
+                pr_info!("G16: queue event index {:?} -> {}\n", owner.last_event, picked);
+            }
+            owner.last_event = Some(picked);
             owner.events = Some(QueueEvents {
                 slots: self.queue_events.clone(),
-                index: (!previous & 0xffff_ffff).trailing_zeros(),
+                index: picked,
             });
         }
         Ok(())
@@ -1278,7 +1304,7 @@ impl Bootstrap {
             }
             let mut owner = flight.owner.lock();
             owner.pending -= 1;
-            if owner.pending == 0 {
+            if owner.pending == 0 && crate::module_parameters::event_affinity.value() < 2 {
                 owner.events = None;
             }
             drop(owner);
@@ -1721,7 +1747,7 @@ impl Bootstrap {
             timestamps,
             dependencies,
         );
-        if queue.pending == 0 {
+        if queue.pending == 0 && crate::module_parameters::event_affinity.value() < 2 {
             queue.events = None;
         }
         result
@@ -2306,7 +2332,7 @@ impl Bootstrap {
             timestamps,
             dependencies,
         );
-        if queue.pending == 0 {
+        if queue.pending == 0 && crate::module_parameters::event_affinity.value() < 2 {
             queue.events = None;
         }
         result
