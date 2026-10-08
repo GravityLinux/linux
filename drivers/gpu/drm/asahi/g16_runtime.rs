@@ -956,6 +956,7 @@ impl Bootstrap {
                 }
             }
         }
+        self.print_render_rings();
         for flight in self.flights.iter().take(24) {
             // blocked: bit 1 notifier, 2 ring, 3 channel, 4 control reply.
             dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} stream={:#x} ordinal={} blocked={:#x} notifier={:?}\n",
@@ -1917,6 +1918,8 @@ impl Bootstrap {
                 bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
             }
         }
+        let vm_root = client.roots().low;
+        self.dump_render(&a, vm_root, params.encoder, queue_ordinal, &ta, &frag);
         if crate::module_parameters::fw_trace.value() & 32 != 0 && queue_ordinal == 10 {
             pr_info!(
                 "G16: work dump TA={:#x} 3D={:#x} queues={:#x}/{:#x} bm={:#x} thing={:#x} support={:#x} micro={:#x}/{:#x}\n",
@@ -2556,5 +2559,266 @@ impl Bootstrap {
             return Ok(());
         }
         Ok(())
+    }
+}
+
+static DUMPED_RENDERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+const DUMP_TA: usize = 0x940;
+const DUMP_FRAG: usize = 0xcc0;
+
+/// A render as submitted, for dump_render. The Work bytes live separately.
+#[derive(Clone, Copy)]
+pub(crate) struct RenderDump {
+    tgid: i32,
+    /// The submitting VM's render root, which identifies it at detach
+    /// whichever task tears it down. 0 once printed at detach.
+    vm_root: u64,
+    context: u64,
+    stream: u64,
+    ordinal: u64,
+    tiling_work: u64,
+    fragment_work: u64,
+    uuids: (u64, u64),
+}
+
+impl RenderDump {
+    fn new(a: &render::Addresses, vm_root: u64, stream: u64, ordinal: u64) -> Self {
+        Self {
+            tgid: kernel::current!().group_leader().pid(),
+            vm_root,
+            context: a.context_id,
+            stream,
+            ordinal,
+            tiling_work: a.tiling_work,
+            fragment_work: a.fragment_work,
+            uuids: (a.tiling_uuid, a.fragment_uuid),
+        }
+    }
+
+    /// Print in the same form as the hang report's 3D register table.
+    fn print(&self, tag: &str, ta: &[u8], frag: &[u8]) {
+        let ordinal = self.ordinal;
+        pr_info!(
+            "G16: {} render tgid={} context={} stream={:#x} ordinal={} TA={:#x} 3D={:#x} uuid={:#x}/{:#x}\n",
+            tag, self.tgid, self.context, self.stream, ordinal, self.tiling_work,
+            self.fragment_work, self.uuids.0, self.uuids.1
+        );
+        let word = |bytes: &[u8], at: usize| -> u32 {
+            bytes.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let mut line = KVec::new();
+        for i in 0..0x600 / 12 {
+            let at = 0x80 + i * 12;
+            let number = word(frag, at);
+            let value = u64::from(word(frag, at + 4)) | (u64::from(word(frag, at + 8)) << 32);
+            if number == 0 && value == 0 {
+                break;
+            }
+            if line.push((number, value), GFP_KERNEL).is_err() {
+                return;
+            }
+            if line.len() == 6 {
+                pr_info!("G16: {} render {} 3D regs {:x?}\n", tag, ordinal, &line[..]);
+                line.clear();
+            }
+        }
+        if !line.is_empty() {
+            pr_info!("G16: {} render {} 3D regs {:x?}\n", tag, ordinal, &line[..]);
+        }
+        // Descriptor words outside the register table: the (offset,
+        // descriptor) pairs and partial/EOT state, plus the lifecycle tail.
+        for (name, bytes, ranges) in [
+            ("3D", frag, &[(0x440usize, 0x700usize), (0xb80, 0xc00)][..]),
+            ("TA", ta, &[(0x800usize, 0x8c0usize)][..]),
+        ] {
+            for &(start, end) in ranges {
+                for at in (start..end.min(bytes.len())).step_by(32) {
+                    let chunk = &bytes[at..(at + 32).min(bytes.len())];
+                    pr_info!("G16: {} render {} {} {:#05x}: {:02x?}\n", tag, ordinal, name, at, chunk);
+                }
+            }
+        }
+    }
+}
+
+/// Debug: whether a render matches the dump_render shape filters.
+fn dump_matches(a: &render::Addresses, frag: &[u8]) -> bool {
+    let context = crate::module_parameters::dump_render_context.value();
+    if context != u32::MAX && a.context_id != u64::from(context) {
+        return false;
+    }
+    let reg = crate::module_parameters::dump_render_reg.value();
+    if reg == 0 {
+        return true;
+    }
+    let want = crate::module_parameters::dump_render_value.value();
+    let word = |at: usize| -> u32 {
+        frag.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    for i in 0..0x600 / 12 {
+        let at = 0x80 + i * 12;
+        let number = word(at);
+        let value = u64::from(word(at + 4)) | (u64::from(word(at + 8)) << 32);
+        if number == 0 && value == 0 {
+            break;
+        }
+        if number == reg {
+            return value == want;
+        }
+    }
+    false
+}
+
+fn dump_window(ordinal: u64) -> bool {
+    let to = crate::module_parameters::dump_render_to.value();
+    to != 0
+        && ordinal >= u64::from(crate::module_parameters::dump_render_from.value())
+        && ordinal <= u64::from(to)
+}
+
+/// Debug: a ring of submitted renders, allocated once on first use so that
+/// recording never allocates or prints on the submission path.
+pub(crate) struct RenderRing {
+    headers: KVec<RenderDump>,
+    bytes: KVVec<u8>,
+    next: usize,
+}
+
+impl RenderRing {
+    pub(crate) const fn new() -> Self {
+        Self { headers: KVec::new(), bytes: KVVec::new(), next: 0 }
+    }
+
+    fn record(&mut self, capacity: usize, header: RenderDump, ta: &[u8], frag: &[u8]) {
+        if capacity == 0 || ta.len() != DUMP_TA || frag.len() != DUMP_FRAG {
+            return;
+        }
+        if self.bytes.is_empty() {
+            let total = capacity * (DUMP_TA + DUMP_FRAG);
+            if self.headers.reserve(capacity, GFP_KERNEL).is_err()
+                || self.bytes.resize(total, 0, GFP_KERNEL).is_err()
+            {
+                self.bytes.clear();
+                return;
+            }
+        }
+        let slot = self.next % capacity;
+        if slot < self.headers.len() {
+            self.headers[slot] = header;
+        } else if self.headers.push(header, GFP_KERNEL).is_err() {
+            return;
+        }
+        let base = slot * (DUMP_TA + DUMP_FRAG);
+        self.bytes[base..base + DUMP_TA].copy_from_slice(ta);
+        self.bytes[base + DUMP_TA..base + DUMP_TA + DUMP_FRAG].copy_from_slice(frag);
+        self.next = self.next.wrapping_add(1);
+    }
+
+    /// Print the entries `keep` selects, oldest first; returns the count.
+    fn print(&self, tag: &str, keep: impl Fn(&RenderDump) -> bool) -> usize {
+        let len = self.headers.len();
+        let start = if self.next > len && len != 0 { self.next % len } else { 0 };
+        let mut printed = 0;
+        for i in 0..len {
+            let slot = (start + i) % len;
+            let entry = &self.headers[slot];
+            if entry.vm_root == 0 || !keep(entry) {
+                continue;
+            }
+            let base = slot * (DUMP_TA + DUMP_FRAG);
+            let Some(bytes) = self.bytes.get(base..base + DUMP_TA + DUMP_FRAG) else {
+                break;
+            };
+            entry.print(tag, &bytes[..DUMP_TA], &bytes[DUMP_TA..]);
+            printed += 1;
+        }
+        printed
+    }
+
+    /// Stop printing a detached VM's entries.
+    fn forget(&mut self, vm_root: u64) {
+        for entry in self.headers.iter_mut() {
+            if entry.vm_root == vm_root {
+                entry.vm_root = 0;
+            }
+        }
+    }
+}
+
+impl Bootstrap {
+    /// Debug (dump_render_*): log a render as submitted, or keep it in the
+    /// rings printed by the hang report, so a stuck Work can be diffed
+    /// against completed renders without printing on the submission path.
+    /// dump_render_buffered keeps renders matching the shape filters;
+    /// dump_render_recent keeps every render, for the stuck context's
+    /// immediate predecessors.
+    fn dump_render(&mut self, a: &render::Addresses, vm_root: u64, stream: u64, ordinal: u64, ta: &[u8], frag: &[u8]) {
+        let recent = crate::module_parameters::dump_render_recent.value() as usize;
+        if recent != 0 {
+            self.recent_ring.record(recent, RenderDump::new(a, vm_root, stream, ordinal), ta, frag);
+        }
+        let ring = crate::module_parameters::dump_render_buffered.value() as usize;
+        let enabled = ring != 0 || crate::module_parameters::dump_render_to.value() != 0;
+        if !enabled || !dump_matches(a, frag) {
+            return;
+        }
+        if ring != 0 {
+            if crate::module_parameters::dump_render_to.value() != 0 && !dump_window(ordinal) {
+                return;
+            }
+            self.render_ring.record(ring, RenderDump::new(a, vm_root, stream, ordinal), ta, frag);
+            return;
+        }
+        if !dump_window(ordinal) {
+            return;
+        }
+        let max = crate::module_parameters::dump_render_max.value();
+        if DUMPED_RENDERS.fetch_add(1, Ordering::Relaxed) >= max {
+            return;
+        }
+        RenderDump::new(a, vm_root, stream, ordinal).print("dump", ta, frag);
+    }
+
+    /// Hang report: the shape ring, then each stuck render context's
+    /// recent renders of any shape.
+    fn print_render_rings(&self) {
+        if crate::module_parameters::dump_render_buffered.value() != 0
+            && self.render_ring.print("ring", |_| true) == 0
+        {
+            pr_info!("G16: ring holds no matching renders ({} recorded since boot)\n", self.render_ring.next);
+        }
+        if crate::module_parameters::dump_render_recent.value() == 0 {
+            return;
+        }
+        let mut contexts = KVec::new();
+        for flight in self.flights.iter().filter(|f| f.render.is_some()) {
+            let context = u64::from(flight.context);
+            if !contexts.contains(&context) && contexts.push(context, GFP_KERNEL).is_err() {
+                break;
+            }
+        }
+        for context in contexts.iter() {
+            let printed = self.recent_ring.print("recent", |e| e.context == *context);
+            pr_info!(
+                "G16: recent renders on context {}: {} printed ({} recorded since boot)\n",
+                context, printed, self.recent_ring.next
+            );
+        }
+    }
+
+    /// Debug (dump_render_buffered): print a detached VM's buffered renders,
+    /// a same-run baseline for runs that do not stall.
+    pub(crate) fn flush_render_ring(&mut self, vm_root: u64) {
+        if crate::module_parameters::dump_render_buffered.value() != 0 {
+            let printed = self.render_ring.print("exit", |e| e.vm_root == vm_root);
+            // Always say so, so an empty result is not mistaken for no hook.
+            pr_info!(
+                "G16: exit ring vm root {:#x}: {} matching renders printed, {} recorded since boot\n",
+                vm_root, printed, self.render_ring.next
+            );
+        }
+        self.render_ring.forget(vm_root);
+        self.recent_ring.forget(vm_root);
     }
 }
