@@ -209,6 +209,10 @@ pub(super) struct Flight {
     id: u64,
     owner: Arc<Mutex<FirmwareQueues>>,
     context: u32,
+    /// Diagnostics: the command stream (VDM encoder or CDM) and the Work's
+    /// ordinal on its queue, to join hang reports with userspace traces.
+    stream: u64,
+    ordinal: u64,
     started: Instant<Monotonic>,
     stamps: [Option<Stamp>; 2],
     driver_stamps: [Option<Stamp>; 2],
@@ -954,9 +958,9 @@ impl Bootstrap {
         }
         for flight in self.flights.iter().take(24) {
             // blocked: bit 1 notifier, 2 ring, 3 channel, 4 control reply.
-            dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} blocked={:#x} notifier={:?}\n",
+            dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} stream={:#x} ordinal={} blocked={:#x} notifier={:?}\n",
                      flight.id, flight.context, flight.started.elapsed().as_millis(),
-                     flight.render.is_some(), flight.blocked,
+                     flight.render.is_some(), flight.stream, flight.ordinal, flight.blocked,
                      flight.notifier_count.map(|(addr, total)| (word(addr), total)));
             for (stage, stamp) in flight.stamps.iter().enumerate() {
                 if let Some(stamp) = stamp {
@@ -1975,6 +1979,8 @@ impl Bootstrap {
                 id: va,
                 owner: queues,
                 context: a.context_id as u32,
+                stream: params.encoder,
+                ordinal: queue_ordinal,
                 started: Instant::now(),
                 notifier_count,
                 stamps_seen: None,
@@ -2390,6 +2396,8 @@ impl Bootstrap {
                 id: a.work,
                 owner: queues.clone(),
                 context: a.context,
+                stream: params.cdm,
+                ordinal,
                 started: Instant::now(),
                 notifier_count: None,
                 stamps_seen: None,
