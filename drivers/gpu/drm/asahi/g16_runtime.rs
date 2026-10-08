@@ -598,6 +598,11 @@ impl Bootstrap {
                 pr_info!("G16: queue event index {:?} -> {}\n", owner.last_event, picked);
             }
             owner.last_event = Some(picked);
+            if let Some(lanes) = owner.lanes {
+                for (stage, lane) in lanes.iter().enumerate() {
+                    self.set_lane_event(lane.firmware_stamp(), 32 + picked * 3 + stage as u32);
+                }
+            }
             owner.events = Some(QueueEvents {
                 slots: self.queue_events.clone(),
                 index: picked,
@@ -989,6 +994,7 @@ impl Bootstrap {
         }
         self.print_render_rings();
         self.print_reuse_history();
+        self.print_lane_events();
         for flight in self.flights.iter().take(24) {
             // blocked: bit 1 notifier, 2 ring, 3 channel, 4 control reply.
             dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} stream={:#x} ordinal={} blocked={:#x} notifier={:?} tgid={} comm={}\n",
@@ -2019,6 +2025,8 @@ impl Bootstrap {
             .ok_or(EIO)?
             .write_live(a.render_shared_state, &use_count.to_le_bytes())?;
         pool.increment(self._firmware_space.as_mut().ok_or(EIO)?)?;
+        let own = queue.lanes.map_or([0; 3], |l| l.map(|lane| lane.firmware_stamp()));
+        self.note_dependency_events(dependencies, own);
         let (heads, epochs) = self.publish_render(
             &a, &ta, &frag, queue, initbm, pool.blocks, dependencies,
             params.vdm_barrier_fragment,
@@ -2398,6 +2406,8 @@ impl Bootstrap {
         a.identity = (u64::from(a.context) << 32) | (a.identity & 0xffff_ffff);
         a.register_identity = (u64::from(a.context) << 32) | 1;
         self.render_failed = true;
+        let own = queue.lanes.map_or([0; 3], |l| l.map(|lane| lane.firmware_stamp()));
+        self.note_dependency_events(dependencies, own);
         a.cdm_entry = Some(alias + compute::ENTRY_OFFSET);
         let work = params.work(&a).ok_or(EINVAL)?;
         // Timestamp's user destinations must lie in the validated special-
@@ -2899,6 +2909,14 @@ impl Bootstrap {
     /// Debug (dump_render_buffered): print a detached VM's buffered renders,
     /// a same-run baseline for runs that do not stall.
     pub(crate) fn flush_render_ring(&mut self, vm_root: u64) {
+        if crate::module_parameters::fw_trace.value() & 256 != 0 {
+            let now = monotonic_ns();
+            pr_info!(
+                "G16: event summary at={}.{:06} (VM {:#x} detached): {} stale ({} live, {} live on own predecessor) of {} waits since boot\n",
+                now / 1_000_000_000, (now % 1_000_000_000) / 1000, vm_root,
+                self.stale_event_tags, self.stale_live_tags, self.stale_live_own_tags, self.dependency_waits
+            );
+        }
         if crate::module_parameters::dump_render_buffered.value() != 0 {
             let printed = self.render_ring.print("exit", |e| e.vm_root == vm_root);
             // Always say so, so an empty result is not mistaken for no hook.
@@ -3020,3 +3038,81 @@ fn resolve_pages(client: &mut g16_vm::AddressSpace, frag: &[u8]) -> [(u32, u64, 
     out
 }
 
+
+impl Bootstrap {
+    /// Diagnostics: the event a lane's queue signals now, by the lane's
+    /// firmware stamp address (the address cross-queue waits name).
+    fn set_lane_event(&mut self, stamp: u64, event: u32) {
+        if let Some(entry) = self.lane_events.iter_mut().find(|e| e.0 == stamp) {
+            entry.1 = event;
+        } else {
+            let _ = self.lane_events.push((stamp, event), GFP_KERNEL);
+        }
+    }
+
+    /// Diagnostics: count waits whose event tag differs from the event the
+    /// producing lane's queue currently holds ("stale tag at publish").
+    fn note_dependency_events(&mut self, dependencies: &[Option<Stamp>; 2], own: [u64; 3]) {
+        for dep in dependencies.iter().flatten() {
+            let Some(&(_, current)) = self.lane_events.iter().find(|e| e.0 == dep.address) else {
+                continue;
+            };
+            self.dependency_waits = self.dependency_waits.wrapping_add(1);
+            if current != dep.event {
+                self.stale_event_tags = self.stale_event_tags.wrapping_add(1);
+                // Is the stale tag's index live for some other queue right
+                // now (its event fires for them), or free?
+                let index = dep.event.wrapping_sub(32) / 3;
+                let live = index < 32
+                    && self.queue_events.load(Ordering::Acquire) & (1 << index) != 0;
+                if live {
+                    self.stale_live_tags = self.stale_live_tags.wrapping_add(1);
+                    // A wait on the publishing queue's own lane: its
+                    // predecessor Work, published before an idle gap.
+                    if own.contains(&dep.address) {
+                        self.stale_live_own_tags = self.stale_live_own_tags.wrapping_add(1);
+                    }
+                }
+                let slot = self.stale_next % self.stale_recent.len();
+                self.stale_recent[slot] = (monotonic_ns(), dep.address, dep.value, dep.event, current, live);
+                self.stale_next = self.stale_next.wrapping_add(1);
+                if crate::module_parameters::fw_trace.value() & 256 != 0 && self.stale_event_tags <= 64 {
+                    pr_info!(
+                        "G16: stale event tag: wait on {:#x} want {:#x} names event {}, its queue now holds {}{}\n",
+                        dep.address, dep.value, dep.event, current,
+                        if live { " (index live for another queue)" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    /// Hang report: stale-tag totals and the event each known lane holds.
+    fn print_lane_events(&self) {
+        dev_err!(self.dev.as_ref(), "G16: hang events: {} stale ({} on an index live for another queue, {} of those on the queue's own predecessor) of {} waits since boot; events in use {:#010x}\n",
+                 self.stale_event_tags, self.stale_live_tags, self.stale_live_own_tags, self.dependency_waits,
+                 self.queue_events.load(Ordering::Acquire) & 0xffff_ffff);
+        // The most recent stale tags, oldest first.
+        let len = self.stale_recent.len();
+        let count = self.stale_next.min(len);
+        for i in 0..count {
+            let (at, stamp, value, tag, current, live) = self.stale_recent[(self.stale_next - count + i) % len];
+            dev_err!(self.dev.as_ref(), "G16: hang stale tag at={}.{:06} wait on {:#x} want {:#x} names event {}, queue holds {}{}\n",
+                     at / 1_000_000_000, (at % 1_000_000_000) / 1000, stamp, value, tag, current,
+                     if live { " (live for another queue)" } else { "" });
+        }
+        let mut line = KVec::new();
+        for &(stamp, event) in self.lane_events.iter().take(96) {
+            if line.push((stamp, event), GFP_KERNEL).is_err() {
+                break;
+            }
+            if line.len() == 6 {
+                dev_err!(self.dev.as_ref(), "G16: hang lane events (stamp, event) {:x?}\n", &line[..]);
+                line.clear();
+            }
+        }
+        if !line.is_empty() {
+            dev_err!(self.dev.as_ref(), "G16: hang lane events (stamp, event) {:x?}\n", &line[..]);
+        }
+    }
+}
