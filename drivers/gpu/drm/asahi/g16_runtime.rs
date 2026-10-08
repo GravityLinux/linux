@@ -587,6 +587,24 @@ impl Bootstrap {
                 // a ring. Like the channel epochs above, never let the head
                 // run half a ring past an unretired flight on this lane, or
                 // that flight's ring check stays false and it never retires.
+                // The firmware reads up to 128 Works ahead on each lane. With
+                // more unretired Works than that on a lane it stops completing
+                // them (Dota 2 bursts: 127 in flight never stalled, 129 did).
+                // This applies to every lane (render TA and 3D as well as
+                // compute), so bound each well below the window, as Metal does
+                // with at most 64 command buffers in flight per queue.
+                let cap = crate::module_parameters::max_lane_works.value() as usize;
+                if cap != 0
+                    && self
+                        .flights
+                        .iter()
+                        .filter(|f| f.queues.iter().any(|&(pointers, _)| pointers == lane.pointers))
+                        .count()
+                        >= cap
+                {
+                    self.report_pressure(16, "workqueue");
+                    return Err(EBUSY);
+                }
                 let next = (lane.head + entries[stage]) % 0x500;
                 if self.flights.iter().any(|f| {
                     f.queues

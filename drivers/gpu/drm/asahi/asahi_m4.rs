@@ -124,6 +124,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts)",
         },
+        max_lane_works: u32 {
+            default: 64,
+            description: "Maximum unretired Works per firmware lane (render TA/3D and compute) before submissions back off; 0: unlimited. The firmware stops completing Works past a 128-Work window per lane, so keep this at 127 or less; Metal keeps at most 64 command buffers in flight per queue",
+        },
         perf_base: u32 {
             default: 0,
             description: "Debug: GPU performance controller base pstate (0: ADT value; 10 is the top state)",
