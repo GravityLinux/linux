@@ -2065,6 +2065,34 @@ impl Bootstrap {
         Ok(())
     }
 
+    /// Order a compute Work against other queues in the kernel rather than
+    /// with firmware dependency items, which can stall the firmware when a
+    /// burst of compute Works carries them (Dota 2's loading screen); Metal's
+    /// compute Works carry none either. The queue's own compute lane is
+    /// ordered by its ring. Any other awaited stamp must already be reached:
+    /// otherwise return EBUSY, and the submission worker publishes what it
+    /// has staged and retries after the next completion, holding back the
+    /// rest of this queue. compute_deps=0 keeps the firmware items.
+    fn resolve_compute_dependencies(
+        &self,
+        queue: &FirmwareQueues,
+        dependencies: &[Option<Stamp>; 2],
+    ) -> Result<[Option<Stamp>; 2]> {
+        if crate::module_parameters::compute_deps.value() == 0 {
+            return Ok(*dependencies);
+        }
+        let own_lane = queue.lanes.as_ref().map(|lanes| lanes[2].firmware_stamp());
+        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        for dep in dependencies.iter().flatten() {
+            if own_lane != Some(dep.address)
+                && !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value)
+            {
+                return Err(EBUSY);
+            }
+        }
+        Ok([None; 2])
+    }
+
     pub(crate) fn submit_compute(
         &mut self,
         queues: Arc<Mutex<FirmwareQueues>>,
@@ -2075,6 +2103,8 @@ impl Bootstrap {
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
         let mut client = owner.lock();
+        let resolved = self.resolve_compute_dependencies(&queue, dependencies)?;
+        let dependencies = &resolved;
         self.reserve_flight(
             &queue,
             false,
