@@ -582,6 +582,20 @@ impl Bootstrap {
                     self.report_pressure(16, "workqueue");
                     return Err(EBUSY);
                 }
+                // Retirement compares the firmware cursors with each flight's
+                // head modulo the ring, which is only unambiguous within half
+                // a ring. Like the channel epochs above, never let the head
+                // run half a ring past an unretired flight on this lane, or
+                // that flight's ring check stays false and it never retires.
+                let next = (lane.head + entries[stage]) % 0x500;
+                if self.flights.iter().any(|f| {
+                    f.queues
+                        .iter()
+                        .any(|&(pointers, head)| pointers == lane.pointers && !reached(next, head, 0x500))
+                }) {
+                    self.report_pressure(16, "workqueue");
+                    return Err(EBUSY);
+                }
             }
         }
         drop(guard);
