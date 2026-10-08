@@ -218,14 +218,15 @@ pub(crate) struct Bootstrap {
     render_ring: render_runtime::RenderRing,
     retire_log: KVec<render_runtime::Retired>,
     retire_next: usize,
-    handovers: [Option<render_runtime::Handover>; 64],
+    /// Heap-allocated: Bootstrap is built on the probe stack.
+    handovers: KVec<Option<render_runtime::Handover>>,
     lane_events: KVec<(u64, u32)>,
     stale_event_tags: u32,
     stale_live_tags: u32,
     stale_live_own_tags: u32,
     dependency_waits: u32,
     /// The last 64 stale tags: (time ns, stamp, want, tag, current, live).
-    stale_recent: [(i64, u64, u32, u32, u32, bool); 64],
+    stale_recent: KVec<(i64, u64, u32, u32, u32, bool)>,
     stale_next: usize,
     recent_ring: render_runtime::RenderRing,
     next_work_va: u64,
@@ -707,13 +708,21 @@ impl Bootstrap {
             render_ring: render_runtime::RenderRing::new(),
             retire_log: KVec::new(),
             retire_next: 0,
-            handovers: [None; 64],
+            handovers: {
+                let mut v = KVec::new();
+                v.extend_with(64, None, GFP_KERNEL)?;
+                v
+            },
             lane_events: KVec::new(),
             stale_event_tags: 0,
             stale_live_tags: 0,
             stale_live_own_tags: 0,
             dependency_waits: 0,
-            stale_recent: [(0, 0, 0, 0, 0, false); 64],
+            stale_recent: {
+                let mut v = KVec::new();
+                v.extend_with(64, (0, 0, 0, 0, 0, false), GFP_KERNEL)?;
+                v
+            },
             stale_next: 0,
             recent_ring: render_runtime::RenderRing::new(),
             next_work_va: 0xffff_fc22_0000_0000,
