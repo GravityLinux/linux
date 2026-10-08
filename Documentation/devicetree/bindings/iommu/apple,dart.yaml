@@ -60,6 +60,29 @@ properties:
       Has to be one. The single cell describes the stream id emitted by
       a master to the IOMMU.
 
+  apple,sid-remap:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: |
+      Hardware requestor SID aliases required by this DART's integration.
+      Each pair contains a source requestor SID followed by the target
+      translation SID whose page tables and access controls it must use.
+      Only T8110-compatible DARTs support this mapping; target SIDs are
+      limited to the four-bit TCR remap field.
+
+      Aliased requestors cannot be isolated from their target and must share
+      its translation context and IOMMU group. A source SID must not also
+      appear as a target; self-maps, chains and cycles are not supported.
+      SIDs not listed as sources retain identity mapping. Omit this property
+      when no hardware requestor aliases are required.
+    minItems: 1
+    maxItems: 255
+    items:
+      items:
+        - description: Source requestor SID
+          maximum: 255
+        - description: Target translation SID
+          maximum: 15
+
   power-domains:
     maxItems: 1
 
@@ -68,6 +91,17 @@ required:
   - reg
   - '#iommu-cells'
   - interrupts
+
+allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8110-dart
+    then:
+      properties:
+        apple,sid-remap: false
 
 additionalProperties: false
 
