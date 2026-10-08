@@ -16,8 +16,10 @@
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/slab.h>
 
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -503,6 +505,9 @@ struct bcm4377_data;
  *                               reserved bits of Primary/Secondary_PHY inside
  *                               LE Extended Advertising Report events which
  *                               have to be ignored
+ * reprobe_on_resume: Set if the chip loses its firmware state across system
+ *                    suspend, so that resume has to repeat the probe-time
+ *                    function reset, firmware download and boot handshake
  * send_calibration: Optional callback to send calibration data
  * send_ptb: Callback to send "PTB" regulatory/calibration data
  */
@@ -523,6 +528,7 @@ struct bcm4377_hw {
 	unsigned long broken_mws_transport_config : 1;
 	unsigned long broken_le_coded : 1;
 	unsigned long broken_le_ext_adv_report_phy : 1;
+	unsigned long reprobe_on_resume : 1;
 
 	int (*send_calibration)(struct bcm4377_data *bcm4377);
 	int (*send_ptb)(struct bcm4377_data *bcm4377,
@@ -2438,10 +2444,48 @@ static int bcm4377_suspend(struct device *dev)
 	return 0;
 }
 
+struct bcm4377_reprobe_work {
+	struct work_struct work;
+	struct pci_dev *pdev;
+};
+
+static void bcm4377_reprobe_work(struct work_struct *work)
+{
+	struct bcm4377_reprobe_work *rw =
+		container_of(work, struct bcm4377_reprobe_work, work);
+	int ret;
+
+	ret = device_reprobe(&rw->pdev->dev);
+	if (ret)
+		dev_err(&rw->pdev->dev, "reprobe after resume failed: %d\n", ret);
+	pci_dev_put(rw->pdev);
+	kfree(rw);
+}
+
 static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+	struct bcm4377_reprobe_work *rw;
+
+	if (bcm4377->hw->reprobe_on_resume) {
+		/*
+		 * The firmware does not survive suspend on these chips: after
+		 * UNQUIESCE every HCI command times out. Unbinding and binding
+		 * the driver again (function reset, firmware download, boot
+		 * handshake, HCI setup) restores the controller, so do exactly
+		 * that. The work item is allocated separately because the
+		 * reprobe frees this device's devm state, including bcm4377.
+		 */
+		rw = kzalloc(sizeof(*rw), GFP_KERNEL);
+		if (!rw)
+			return -ENOMEM;
+		INIT_WORK(&rw->work, bcm4377_reprobe_work);
+		rw->pdev = pci_dev_get(pdev);
+		dev_info(dev, "reloading firmware after resume\n");
+		schedule_work(&rw->work);
+		return 0;
+	}
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
@@ -2527,6 +2571,7 @@ static const struct bcm4377_hw bcm4377_hw_variants[] = {
 		.broken_mws_transport_config = true,
 		.broken_le_coded = true,
 		.broken_le_ext_adv_report_phy = true,
+		.reprobe_on_resume = true,
 		.send_calibration = bcm4388_send_calibration,
 		.send_ptb = bcm4378_send_ptb,
 	},
