@@ -1528,6 +1528,42 @@ impl Bootstrap {
 
     /// The caller retains all client mappings throughout this call. On failure
     /// after publication it must quarantine those mappings until reset.
+    /// Experiment (render_deps=1): order a render against earlier work in the
+    /// kernel instead of with firmware dependency items, as for compute. A
+    /// render waiting on this queue's own fragment lane from its fragment
+    /// stage (VDM_BARRIER_FRAGMENT) is ordered by that lane. Every other
+    /// awaited stamp, including the previous render's fragment stamp that a
+    /// tiling stage must wait for when the render reads earlier fragment
+    /// output, must be reached before admission; until then return EBUSY and
+    /// let the worker retry after the next completion. The render then
+    /// reaches the firmware with no dependency items; its internal TA-to-3D
+    /// link is unchanged. render_deps=0 keeps the items.
+    fn resolve_render_dependencies(
+        &self,
+        queue: &FirmwareQueues,
+        params: &render::Parameters,
+        dependencies: &[Option<Stamp>; 2],
+    ) -> Result<[Option<Stamp>; 2]> {
+        if crate::module_parameters::render_deps.value() == 0 {
+            return Ok(*dependencies);
+        }
+        let fragment_stage = params.vdm_barrier_fragment
+            || crate::module_parameters::render_barrier.value() & 1 != 0;
+        let own_fragment = queue.lanes.as_ref().map(|lanes| lanes[1].firmware_stamp());
+        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        for (slot, dep) in dependencies.iter().enumerate() {
+            let Some(dep) = dep else { continue };
+            // Slot 0 is the render dependency: on the fragment stage with a
+            // fragment barrier, else on the tiling stage. Slot 1 (compute) is
+            // always a tiling-stage wait.
+            let lane_ordered = slot == 0 && fragment_stage && own_fragment == Some(dep.address);
+            if !lane_ordered && !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value) {
+                return Err(EBUSY);
+            }
+        }
+        Ok([None; 2])
+    }
+
     pub(crate) fn submit_render(
         &mut self,
         queues: Arc<Mutex<FirmwareQueues>>,
@@ -1538,6 +1574,8 @@ impl Bootstrap {
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let mut queue = queues.lock();
+        let resolved = self.resolve_render_dependencies(&queue, params, dependencies)?;
+        let dependencies = &resolved;
         let root = owner.lock().roots().low;
         let initbm = !self
             .tvb_pools
