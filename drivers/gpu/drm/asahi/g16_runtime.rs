@@ -1923,8 +1923,14 @@ impl Bootstrap {
         a.fragment_user_timestamp_end = timestamps[3];
         // From here any publication failure quarantines the roots.
         self.render_failed = true;
-        let mut ta = params.tiling_work(&a).ok_or(EINVAL)?;
-        let mut frag = params.fragment_work(&a).ok_or(EINVAL)?;
+        // Heap buffers: two copies of each encoding on this frame would
+        // exceed the kernel stack together with the job worker's own frame.
+        let mut ta = KVec::new();
+        ta.extend_with(0x940, 0u8, GFP_KERNEL)?;
+        let mut frag = KVec::new();
+        frag.extend_with(0xcc0, 0u8, GFP_KERNEL)?;
+        params.tiling_work(&a, &mut ta).ok_or(EINVAL)?;
+        params.fragment_work(&a, &mut frag).ok_or(EINVAL)?;
         // Keep firmware's internal profiling destinations distinct from the
         // explicit user timestamp slots used for UAPI completion above.
         if crate::module_parameters::work_timestamps.value() != 0 {

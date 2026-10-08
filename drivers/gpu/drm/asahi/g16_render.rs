@@ -650,11 +650,13 @@ impl Addresses {
 }
 
 impl Parameters {
-    pub(crate) fn tiling_work(&self, a: &Addresses) -> Option<[u8; 0x940]> {
+    pub(crate) fn tiling_work(&self, a: &Addresses, out: &mut [u8]) -> Option<()> {
         if !self.valid() || !a.valid() {
             return None;
         }
-        let mut out = [0; 0x940];
+        if out.len() != 0x940 {
+            return None;
+        }
         let registers = pack_registers(&self.tiling_registers()?)?;
         let g = self.geometry();
         let sampler_array = self.sampler_array;
@@ -664,58 +666,60 @@ impl Parameters {
         } else {
             sampler_count + 1
         };
-        u32_at(&mut out, 0x0, 0x0);
-        u64_at(&mut out, 0x4, a.tiling_counter);
-        u32_at(&mut out, 0xc, a.context_id as u32);
-        u64_at(&mut out, 0x10, a.event_control);
-        u64_at(&mut out, 0x18, a.buffer_manager_slot);
-        u64_at(&mut out, 0x20, a.buffer_manager);
-        u64_at(&mut out, 0x28, a.buffer_thing);
-        u64_at(&mut out, 0x30, a.empty_buffer);
+        u32_at(&mut *out, 0x0, 0x0);
+        u64_at(&mut *out, 0x4, a.tiling_counter);
+        u32_at(&mut *out, 0xc, a.context_id as u32);
+        u64_at(&mut *out, 0x10, a.event_control);
+        u64_at(&mut *out, 0x18, a.buffer_manager_slot);
+        u64_at(&mut *out, 0x20, a.buffer_manager);
+        u64_at(&mut *out, 0x28, a.buffer_thing);
+        u64_at(&mut *out, 0x30, a.empty_buffer);
         out[0x40..0x640].copy_from_slice(&registers);
-        u64_at(&mut out, 0x740, a.tiling_register_alias);
+        u64_at(&mut *out, 0x740, a.tiling_register_alias);
         out[0x748..0x74a].copy_from_slice(&(0x41u16).to_le_bytes());
         out[0x74a..0x74c].copy_from_slice(&((0x41 * 0xc) as u16).to_le_bytes());
-        u64_at(&mut out, 0x760, self.tpc);
-        u64_at(&mut out, 0x768, (g.size3 << 0x6) * self.layers);
-        u64_at(&mut out, 0x770, a.tiling_microsequence);
-        u32_at(&mut out, 0x778, 0x300);
+        u64_at(&mut *out, 0x760, self.tpc);
+        u64_at(&mut *out, 0x768, (g.size3 << 0x6) * self.layers);
+        u64_at(&mut *out, 0x770, a.tiling_microsequence);
+        u32_at(&mut *out, 0x778, 0x300);
         // Partial rendering finds its matching fragment Work through this
         // event/stamp pair, independently of the tiling completion event.
-        u32_at(&mut out, 0x77c, a.fragment_event as u32);
-        u32_at(&mut out, 0x780, a.fragment_stamp as u32);
-        u64_at(&mut out, 0x7a8, self.ta_offset(self.deflake_1));
+        u32_at(&mut *out, 0x77c, a.fragment_event as u32);
+        u32_at(&mut *out, 0x780, a.fragment_stamp as u32);
+        u64_at(&mut *out, 0x7a8, self.ta_offset(self.deflake_1));
         out[0x864] = u8::from(self.request_tvb_growth);
-        u64_at(&mut out, 0x840, self.tiling_lifecycle >> 0x20);
-        u32_at(&mut out, 0x848, 0xffffffff);
-        u64_at(&mut out, 0x84c, sampler_array);
-        u32_at(&mut out, 0x84c + 0x8, sampler_count as u32);
-        u32_at(&mut out, 0x84c + 0xc, sampler_max as u32);
-        u64_at(&mut out, 0x878, a.tiling_driver_stamp);
-        u64_at(&mut out, 0x880, a.tiling_firmware_stamp);
-        u32_at(&mut out, 0x888, a.tiling_stamp as u32);
+        u64_at(&mut *out, 0x840, self.tiling_lifecycle >> 0x20);
+        u32_at(&mut *out, 0x848, 0xffffffff);
+        u64_at(&mut *out, 0x84c, sampler_array);
+        u32_at(&mut *out, 0x84c + 0x8, sampler_count as u32);
+        u32_at(&mut *out, 0x84c + 0xc, sampler_max as u32);
+        u64_at(&mut *out, 0x878, a.tiling_driver_stamp);
+        u64_at(&mut *out, 0x880, a.tiling_firmware_stamp);
+        u32_at(&mut *out, 0x888, a.tiling_stamp as u32);
         // Flush notifier stamps before storage reuse. macOS writes 0 here.
-        u32_at(&mut out, 0x894, crate::module_parameters::notifier_flush.value());
-        u32_at(&mut out, 0x88c, a.tiling_event as u32);
-        u32_at(&mut out, 0x898, a.tiling_uuid as u32);
-        u64_at(&mut out, 0x8a0, self.layers - 0x1);
-        u64_at(&mut out, 0x8c8, a.timestamp_start);
-        u64_at(&mut out, 0x8d8, a.tiling_user_timestamp_start);
-        u64_at(&mut out, 0x8e0, a.tiling_user_timestamp_end);
-        u64_at(&mut out, 0x8ff, tagged_page(a.support));
+        u32_at(&mut *out, 0x894, crate::module_parameters::notifier_flush.value());
+        u32_at(&mut *out, 0x88c, a.tiling_event as u32);
+        u32_at(&mut *out, 0x898, a.tiling_uuid as u32);
+        u64_at(&mut *out, 0x8a0, self.layers - 0x1);
+        u64_at(&mut *out, 0x8c8, a.timestamp_start);
+        u64_at(&mut *out, 0x8d8, a.tiling_user_timestamp_start);
+        u64_at(&mut *out, 0x8e0, a.tiling_user_timestamp_end);
+        u64_at(&mut *out, 0x8ff, tagged_page(a.support));
         u64_at(
-            &mut out,
+            &mut *out,
             0x908,
             0xdaa0 | if self.layers > 1 { 1 << 62 } else { 0 },
         );
-        u64_at(&mut out, 0x910, tagged_page(a.tiling_shared_tail));
-        Some(out)
+        u64_at(&mut *out, 0x910, tagged_page(a.tiling_shared_tail));
+        Some(())
     }
-    pub(crate) fn fragment_work(&self, a: &Addresses) -> Option<[u8; 0xcc0]> {
+    pub(crate) fn fragment_work(&self, a: &Addresses, out: &mut [u8]) -> Option<()> {
         if !self.valid() || !a.valid() {
             return None;
         }
-        let mut out = [0; 0xcc0];
+        if out.len() != 0xcc0 {
+            return None;
+        }
         let registers = pack_registers(&self.fragment_registers()?)?;
         let g = self.geometry();
         let sampler_array = self.sampler_array;
@@ -741,102 +745,102 @@ impl Parameters {
         };
         let compact_store = (self.store_pipeline & 0xffffffff) << 32;
         let compact_partial_store = (self.partial_store_pipeline & 0xffffffff) << 32;
-        u32_at(&mut out, 0x0, 0x1);
-        u64_at(&mut out, 0x4, a.fragment_counter);
-        u32_at(&mut out, 0xc, a.context_id as u32);
-        u32_at(&mut out, 0x10, 0x0);
-        u64_at(&mut out, 0x14, a.fragment_microsequence);
-        u32_at(&mut out, 0x1c, 0x380);
-        u64_at(&mut out, 0x20, a.event_control);
-        u64_at(&mut out, 0x28, a.buffer_manager);
-        u64_at(&mut out, 0x30, a.buffer_thing);
-        u64_at(&mut out, 0x38, a.empty_buffer);
-        u64_at(&mut out, 0x40, self.tilemap);
-        u64_at(&mut out, 0x48, self.multisample_control);
-        u32_at(&mut out, 0x50, self.samples as u32);
-        u32_at(&mut out, 0x54, g.macro_size as u32);
-        u32_at(&mut out, 0x68, merge_x as u32);
-        u32_at(&mut out, 0x6c, merge_y as u32);
-        u64_at(&mut out, 0x78, tiles_x * tiles_y);
+        u32_at(&mut *out, 0x0, 0x1);
+        u64_at(&mut *out, 0x4, a.fragment_counter);
+        u32_at(&mut *out, 0xc, a.context_id as u32);
+        u32_at(&mut *out, 0x10, 0x0);
+        u64_at(&mut *out, 0x14, a.fragment_microsequence);
+        u32_at(&mut *out, 0x1c, 0x380);
+        u64_at(&mut *out, 0x20, a.event_control);
+        u64_at(&mut *out, 0x28, a.buffer_manager);
+        u64_at(&mut *out, 0x30, a.buffer_thing);
+        u64_at(&mut *out, 0x38, a.empty_buffer);
+        u64_at(&mut *out, 0x40, self.tilemap);
+        u64_at(&mut *out, 0x48, self.multisample_control);
+        u32_at(&mut *out, 0x50, self.samples as u32);
+        u32_at(&mut *out, 0x54, g.macro_size as u32);
+        u32_at(&mut *out, 0x68, merge_x as u32);
+        u32_at(&mut *out, 0x6c, merge_y as u32);
+        u64_at(&mut *out, 0x78, tiles_x * tiles_y);
         out[0x80..0x680].copy_from_slice(&registers);
-        u64_at(&mut out, 0x680, 0x8c020001dddc00);
-        u64_at(&mut out, 0x688, 0xa0001de1800);
-        u64_at(&mut out, 0x690, 0x8c020200029800);
-        u64_at(&mut out, 0x698, 0x220200039520);
-        u64_at(&mut out, 0x780, a.fragment_register_alias);
+        u64_at(&mut *out, 0x680, 0x8c020001dddc00);
+        u64_at(&mut *out, 0x688, 0xa0001de1800);
+        u64_at(&mut *out, 0x690, 0x8c020200029800);
+        u64_at(&mut *out, 0x698, 0x220200039520);
+        u64_at(&mut *out, 0x780, a.fragment_register_alias);
         out[0x788..0x78a].copy_from_slice(&(0x51u16).to_le_bytes());
         out[0x78a..0x78c].copy_from_slice(&((0x51 * 0xc) as u16).to_le_bytes());
-        u64_at(&mut out, 0x7a0, self.depth_bias_array);
-        u64_at(&mut out, 0x7b0, self.scissor_array);
-        u64_at(&mut out, 0x7c0, self.occlusion_query_base);
-        u64_at(&mut out, 0x8f8, self.load_pipeline_bind);
-        u64_at(&mut out, 0x900, self.load_pipeline);
-        u64_at(&mut out, 0x928, self.partial_load_pipeline_bind);
-        u64_at(&mut out, 0x930, self.partial_load_pipeline);
-        u64_at(&mut out, 0x938, self.depth_flags);
-        u32_at(&mut out, 0x940, 0x4040404);
-        u64_at(&mut out, 0x948, self.depth_buffer);
-        u64_at(&mut out, 0x950, self.depth_stride);
-        u64_at(&mut out, 0x958, self.depth_aux_stride);
-        u64_at(&mut out, 0x960, self.depth_buffer);
-        u64_at(&mut out, 0x968, self.depth_buffer);
-        u64_at(&mut out, 0x970, self.depth_aux_buffer);
-        u64_at(&mut out, 0x978, self.stencil_buffer);
-        u64_at(&mut out, 0x980, self.stencil_stride);
-        u64_at(&mut out, 0x988, self.stencil_aux_stride);
-        u64_at(&mut out, 0x990, self.stencil_buffer);
-        u64_at(&mut out, 0x998, self.stencil_buffer);
-        u64_at(&mut out, 0x9a0, self.stencil_aux_buffer);
-        u32_at(&mut out, 0x9b8, self.tib_encoding() as u32);
-        u64_at(&mut out, 0x9c0, self.aux_fb_flags);
-        u64_at(&mut out, 0x9c8, (self.height << 0x20) | self.width);
-        u64_at(&mut out, 0x9d0, self.aux_fb_page_count);
-        u64_at(&mut out, 0x9d8, self.tile_config);
+        u64_at(&mut *out, 0x7a0, self.depth_bias_array);
+        u64_at(&mut *out, 0x7b0, self.scissor_array);
+        u64_at(&mut *out, 0x7c0, self.occlusion_query_base);
+        u64_at(&mut *out, 0x8f8, self.load_pipeline_bind);
+        u64_at(&mut *out, 0x900, self.load_pipeline);
+        u64_at(&mut *out, 0x928, self.partial_load_pipeline_bind);
+        u64_at(&mut *out, 0x930, self.partial_load_pipeline);
+        u64_at(&mut *out, 0x938, self.depth_flags);
+        u32_at(&mut *out, 0x940, 0x4040404);
+        u64_at(&mut *out, 0x948, self.depth_buffer);
+        u64_at(&mut *out, 0x950, self.depth_stride);
+        u64_at(&mut *out, 0x958, self.depth_aux_stride);
+        u64_at(&mut *out, 0x960, self.depth_buffer);
+        u64_at(&mut *out, 0x968, self.depth_buffer);
+        u64_at(&mut *out, 0x970, self.depth_aux_buffer);
+        u64_at(&mut *out, 0x978, self.stencil_buffer);
+        u64_at(&mut *out, 0x980, self.stencil_stride);
+        u64_at(&mut *out, 0x988, self.stencil_aux_stride);
+        u64_at(&mut *out, 0x990, self.stencil_buffer);
+        u64_at(&mut *out, 0x998, self.stencil_buffer);
+        u64_at(&mut *out, 0x9a0, self.stencil_aux_buffer);
+        u32_at(&mut *out, 0x9b8, self.tib_encoding() as u32);
+        u64_at(&mut *out, 0x9c0, self.aux_fb_flags);
+        u64_at(&mut *out, 0x9c8, (self.height << 0x20) | self.width);
+        u64_at(&mut *out, 0x9d0, self.aux_fb_page_count);
+        u64_at(&mut *out, 0x9d8, self.tile_config);
         // The compact EOT records retain the common firmware layout:
         // rsrc_spec at +0x0c, USC address at +0x14 (fw/fragment.rs::EotProgram).
-        u32_at(&mut out, 0x9f4, self.store_pipeline_bind as u32);
-        u64_at(&mut out, 0x9f8, compact_store);
-        u64_at(&mut out, 0x9fc, self.store_pipeline);
-        u32_at(&mut out, 0xa14, self.partial_store_pipeline_bind as u32);
-        u64_at(&mut out, 0xa18, compact_partial_store);
-        u64_at(&mut out, 0xa1c, self.partial_store_pipeline);
-        u32_at(&mut out, 0xa28, self.depth_clear_value_bits as u32);
+        u32_at(&mut *out, 0x9f4, self.store_pipeline_bind as u32);
+        u64_at(&mut *out, 0x9f8, compact_store);
+        u64_at(&mut *out, 0x9fc, self.store_pipeline);
+        u32_at(&mut *out, 0xa14, self.partial_store_pipeline_bind as u32);
+        u64_at(&mut *out, 0xa18, compact_partial_store);
+        u64_at(&mut *out, 0xa1c, self.partial_store_pipeline);
+        u32_at(&mut *out, 0xa28, self.depth_clear_value_bits as u32);
         u32_at(
-            &mut out,
+            &mut *out,
             0xa2c,
             ((self.stencil_clear_value & 0xff) | 0x300) as u32,
         );
-        u64_at(&mut out, 0xa30, self.sample_size);
-        u64_at(&mut out, 0xa50, self.depth_dimensions);
-        u32_at(&mut out, 0xb80, u32::from(self.fragment_sync_grow));
-        u64_at(&mut out, 0xb88, self.fragment_lifecycle >> 0x20);
-        u32_at(&mut out, 0xb90, 0xffffffff);
-        u64_at(&mut out, 0xb94, sampler_array);
-        u32_at(&mut out, 0xb94 + 0x8, sampler_count as u32);
-        u32_at(&mut out, 0xb94 + 0xc, sampler_max as u32);
-        u32_at(&mut out, 0xba4, u32::from(self.process_empty_tiles));
-        u32_at(&mut out, 0xba8, 0x1);
-        u32_at(&mut out, 0xbac, u32::from(self.samples > 1));
-        u64_at(&mut out, 0xbc0, a.fragment_driver_stamp);
-        u64_at(&mut out, 0xbc8, a.fragment_firmware_stamp);
-        u32_at(&mut out, 0xbd0, a.fragment_stamp as u32);
-        u32_at(&mut out, 0xbdc, 1);
-        u32_at(&mut out, 0xbd4, a.fragment_event as u32);
-        u32_at(&mut out, 0xbe0, a.fragment_uuid as u32);
-        u64_at(&mut out, 0xbe8, self.layers - 0x1);
-        u64_at(&mut out, 0xc10, a.timestamp_start);
-        u64_at(&mut out, 0xc18, a.timestamp_end);
-        u64_at(&mut out, 0xc20, a.fragment_user_timestamp_start);
-        u64_at(&mut out, 0xc28, a.fragment_user_timestamp_end);
-        u64_at(&mut out, 0xc47, tagged_page(a.support));
+        u64_at(&mut *out, 0xa30, self.sample_size);
+        u64_at(&mut *out, 0xa50, self.depth_dimensions);
+        u32_at(&mut *out, 0xb80, u32::from(self.fragment_sync_grow));
+        u64_at(&mut *out, 0xb88, self.fragment_lifecycle >> 0x20);
+        u32_at(&mut *out, 0xb90, 0xffffffff);
+        u64_at(&mut *out, 0xb94, sampler_array);
+        u32_at(&mut *out, 0xb94 + 0x8, sampler_count as u32);
+        u32_at(&mut *out, 0xb94 + 0xc, sampler_max as u32);
+        u32_at(&mut *out, 0xba4, u32::from(self.process_empty_tiles));
+        u32_at(&mut *out, 0xba8, 0x1);
+        u32_at(&mut *out, 0xbac, u32::from(self.samples > 1));
+        u64_at(&mut *out, 0xbc0, a.fragment_driver_stamp);
+        u64_at(&mut *out, 0xbc8, a.fragment_firmware_stamp);
+        u32_at(&mut *out, 0xbd0, a.fragment_stamp as u32);
+        u32_at(&mut *out, 0xbdc, 1);
+        u32_at(&mut *out, 0xbd4, a.fragment_event as u32);
+        u32_at(&mut *out, 0xbe0, a.fragment_uuid as u32);
+        u64_at(&mut *out, 0xbe8, self.layers - 0x1);
+        u64_at(&mut *out, 0xc10, a.timestamp_start);
+        u64_at(&mut *out, 0xc18, a.timestamp_end);
+        u64_at(&mut *out, 0xc20, a.fragment_user_timestamp_start);
+        u64_at(&mut *out, 0xc28, a.fragment_user_timestamp_end);
+        u64_at(&mut *out, 0xc47, tagged_page(a.support));
         u64_at(
-            &mut out,
+            &mut *out,
             0xc50,
             0x113a0 | if self.layers > 1 { 1 << 62 } else { 0 },
         );
-        u64_at(&mut out, 0xc58, tagged_page(a.fragment_shared_tail));
-        u64_at(&mut out, 0xc80, 0x100000000);
-        Some(out)
+        u64_at(&mut *out, 0xc58, tagged_page(a.fragment_shared_tail));
+        u64_at(&mut *out, 0xc80, 0x100000000);
+        Some(())
     }
 }
 
