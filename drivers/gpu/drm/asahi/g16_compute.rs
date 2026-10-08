@@ -67,6 +67,9 @@ fn u64_at(out: &mut [u8], off: usize, value: u64) {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Parameters {
+    /// Diagnostics: the submitting process, captured at ioctl time.
+    pub(crate) tgid: i32,
+    pub(crate) comm: [u8; 16],
     pub(crate) cdm: u64,
     pub(crate) cdm_end: u64,
     pub(crate) sampler: u64,

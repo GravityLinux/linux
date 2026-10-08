@@ -146,7 +146,7 @@ kernel::module_platform_driver! {
         },
         dump_render_recent: u32 {
             default: 0,
-            description: "Debug: N > 0 keeps the last N submitted renders of any shape in a second ring; the hang report prints those on each stuck render's context, for diffing against its immediate predecessors",
+            description: "Debug: N > 0 keeps the last N submitted renders of any shape in a second ring, printed in full by the hang report (each header names tgid, VM, context, size and stamps), for what ran just before a stuck render",
         },
         dump_render_buffered: u32 {
             default: 0,

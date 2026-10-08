@@ -1039,6 +1039,16 @@ static FENCE_KEY: Pin<&kernel::sync::LockClassKey> = kernel::static_lock_class!(
 /// Wait only for actual worker completion, including on scheduler timeout.
 /// Callers hold admission or the affected file state, preventing new uses
 /// of the mappings protected by these fences.
+/// Diagnostics: the calling process's name, for hang reports.
+fn current_comm() -> [u8; 16] {
+    let task = kernel::current!();
+    let leader = task.group_leader();
+    // SAFETY: comm is a NUL-padded fixed array; a concurrent rename can at
+    // worst tear this diagnostic string.
+    let comm = unsafe { (*leader.as_ptr()).comm };
+    core::array::from_fn(|i| comm[i] as u8)
+}
+
 fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
     for fence in pending.iter() {
         // SAFETY: Each entry owns its fence reference throughout the wait.
@@ -1728,6 +1738,8 @@ impl Vm {
             self.cover(c.sampler_heap, u64::from(c.sampler_count) * 8, 2)?;
         }
         Ok(compute::Parameters {
+            tgid: kernel::current!().group_leader().pid(),
+            comm: current_comm(),
             cdm: c.cdm_ctrl_stream_base,
             cdm_end: c.cdm_ctrl_stream_end,
             sampler: c.sampler_heap,
@@ -1757,6 +1769,8 @@ impl Vm {
             return Err(ENOTSUPP);
         }
         let mut p = render::Parameters::default();
+        p.tgid = kernel::current!().group_leader().pid();
+        p.comm = current_comm();
         p.vdm_barrier_fragment = c.flags & VDM_BARRIER_FRAGMENT != 0;
         p.set_private(self.kernel.start, self.kernel.end)
             .ok_or(EINVAL)?;

@@ -213,6 +213,8 @@ pub(super) struct Flight {
     /// ordinal on its queue, to join hang reports with userspace traces.
     stream: u64,
     ordinal: u64,
+    tgid: i32,
+    comm: [u8; 16],
     started: Instant<Monotonic>,
     stamps: [Option<Stamp>; 2],
     driver_stamps: [Option<Stamp>; 2],
@@ -293,6 +295,9 @@ impl Bootstrap {
     /// so a pending dependency never follows a recycled completion address.
     fn allocate_work(&mut self, render: bool) -> Result<u64> {
         use crate::pgtable::prot::{PROT_FW_PRIV_RW, PROT_FW_SHARED_RW};
+        if self.retire_log.capacity() < RETIRE_LOG {
+            self.retire_log.reserve(RETIRE_LOG, GFP_KERNEL)?;
+        }
         let index = usize::from(render);
         if let Some(va) = self.free_work[index].pop() {
             return Ok(va);
@@ -957,12 +962,14 @@ impl Bootstrap {
             }
         }
         self.print_render_rings();
+        self.print_reuse_history();
         for flight in self.flights.iter().take(24) {
             // blocked: bit 1 notifier, 2 ring, 3 channel, 4 control reply.
-            dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} stream={:#x} ordinal={} blocked={:#x} notifier={:?}\n",
+            dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} stream={:#x} ordinal={} blocked={:#x} notifier={:?} tgid={} comm={}\n",
                      flight.id, flight.context, flight.started.elapsed().as_millis(),
                      flight.render.is_some(), flight.stream, flight.ordinal, flight.blocked,
-                     flight.notifier_count.map(|(addr, total)| (word(addr), total)));
+                     flight.notifier_count.map(|(addr, total)| (word(addr), total)), flight.tgid,
+                     comm_str(&flight.comm));
             for (stage, stamp) in flight.stamps.iter().enumerate() {
                 if let Some(stamp) = stamp {
                     dev_err!(self.dev.as_ref(), "G16:   stage {} fw stamp {:#x}={:#x} want {:#x}\n",
@@ -1277,6 +1284,28 @@ impl Bootstrap {
             drop(owner);
             self.context_users[flight.context as usize] -= 1;
             let flight = self.flights.remove(index).map_err(|_| EIO)?;
+            let root = match &flight.render {
+                Some(render) => render.root,
+                None => flight.client.lock().roots().low,
+            };
+            let entry = Retired {
+                work: id,
+                context: flight.context,
+                root,
+                tgid: flight.tgid,
+                comm: flight.comm,
+                ordinal: flight.ordinal,
+                render: render_work,
+                submitted: flight.started,
+                retired: Instant::now(),
+            };
+            // Retirement must not allocate: capacity is reserved up front.
+            if self.retire_log.len() < RETIRE_LOG {
+                let _ = self.retire_log.push_within_capacity(entry);
+            } else {
+                self.retire_log[self.retire_next % RETIRE_LOG] = entry;
+            }
+            self.retire_next = self.retire_next.wrapping_add(1);
             flight.client.lock().release_scratch(flight.scratch)?;
             self.free_work[usize::from(render_work)].push(id, GFP_KERNEL)?;
             self.retired.push_within_capacity((id, limited)).map_err(|_| ENOMEM)?;
@@ -1458,6 +1487,13 @@ impl Bootstrap {
             }
         }
         crate::mem::sync();
+        if let Some(next) = roots {
+            self.handovers[index] = Some(Handover {
+                at: Instant::now(),
+                previous: self.context_roots[index].map_or(0, |r| r.low),
+                next: next.low,
+            });
+        }
         self.context_roots[index] = roots;
         Ok(())
     }
@@ -1919,7 +1955,7 @@ impl Bootstrap {
             }
         }
         let vm_root = client.roots().low;
-        self.dump_render(&a, vm_root, params.encoder, queue_ordinal, &ta, &frag);
+        self.dump_render(&a, (params.tgid, params.comm), vm_root, params.encoder, queue_ordinal, &ta, &frag);
         if crate::module_parameters::fw_trace.value() & 32 != 0 && queue_ordinal == 10 {
             pr_info!(
                 "G16: work dump TA={:#x} 3D={:#x} queues={:#x}/{:#x} bm={:#x} thing={:#x} support={:#x} micro={:#x}/{:#x}\n",
@@ -1984,6 +2020,8 @@ impl Bootstrap {
                 context: a.context_id as u32,
                 stream: params.encoder,
                 ordinal: queue_ordinal,
+                tgid: params.tgid,
+                comm: params.comm,
                 started: Instant::now(),
                 notifier_count,
                 stamps_seen: None,
@@ -2401,6 +2439,8 @@ impl Bootstrap {
                 context: a.context,
                 stream: params.cdm,
                 ordinal,
+                tgid: params.tgid,
+                comm: params.comm,
                 started: Instant::now(),
                 notifier_count: None,
                 stamps_seen: None,
@@ -2570,7 +2610,10 @@ const DUMP_FRAG: usize = 0xcc0;
 /// A render as submitted, for dump_render. The Work bytes live separately.
 #[derive(Clone, Copy)]
 pub(crate) struct RenderDump {
+    /// Submission time, CLOCK_MONOTONIC ns (as dmesg's uptime).
+    at_ns: i64,
     tgid: i32,
+    comm: [u8; 16],
     /// The submitting VM's render root, which identifies it at detach
     /// whichever task tears it down. 0 once printed at detach.
     vm_root: u64,
@@ -2580,12 +2623,16 @@ pub(crate) struct RenderDump {
     tiling_work: u64,
     fragment_work: u64,
     uuids: (u64, u64),
+    stamps: (u64, u64),
 }
 
 impl RenderDump {
-    fn new(a: &render::Addresses, vm_root: u64, stream: u64, ordinal: u64) -> Self {
+    fn new(a: &render::Addresses, (tgid, comm): (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64) -> Self {
         Self {
-            tgid: kernel::current!().group_leader().pid(),
+            at_ns: monotonic_ns(),
+            tgid,
+            comm,
+            stamps: (a.tiling_stamp, a.fragment_stamp),
             vm_root,
             context: a.context_id,
             stream,
@@ -2599,14 +2646,20 @@ impl RenderDump {
     /// Print in the same form as the hang report's 3D register table.
     fn print(&self, tag: &str, ta: &[u8], frag: &[u8]) {
         let ordinal = self.ordinal;
-        pr_info!(
-            "G16: {} render tgid={} context={} stream={:#x} ordinal={} TA={:#x} 3D={:#x} uuid={:#x}/{:#x}\n",
-            tag, self.tgid, self.context, self.stream, ordinal, self.tiling_work,
-            self.fragment_work, self.uuids.0, self.uuids.1
-        );
         let word = |bytes: &[u8], at: usize| -> u32 {
             bytes.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
+        let size = (0..0x600 / 12)
+            .map(|i| 0x80 + i * 12)
+            .find(|&at| word(frag, at) == 0x15211)
+            .map_or(0, |at| u64::from(word(frag, at + 4)) | (u64::from(word(frag, at + 8)) << 32));
+        pr_info!(
+            "G16: {} render at={}.{:06} tgid={} comm={} vm={:#x} context={} stream={:#x} ordinal={} size={}x{} stamps={:#x}/{:#x} TA={:#x} 3D={:#x} uuid={:#x}/{:#x}\n",
+            tag, self.at_ns / 1_000_000_000, (self.at_ns % 1_000_000_000) / 1000,
+            self.tgid, comm_str(&self.comm), self.vm_root, self.context, self.stream, ordinal,
+            size & 0xffff_ffff, size >> 32, self.stamps.0, self.stamps.1,
+            self.tiling_work, self.fragment_work, self.uuids.0, self.uuids.1
+        );
         let mut line = KVec::new();
         for i in 0..0x600 / 12 {
             let at = 0x80 + i * 12;
@@ -2753,10 +2806,10 @@ impl Bootstrap {
     /// dump_render_buffered keeps renders matching the shape filters;
     /// dump_render_recent keeps every render, for the stuck context's
     /// immediate predecessors.
-    fn dump_render(&mut self, a: &render::Addresses, vm_root: u64, stream: u64, ordinal: u64, ta: &[u8], frag: &[u8]) {
+    fn dump_render(&mut self, a: &render::Addresses, tgid: (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64, ta: &[u8], frag: &[u8]) {
         let recent = crate::module_parameters::dump_render_recent.value() as usize;
         if recent != 0 {
-            self.recent_ring.record(recent, RenderDump::new(a, vm_root, stream, ordinal), ta, frag);
+            self.recent_ring.record(recent, RenderDump::new(a, tgid, vm_root, stream, ordinal), ta, frag);
         }
         let ring = crate::module_parameters::dump_render_buffered.value() as usize;
         let enabled = ring != 0 || crate::module_parameters::dump_render_to.value() != 0;
@@ -2767,7 +2820,7 @@ impl Bootstrap {
             if crate::module_parameters::dump_render_to.value() != 0 && !dump_window(ordinal) {
                 return;
             }
-            self.render_ring.record(ring, RenderDump::new(a, vm_root, stream, ordinal), ta, frag);
+            self.render_ring.record(ring, RenderDump::new(a, tgid, vm_root, stream, ordinal), ta, frag);
             return;
         }
         if !dump_window(ordinal) {
@@ -2777,12 +2830,14 @@ impl Bootstrap {
         if DUMPED_RENDERS.fetch_add(1, Ordering::Relaxed) >= max {
             return;
         }
-        RenderDump::new(a, vm_root, stream, ordinal).print("dump", ta, frag);
+        RenderDump::new(a, tgid, vm_root, stream, ordinal).print("dump", ta, frag);
     }
 
     /// Hang report: the shape ring, then each stuck render context's
     /// recent renders of any shape.
     fn print_render_rings(&self) {
+        let now = monotonic_ns();
+        pr_info!("G16: render rings printed at={}.{:06}\n", now / 1_000_000_000, (now % 1_000_000_000) / 1000);
         if crate::module_parameters::dump_render_buffered.value() != 0
             && self.render_ring.print("ring", |_| true) == 0
         {
@@ -2791,20 +2846,13 @@ impl Bootstrap {
         if crate::module_parameters::dump_render_recent.value() == 0 {
             return;
         }
-        let mut contexts = KVec::new();
-        for flight in self.flights.iter().filter(|f| f.render.is_some()) {
-            let context = u64::from(flight.context);
-            if !contexts.contains(&context) && contexts.push(context, GFP_KERNEL).is_err() {
-                break;
-            }
-        }
-        for context in contexts.iter() {
-            let printed = self.recent_ring.print("recent", |e| e.context == *context);
-            pr_info!(
-                "G16: recent renders on context {}: {} printed ({} recorded since boot)\n",
-                context, printed, self.recent_ring.next
-            );
-        }
+        // Everything submitted just before the hang, on every context and
+        // VM; each header names its tgid, VM, context and size.
+        let printed = self.recent_ring.print("recent", |_| true);
+        pr_info!(
+            "G16: recent renders: {} printed ({} recorded since boot)\n",
+            printed, self.recent_ring.next
+        );
     }
 
     /// Debug (dump_render_buffered): print a detached VM's buffered renders,
@@ -2821,4 +2869,85 @@ impl Bootstrap {
         self.render_ring.forget(vm_root);
         self.recent_ring.forget(vm_root);
     }
+}
+
+/// Diagnostics: a process name from a NUL-padded comm.
+fn comm_str(comm: &[u8; 16]) -> &str {
+    let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+    core::str::from_utf8(&comm[..len]).unwrap_or("?")
+}
+
+/// Diagnostics: one retired Work, kept to explain later reuse of its slot
+/// and its Work memory in hang reports.
+#[derive(Clone, Copy)]
+pub(crate) struct Retired {
+    work: u64,
+    context: u32,
+    root: u64,
+    tgid: i32,
+    comm: [u8; 16],
+    ordinal: u64,
+    render: bool,
+    submitted: Instant<Monotonic>,
+    retired: Instant<Monotonic>,
+}
+
+/// Diagnostics: the latest rebinding of a firmware context slot.
+#[derive(Clone, Copy)]
+pub(crate) struct Handover {
+    at: Instant<Monotonic>,
+    previous: u64,
+    next: u64,
+}
+
+const RETIRE_LOG: usize = 256;
+
+fn micros(later: Instant<Monotonic>, earlier: Instant<Monotonic>) -> i64 {
+    (later - earlier).as_nanos() / 1000
+}
+
+impl Bootstrap {
+    /// Hang report: for each stuck render, when its context slot last changed
+    /// hands and what the previous occupant last retired there, and who used
+    /// its Work memory before it. Negative times are after the stuck submit.
+    fn print_reuse_history(&self) {
+        for flight in self.flights.iter().filter(|f| f.render.is_some()).take(8) {
+            let slot = flight.context as usize;
+            let root = flight.render.as_ref().map_or(0, |r| r.root);
+            match self.handovers.get(slot).copied().flatten() {
+                Some(h) => {
+                    let other = if h.next == root { "" } else { " (not to this Work's VM)" };
+                    dev_err!(self.dev.as_ref(),
+                        "G16: hang history Work={:#x} slot {}: rebound {:#x} -> {:#x} {} us before submit{}\n",
+                        flight.id, slot, h.previous, h.next, micros(flight.started, h.at),
+                        other);
+                    if let Some(r) = self.retire_log.iter()
+                        .filter(|r| r.context as usize == slot && r.root == h.previous)
+                        .max_by_key(|r| micros(r.retired, flight.started))
+                    {
+                        dev_err!(self.dev.as_ref(),
+                            "G16: hang history   previous occupant tgid={} comm={} ordinal={} render={} retired {} us before the rebind, {} us before submit\n",
+                            r.tgid, comm_str(&r.comm), r.ordinal, r.render,
+                            micros(h.at, r.retired), micros(flight.started, r.retired));
+                    }
+                }
+                None => dev_err!(self.dev.as_ref(),
+                    "G16: hang history Work={:#x} slot {}: no rebind recorded\n", flight.id, slot),
+            }
+            match self.retire_log.iter().filter(|r| r.work == flight.id).max_by_key(|r| micros(r.retired, flight.started)) {
+                Some(r) => dev_err!(self.dev.as_ref(),
+                    "G16: hang history   Work memory last used by tgid={} comm={} slot {} ordinal={} vm {:#x}: submitted {} us and retired {} us before this submit\n",
+                    r.tgid, comm_str(&r.comm), r.context, r.ordinal, r.root,
+                    micros(flight.started, r.submitted), micros(flight.started, r.retired)),
+                None => dev_err!(self.dev.as_ref(),
+                    "G16: hang history   Work memory: no earlier use in the last {} retirements\n", RETIRE_LOG),
+            }
+        }
+    }
+}
+
+/// Diagnostics: CLOCK_MONOTONIC in ns, comparable with dmesg timestamps.
+fn monotonic_ns() -> i64 {
+    // SAFETY: ktime_get has no preconditions.
+    unsafe { kernel::bindings::ktime_get() }
 }
