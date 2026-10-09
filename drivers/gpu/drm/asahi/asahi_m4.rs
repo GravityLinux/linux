@@ -173,8 +173,12 @@ kernel::module_platform_driver! {
             description: "Experiment: 1 orders renders in the kernel (waits for other queues and for the previous fragment stamp a tiling stage needs, then submits with no firmware dependency items); 0 encodes firmware dependency items",
         },
         compute_deps: u32 {
-            default: 1,
+            default: 2,
             description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts); 2 as 1, but waits on the same queue's own render lanes stay firmware items (in-submission render -> compute edges without a host round trip)",
+        },
+        max_queue_entries: u32 {
+            default: 96,
+            description: "Maximum unretired Works plus their firmware dependency items per queue (all lanes together) before submissions back off; 0: unlimited. Keeps the firmware's per-queue completion window (about 128) from overflowing",
         },
         max_lane_works: u32 {
             default: 64,

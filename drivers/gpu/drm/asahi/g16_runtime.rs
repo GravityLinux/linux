@@ -678,6 +678,30 @@ impl Bootstrap {
             self.report_pressure(1, "ASIDs");
             return Err(EBUSY);
         }
+        // The firmware stops completing a queue's Works (its shared notifier
+        // stalls with the stamps already past, blocked=0x2) when too many
+        // are outstanding: k24-cap129 (129 Works on a lane) and k69 on #108,
+        // whose compute_deps=2 adds firmware dependency items. Bound the
+        // whole queue's unretired Works plus their dependency items.
+        let cap = crate::module_parameters::max_queue_entries.value() as usize;
+        if cap != 0 {
+            if let Some(lanes) = &queue.lanes {
+                let ours = |f: &&Flight| {
+                    f.queues.iter().any(|&(p, _)| lanes.iter().any(|l| l.pointers == p))
+                };
+                let outstanding: usize = self
+                    .flights
+                    .iter()
+                    .filter(ours)
+                    .map(|f| 1 + f.dependencies.iter().flatten().count())
+                    .sum();
+                let new = entries.iter().copied().max().unwrap_or(1) as usize;
+                if outstanding + new > cap {
+                    self.report_pressure(16, "queue entries");
+                    return Err(EBUSY);
+                }
+            }
+        }
         let stages: &[usize] = if render { &[0, 1] } else { &[2] };
         let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
         let guard = self._sgx.try_access().ok_or(ENODEV)?;
