@@ -6464,6 +6464,7 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 	struct brcmf_cfg80211_profile *profile = &ifp->vif->profile;
 	struct brcmf_cfg80211_connect_info *conn_info = cfg_to_conn(cfg);
 	struct cfg80211_connect_resp_params conn_params;
+	bool authorized = false;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -6473,12 +6474,8 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		if (completed) {
 			brcmf_get_assoc_ies(cfg, ifp);
 			brcmf_update_bss_info(cfg, ifp);
-			if ((profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) ||
-			    (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK)) {
-				cfg80211_port_authorized(ndev, profile->bssid,
-							 NULL, 0, GFP_KERNEL);
-				brcmf_dbg(CONN, "Report port authorized\n");
-			}
+			authorized = profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE ||
+				     profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK;
 			set_bit(BRCMF_VIF_STATUS_CONNECTED,
 				&ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_SUCCESS;
@@ -6497,6 +6494,16 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		cfg80211_connect_done(ndev, &conn_params, GFP_KERNEL);
 		brcmf_dbg(CONN, "Report connect result - connection %s\n",
 			  completed ? "succeeded" : "failed");
+		/*
+		 * cfg80211 handles queued events in order and only accepts
+		 * port authorization once the connection is established, so
+		 * report it after the connect result.
+		 */
+		if (authorized) {
+			cfg80211_port_authorized(ndev, profile->bssid, NULL, 0,
+						 GFP_KERNEL);
+			brcmf_dbg(CONN, "Report port authorized\n");
+		}
 	}
 	brcmf_dbg(TRACE, "Exit\n");
 	return 0;
