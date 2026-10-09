@@ -248,3 +248,31 @@
 	phy-names = "dp-phy";
 	apple,dptx-phy = <4>;
 };
+
+#include "hwmon-common.dtsi"
+#include "hwmon-laptop.dtsi"
+
+/*
+ * J713 SoC sensors, identified on the Air by behavior: under an all-core CPU
+ * load Tp0f is among the hottest of the Tp keys (49 -> 106 C), and the PP0b/VP0b/IP0b rail follows
+ * the load (1.5 -> 10 W, 0.61 -> 0.97 V, 2.4 -> 10.3 A; V * I matches P).
+ * PMVR from hwmon-common doesn't exist on this SMC and is skipped.
+ */
+&smc_hwmon {
+	temperature-Tp0f {
+		apple,key-id = "Tp0f";
+		label = "CPU Temperature";
+	};
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "CPU Rail Power";
+	};
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "CPU Rail Voltage";
+	};
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "CPU Rail Current";
+	};
+};
