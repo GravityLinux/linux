@@ -174,7 +174,7 @@ kernel::module_platform_driver! {
         },
         compute_deps: u32 {
             default: 1,
-            description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts)",
+            description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts); 2 as 1, but waits on the same queue's own render lanes stay firmware items (in-submission render -> compute edges without a host round trip)",
         },
         max_lane_works: u32 {
             default: 64,

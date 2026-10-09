@@ -2414,8 +2414,23 @@ impl Bootstrap {
             return Ok(*dependencies);
         }
         let own_lane = queue.lanes.as_ref().map(|lanes| lanes[2].firmware_stamp());
+        // compute_deps=2: a wait on this queue's own render lanes (the
+        // render -> compute edge inside one submission) stays a firmware
+        // item, so the firmware starts the compute right after the render
+        // instead of after a host round trip. Other queues stay kernel-side.
+        let own_render = queue
+            .lanes
+            .as_ref()
+            .map(|lanes| [lanes[0].firmware_stamp(), lanes[1].firmware_stamp()]);
+        let keep_own_render = crate::module_parameters::compute_deps.value() == 2;
+        let mut kept = [None; 2];
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-        for dep in dependencies.iter().flatten() {
+        for (slot, dep) in dependencies.iter().enumerate() {
+            let Some(dep) = dep else { continue };
+            if keep_own_render && own_render.is_some_and(|r| r.contains(&dep.address)) {
+                kept[slot] = Some(*dep);
+                continue;
+            }
             if own_lane != Some(dep.address) {
                 let now = fw.read_u32(dep.address)?;
                 let done = g16_stamp::reached(now, dep.value);
@@ -2428,7 +2443,7 @@ impl Bootstrap {
             }
         }
         queue.deps.admit();
-        Ok([None; 2])
+        Ok(kept)
     }
 
     pub(crate) fn submit_compute(
