@@ -250,6 +250,9 @@ pub(crate) struct Bootstrap {
     context_roots: [Option<crate::g16_vm::Roots>; 64],
     context_users: [u32; 64],
     pressure_reported: core::sync::atomic::AtomicU64,
+    hold_key: core::sync::atomic::AtomicU64,
+    hold_since_ns: core::sync::atomic::AtomicI64,
+    hold_near_misses: core::sync::atomic::AtomicU32,
     render_support: kernel::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 
@@ -742,6 +745,9 @@ impl Bootstrap {
             context_roots: [None; 64],
             context_users: [0; 64],
             pressure_reported: core::sync::atomic::AtomicU64::new(0),
+            hold_key: core::sync::atomic::AtomicU64::new(0),
+            hold_since_ns: core::sync::atomic::AtomicI64::new(0),
+            hold_near_misses: core::sync::atomic::AtomicU32::new(0),
             render_support: kernel::sync::Arc::new(
                 core::sync::atomic::AtomicU64::new(0),
                 GFP_KERNEL,

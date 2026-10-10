@@ -271,6 +271,52 @@ fn ring_room(tail: u32, read: u32, done: u32, entries: u32, capacity: u32) -> bo
 impl Bootstrap {
     /// Report each exhausted resource once, without logging every retry or
     /// enabling firmware KTrace (which changes command execution timing).
+    /// A Work held on a stamp waits for a completion to advance it. With no
+    /// Work in flight anywhere nothing can write that stamp, so the hold
+    /// would never clear and the pump would keep the job forever with an
+    /// idle GPU. If the same wait stays unreached with nothing in flight
+    /// for a second (the pump re-polls every 256 ms), fail just that
+    /// command and say why. A recorded hold that later resolves is counted
+    /// and logged as a near miss.
+    fn hold_check(&self, kind: &str, dep: &Stamp, now: u32, done: bool) -> Result {
+        let key = dep.address ^ (u64::from(dep.value) << 32).rotate_left(16);
+        let recorded = self.hold_key.load(Ordering::Relaxed);
+        if done {
+            if recorded == key {
+                self.hold_key.store(0, Ordering::Relaxed);
+                let misses = self.hold_near_misses.fetch_add(1, Ordering::Relaxed) + 1;
+                if misses <= 16 {
+                    dev_info!(self.dev.as_ref(),
+                              "G16: {} wait on stamp {:#x} want {:#x} resolved after being unreachable with nothing in flight (near miss #{})\n",
+                              kind, dep.address, dep.value, misses);
+                }
+            }
+            return Ok(());
+        }
+        if !self.flights.is_empty() {
+            if recorded == key {
+                self.hold_key.store(0, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        let now_ns = monotonic_ns();
+        if recorded != key {
+            self.hold_key.store(key, Ordering::Relaxed);
+            self.hold_since_ns.store(now_ns, Ordering::Relaxed);
+            return Ok(());
+        }
+        if now_ns - self.hold_since_ns.load(Ordering::Relaxed) < 1_000_000_000 {
+            return Ok(());
+        }
+        self.hold_key.store(0, Ordering::Relaxed);
+        dev_err!(
+            self.dev.as_ref(),
+            "G16: {} wait on stamp {:#x} want {:#x} (now {:#x}, event {}) unreachable with nothing in flight for 1 s; failing the command\n",
+            kind, dep.address, dep.value, now, dep.event
+        );
+        Err(EDEADLK)
+    }
+
     fn report_pressure(&self, bit: u64, resource: &str) {
         // Every resource here is released when work retires. Backpressure with
         // nothing in flight can therefore never clear: it means an accounting
@@ -1413,8 +1459,11 @@ impl Bootstrap {
             .min()
             .unwrap_or(10000);
         // Wedge detection samples render progress a few times per window.
+        // A recorded unreachable hold is re-checked within its grace second.
         if self.flights.iter().any(|f| f.render.is_some()) {
             watchdog.min(250)
+        } else if self.hold_key.load(Ordering::Relaxed) != 0 {
+            watchdog.min(500)
         } else {
             watchdog
         }
@@ -1746,7 +1795,12 @@ impl Bootstrap {
             // always a tiling-stage wait.
             let lane_ordered = slot == 0 && fragment_stage && own_fragment == Some(dep.address);
             let ta_wait = slot == 0 && !fragment_stage && own_fragment == Some(dep.address);
-            if !lane_ordered && !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value) {
+            let now = if lane_ordered { 0 } else { fw.read_u32(dep.address)? };
+            let done = lane_ordered || g16_stamp::reached(now, dep.value);
+            if !lane_ordered {
+                self.hold_check("render", dep, now, done)?;
+            }
+            if !done {
                 if ta_wait {
                     queue.deps.ta_held += 1;
                 } else {
@@ -2362,12 +2416,15 @@ impl Bootstrap {
         let own_lane = queue.lanes.as_ref().map(|lanes| lanes[2].firmware_stamp());
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
         for dep in dependencies.iter().flatten() {
-            if own_lane != Some(dep.address)
-                && !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value)
-            {
-                queue.deps.compute_held += 1;
-                queue.deps.defer();
-                return Err(EBUSY);
+            if own_lane != Some(dep.address) {
+                let now = fw.read_u32(dep.address)?;
+                let done = g16_stamp::reached(now, dep.value);
+                self.hold_check("compute", dep, now, done)?;
+                if !done {
+                    queue.deps.compute_held += 1;
+                    queue.deps.defer();
+                    return Err(EBUSY);
+                }
             }
         }
         queue.deps.admit();
