@@ -243,28 +243,91 @@ impl DriverObject for Buffer {
         if inner.device.failed.load(Ordering::Acquire) {
             return;
         }
-        let result: Result = (|| {
-            let mut state = inner.state.lock();
-            for vm in &mut state.vms {
-                if !vm.mappings.iter().any(|m| core::ptr::eq(&*m.obj, obj)) {
-                    continue;
+        let exiting = current_exiting();
+        let mut state = inner.state.lock();
+        for vm in &mut state.vms {
+            if !vm.mappings.iter().any(|m| core::ptr::eq(&*m.obj, obj)) {
+                continue;
+            }
+            if vm.render_broken {
+                // Already failed: its mappings stay until the file goes
+                // away, and waiting again per object would only multiply
+                // the stall (every handle is closed on exit).
+                continue;
+            }
+            if exiting && vm.pending.iter().any(|f| {
+                // SAFETY: The vector retains a live reference while queried.
+                !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+            }) {
+                // DRM closes every handle before the file's teardown, which
+                // destroys the queues (cancelling dependency-blocked jobs)
+                // and then waits once. Don't wait here: keep the mappings
+                // and leave the VM to that teardown.
+                vm.render_broken = true;
+                continue;
+            }
+            // A live close: wait at most CLOSE_DRAIN_MS. Only a fatal signal
+            // ends the wait early (the process is then exiting anyway); any
+            // other signal is ignored, so a healthy client's VM stays usable.
+            if let Err(error) = drain_within(&mut vm.pending, CLOSE_DRAIN_MS, true /* killable */) {
+                // This VM's own work hasn't completed: typically a job still
+                // waiting on an input fence that never signaled, or a hung
+                // client. Its mappings keep the backing pinned, so late DMA
+                // stays inside this client's pages. Only this VM becomes
+                // unusable; other clients keep running.
+                vm.render_broken = true;
+                let task = kernel::current!();
+                // SAFETY: comm is a NUL-padded fixed array; a concurrent
+                // rename can at worst tear this log string.
+                let comm = unsafe { (*task.as_ptr()).comm };
+                let comm: [u8; 16] = core::array::from_fn(|i| comm[i] as u8);
+                let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+                // Where the unfinished work is: in the pump (issued or held on
+                // a stamp) or still in drm_sched waiting for its input fences.
+                let unsignaled = vm.pending.iter().filter(|f| {
+                    // SAFETY: The vector retains a live reference while queried.
+                    !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+                }).count();
+                let (mut pumped, mut issued) = (0usize, 0usize);
+                {
+                    let engine = inner.device.engine.lock();
+                    for job in engine.jobs.iter() {
+                        let e = &job.execution;
+                        if Arc::ptr_eq(&e.space, &vm.space) || Arc::ptr_eq(&e.space, &vm.compute_space) {
+                            pumped += 1;
+                            if job.next > 0 {
+                                issued += 1;
+                            }
+                        }
+                    }
                 }
-                drain(&mut vm.pending)?;
-                let runtime = inner.device.runtime.lock();
+                pr_err!(
+                    "G16: closing a GEM object: VM {} work didn't complete ({:?}) in {}[{}]; keeping its mappings and failing that VM's further submissions\n",
+                    vm.id, error, core::str::from_utf8(&comm[..len]).unwrap_or("?"), task.pid()
+                );
+                pr_err!(
+                    "G16: VM {}: {} of {} submissions unfinished: {} in the pump ({} started), {} waiting for input fences\n",
+                    vm.id, unsignaled, vm.pending.len(), pumped, issued, unsignaled.saturating_sub(pumped)
+                );
+                continue;
+            }
+            let runtime = inner.device.runtime.lock();
+            let result: Result = (|| {
                 while let Some(range) = vm.mappings.iter()
                     .find(|m| core::ptr::eq(&*m.obj, obj))
                     .map(|m| m.range.clone())
                 {
                     vm.unmap(range, &runtime)?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                // Page tables may be partly edited: the hardware state is
+                // unknown, so stop the device as before.
+                inner.device.failed.store(true, Ordering::Release);
+                pr_err!("G16: failed to unbind closed GEM object: {:?}\n", error);
+                return;
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            // close cannot report failure. Preserve backing for late DMA and
-            // reject further submissions if completion was not established.
-            inner.device.failed.store(true, Ordering::Release);
-            pr_err!("G16: failed to unbind closed GEM object: {:?}\n", error);
         }
     }
 }
@@ -307,15 +370,26 @@ impl PinnedDrop for File {
         // state lock while DRM waits for scheduler callbacks.
         let queues = core::mem::take(&mut self.state.lock().queues);
         drop(queues);
-        let mut admission = self.device.admission.lock();
-        if drain(&mut admission).is_err() {
-            // Completion was not established. Retain roots and every pinned
-            // GEM page until reboot; do not let late DMA reach reused RAM.
+        // Wait only for this file's own work. Other clients' fences don't
+        // protect anything torn down here.
+        let mut state = self.state.lock();
+        let mut drained = true;
+        for vm in state.vms.iter_mut() {
+            // Not interruptible: a killed process has a fatal signal
+            // pending, and giving up early would leak its pages.
+            if drain_within(&mut vm.pending, CLOSE_DRAIN_MS, false).is_err() {
+                drained = false;
+            }
+        }
+        if !drained {
+            // Completion was not established. Retain this file's roots and
+            // every pinned GEM page until reboot, so late DMA can't reach
+            // reused RAM. Other clients keep running.
+            pr_err!("G16: closing a client whose GPU work didn't complete; leaking its address spaces\n");
+            drop(state);
             core::mem::forget(self.state.clone());
-            self.device.failed.store(true, Ordering::Release);
             return;
         }
-        let state = self.state.lock();
         let mut runtime = self.device.runtime.lock();
         for vm in state.vms.iter().rev() {
             if vm.detach(&mut runtime).is_err() {
@@ -1079,24 +1153,69 @@ fn current_comm() -> [u8; 16] {
 }
 
 fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
+    drain_within(pending, 35000, false)
+}
+
+/// Wait for every fence in `pending` within one overall budget of `ms`.
+/// With `killable`, a fatal signal ends the wait early with EINTR; other
+/// signals are ignored, since a GEM close can't be restarted (DRM has
+/// already removed the handle) and failing a live client's VM because of
+/// SIGIO or a timer would break a healthy process.
+fn drain_within(pending: &mut KVec<dma_fence::Fence>, ms: u32, killable: bool) -> Result {
+    let mut left = kernel::time::msecs_to_jiffies(ms) as core::ffi::c_long;
+    // Re-check for a fatal signal this often while waiting.
+    let slice = if killable {
+        kernel::time::msecs_to_jiffies(100) as core::ffi::c_long
+    } else {
+        left
+    };
     for fence in pending.iter() {
-        // SAFETY: Each entry owns its fence reference throughout the wait.
-        let result = unsafe {
-            bindings::dma_fence_wait_timeout(
-                fence.raw(),
-                false,
-                kernel::time::msecs_to_jiffies(35000) as _,
-            )
-        };
-        if result < 0 {
-            return Err(Error::from_errno(result as i32));
-        }
-        if result == 0 {
-            return Err(ETIMEDOUT);
+        loop {
+            let step = left.min(slice).max(1);
+            // SAFETY: Each entry owns its fence reference throughout the wait.
+            let result = unsafe { bindings::dma_fence_wait_timeout(fence.raw(), false, step as _) };
+            if result < 0 {
+                return Err(Error::from_errno(result as i32));
+            }
+            if result > 0 {
+                // dma_fence_wait_timeout returns the jiffies of `step` left
+                // (at least 1), so `left` stays positive.
+                left -= step - result as core::ffi::c_long;
+                break;
+            }
+            left -= step;
+            if left <= 0 {
+                return Err(ETIMEDOUT);
+            }
+            if killable && fatal_signal_pending() {
+                return Err(EINTR);
+            }
         }
     }
     pending.clear();
     Ok(())
+}
+
+/// Whether the calling task has SIGKILL pending (fatal_signal_pending()).
+fn fatal_signal_pending() -> bool {
+    let task = kernel::current!();
+    // SAFETY: `current` is valid for the duration of this call. Like
+    // __fatal_signal_pending(), this is an unlocked read of the task's own
+    // pending set; SIGKILL stays set once delivered.
+    unsafe {
+        (*task.as_ptr()).pending.signal.sig[0] & (1 << (bindings::SIGKILL - 1)) != 0
+    }
+}
+
+/// A healthy issued Work finishes within the 10 s firmware watchdog, or the
+/// device fails anyway; past this only unissued (stuck) work can remain.
+const CLOSE_DRAIN_MS: u32 = 12000;
+
+/// Whether the calling task is exiting (DRM releases its GEM handles).
+fn current_exiting() -> bool {
+    let task = kernel::current!();
+    // SAFETY: `current` is valid for the duration of this call.
+    unsafe { (*task.as_ptr()).flags & bindings::PF_EXITING != 0 }
 }
 
 /// Owns copied commands and the VM storage until hardware completion. The
