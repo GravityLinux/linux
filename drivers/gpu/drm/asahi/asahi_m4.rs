@@ -179,7 +179,11 @@ kernel::module_platform_driver! {
         },
         max_queue_entries: u32 {
             default: 96,
-            description: "Maximum unretired Works plus their firmware dependency items per queue (all lanes together) before submissions back off; 0: unlimited. Keeps the firmware's per-queue completion window (about 128) from overflowing",
+            description: "Maximum unretired Works plus their firmware dependency items per queue (all lanes together) before submissions back off; 0: unlimited (then max_lane_entries must bound each lane). Runtime: debugfs asahi_m4/queue_cap",
+        },
+        max_lane_entries: u32 {
+            default: 0,
+            description: "Maximum unretired Works plus their firmware dependency items on one firmware lane (render TA or 3D, or compute) before submissions back off; 0: unlimited. Keeps dependency items below the firmware's 128-Work per-lane window. Keep it at 127 or less whenever compute_deps or render_deps leave firmware items",
         },
         max_lane_works: u32 {
             default: 64,

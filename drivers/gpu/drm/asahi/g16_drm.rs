@@ -152,6 +152,8 @@ pub(crate) struct Data {
     timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
     _profile: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>>,
     _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
+    _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
+    _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
 }
 
@@ -201,7 +203,19 @@ pub(crate) fn register<'a>(
         crate::module_parameters::fw_cache_maint.value(),
         Ordering::Relaxed,
     );
+    crate::g16_timeline::init_caps(
+        crate::module_parameters::max_queue_entries.value(),
+        crate::module_parameters::max_lane_entries.value(),
+    )?;
     let dir = kernel::debugfs::Dir::new(c_str!("asahi_m4"));
+    let queue_cap = KBox::pin_init(
+        dir.read_write_file(c_str!("queue_cap"), crate::g16_timeline::CapKnob::QUEUE),
+        GFP_KERNEL,
+    )?;
+    let lane_cap = KBox::pin_init(
+        dir.read_write_file(c_str!("lane_cap"), crate::g16_timeline::CapKnob::LANE),
+        GFP_KERNEL,
+    )?;
     let maint = KBox::pin_init(
         dir.read_write_file(c_str!("fw_cache_maint"), crate::g16_timeline::MaintKnob),
         GFP_KERNEL,
@@ -231,6 +245,8 @@ pub(crate) fn register<'a>(
         timeline,
         _profile: profile,
         _maint: maint,
+        _queue_cap: queue_cap,
+        _lane_cap: lane_cap,
         _debugfs: dir, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
     let bound: &'a platform::Device<Bound> = pdev;

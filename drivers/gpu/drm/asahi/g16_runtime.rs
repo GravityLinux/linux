@@ -253,6 +253,23 @@ pub(super) struct Flight {
     blocked: u32,
     /// Stamps this Work waits on before it may run, for hang reports.
     dependencies: [Option<Stamp>; 2],
+    /// Firmware dependency items this flight queued on each of `queues`.
+    lane_items: [u32; 2],
+}
+
+impl Flight {
+    /// Works plus firmware dependency items this flight holds on `lane`
+    /// (identified by its pointers): one Work per lane it uses, plus the items
+    /// queued there (a render's move to its fragment lane with
+    /// VDM_BARRIER_FRAGMENT).
+    fn lane_load(&self, lane: u64) -> usize {
+        self.queues
+            .iter()
+            .zip(self.lane_items)
+            .filter(|((pointers, _), _)| *pointers == lane && lane != 0)
+            .map(|(_, items)| 1 + items as usize)
+            .sum()
+    }
 }
 
 /// One channel message for all staged commands on this firmware queue.
@@ -707,7 +724,7 @@ impl Bootstrap {
         // are outstanding: k24-cap129 (129 Works on a lane) and k69 on #108,
         // whose compute_deps=2 adds firmware dependency items. Bound the
         // whole queue's unretired Works plus their dependency items.
-        let cap = crate::module_parameters::max_queue_entries.value() as usize;
+        let cap = crate::g16_timeline::QUEUE_CAP.load(Ordering::Relaxed) as usize;
         if cap != 0 {
             if let Some(lanes) = &queue.lanes {
                 let ours = |f: &&Flight| {
@@ -806,6 +823,19 @@ impl Bootstrap {
                 {
                     self.report_pressure(16, "workqueue");
                     return Err(EBUSY);
+                }
+                // Dependency items on a lane deeper than its 128-Work window
+                // stall the firmware. Bound each lane's unretired Works plus
+                // the items queued on it (preludes are not Works).
+                let cap = crate::g16_timeline::LANE_CAP.load(Ordering::Relaxed) as usize;
+                if cap != 0 {
+                    let load: usize = self.flights.iter().map(|f| f.lane_load(lane.pointers)).sum();
+                    // A fragment Work may carry the render item it moved there.
+                    let new = if stage == 1 { 2 } else { entries[stage] as usize };
+                    if load + new > cap {
+                        self.report_pressure(32, "lane entries");
+                        return Err(EBUSY);
+                    }
                 }
                 let next = (lane.head + entries[stage]) % 0x500;
                 if self.flights.iter().any(|f| {
@@ -2199,7 +2229,7 @@ impl Bootstrap {
         pool.increment(self._firmware_space.as_mut().ok_or(EIO)?)?;
         let own = queue.lanes.map_or([0; 3], |l| l.map(|lane| lane.firmware_stamp()));
         self.note_dependency_events(dependencies, own);
-        let (heads, epochs) = self.publish_render(
+        let (heads, epochs, lane_items) = self.publish_render(
             &a, &ta, &frag, queue, initbm, pool.blocks, dependencies,
             params.vdm_barrier_fragment,
         )?;
@@ -2262,6 +2292,7 @@ impl Bootstrap {
                 scratch,
                 client: owner.clone(),
                 queues: [(lanes[0].pointers, heads[0]), (lanes[1].pointers, heads[1])],
+                lane_items,
                 channels: [
                     (queue.priority as usize * 3, (epochs[0] + 1) & 255),
                     (queue.priority as usize * 3 + 1, (epochs[1] + 1) & 255),
@@ -2293,7 +2324,7 @@ impl Bootstrap {
         blocks: u32,
         dependencies: &[Option<Stamp>; 2],
         vdm_barrier_fragment: bool,
-    ) -> Result<([u32; 2], [u32; 2])> {
+    ) -> Result<([u32; 2], [u32; 2], [u32; 2])> {
         let priority = queue.priority;
         let lanes = queue.lanes.as_ref().ok_or(EIO)?;
         let publication = self.render_publication;
@@ -2425,7 +2456,8 @@ impl Bootstrap {
                 publication.wrapping_add(1),
             )?;
         }
-        Ok((heads, epochs))
+        let lane_items = stage_dependencies.map(|d| d.iter().flatten().count() as u32);
+        Ok((heads, epochs, lane_items))
     }
 }
 
@@ -2694,6 +2726,7 @@ impl Bootstrap {
                 scratch,
                 client: owner,
                 queues: [(pointers, head), (0, 0)],
+                lane_items: [dependencies.iter().flatten().count() as u32, 0],
                 channels: [(channel, (epoch + 1) & 255), (usize::MAX, 0)],
                 render: None,
             },

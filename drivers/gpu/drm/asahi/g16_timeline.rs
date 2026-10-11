@@ -242,3 +242,71 @@ impl kernel::debugfs::Reader for MaintKnob {
         Ok(())
     }
 }
+
+/// Runtime copies of `max_queue_entries` and `max_lane_entries`, writable from
+/// debugfs `asahi_m4/queue_cap` and `asahi_m4/lane_cap` for same-session A/B.
+/// Every lane must stay below the firmware's 128-Work window for dependency
+/// items (k24: 127 clean, 129 stalled), so writes keep one bound in force: the queue cap at most 127
+/// (it bounds every lane), or a lane cap of at most 127.
+pub(crate) static QUEUE_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(96);
+pub(crate) static LANE_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn caps_safe(queue: u32, lane: u32) -> bool {
+    (1..=127).contains(&queue) || (1..=127).contains(&lane)
+}
+
+/// The debugfs view of one cap.
+pub(crate) struct CapKnob {
+    lane: bool,
+}
+
+impl CapKnob {
+    pub(crate) const QUEUE: Self = Self { lane: false };
+    pub(crate) const LANE: Self = Self { lane: true };
+}
+
+impl kernel::debugfs::Writer for CapKnob {
+    fn write(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let cap = if self.lane { &LANE_CAP } else { &QUEUE_CAP };
+        writeln!(f, "{}", cap.load(core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl kernel::debugfs::Reader for CapKnob {
+    fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut buf = [0u8; 8];
+        let n = reader.len();
+        if n == 0 || n > buf.len() {
+            return Err(EINVAL);
+        }
+        reader.read_slice(&mut buf[..n])?;
+        let value: u32 = core::str::from_utf8(&buf[..n])
+            .map_err(|_| EINVAL)?
+            .trim()
+            .parse()
+            .map_err(|_| EINVAL)?;
+        let (queue, lane) = if self.lane {
+            (QUEUE_CAP.load(Relaxed), value)
+        } else {
+            (value, LANE_CAP.load(Relaxed))
+        };
+        if !caps_safe(queue, lane) || lane > 127 {
+            return Err(EINVAL);
+        }
+        (if self.lane { &LANE_CAP } else { &QUEUE_CAP }).store(value, Relaxed);
+        pr_info!("G16: queue_cap={} lane_cap={}\n", queue, lane);
+        Ok(())
+    }
+}
+
+/// Validates the boot parameters with the same rule as the knobs.
+pub(crate) fn init_caps(queue: u32, lane: u32) -> Result {
+    if !caps_safe(queue, lane) || lane > 127 {
+        pr_err!("G16: max_queue_entries={} max_lane_entries={} leave a lane unbounded\n", queue, lane);
+        return Err(EINVAL);
+    }
+    QUEUE_CAP.store(queue, core::sync::atomic::Ordering::Relaxed);
+    LANE_CAP.store(lane, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
