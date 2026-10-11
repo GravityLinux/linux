@@ -153,6 +153,7 @@ pub(crate) struct Data {
     _profile: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>>,
     _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
+    _early: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
 }
@@ -216,6 +217,14 @@ pub(crate) fn register<'a>(
         dir.read_write_file(c_str!("lane_cap"), crate::g16_timeline::CapKnob::LANE),
         GFP_KERNEL,
     )?;
+    crate::g16_timeline::EARLY_SIGNAL.store(
+        crate::module_parameters::early_signal.value().min(2),
+        Ordering::Relaxed,
+    );
+    let early = KBox::pin_init(
+        dir.read_write_file(c_str!("early_signal"), crate::g16_timeline::FlagKnob::EARLY_SIGNAL),
+        GFP_KERNEL,
+    )?;
     let maint = KBox::pin_init(
         dir.read_write_file(c_str!("fw_cache_maint"), crate::g16_timeline::MaintKnob),
         GFP_KERNEL,
@@ -246,6 +255,7 @@ pub(crate) fn register<'a>(
         _profile: profile,
         _maint: maint,
         _queue_cap: queue_cap,
+        _early: early,
         _lane_cap: lane_cap,
         _debugfs: dir, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
@@ -1441,6 +1451,54 @@ impl WorkItem for Execution {
                     }
                     progress = true;
                 }
+                Ok(progress)
+            })();
+            // Signal every finished job before admitting more work, with the
+            // locks dropped: a completed fence must not wait behind a
+            // publication pass. Upstream signals from its event path.
+            let mut finished = KVec::new();
+            if result.is_ok()
+                && crate::g16_timeline::EARLY_SIGNAL.load(Ordering::Relaxed) == 1
+                && finished.reserve(engine.jobs.len(), GFP_KERNEL).is_ok()
+            {
+                let mut index = 0;
+                while index < engine.jobs.len() {
+                    let j = &engine.jobs[index];
+                    if j.pending == 0
+                        && (j.error.is_some() || j.next == j.execution.parameters.len())
+                    {
+                        let job = engine.jobs.remove(index).expect("index in range");
+                        finished
+                            .push_within_capacity(job)
+                            .map_err(|_| ())
+                            .expect("reserved for every job");
+                    } else {
+                        index += 1;
+                    }
+                }
+                // Removal shifts later entries; keep the admission cursor valid.
+                if engine.cursor > engine.jobs.len() {
+                    engine.cursor = 0;
+                }
+            }
+            let signalled = !finished.is_empty();
+            if signalled {
+                drop(runtime);
+                drop(engine);
+                for job in finished.drain_all() {
+                    if let Some(ring) = &this.device.timeline {
+                        trace_record(ring, &job);
+                    }
+                    if let Some(error) = job.error {
+                        job.execution.completion.set_error(error);
+                    }
+                    let _ = job.execution.completion.signal();
+                }
+                engine = this.device.engine.lock();
+                runtime = this.device.runtime.lock();
+            }
+            let result = result.and_then(|progress| (|| -> Result<bool> {
+                let mut progress = progress || signalled;
                 let mut admitted = 0;
                 loop {
                     let previous = admitted;
@@ -1556,7 +1614,7 @@ impl WorkItem for Execution {
                     }
                 }
                 Ok(progress)
-            })();
+            })());
             if let Err(error) = result {
                 pr_err!(
                     "G16: submission pipeline failed: {:?}, {} jobs, {} issued\n",
@@ -1578,6 +1636,45 @@ impl WorkItem for Execution {
                     let _ = job.execution.completion.signal();
                 }
                 return;
+            }
+            // early_signal=2: publish first (above), then signal every
+            // finished job in one batch with the locks dropped.
+            if crate::g16_timeline::EARLY_SIGNAL.load(Ordering::Relaxed) == 2 {
+                let mut finished = KVec::new();
+                if finished.reserve(engine.jobs.len(), GFP_KERNEL).is_ok() {
+                    let mut index = 0;
+                    while index < engine.jobs.len() {
+                        let j = &engine.jobs[index];
+                        if j.pending == 0
+                            && (j.error.is_some() || j.next == j.execution.parameters.len())
+                        {
+                            let job = engine.jobs.remove(index).expect("index in range");
+                            finished
+                                .push_within_capacity(job)
+                                .map_err(|_| ())
+                                .expect("reserved for every job");
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    if engine.cursor > engine.jobs.len() {
+                        engine.cursor = 0;
+                    }
+                }
+                if !finished.is_empty() {
+                    drop(runtime);
+                    drop(engine);
+                    for job in finished.drain_all() {
+                        if let Some(ring) = &this.device.timeline {
+                            trace_record(ring, &job);
+                        }
+                        if let Some(error) = job.error {
+                            job.execution.completion.set_error(error);
+                        }
+                        let _ = job.execution.completion.signal();
+                    }
+                    continue;
+                }
             }
             if let Some(index) = engine.jobs.iter().position(|j| {
                 j.pending == 0 && (j.error.is_some() || j.next == j.execution.parameters.len())

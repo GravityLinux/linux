@@ -310,3 +310,44 @@ pub(crate) fn init_caps(queue: u32, lane: u32) -> Result {
     LANE_CAP.store(lane, core::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
+
+/// Signal finished jobs before each admission pass (asahi_m4.early_signal,
+/// runtime: debugfs `asahi_m4/early_signal`). 0 restores signalling one job
+/// per pump pass after admission.
+pub(crate) static EARLY_SIGNAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// A 0/1 debugfs switch over a static.
+pub(crate) struct FlagKnob {
+    cell: &'static core::sync::atomic::AtomicU32,
+    name: &'static str,
+}
+
+impl FlagKnob {
+    pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal" };
+}
+
+impl kernel::debugfs::Writer for FlagKnob {
+    fn write(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "{}", self.cell.load(core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl kernel::debugfs::Reader for FlagKnob {
+    fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
+        let mut buf = [0u8; 8];
+        let n = reader.len();
+        if n == 0 || n > buf.len() {
+            return Err(EINVAL);
+        }
+        reader.read_slice(&mut buf[..n])?;
+        let value = match core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?.trim() {
+            "0" => 0,
+            "1" => 1,
+            "2" if self.name == "early_signal" => 2,
+            _ => return Err(EINVAL),
+        };
+        self.cell.store(value, core::sync::atomic::Ordering::Relaxed);
+        pr_info!("G16: {}={}\n", self.name, value);
+        Ok(())
+    }
+}

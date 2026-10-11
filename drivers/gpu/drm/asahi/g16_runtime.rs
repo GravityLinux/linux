@@ -192,18 +192,24 @@ impl FirmwareQueues {
 
 /// Firmware words read once per retirement scan (per-lane stamps and ring
 /// cursors are shared by every flight on the lane).
+/// A fixed table on the stack: no allocation per scan. Words beyond its
+/// capacity are read directly.
 #[derive(Default)]
 struct WordSnapshot {
-    words: KVec<(u64, u32)>,
+    words: [(u64, u32); 32],
+    len: usize,
 }
 
 impl WordSnapshot {
     fn read(&mut self, fw: &g16_vm::FirmwareSpace, address: u64) -> Result<u32> {
-        if let Some(&(_, value)) = self.words.iter().find(|(a, _)| *a == address) {
+        if let Some(&(_, value)) = self.words[..self.len].iter().find(|(a, _)| *a == address) {
             return Ok(value);
         }
         let value = fw.read_u32(address)?;
-        self.words.push((address, value), GFP_KERNEL)?;
+        if self.len < self.words.len() {
+            self.words[self.len] = (address, value);
+            self.len += 1;
+        }
         Ok(value)
     }
 }
