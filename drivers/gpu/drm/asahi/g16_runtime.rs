@@ -190,6 +190,24 @@ impl FirmwareQueues {
     }
 }
 
+/// Firmware words read once per retirement scan (per-lane stamps and ring
+/// cursors are shared by every flight on the lane).
+#[derive(Default)]
+struct WordSnapshot {
+    words: KVec<(u64, u32)>,
+}
+
+impl WordSnapshot {
+    fn read(&mut self, fw: &g16_vm::FirmwareSpace, address: u64) -> Result<u32> {
+        if let Some(&(_, value)) = self.words.iter().find(|(a, _)| *a == address) {
+            return Ok(value);
+        }
+        let value = fw.read_u32(address)?;
+        self.words.push((address, value), GFP_KERNEL)?;
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Stamp {
     pub(crate) address: u64,
@@ -1296,20 +1314,33 @@ impl Bootstrap {
             guard.try_read32(0xd640c0)? == tail && guard.try_read32(0xd640c8)? == tail
         };
         self.retired.reserve(self.flights.len(), GFP_KERNEL)?;
+        // Like upstream's per-queue event check, read each lane's stamp and
+        // ring cursors once per scan and judge every flight on that lane
+        // against the same snapshot: flights share a lane's stamp address
+        // with rising values. A completion after the read is retired by the
+        // pass its own notification triggers.
+        let mut snapshot = WordSnapshot::default();
         let mut index = self.flights.len();
         while index > 0 {
             index -= 1;
             let flight = &self.flights[index];
-            if !self.stamps_done(flight)? {
+            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+            let mut reached_all = true;
+            for stamp in flight.stamps.iter().flatten() {
+                if !g16_stamp::reached(snapshot.read(fw, stamp.address)?, stamp.value) {
+                    reached_all = false;
+                    break;
+                }
+            }
+            if !reached_all {
                 continue;
             }
-            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
             let mut done = true;
             let mut blocked = 0u32;
             // The notifier pass drops embedded JobMeta references and cleans
             // their cache lines before publishing these later driver stamps.
             for stamp in flight.driver_stamps.iter().flatten() {
-                done &= g16_stamp::reached(fw.read_u32(stamp.address)?, stamp.value);
+                done &= g16_stamp::reached(snapshot.read(fw, stamp.address)?, stamp.value);
             }
             blocked |= u32::from(!done);
             // A reusable Work has its own notifier and exact submitted count.
@@ -1336,8 +1367,8 @@ impl Bootstrap {
             if done {
                 for &(pointers, head) in &flight.queues {
                     if pointers != 0 {
-                        let lane = reached(fw.read_u32(pointers)?, head, 0x500)
-                            && reached(fw.read_u32(pointers + 0x30)?, head, 0x500);
+                        let lane = reached(snapshot.read(fw, pointers)?, head, 0x500)
+                            && reached(snapshot.read(fw, pointers + 0x30)?, head, 0x500);
                         blocked |= u32::from(!lane) << 2;
                         done &= lane;
                     }

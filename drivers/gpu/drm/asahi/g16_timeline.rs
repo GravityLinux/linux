@@ -206,7 +206,7 @@ impl kernel::debugfs::Writer for Profile {
 /// `asahi_m4/fw_cache_maint` for same-boot A/B. Maintenance uses clean+invalidate
 /// (`dc civac`), so switching it back on never discards lines written while it
 /// was off.
-pub(crate) static FW_CACHE_MAINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+pub(crate) static FW_CACHE_MAINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[inline(always)]
 pub(crate) fn fw_cache_maint() -> bool {
