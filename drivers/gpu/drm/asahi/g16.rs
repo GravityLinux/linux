@@ -152,8 +152,27 @@ impl rtkit::Operations for BootOps {
         })
     }
 
+    fn recv_message_early(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        ep: u8,
+        msg: u64,
+    ) -> bool {
+        // timeline=2 only stamps the IRQ; RTKit's thread still delivers it.
+        if crate::module_parameters::timeline.value() >= 2 && ep == 0x20 && msg == 0x0042_0000_0000_0000 {
+            data.notifications
+                .last_irq
+                .store(crate::g16_drm::ticks(), core::sync::atomic::Ordering::Relaxed);
+        }
+        false
+    }
+
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
         if ep == 0x20 && msg == 0x0042_0000_0000_0000 {
+            if crate::module_parameters::timeline.value() >= 2 {
+                data.notifications
+                    .last_rx
+                    .store(crate::g16_drm::ticks(), core::sync::atomic::Ordering::Relaxed);
+            }
             // RTKit delivers this callback in process context after the
             // mailbox receive barrier. The worker drains the firmware rings.
             data.notifications.notify(false);
@@ -250,6 +269,8 @@ pub(crate) struct Bootstrap {
     context_roots: [Option<crate::g16_vm::Roots>; 64],
     context_users: [u32; 64],
     pressure_reported: core::sync::atomic::AtomicU64,
+    /// Backpressure bits seen since the last take_pressure() (timeline=1).
+    pressure_seen: core::sync::atomic::AtomicU64,
     hold_key: core::sync::atomic::AtomicU64,
     hold_since_ns: core::sync::atomic::AtomicI64,
     hold_near_misses: core::sync::atomic::AtomicU32,
@@ -745,6 +766,7 @@ impl Bootstrap {
             context_roots: [None; 64],
             context_users: [0; 64],
             pressure_reported: core::sync::atomic::AtomicU64::new(0),
+            pressure_seen: core::sync::atomic::AtomicU64::new(0),
             hold_key: core::sync::atomic::AtomicU64::new(0),
             hold_since_ns: core::sync::atomic::AtomicI64::new(0),
             hold_near_misses: core::sync::atomic::AtomicU32::new(0),

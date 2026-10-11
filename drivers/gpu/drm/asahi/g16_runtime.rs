@@ -317,7 +317,13 @@ impl Bootstrap {
         Err(EDEADLK)
     }
 
+    /// Backpressure bits recorded since the previous call (timeline=1).
+    pub(crate) fn take_pressure(&self) -> u64 {
+        self.pressure_seen.swap(0, Ordering::Relaxed)
+    }
+
     fn report_pressure(&self, bit: u64, resource: &str) {
+        self.pressure_seen.fetch_or(bit, Ordering::Relaxed);
         // Every resource here is released when work retires. Backpressure with
         // nothing in flight can therefore never clear: it means an accounting
         // leak, and submission stalls indefinitely with an idle GPU. Always

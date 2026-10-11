@@ -147,6 +147,10 @@ pub(crate) struct Data {
     runtime: Mutex<crate::g16::Bootstrap>,
     #[pin]
     engine: Mutex<Engine>,
+    /// timeline=1/2: the record ring and its debugfs file (dropped before the
+    /// directory).
+    timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
+    _debugfs: Option<kernel::debugfs::Dir>,
 }
 
 #[vtable]
@@ -191,6 +195,16 @@ pub(crate) fn register<'a>(
         pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)?;
     }
     let runtime = crate::g16::Bootstrap::new(pdev)?;
+    let (timeline, debugfs) = if crate::module_parameters::timeline.value() != 0 {
+        let dir = kernel::debugfs::Dir::new(c_str!("asahi_m4"));
+        let ring = crate::g16_timeline::Ring::new(
+            crate::module_parameters::timeline_records.value() as usize,
+        )?;
+        let file = KBox::pin_init(dir.read_binary_file(c_str!("timeline"), ring), GFP_KERNEL)?;
+        (Some(file), Some(dir))
+    } else {
+        (None, None)
+    };
     let data = try_pin_init!(Data {
         gpu_revision: runtime.gpu_revision,
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
@@ -199,7 +213,9 @@ pub(crate) fn register<'a>(
         failed: AtomicBool::new(false),
         notifications: runtime.notifications.clone(),
         runtime <- kernel::new_mutex!(runtime),
-        engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }), });
+        engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
+        timeline,
+        _debugfs: debugfs, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
     let bound: &'a platform::Device<Bound> = pdev;
     // SAFETY: The registration is stored in the platform driver data and dropped on unbind.
@@ -1237,15 +1253,83 @@ struct Execution {
     timestamps: KVec<[u64; 4]>,
     completion: dma_fence::Fence,
     started: AtomicBool,
+    /// timeline=1: CNTVCT at the ioctl and when the scheduler ran the job,
+    /// the public queue, and input fences in total and still pending then.
+    trace: Trace,
     #[pin]
     work: Work<Execution>,
 }
 
 impl_has_work! { impl HasWork<Self> for Execution { self.work } }
 
+#[derive(Default)]
+struct Trace {
+    ioctl: u64,
+    run: AtomicU64,
+    queue: u32,
+    inputs: u32,
+    pending: u32,
+}
+
+/// The CPU's virtual counter (1 GHz on T8132).
+pub(crate) fn ticks() -> u64 {
+    let value: u64;
+    // SAFETY: Reading CNTVCT_EL0 has no side effects.
+    unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) value) };
+    value
+}
+
+fn trace_record(ring: &crate::g16_timeline::Ring, job: &Running) {
+    let t = &job.execution.trace;
+    let pid = match job.execution.parameters.first() {
+        Some(Parameters::Render(p)) => p.tgid,
+        Some(Parameters::Compute(p)) => p.tgid,
+        None => 0,
+    };
+    ring.push(&crate::g16_timeline::Record {
+        exec: job.execution.id,
+        pid: pid as u32,
+        // A per-file id: muvm guests all submit from the one krun process.
+        file: (Arc::as_ptr(&job.execution._owner) as usize >> 4) as u64 & 0xffff_ffff,
+        queue: t.queue,
+        cmds: job.execution.parameters.len() as u32,
+        pending: t.pending,
+        inputs: t.inputs,
+        busy: job.busy,
+        error: job.error.is_some(),
+        why: job.why,
+        ticks: [
+            t.ioctl,
+            t.run.load(Ordering::Relaxed),
+            job.first,
+            job.last,
+            ticks(),
+            job.kick,
+            job.irq,
+            job.rx,
+            job.wake,
+            job.seen,
+        ],
+    });
+}
+
 struct Running {
     execution: Arc<Execution>,
     next: usize,
+    /// timeline=1: publication times, deferrals and their reasons
+    /// (backpressure bits; 0x100 a dependency hold).
+    first: u64,
+    last: u64,
+    busy: u32,
+    why: u64,
+    /// timeline=2: doorbell after the first publication, and for the
+    /// notification that retired the last Work: IRQ, RTKit delivery, pump
+    /// wake and the retire scan that saw it.
+    kick: u64,
+    irq: u64,
+    rx: u64,
+    wake: u64,
+    seen: u64,
     pending: usize,
     error: Option<Error>,
     history: [KVec<Option<crate::g16::Stamp>>; 2],
@@ -1312,6 +1396,13 @@ impl WorkItem for Execution {
                         .find(|r| r.execution.id == issued.owner)
                         .ok_or(EIO)?;
                     job.pending -= 1;
+                    if job.pending == 0 && crate::module_parameters::timeline.value() >= 2 {
+                        let n = &this.device.notifications;
+                        job.seen = ticks();
+                        job.irq = n.last_irq.load(Ordering::Relaxed);
+                        job.rx = n.last_rx.load(Ordering::Relaxed);
+                        job.wake = n.last_wake.load(Ordering::Relaxed);
+                    }
                     if let Err(error) = result {
                         job.error = Some(error);
                     }
@@ -1374,7 +1465,16 @@ impl WorkItem for Execution {
                         };
                         let receipt = match receipt {
                             Ok(receipt) => receipt,
-                            Err(EBUSY) if !runtime.render_failed() => continue,
+                            Err(EBUSY) if !runtime.render_failed() => {
+                                if crate::module_parameters::timeline.value() != 0 {
+                                    job.busy += 1;
+                                    job.why |= match runtime.take_pressure() {
+                                        0 => 0x100,
+                                        bits => bits,
+                                    };
+                                }
+                                continue;
+                            }
                             Err(error) if !runtime.render_failed() => {
                                 pr_err!(
                                     "G16: command {} preparation failed: {:?}\n",
@@ -1392,6 +1492,13 @@ impl WorkItem for Execution {
                             id: receipt.id,
                             owner: execution.id,
                         };
+                        if crate::module_parameters::timeline.value() != 0 {
+                            let now = ticks();
+                            if job.next == 0 {
+                                job.first = now;
+                            }
+                            job.last = now;
+                        }
                         job.next += 1;
                         job.pending += 1;
                         engine.issued.push(issued, GFP_KERNEL)?;
@@ -1409,6 +1516,12 @@ impl WorkItem for Execution {
                     }
                 }
                 runtime.flush()?;
+                if crate::module_parameters::timeline.value() >= 2 {
+                    let now = ticks();
+                    for job in engine.jobs.iter_mut().filter(|j| j.first != 0 && j.kick == 0) {
+                        job.kick = now;
+                    }
+                }
                 Ok(progress)
             })();
             if let Err(error) = result {
@@ -1442,6 +1555,9 @@ impl WorkItem for Execution {
                     .expect("index found under engine lock");
                 drop(runtime);
                 drop(engine);
+                if let Some(ring) = &this.device.timeline {
+                    trace_record(ring, &job);
+                }
                 if let Some(error) = job.error {
                     job.execution.completion.set_error(error);
                 }
@@ -1460,6 +1576,9 @@ impl WorkItem for Execution {
                     generation.expect("checked before servicing jobs"),
                     timeout_ms,
                 );
+                if crate::module_parameters::timeline.value() >= 2 {
+                    this.device.notifications.last_wake.store(ticks(), Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1484,6 +1603,9 @@ struct SubmissionJob {
 impl sched::JobImpl for SubmissionJob {
     fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
         let execution = &job.execution;
+        if crate::module_parameters::timeline.value() != 0 {
+            execution.trace.run.store(ticks(), Ordering::Relaxed);
+        }
         // Firmware jobs cannot be replayed after a fault without a reboot.
         if execution.started.swap(true, Ordering::AcqRel) {
             return Err(EIO);
@@ -1499,6 +1621,15 @@ impl sched::JobImpl for SubmissionJob {
                 Running {
                     execution: execution.clone(),
                     next: 0,
+                    first: 0,
+                    last: 0,
+                    busy: 0,
+                    why: 0,
+                    kick: 0,
+                    irq: 0,
+                    rx: 0,
+                    wake: 0,
+                    seen: 0,
                     pending: 0,
                     error: None,
                     history,
@@ -1684,6 +1815,17 @@ impl File {
                 }
             }
         }
+        let mut trace = Trace::default();
+        if crate::module_parameters::timeline.value() != 0 {
+            trace.ioctl = ticks();
+            trace.queue = data.queue_id;
+            trace.inputs = dependencies.len() as u32;
+            trace.pending = dependencies
+                .iter()
+                // SAFETY: The vector holds a live reference to each fence.
+                .filter(|f| !unsafe { bindings::dma_fence_is_signaled(f.raw()) })
+                .count() as u32;
+        }
         let inner = file.inner();
         let mut admission = device.admission.lock();
         if device.failed.load(Ordering::Acquire) {
@@ -1825,7 +1967,7 @@ impl File {
                 render_space: vm.space.clone(), space: vm.compute_space.clone(), _bindings: bindings,
                 support: vm.render_support.clone(),
                 parameters, timestamps, completion: worker_completion,
-                started: AtomicBool::new(false), work <- new_work!("m4-execution"),
+                started: AtomicBool::new(false), trace, work <- new_work!("m4-execution"),
             }),
             GFP_KERNEL,
         )?;

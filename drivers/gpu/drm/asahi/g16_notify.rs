@@ -3,11 +3,17 @@
 
 //! RTKit and scheduler wakeups for the single G16 submission worker.
 
+use core::sync::atomic::AtomicU64;
 use kernel::sync::{CondVar, CondVarTimeoutResult, Mutex};
 use kernel::{prelude::*, time::msecs_to_jiffies};
 
 #[pin_data]
 pub(crate) struct Notifications {
+    /// timeline=2: CNTVCT of the latest completion message at IRQ time, when
+    /// RTKit's workqueue delivered it, and when the pump last woke.
+    pub(crate) last_irq: AtomicU64,
+    pub(crate) last_rx: AtomicU64,
+    pub(crate) last_wake: AtomicU64,
     #[pin]
     state: Mutex<State>,
     #[pin]
@@ -22,6 +28,9 @@ struct State {
 impl Notifications {
     pub(crate) fn new() -> impl PinInit<Self> {
         pin_init!(Self {
+            last_irq: AtomicU64::new(0),
+            last_rx: AtomicU64::new(0),
+            last_wake: AtomicU64::new(0),
             state <- kernel::new_mutex!(State { generation: 0, crashed: false }),
             changed <- kernel::new_condvar!(),
         })
