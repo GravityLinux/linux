@@ -245,8 +245,8 @@ kernel::module_platform_driver! {
             description: "Firmware fault control word (region C +0xe28): 3 as macOS; 0 hard faults",
         },
         soft_faults: u32 {
-            default: 0,
-            description: "Debug: 1 advertises soft faults to userspace (needs fault_control=3)",
+            default: 1,
+            description: "1 advertises soft faults to userspace (needs fault_control=3; Mesa with hk 243c5ac0c43 and 31b9d1d5bfb); 0 hides them",
         },
     },
 }
