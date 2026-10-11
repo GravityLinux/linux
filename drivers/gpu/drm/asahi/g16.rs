@@ -230,6 +230,9 @@ pub(crate) struct Bootstrap {
     render_publication: u64,
     /// A4 wedge detection state (check_wedge).
     wedge_since: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+    /// read_opt: when check_wedge last sampled (it reads every render
+    /// flight's stamps and every channel's registers).
+    wedge_sampled: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     wedge_signature: u64,
     wedge_rung: u32,
     /// Debug (dump_render_buffered): the most recent submitted renders,
@@ -256,6 +259,9 @@ pub(crate) struct Bootstrap {
     /// Queue storage returned by dropped queues, awaiting context destruction.
     /// It holds a reserved slot for every region, so dropping never allocates.
     retired_queues: Arc<kernel::sync::Mutex<KVec<u64>>>,
+    /// The last retire scan's firmware words (read_opt), on the heap: this
+    /// struct is built by value on the probe stack.
+    pub(crate) last_scan: KBox<render_runtime::WordSnapshot>,
     queue_regions: usize,
     /// Storage whose context destruction is published, with its control target.
     destroying_queues: KVec<(u64, u32)>,
@@ -727,6 +733,7 @@ impl Bootstrap {
             tvb_pools: KVec::new(),
             render_publication: crate::module_parameters::fw_counter_start.value(),
             wedge_since: None,
+            wedge_sampled: None,
             wedge_signature: 0,
             wedge_rung: 0,
             render_ring: render_runtime::RenderRing::new(),
@@ -755,6 +762,7 @@ impl Bootstrap {
             compute_publication: crate::module_parameters::fw_counter_start.value(),
             queue_events: Arc::new(core::sync::atomic::AtomicU64::new(0), GFP_KERNEL)?,
             retired_queues: Arc::pin_init(kernel::new_mutex!(KVec::new()), GFP_KERNEL)?,
+            last_scan: KBox::new(Default::default(), GFP_KERNEL)?,
             queue_regions: 0,
             destroying_queues: KVec::new(),
             free_queues: KVec::new(),

@@ -265,6 +265,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 times publish-path sections into debugfs asahi_m4/publish_profile (two serialized counter reads per section, per firmware read). Runtime: debugfs asahi_m4/profile",
         },
+        read_opt: u32 {
+            default: 1,
+            description: "1 (default) cuts per-pass firmware reads: cached admission lane cursors (reread when they show no room), the shared render-notifier count through the retire snapshot, dep_elide's reached test from the last scan, and wedge sampling at most every 50 ms instead of every pump pass; 0 restores #167's reads. Runtime: debugfs asahi_m4/read_opt",
+        },
         dep_elide: u32 {
             default: 6,
             description: "Bitmask: drop firmware dependency items that are redundant: 1 on the same lane's earlier Work, 2 already reached at publish, 4 already waited on by this lane's previous Work. Counters in debugfs asahi_m4/dep_stats. Runtime: debugfs asahi_m4/dep_elide",

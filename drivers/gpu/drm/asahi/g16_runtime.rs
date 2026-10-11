@@ -34,6 +34,10 @@ pub(crate) struct FirmwareQueues {
     /// Per lane (TA, 3D, compute), the latest stamps its published Works
     /// waited on as firmware items, keyed by address (dep_elide bit 4).
     waited: [[Option<Stamp>; 2]; 3],
+    /// read_opt: the last (read, done) cursors admission read per lane;
+    /// u32::MAX until read. Cursors only advance, so a stale view
+    /// underestimates room.
+    cursors: [core::cell::Cell<(u32, u32)>; 3],
     /// Kernel-side dependency resolution statistics (logged at teardown with
     /// dep_stats=1).
     deps: DependencyStats,
@@ -199,6 +203,7 @@ impl FirmwareQueues {
             notified_works: 0,
             last: [None; 2],
             waited: [[None; 2]; 3],
+            cursors: [const { core::cell::Cell::new((u32::MAX, u32::MAX)) }; 3],
             deps: DependencyStats::default(),
         }
     }
@@ -212,8 +217,8 @@ impl FirmwareQueues {
 /// cursors are shared by every flight on the lane).
 /// A fixed table on the stack: no allocation per scan. Words beyond its
 /// capacity are read directly.
-#[derive(Default)]
-struct WordSnapshot {
+#[derive(Default, Clone)]
+pub(crate) struct WordSnapshot {
     words: [(u64, u32); 32],
     len: usize,
 }
@@ -229,6 +234,11 @@ impl WordSnapshot {
             self.len += 1;
         }
         Ok(value)
+    }
+
+    /// A value seen by this snapshot, without reading.
+    fn peek(&self, address: u64) -> Option<u32> {
+        self.words[..self.len].iter().find(|(a, _)| *a == address).map(|&(_, v)| v)
     }
 }
 
@@ -665,6 +675,9 @@ impl Bootstrap {
                 retired: self.retired_queues.clone(),
             });
             owner.lanes = Some(lanes);
+            for c in &owner.cursors {
+                c.set((u32::MAX, u32::MAX));
+            }
             owner.notified_works = 0;
             if crate::module_parameters::fw_trace.value() & 1 != 0 {
                 dev_info!(
@@ -816,8 +829,18 @@ impl Bootstrap {
             if let Some(lanes) = &queue.lanes {
                 let lane = lanes[stage];
                 let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-                let read = fw.read_u32(lane.pointers)?;
-                let done = fw.read_u32(lane.pointers + 0x30)?;
+                let before = crate::g16_timeline::reads();
+                let (mut read, mut done) = queue.cursors[stage].get();
+                if !crate::g16_timeline::read_opt()
+                    || read >= 0x500
+                    || done >= 0x500
+                    || !ring_room(lane.head, read, done, entries[stage], 0x500)
+                {
+                    read = fw.read_u32(lane.pointers)?;
+                    done = fw.read_u32(lane.pointers + 0x30)?;
+                    queue.cursors[stage].set((read, done));
+                }
+                crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_ADMIT, before);
                 if read >= 0x500 || done >= 0x500 || lane.head >= 0x500 {
                     return Err(EIO);
                 }
@@ -1350,7 +1373,11 @@ impl Bootstrap {
         if let Some((id, limited)) = self.retired.pop() {
             return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(()) })));
         }
-        self.service_flights().inspect_err(|error| {
+        let before = crate::g16_timeline::reads();
+        let serviced = self.service_flights();
+        crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_EVENTS, before);
+        let scan_before = crate::g16_timeline::reads();
+        serviced.inspect_err(|error| {
             dev_err!(
                 self.dev.as_ref(),
                 "G16: firmware event service failed: {:?}\n",
@@ -1403,7 +1430,12 @@ impl Bootstrap {
                 let notified = match flight.notifier_count {
                     // The shared notifier has counted this render's Works.
                     Some((completed, total)) => {
-                        (fw.read_u32(completed)?.wrapping_sub(total) as i32) >= 0
+                        let count = if crate::g16_timeline::read_opt() {
+                            snapshot.read(fw, completed)?
+                        } else {
+                            fw.read_u32(completed)?
+                        };
+                        (count.wrapping_sub(total) as i32) >= 0
                     }
                     None => {
                         let notifier = flight.id
@@ -1535,6 +1567,8 @@ impl Bootstrap {
             self.free_work[usize::from(render_work)].push(id, GFP_KERNEL)?;
             self.retired.push_within_capacity((id, limited)).map_err(|_| ENOMEM)?;
         }
+        crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_SCAN, scan_before);
+        *self.last_scan = snapshot;
         if !self.retired.is_empty() {
             // Queued commands can legitimately wait longer than one Work's
             // timeout. Watch for a lack of retirement progress, rather than
@@ -1546,7 +1580,18 @@ impl Bootstrap {
             let (id, limited) = self.retired.pop().ok_or(EIO)?;
             return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(()) })));
         }
-        self.check_wedge()?;
+        // Wedge detection needs a few samples per wedge_ms window (default
+        // 2 s), not one per pump pass: each sample reads two stamps per
+        // outstanding render and 36 channel registers.
+        let sample = !crate::g16_timeline::read_opt()
+            || self.wedge_sampled.is_none_or(|t| t.elapsed().as_millis() >= 50);
+        if sample {
+            self.wedge_sampled = Some(Instant::now());
+            let before = crate::g16_timeline::reads();
+            let checked = self.check_wedge();
+            crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_WEDGE, before);
+            checked?;
+        }
         if let Some(flight) = self
             .flights
             .iter()
@@ -1905,8 +1950,16 @@ impl Bootstrap {
             t::DEP_REPEAT.fetch_add(1, Ordering::Relaxed);
             mode & 4 != 0
         } else if mode & 2 != 0 {
-            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-            let reached = g16_stamp::reached(fw.read_u32(dep.address)?, dep.value);
+            let before = t::reads();
+            let now = if t::read_opt() {
+                // The last retire scan's value: stamps only advance, so a
+                // value that already reached the target still does.
+                self.last_scan.peek(dep.address)
+            } else {
+                Some(self._firmware_space.as_ref().ok_or(EIO)?.read_u32(dep.address)?)
+            };
+            t::attribute(&t::P_RD_ELIDE, before);
+            let reached = now.is_some_and(|v| g16_stamp::reached(v, dep.value));
             if reached {
                 t::DEP_REACHED.fetch_add(1, Ordering::Relaxed);
             }

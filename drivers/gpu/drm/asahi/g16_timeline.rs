@@ -147,8 +147,14 @@ pub(crate) static P_VM_SYNC: Section = Section::new("vm sync");
 pub(crate) static P_WRITE_LOW: Section = Section::new("vm write_low");
 pub(crate) static P_FLUSH: Section = Section::new("flush (doorbell)");
 pub(crate) static P_PUMP: Section = Section::new("pump pass");
+/// Read attribution (calls only): firmware reads made inside each site.
+pub(crate) static P_RD_EVENTS: Section = Section::new("reads: event ring");
+pub(crate) static P_RD_SCAN: Section = Section::new("reads: retire scan");
+pub(crate) static P_RD_ADMIT: Section = Section::new("reads: admission cursors");
+pub(crate) static P_RD_ELIDE: Section = Section::new("reads: dep_elide reached");
+pub(crate) static P_RD_WEDGE: Section = Section::new("reads: wedge check");
 
-static SECTIONS: [&Section; 11] = [
+static SECTIONS: [&Section; 16] = [
     &P_SUBMIT_RENDER,
     &P_SUBMIT_COMPUTE,
     &P_PREPARE_RENDER,
@@ -160,7 +166,26 @@ static SECTIONS: [&Section; 11] = [
     &P_WRITE_LOW,
     &P_FLUSH,
     &P_PUMP,
+    &P_RD_EVENTS,
+    &P_RD_SCAN,
+    &P_RD_ADMIT,
+    &P_RD_ELIDE,
+    &P_RD_WEDGE,
 ];
+
+/// Firmware reads so far (counted only while profiling).
+#[inline(always)]
+pub(crate) fn reads() -> u64 {
+    P_READ.calls.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Attribute the firmware reads since `before` to `site` (profiling only).
+#[inline(always)]
+pub(crate) fn attribute(site: &Section, before: u64) {
+    if PROFILE.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        site.calls.fetch_add(reads().wrapping_sub(before), core::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Section timing switch (asahi_m4.profile, runtime: debugfs
 /// `asahi_m4/profile`). Off by default: each timed section costs two
@@ -332,6 +357,7 @@ impl FlagKnob {
     pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal", max: 2 };
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
     pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
+    pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {
@@ -395,4 +421,19 @@ impl kernel::debugfs::Writer for DepStats {
             DEP_ELIDE.load(Relaxed)
         )
     }
+}
+
+/// Fewer firmware reads per pass (asahi_m4.read_opt, runtime: debugfs
+/// `asahi_m4/read_opt`; 0 restores #167's reads):
+/// - admission reuses the last lane cursors it read and rereads them only when
+///   they show no room (cursors only advance, so a stale view is conservative);
+/// - retirement reads the shared render-notifier count through the scan
+///   snapshot;
+/// - dep_elide's already-reached test uses the last retire scan's values and
+///   keeps the item when the stamp wasn't seen there, with no read.
+pub(crate) static READ_OPT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+#[inline(always)]
+pub(crate) fn read_opt() -> bool {
+    READ_OPT.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
