@@ -253,6 +253,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 records each submission when its fence signals into a binary ring at debugfs asahi_m4/timeline (format in g16_timeline.rs): the client pid and file, input fences pending at the ioctl, CNTVCT ticks (1 GHz) at the ioctl, scheduler run, first and last publication and completion, plus admission deferrals and their reasons. 2 also records the doorbell, and for the notification that retired the submission its IRQ, RTKit delivery, pump wake and retire-scan times",
         },
+        fw_cache_maint: u32 {
+            default: 1,
+            description: "Experiment: 0 skips CPU data-cache maintenance (dc ivac/cvac) on firmware and client memory writes, reads and page initialization, keeping the barriers; page-table, TTB and handoff cleans are unchanged. Upstream G13/G14 and writeback user BOs on G16 rely on coherency",
+        },
         timeline_records: u32 {
             default: 131072,
             description: "Debug: timeline ring capacity in records (160 bytes each), allocated at probe only when timeline is nonzero",

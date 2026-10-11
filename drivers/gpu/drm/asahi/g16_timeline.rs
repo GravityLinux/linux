@@ -201,3 +201,44 @@ impl kernel::debugfs::Writer for Profile {
         Ok(())
     }
 }
+
+/// Runtime copy of `fw_cache_maint`, writable from debugfs
+/// `asahi_m4/fw_cache_maint` for same-boot A/B. Maintenance uses clean+invalidate
+/// (`dc civac`), so switching it back on never discards lines written while it
+/// was off.
+pub(crate) static FW_CACHE_MAINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+#[inline(always)]
+pub(crate) fn fw_cache_maint() -> bool {
+    FW_CACHE_MAINT.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// The debugfs view of `FW_CACHE_MAINT` (accepts 0 or 1).
+pub(crate) struct MaintKnob;
+
+impl kernel::debugfs::Writer for MaintKnob {
+    fn write(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "{}", FW_CACHE_MAINT.load(core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl kernel::debugfs::Reader for MaintKnob {
+    fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
+        let mut buf = [0u8; 8];
+        let n = reader.len();
+        if n == 0 || n > buf.len() {
+            return Err(EINVAL);
+        }
+        reader.read_slice(&mut buf[..n])?;
+        let value = match core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?.trim() {
+            "0" => 0,
+            "1" => 1,
+            _ => return Err(EINVAL),
+        };
+        // Order earlier maintained writes before later unmaintained ones.
+        crate::mem::sync();
+        FW_CACHE_MAINT.store(value, core::sync::atomic::Ordering::Relaxed);
+        pr_info!("G16: fw_cache_maint={}\n", value);
+        Ok(())
+    }
+}

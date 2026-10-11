@@ -691,6 +691,7 @@ impl FirmwareSpace {
         mut update: impl FnMut(*mut u8, usize, usize),
     ) -> Result {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_LIVE);
+        let maint = crate::g16_timeline::fw_cache_maint();
         let region = self.region(va, size)?;
         if size == 0 {
             return Ok(());
@@ -701,7 +702,7 @@ impl FirmwareSpace {
         let last = (end - 1) / UAT_PGSZ;
         for index in first..=last {
             // Unpublished initialization is still authoritative in CPU cache.
-            if region.dirty_pages[index].get() {
+            if region.dirty_pages[index].get() || !maint {
                 continue;
             }
             let base = index * UAT_PGSZ;
@@ -710,7 +711,7 @@ impl FirmwareSpace {
             region.pages[index].with_page_mapped(|p| {
                 for off in (within & !63..limit).step_by(64) {
                     // SAFETY: These cache lines lie within the mapped page.
-                    unsafe { core::arch::asm!("dc ivac, {addr}", addr = in(reg) p.add(off)) };
+                    unsafe { core::arch::asm!("dc civac, {addr}", addr = in(reg) p.add(off)) };
                 }
             });
         }
@@ -727,7 +728,9 @@ impl FirmwareSpace {
                 unsafe { update(p.add(within), base + within - start, limit - within) };
                 // Publish all initialization on a dirty page, including zeros
                 // outside this write. Published pages need only touched lines.
-                let lines = if dirty {
+                let lines = if !maint {
+                    0..0
+                } else if dirty {
                     0..UAT_PGSZ
                 } else {
                     (within & !63)..limit
@@ -774,7 +777,10 @@ impl FirmwareSpace {
             // SAFETY: The aligned word lies in this owned mapped page.
             // Firmware owns it and all CPU writes have reached PoC.
             unsafe {
-                core::arch::asm!("dc ivac, {addr}", "dsb sy", addr = in(reg) p);
+                if crate::g16_timeline::fw_cache_maint() {
+                    core::arch::asm!("dc civac, {addr}", addr = in(reg) p);
+                }
+                core::arch::asm!("dsb sy");
                 Ok(u32::from_le(p.cast::<u32>().read_volatile()))
             }
         })
@@ -845,6 +851,11 @@ impl Drop for FirmwareSpace {
 }
 
 fn clean_page(page: &Page) {
+    // fw_cache_maint=0: rely on G16 coherency for shared memory, as for
+    // writeback user BOs; callers keep their barriers.
+    if !(crate::g16_timeline::fw_cache_maint()) {
+        return;
+    }
     page.with_page_mapped(|p| {
         for off in (0..UAT_PGSZ).step_by(64) {
             // SAFETY: The cache line lies inside this owned page.

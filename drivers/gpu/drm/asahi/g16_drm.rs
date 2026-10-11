@@ -151,7 +151,8 @@ pub(crate) struct Data {
     /// directory).
     timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
     _profile: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>>,
-    _debugfs: Option<kernel::debugfs::Dir>,
+    _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
+    _debugfs: kernel::debugfs::Dir,
 }
 
 #[vtable]
@@ -196,8 +197,16 @@ pub(crate) fn register<'a>(
         pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)?;
     }
     let runtime = crate::g16::Bootstrap::new(pdev)?;
-    let (timeline, profile, debugfs) = if crate::module_parameters::timeline.value() != 0 {
-        let dir = kernel::debugfs::Dir::new(c_str!("asahi_m4"));
+    crate::g16_timeline::FW_CACHE_MAINT.store(
+        crate::module_parameters::fw_cache_maint.value(),
+        Ordering::Relaxed,
+    );
+    let dir = kernel::debugfs::Dir::new(c_str!("asahi_m4"));
+    let maint = KBox::pin_init(
+        dir.read_write_file(c_str!("fw_cache_maint"), crate::g16_timeline::MaintKnob),
+        GFP_KERNEL,
+    )?;
+    let (timeline, profile) = if crate::module_parameters::timeline.value() != 0 {
         let ring = crate::g16_timeline::Ring::new(
             crate::module_parameters::timeline_records.value() as usize,
         )?;
@@ -206,9 +215,9 @@ pub(crate) fn register<'a>(
             dir.read_only_file(c_str!("publish_profile"), crate::g16_timeline::Profile),
             GFP_KERNEL,
         )?;
-        (Some(file), Some(profile), Some(dir))
+        (Some(file), Some(profile))
     } else {
-        (None, None, None)
+        (None, None)
     };
     let data = try_pin_init!(Data {
         gpu_revision: runtime.gpu_revision,
@@ -221,7 +230,8 @@ pub(crate) fn register<'a>(
         engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
         timeline,
         _profile: profile,
-        _debugfs: debugfs, });
+        _maint: maint,
+        _debugfs: dir, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
     let bound: &'a platform::Device<Bound> = pdev;
     // SAFETY: The registration is stored in the platform driver data and dropped on unbind.
