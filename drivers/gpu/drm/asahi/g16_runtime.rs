@@ -1612,6 +1612,15 @@ impl Bootstrap {
 
     /// Notifications do not extend the watchdog. Only retirement progress
     /// resets it, so trace traffic cannot keep a stuck command alive.
+    /// Age of the oldest flight since the last retirement progress (ms).
+    pub(crate) fn oldest_flight_ms(&self) -> u64 {
+        self.flights
+            .iter()
+            .map(|flight| flight.started.elapsed().as_millis() as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn watchdog_remaining_ms(&self) -> u32 {
         let watchdog = self
             .flights
@@ -1621,10 +1630,18 @@ impl Bootstrap {
             .unwrap_or(10000);
         // Wedge detection samples render progress a few times per window.
         // A recorded unreachable hold is re-checked within its grace second.
-        if self.flights.iter().any(|f| f.render.is_some()) {
+        let watchdog = if self.flights.iter().any(|f| f.render.is_some()) {
             watchdog.min(250)
         } else if self.hold_key.load(Ordering::Relaxed) != 0 {
             watchdog.min(500)
+        } else {
+            watchdog
+        };
+        // safety_poll_ms: with work outstanding, recheck at least this often,
+        // so a late or lost completion notification costs milliseconds.
+        let safety = crate::g16_timeline::SAFETY_POLL_MS.load(Ordering::Relaxed);
+        if safety != 0 && !self.flights.is_empty() {
+            watchdog.min(safety)
         } else {
             watchdog
         }

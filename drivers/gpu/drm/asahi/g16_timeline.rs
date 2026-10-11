@@ -358,6 +358,7 @@ impl FlagKnob {
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
     pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
     pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };
+    pub(crate) const SAFETY_POLL_MS: Self = Self { cell: &SAFETY_POLL_MS, name: "safety_poll_ms", max: 10000 };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {
@@ -411,14 +412,16 @@ impl kernel::debugfs::Writer for DepStats {
         use core::sync::atomic::Ordering::Relaxed;
         writeln!(
             f,
-            "works {}\nitems {}\nsame_lane {}\nrepeat {}\nreached {}\ndropped {}\ndep_elide {}",
+            "works {}\nitems {}\nsame_lane {}\nrepeat {}\nreached {}\ndropped {}\ndep_elide {}\npoll_timeouts {}\npoll_retired {}",
             DEP_WORKS.load(Relaxed),
             DEP_ITEMS.load(Relaxed),
             DEP_SAME_LANE.load(Relaxed),
             DEP_REPEAT.load(Relaxed),
             DEP_REACHED.load(Relaxed),
             DEP_DROPPED.load(Relaxed),
-            DEP_ELIDE.load(Relaxed)
+            DEP_ELIDE.load(Relaxed),
+            POLL_TIMEOUTS.load(Relaxed),
+            POLL_RETIRED.load(Relaxed)
         )
     }
 }
@@ -437,3 +440,12 @@ pub(crate) static READ_OPT: core::sync::atomic::AtomicU32 = core::sync::atomic::
 pub(crate) fn read_opt() -> bool {
     READ_OPT.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
+
+/// With work outstanding, the pump rechecks completion at least every this
+/// many ms (asahi_m4.safety_poll_ms, runtime: debugfs `asahi_m4/safety_poll_ms`;
+/// 0 = only the watchdog windows of #170). Counters in dep_stats:
+/// poll_timeouts (waits that timed out), poll_retired (Works those polls
+/// retired, i.e. completions whose notification was late or lost).
+pub(crate) static SAFETY_POLL_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(50);
+pub(crate) static POLL_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static POLL_RETIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
