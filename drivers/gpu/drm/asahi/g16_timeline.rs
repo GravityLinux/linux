@@ -162,13 +162,18 @@ static SECTIONS: [&Section; 11] = [
     &P_PUMP,
 ];
 
-/// Times a section until dropped, when timeline >= 2.
+/// Section timing switch (asahi_m4.profile, runtime: debugfs
+/// `asahi_m4/profile`). Off by default: each timed section costs two
+/// serialized counter reads, which a pump-bound load pays per firmware read.
+pub(crate) static PROFILE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Times a section until dropped, when profiling is on.
 pub(crate) struct Timer(Option<(u64, &'static Section)>);
 
 impl Timer {
     #[inline(always)]
     pub(crate) fn start(section: &'static Section) -> Self {
-        if crate::module_parameters::timeline.value() >= 2 {
+        if PROFILE.load(core::sync::atomic::Ordering::Relaxed) != 0 {
             Timer(Some((crate::g16_drm::ticks(), section)))
         } else {
             Timer(None)
@@ -324,6 +329,7 @@ pub(crate) struct FlagKnob {
 
 impl FlagKnob {
     pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal" };
+    pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile" };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {

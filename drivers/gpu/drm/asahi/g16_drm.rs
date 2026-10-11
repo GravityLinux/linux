@@ -154,6 +154,7 @@ pub(crate) struct Data {
     _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _early: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
+    _profile_knob: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
 }
@@ -221,6 +222,14 @@ pub(crate) fn register<'a>(
         crate::module_parameters::early_signal.value().min(2),
         Ordering::Relaxed,
     );
+    crate::g16_timeline::PROFILE.store(
+        crate::module_parameters::profile.value().min(1),
+        Ordering::Relaxed,
+    );
+    let profile_knob = KBox::pin_init(
+        dir.read_write_file(c_str!("profile"), crate::g16_timeline::FlagKnob::PROFILE),
+        GFP_KERNEL,
+    )?;
     let early = KBox::pin_init(
         dir.read_write_file(c_str!("early_signal"), crate::g16_timeline::FlagKnob::EARLY_SIGNAL),
         GFP_KERNEL,
@@ -229,19 +238,18 @@ pub(crate) fn register<'a>(
         dir.read_write_file(c_str!("fw_cache_maint"), crate::g16_timeline::MaintKnob),
         GFP_KERNEL,
     )?;
-    let (timeline, profile) = if crate::module_parameters::timeline.value() != 0 {
+    let timeline = if crate::module_parameters::timeline.value() != 0 {
         let ring = crate::g16_timeline::Ring::new(
             crate::module_parameters::timeline_records.value() as usize,
         )?;
-        let file = KBox::pin_init(dir.read_binary_file(c_str!("timeline"), ring), GFP_KERNEL)?;
-        let profile = KBox::pin_init(
-            dir.read_only_file(c_str!("publish_profile"), crate::g16_timeline::Profile),
-            GFP_KERNEL,
-        )?;
-        (Some(file), Some(profile))
+        Some(KBox::pin_init(dir.read_binary_file(c_str!("timeline"), ring), GFP_KERNEL)?)
     } else {
-        (None, None)
+        None
     };
+    let profile = Some(KBox::pin_init(
+        dir.read_only_file(c_str!("publish_profile"), crate::g16_timeline::Profile),
+        GFP_KERNEL,
+    )?);
     let data = try_pin_init!(Data {
         gpu_revision: runtime.gpu_revision,
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
@@ -256,6 +264,7 @@ pub(crate) fn register<'a>(
         _maint: maint,
         _queue_cap: queue_cap,
         _early: early,
+        _profile_knob: profile_knob,
         _lane_cap: lane_cap,
         _debugfs: dir, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
