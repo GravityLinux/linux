@@ -31,6 +31,9 @@ pub(crate) struct FirmwareQueues {
     /// Render Works counted into the queue's shared notifier (two per render).
     notified_works: u32,
     pub(crate) last: [Option<Stamp>; 2],
+    /// Per lane (TA, 3D, compute), the latest stamps its published Works
+    /// waited on as firmware items, keyed by address (dep_elide bit 4).
+    waited: [[Option<Stamp>; 2]; 3],
     /// Kernel-side dependency resolution statistics (logged at teardown with
     /// dep_stats=1).
     deps: DependencyStats,
@@ -93,6 +96,20 @@ impl Drop for FirmwareQueues {
                 d.held_works,
                 d.held_us
             );
+        }
+    }
+}
+
+impl FirmwareQueues {
+    /// Remember that a published Work on `lane` waited on `dep` (a field-level
+    /// borrow, usable while the queue's lanes are borrowed).
+    fn note_wait(waited: &mut [[Option<Stamp>; 2]; 3], lane: usize, dep: Stamp) {
+        let slots = &mut waited[lane];
+        if let Some(s) = slots.iter_mut().find(|s| s.is_some_and(|w| w.address == dep.address)) {
+            *s = Some(dep);
+        } else {
+            slots[1] = slots[0];
+            slots[0] = Some(dep);
         }
     }
 }
@@ -181,6 +198,7 @@ impl FirmwareQueues {
             compute_count: crate::module_parameters::fw_counter_start.value(),
             notified_works: 0,
             last: [None; 2],
+            waited: [[None; 2]; 3],
             deps: DependencyStats::default(),
         }
     }
@@ -1871,6 +1889,45 @@ impl Bootstrap {
     /// let the worker retry after the next completion. The render then
     /// reaches the firmware with no dependency items; its internal TA-to-3D
     /// link is unchanged. render_deps=0 keeps the items.
+    /// dep_elide: count the item and decide whether to drop it.
+    fn elide_item(&self, queue: &FirmwareQueues, lane: usize, dep: &Stamp, same_lane: bool) -> Result<bool> {
+        use crate::g16_timeline as t;
+        let mode = t::DEP_ELIDE.load(Ordering::Relaxed);
+        t::DEP_ITEMS.fetch_add(1, Ordering::Relaxed);
+        let drop = if same_lane {
+            t::DEP_SAME_LANE.fetch_add(1, Ordering::Relaxed);
+            mode & 1 != 0
+        } else if queue.waited[lane]
+            .iter()
+            .flatten()
+            .any(|w| w.address == dep.address && g16_stamp::reached(w.value, dep.value))
+        {
+            t::DEP_REPEAT.fetch_add(1, Ordering::Relaxed);
+            mode & 4 != 0
+        } else if mode & 2 != 0 {
+            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+            let reached = g16_stamp::reached(fw.read_u32(dep.address)?, dep.value);
+            if reached {
+                t::DEP_REACHED.fetch_add(1, Ordering::Relaxed);
+            }
+            reached
+        } else {
+            false
+        };
+        if drop {
+            t::DEP_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(drop)
+    }
+
+    /// The lane a render's dependency item sits on: slot 0 (render) on the
+    /// fragment lane with a fragment barrier, else the tiling lane.
+    fn render_item_lane(params: &render::Parameters, slot: usize) -> usize {
+        let fragment = params.vdm_barrier_fragment
+            || crate::module_parameters::render_barrier.value() & 1 != 0;
+        usize::from(slot == 0 && fragment)
+    }
+
     fn resolve_render_dependencies(
         &self,
         queue: &mut FirmwareQueues,
@@ -1878,7 +1935,18 @@ impl Bootstrap {
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<[Option<Stamp>; 2]> {
         if crate::module_parameters::render_deps.value() == 0 {
-            return Ok(*dependencies);
+            crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
+            let own_fragment = queue.lanes.as_ref().map(|lanes| lanes[1].firmware_stamp());
+            let mut kept = *dependencies;
+            for (slot, dep) in dependencies.iter().enumerate() {
+                let Some(dep) = dep else { continue };
+                let lane = Self::render_item_lane(params, slot);
+                let same_lane = lane == 1 && own_fragment == Some(dep.address);
+                if self.elide_item(queue, lane, dep, same_lane)? {
+                    kept[slot] = None;
+                }
+            }
+            return Ok(kept);
         }
         let fragment_stage = params.vdm_barrier_fragment
             || crate::module_parameters::render_barrier.value() & 1 != 0;
@@ -2261,6 +2329,11 @@ impl Bootstrap {
         };
         let receipt = Receipt { id: va, stamp };
         queue.last[0] = Some(stamp);
+        for (slot, dep) in dependencies.iter().enumerate() {
+            if let Some(dep) = dep {
+                FirmwareQueues::note_wait(&mut queue.waited, Self::render_item_lane(&params, slot), *dep);
+            }
+        }
         queue.pending += 1;
         self.flights.push(
             Flight {
@@ -2526,10 +2599,13 @@ impl Bootstrap {
         let keep_own_render = crate::module_parameters::compute_deps.value() == 2;
         let mut kept = [None; 2];
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
         for (slot, dep) in dependencies.iter().enumerate() {
             let Some(dep) = dep else { continue };
             if keep_own_render && own_render.is_some_and(|r| r.contains(&dep.address)) {
-                kept[slot] = Some(*dep);
+                if !self.elide_item(queue, 2, dep, false)? {
+                    kept[slot] = Some(*dep);
+                }
                 continue;
             }
             if own_lane != Some(dep.address) {
@@ -2706,6 +2782,9 @@ impl Bootstrap {
         };
         let pointers = lane.pointers;
         queue.last[1] = Some(stamp);
+        for dep in dependencies.iter().flatten() {
+            FirmwareQueues::note_wait(&mut queue.waited, 2, *dep);
+        }
         queue.pending += 1;
         self.flights.push(
             Flight {

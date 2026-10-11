@@ -325,11 +325,13 @@ pub(crate) static EARLY_SIGNAL: core::sync::atomic::AtomicU32 = core::sync::atom
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
     name: &'static str,
+    max: u32,
 }
 
 impl FlagKnob {
-    pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal" };
-    pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile" };
+    pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal", max: 2 };
+    pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
+    pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {
@@ -346,14 +348,51 @@ impl kernel::debugfs::Reader for FlagKnob {
             return Err(EINVAL);
         }
         reader.read_slice(&mut buf[..n])?;
-        let value = match core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?.trim() {
-            "0" => 0,
-            "1" => 1,
-            "2" if self.name == "early_signal" => 2,
-            _ => return Err(EINVAL),
-        };
+        let value: u32 = core::str::from_utf8(&buf[..n])
+            .map_err(|_| EINVAL)?
+            .trim()
+            .parse()
+            .map_err(|_| EINVAL)?;
+        if value > self.max {
+            return Err(EINVAL);
+        }
         self.cell.store(value, core::sync::atomic::Ordering::Relaxed);
         pr_info!("G16: {}={}\n", self.name, value);
         Ok(())
+    }
+}
+
+/// Firmware dependency-item elision (asahi_m4.dep_elide, runtime: debugfs
+/// `asahi_m4/dep_elide`), a bitmask. An item is redundant when:
+/// 1: it waits on the same lane's earlier Work (lane order implies it);
+/// 2: its stamp has already been reached at publish (costs a firmware read);
+/// 4: this lane's previous Work already waited on that stamp or a later one
+///    (Works on a lane start in order).
+/// Counters in debugfs `asahi_m4/dep_stats` (category 2 only while bit 2 is set).
+pub(crate) static DEP_ELIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static DEP_ITEMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static DEP_SAME_LANE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static DEP_REACHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static DEP_REPEAT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static DEP_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static DEP_WORKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The debugfs view of the dependency-item counters.
+pub(crate) struct DepStats;
+
+impl kernel::debugfs::Writer for DepStats {
+    fn write(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::sync::atomic::Ordering::Relaxed;
+        writeln!(
+            f,
+            "works {}\nitems {}\nsame_lane {}\nrepeat {}\nreached {}\ndropped {}\ndep_elide {}",
+            DEP_WORKS.load(Relaxed),
+            DEP_ITEMS.load(Relaxed),
+            DEP_SAME_LANE.load(Relaxed),
+            DEP_REPEAT.load(Relaxed),
+            DEP_REACHED.load(Relaxed),
+            DEP_DROPPED.load(Relaxed),
+            DEP_ELIDE.load(Relaxed)
+        )
     }
 }

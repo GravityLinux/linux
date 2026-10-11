@@ -265,6 +265,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 times publish-path sections into debugfs asahi_m4/publish_profile (two serialized counter reads per section, per firmware read). Runtime: debugfs asahi_m4/profile",
         },
+        dep_elide: u32 {
+            default: 0,
+            description: "Bitmask: drop firmware dependency items that are redundant: 1 on the same lane's earlier Work, 2 already reached at publish, 4 already waited on by this lane's previous Work. Counters in debugfs asahi_m4/dep_stats. Runtime: debugfs asahi_m4/dep_elide",
+        },
         early_signal: u32 {
             default: 1,
             description: "Fence signalling order in the pump: 0 one finished submission per pass after admission (the earlier behaviour); 1 every finished submission before admission; 2 publish first, then every finished submission in one batch. Runtime: debugfs asahi_m4/early_signal",

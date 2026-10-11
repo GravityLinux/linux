@@ -154,6 +154,8 @@ pub(crate) struct Data {
     _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _early: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
+    _dep_elide: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
+    _dep_stats: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::DepStats>>>,
     _profile_knob: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
@@ -230,6 +232,18 @@ pub(crate) fn register<'a>(
         dir.read_write_file(c_str!("profile"), crate::g16_timeline::FlagKnob::PROFILE),
         GFP_KERNEL,
     )?;
+    crate::g16_timeline::DEP_ELIDE.store(
+        crate::module_parameters::dep_elide.value().min(7),
+        Ordering::Relaxed,
+    );
+    let dep_elide = KBox::pin_init(
+        dir.read_write_file(c_str!("dep_elide"), crate::g16_timeline::FlagKnob::DEP_ELIDE),
+        GFP_KERNEL,
+    )?;
+    let dep_stats = KBox::pin_init(
+        dir.read_only_file(c_str!("dep_stats"), crate::g16_timeline::DepStats),
+        GFP_KERNEL,
+    )?;
     let early = KBox::pin_init(
         dir.read_write_file(c_str!("early_signal"), crate::g16_timeline::FlagKnob::EARLY_SIGNAL),
         GFP_KERNEL,
@@ -264,6 +278,8 @@ pub(crate) fn register<'a>(
         _maint: maint,
         _queue_cap: queue_cap,
         _early: early,
+        _dep_elide: dep_elide,
+        _dep_stats: dep_stats,
         _profile_knob: profile_knob,
         _lane_cap: lane_cap,
         _debugfs: dir, });
