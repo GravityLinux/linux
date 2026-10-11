@@ -178,11 +178,11 @@ kernel::module_platform_driver! {
             description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts); 2 as 1, but waits on the same queue's own render lanes stay firmware items (in-submission render -> compute edges without a host round trip)",
         },
         max_queue_entries: u32 {
-            default: 96,
-            description: "Maximum unretired Works plus their firmware dependency items per queue (all lanes together) before submissions back off; 0: unlimited (then max_lane_entries must bound each lane). Runtime: debugfs asahi_m4/queue_cap",
+            default: 0,
+            description: "Maximum unretired Works plus their firmware dependency items per queue (all lanes together) before submissions back off; 0 (default): unlimited, with max_lane_entries bounding each lane (production #149 used 96). Runtime: debugfs asahi_m4/queue_cap",
         },
         max_lane_entries: u32 {
-            default: 0,
+            default: 120,
             description: "Maximum unretired Works plus their firmware dependency items on one firmware lane (render TA or 3D, or compute) before submissions back off; 0: unlimited. Keeps dependency items below the firmware's 128-Work per-lane window. Keep it at 127 or less whenever compute_deps or render_deps leave firmware items",
         },
         max_lane_works: u32 {
@@ -258,15 +258,15 @@ kernel::module_platform_driver! {
             description: "Debug: 1 records each submission when its fence signals into a binary ring at debugfs asahi_m4/timeline (format in g16_timeline.rs): the client pid and file, input fences pending at the ioctl, CNTVCT ticks (1 GHz) at the ioctl, scheduler run, first and last publication and completion, plus admission deferrals and their reasons. 2 also records the doorbell, and for the notification that retired the submission its IRQ, RTKit delivery, pump wake and retire-scan times",
         },
         fw_cache_maint: u32 {
-            default: 0,
-            description: "1 restores CPU data-cache maintenance; 0 (default) skips CPU data-cache maintenance (dc ivac/cvac) on firmware and client memory writes, reads and page initialization, keeping the barriers; page-table, TTB and handoff cleans are unchanged. Upstream G13/G14 and writeback user BOs on G16 rely on coherency",
+            default: 1,
+            description: "1 (default) keeps CPU data-cache maintenance; 0 skips CPU data-cache maintenance (dc ivac/cvac) on firmware and client memory writes, reads and page initialization, keeping the barriers; page-table, TTB and handoff cleans are unchanged. Upstream G13/G14 and writeback user BOs on G16 rely on coherency",
         },
         profile: u32 {
             default: 0,
             description: "Debug: 1 times publish-path sections into debugfs asahi_m4/publish_profile (two serialized counter reads per section, per firmware read). Runtime: debugfs asahi_m4/profile",
         },
         dep_elide: u32 {
-            default: 0,
+            default: 6,
             description: "Bitmask: drop firmware dependency items that are redundant: 1 on the same lane's earlier Work, 2 already reached at publish, 4 already waited on by this lane's previous Work. Counters in debugfs asahi_m4/dep_stats. Runtime: debugfs asahi_m4/dep_elide",
         },
         early_signal: u32 {
