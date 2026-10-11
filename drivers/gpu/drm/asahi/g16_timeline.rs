@@ -116,3 +116,88 @@ impl BinaryWriter for Ring {
         writer.write_slice_file(bytes, offset)
     }
 }
+
+/// timeline=2: cumulative CNTVCT ticks and call counts of publish-path
+/// sections, read as text from debugfs `asahi_m4/publish_profile`. Counters
+/// only grow; diff two reads to bracket a window.
+pub(crate) struct Section {
+    name: &'static str,
+    calls: core::sync::atomic::AtomicU64,
+    ticks: core::sync::atomic::AtomicU64,
+}
+
+impl Section {
+    const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            calls: core::sync::atomic::AtomicU64::new(0),
+            ticks: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+pub(crate) static P_SUBMIT_RENDER: Section = Section::new("submit_render");
+pub(crate) static P_SUBMIT_COMPUTE: Section = Section::new("submit_compute");
+pub(crate) static P_PREPARE_RENDER: Section = Section::new("prepare_render");
+pub(crate) static P_PREPARE_COMPUTE: Section = Section::new("prepare_compute");
+pub(crate) static P_LIVE: Section = Section::new("fw write_live/zero_live");
+pub(crate) static P_READ: Section = Section::new("fw read_u32");
+pub(crate) static P_FW_SYNC: Section = Section::new("fw sync");
+pub(crate) static P_VM_SYNC: Section = Section::new("vm sync");
+pub(crate) static P_WRITE_LOW: Section = Section::new("vm write_low");
+pub(crate) static P_FLUSH: Section = Section::new("flush (doorbell)");
+pub(crate) static P_PUMP: Section = Section::new("pump pass");
+
+static SECTIONS: [&Section; 11] = [
+    &P_SUBMIT_RENDER,
+    &P_SUBMIT_COMPUTE,
+    &P_PREPARE_RENDER,
+    &P_PREPARE_COMPUTE,
+    &P_LIVE,
+    &P_READ,
+    &P_FW_SYNC,
+    &P_VM_SYNC,
+    &P_WRITE_LOW,
+    &P_FLUSH,
+    &P_PUMP,
+];
+
+/// Times a section until dropped, when timeline >= 2.
+pub(crate) struct Timer(Option<(u64, &'static Section)>);
+
+impl Timer {
+    #[inline(always)]
+    pub(crate) fn start(section: &'static Section) -> Self {
+        if crate::module_parameters::timeline.value() >= 2 {
+            Timer(Some((crate::g16_drm::ticks(), section)))
+        } else {
+            Timer(None)
+        }
+    }
+}
+
+impl Drop for Timer {
+    #[inline(always)]
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if let Some((start, s)) = self.0 {
+            s.calls.fetch_add(1, Relaxed);
+            s.ticks.fetch_add(crate::g16_drm::ticks().wrapping_sub(start), Relaxed);
+        }
+    }
+}
+
+/// The debugfs view of the sections.
+pub(crate) struct Profile;
+
+impl kernel::debugfs::Writer for Profile {
+    fn write(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::sync::atomic::Ordering::Relaxed;
+        writeln!(f, "# section calls ticks(1GHz) avg_ns")?;
+        for s in SECTIONS.iter() {
+            let (c, t) = (s.calls.load(Relaxed), s.ticks.load(Relaxed));
+            writeln!(f, "{}\t{}\t{}\t{}", s.name, c, t, if c != 0 { t / c } else { 0 })?;
+        }
+        Ok(())
+    }
+}

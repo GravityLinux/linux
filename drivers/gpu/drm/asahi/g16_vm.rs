@@ -155,6 +155,7 @@ impl AddressSpace {
         &mut self,
         p: &mut crate::g16_render::Parameters,
     ) -> Result<Scratch> {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_PREPARE_RENDER);
         let (tilemap, tpc) = p.scratch_sizes().ok_or(EINVAL)?;
         let size = tilemap
             .checked_add(tpc)
@@ -189,6 +190,7 @@ impl AddressSpace {
         &mut self,
         p: &mut crate::g16_compute::Parameters,
     ) -> Result<Scratch> {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_PREPARE_COMPUTE);
         let scratch = self.lease_scratch(false, 0x24000)?;
         let base = scratch.range.start;
         p.scratch = base;
@@ -316,6 +318,7 @@ impl AddressSpace {
     }
 
     pub(crate) fn write_low(&mut self, mut va: u64, mut bytes: &[u8]) -> Result {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_WRITE_LOW);
         while !bytes.is_empty() {
             let base = va & !(UAT_PGSZ as u64 - 1);
             let page = self.pages.get(&base).ok_or(EINVAL)?;
@@ -339,6 +342,7 @@ impl AddressSpace {
     /// mapping changes do not need to sweep all existing client allocations.
     /// Firmware-private storage is managed separately by FirmwareSpace.
     pub(crate) fn sync(&self) {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_VM_SYNC);
         self.low.clean();
         self.high.clean();
         crate::mem::sync();
@@ -686,6 +690,7 @@ impl FirmwareSpace {
         size: usize,
         mut update: impl FnMut(*mut u8, usize, usize),
     ) -> Result {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_LIVE);
         let region = self.region(va, size)?;
         if size == 0 {
             return Ok(());
@@ -759,6 +764,7 @@ impl FirmwareSpace {
     }
 
     pub(crate) fn read_u32(&self, va: u64) -> Result<u32> {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_READ);
         if va & 3 != 0 {
             return Err(EINVAL);
         }
@@ -775,6 +781,7 @@ impl FirmwareSpace {
     }
 
     pub(crate) fn sync(&self) {
+        let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_FW_SYNC);
         for va in self.dirty_regions.borrow_mut().drain_all() {
             let region = self.regions.get(&va).unwrap();
             region.pending.set(false);

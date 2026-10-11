@@ -150,6 +150,7 @@ pub(crate) struct Data {
     /// timeline=1/2: the record ring and its debugfs file (dropped before the
     /// directory).
     timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
+    _profile: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>>,
     _debugfs: Option<kernel::debugfs::Dir>,
 }
 
@@ -195,15 +196,19 @@ pub(crate) fn register<'a>(
         pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)?;
     }
     let runtime = crate::g16::Bootstrap::new(pdev)?;
-    let (timeline, debugfs) = if crate::module_parameters::timeline.value() != 0 {
+    let (timeline, profile, debugfs) = if crate::module_parameters::timeline.value() != 0 {
         let dir = kernel::debugfs::Dir::new(c_str!("asahi_m4"));
         let ring = crate::g16_timeline::Ring::new(
             crate::module_parameters::timeline_records.value() as usize,
         )?;
         let file = KBox::pin_init(dir.read_binary_file(c_str!("timeline"), ring), GFP_KERNEL)?;
-        (Some(file), Some(dir))
+        let profile = KBox::pin_init(
+            dir.read_only_file(c_str!("publish_profile"), crate::g16_timeline::Profile),
+            GFP_KERNEL,
+        )?;
+        (Some(file), Some(profile), Some(dir))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let data = try_pin_init!(Data {
         gpu_revision: runtime.gpu_revision,
@@ -215,6 +220,7 @@ pub(crate) fn register<'a>(
         runtime <- kernel::new_mutex!(runtime),
         engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
         timeline,
+        _profile: profile,
         _debugfs: debugfs, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
     let bound: &'a platform::Device<Bound> = pdev;
@@ -1371,6 +1377,7 @@ impl WorkItem for Execution {
             let mut engine = this.device.engine.lock();
             let mut runtime = this.device.runtime.lock();
             let result = (|| -> Result<bool> {
+                let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_PUMP);
                 match wake_result {
                     // No notification within the watchdog window: poll the
                     // stamps. Retirement's watchdog reports a real hang; a
