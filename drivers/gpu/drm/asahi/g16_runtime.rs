@@ -397,13 +397,15 @@ impl Ledger {
             if book.works == 0 {
                 self.lanes.swap_remove(i);
             }
+            // Publication order, and retirement is mostly oldest first: the
+            // entry is usually at the front. remove() keeps that order.
             let i = self.heads.iter().position(|&e| e == (pointers, head)).ok_or(EIO)?;
-            self.heads.swap_remove(i);
+            self.heads.remove(i).map_err(|_| EIO)?;
         }
         for &(channel, target) in &f.channels {
             if channel != usize::MAX {
                 let i = self.targets.iter().position(|&e| e == (channel, target)).ok_or(EIO)?;
-                self.targets.swap_remove(i);
+                self.targets.remove(i).map_err(|_| EIO)?;
             }
         }
         Ok(())
