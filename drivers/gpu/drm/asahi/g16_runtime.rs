@@ -1312,7 +1312,9 @@ impl Bootstrap {
         }
         // Never let one unreadable word end the report early.
         let word = |address: u64| fw.read_u32(address).unwrap_or(0xdead_beef);
-        if let Some(flight) = self.flights.first() {
+        // The oldest publication; `flights` is unordered.
+        let now = Instant::now();
+        if let Some(flight) = self.flights.iter().max_by_key(|f| now - f.started) {
             for (stage, (pointers, head)) in flight.queues.iter().enumerate() {
                 if *pointers == 0 {
                     continue;
@@ -1691,7 +1693,10 @@ impl Bootstrap {
             }
             drop(owner);
             self.context_users[flight.context as usize] -= 1;
-            let flight = self.flights.remove(index).map_err(|_| EIO)?;
+            // The scan runs downwards: the flight swapped into `index` was
+            // already examined. Order carries no meaning (removal shifted
+            // every later flight, tens of KB per Work under load).
+            let flight = self.flights.swap_remove(index);
             self.ledger.remove(&flight)?;
             let root = match &flight.render {
                 Some(render) => render.root,
