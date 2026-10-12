@@ -718,24 +718,12 @@ impl FirmwareSpace {
         })
     }
 
-    /// The region holding `va..va + size`, reusing `last` when it does.
-    fn region_from<'a>(
-        &'a self,
-        last: Option<&'a FirmwareRegion>,
-        va: u64,
-        size: usize,
-    ) -> Result<&'a FirmwareRegion> {
-        match last {
-            Some(r)
-                if va >= r.va
-                    && va
-                        .checked_add(size as u64)
-                        .is_some_and(|end| end <= r.va + (r.pages.len() * UAT_PGSZ) as u64) =>
-            {
-                Ok(r)
-            }
-            _ => self.region(va, size),
-        }
+    /// Whether `region` holds all of `va..va + size`.
+    fn holds(region: &FirmwareRegion, va: u64, size: usize) -> bool {
+        va >= region.va
+            && va
+                .checked_add(size as u64)
+                .is_some_and(|end| end <= region.va + (region.pages.len() * UAT_PGSZ) as u64)
     }
 
     /// Update host-owned bytes, preserving adjacent firmware-owned cache lines.
@@ -747,18 +735,41 @@ impl FirmwareSpace {
     ) -> Result {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_LIVE);
         let maint = crate::g16_timeline::fw_cache_maint();
-        let mut last = None;
-        // Validate every destination before touching any of them.
-        for &(va, size) in ranges {
-            last = Some(self.region_from(last, va, size)?);
+        // Validate every destination before touching any of them, resolving
+        // each distinct region once: a render's writes alternate between a
+        // few regions (notifier, Work slot, lane rings).
+        // Fixed-size bookkeeping: no allocation per write. Destinations past
+        // these bounds are looked up individually (NONE).
+        const NONE: u8 = u8::MAX;
+        let mut found: [Option<&FirmwareRegion>; 4] = [None; 4];
+        let mut owner = [NONE; 32];
+        for (n, &(va, size)) in ranges.iter().enumerate() {
+            let region = match found.iter().flatten().position(|r| Self::holds(r, va, size)) {
+                Some(index) => {
+                    if let Some(slot) = owner.get_mut(n) {
+                        *slot = index as u8;
+                    }
+                    continue;
+                }
+                None => self.region(va, size)?,
+            };
+            if let (Some(slot), Some(free)) = (owner.get_mut(n), found.iter().position(Option::is_none)) {
+                found[free] = Some(region);
+                *slot = free as u8;
+            }
         }
+        let resolve = |n: usize, va: u64, size: usize| -> Result<&FirmwareRegion> {
+            match owner.get(n).and_then(|&i| found.get(i as usize).copied().flatten()) {
+                Some(region) => Ok(region),
+                None => self.region(va, size),
+            }
+        };
         if maint {
-            for &(va, size) in ranges {
+            for (n, &(va, size)) in ranges.iter().enumerate() {
                 if size == 0 {
                     continue;
                 }
-                let region = self.region_from(last, va, size)?;
-                last = Some(region);
+                let region = resolve(n, va, size)?;
                 let start = (va - region.va) as usize;
                 let end = start + size;
                 for index in start / UAT_PGSZ..=(end - 1) / UAT_PGSZ {
@@ -783,8 +794,7 @@ impl FirmwareSpace {
             if size == 0 {
                 continue;
             }
-            let region = self.region_from(last, va, size)?;
-            last = Some(region);
+            let region = resolve(which, va, size)?;
             let start = (va - region.va) as usize;
             let end = start + size;
             for index in start / UAT_PGSZ..=(end - 1) / UAT_PGSZ {
