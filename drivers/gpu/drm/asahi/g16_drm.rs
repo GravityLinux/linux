@@ -147,6 +147,11 @@ pub(crate) struct Data {
     runtime: Mutex<crate::g16::Bootstrap>,
     #[pin]
     engine: Mutex<Engine>,
+    /// Jobs drm_sched has run but the pump has not yet taken. Scheduler
+    /// callbacks hold only this lock, briefly, never `engine`: the pump
+    /// keeps `engine` through a whole publication pass.
+    #[pin]
+    inbox: Mutex<Inbox>,
     /// timeline=1/2: the record ring and its debugfs file (dropped before the
     /// directory).
     timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
@@ -290,7 +295,8 @@ pub(crate) fn register<'a>(
         failed: AtomicBool::new(false),
         notifications: runtime.notifications.clone(),
         runtime <- kernel::new_mutex!(runtime),
-        engine <- kernel::new_mutex!(Engine { running: false, cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
+        engine <- kernel::new_mutex!(Engine { cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
+        inbox <- kernel::new_mutex!(Inbox { running: false, jobs: KVec::new() }),
         timeline,
         _profile: profile,
         _maint: maint,
@@ -394,7 +400,8 @@ impl DriverObject for Buffer {
                 let (mut pumped, mut issued) = (0usize, 0usize);
                 {
                     let engine = inner.device.engine.lock();
-                    for job in engine.jobs.iter() {
+                    let inbox = inner.device.inbox.lock();
+                    for job in Iterator::chain(engine.jobs.iter(), inbox.jobs.iter()) {
                         let e = &job.execution;
                         if Arc::ptr_eq(&e.space, &vm.space) || Arc::ptr_eq(&e.space, &vm.compute_space) {
                             pumped += 1;
@@ -1439,10 +1446,29 @@ struct Issued {
     owner: u64,
 }
 struct Engine {
-    running: bool,
     cursor: usize,
     jobs: KVec<Running>,
     issued: KVec<Issued>,
+}
+struct Inbox {
+    /// A pump is queued or running; it rechecks the inbox before stopping.
+    running: bool,
+    jobs: KVec<Running>,
+}
+
+impl Engine {
+    /// Take the jobs drm_sched has run since the last pass, in order.
+    /// On failure the jobs stay in the inbox for the error path to fail.
+    fn admit(&mut self, inbox: &Mutex<Inbox>) -> Result {
+        let mut inbox = inbox.lock();
+        self.jobs.reserve(inbox.jobs.len(), GFP_KERNEL)?;
+        let incoming = core::mem::take(&mut inbox.jobs);
+        drop(inbox);
+        for job in incoming {
+            self.jobs.push_within_capacity(job).map_err(|_| ENOMEM)?;
+        }
+        Ok(())
+    }
 }
 
 impl WorkItem for Execution {
@@ -1456,9 +1482,11 @@ impl WorkItem for Execution {
         loop {
             let generation = this.device.notifications.snapshot();
             let mut engine = this.device.engine.lock();
+            let taken = engine.admit(&this.device.inbox);
             let mut runtime = this.device.runtime.lock();
             let result = (|| -> Result<bool> {
                 let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_PUMP);
+                taken?;
                 // No notification within the watchdog window: poll the stamps.
                 // Retirement's watchdog reports a real hang; a lost
                 // notification simply retires the finished work. Report what
@@ -1686,14 +1714,18 @@ impl WorkItem for Execution {
                 );
                 runtime.poison();
                 this.device.failed.store(true, Ordering::Release);
-                let jobs = core::mem::take(&mut engine.jobs);
+                let mut jobs = core::mem::take(&mut engine.jobs);
                 engine.issued.clear();
-                engine.running = false;
+                let queued = {
+                    let mut inbox = this.device.inbox.lock();
+                    inbox.running = false;
+                    core::mem::take(&mut inbox.jobs)
+                };
                 drop(runtime);
                 drop(engine);
                 // Quarantined context roots remain installed and retained;
                 // a failed fence never authorizes reuse of their backing.
-                for job in jobs {
+                for job in Iterator::chain(jobs.drain_all(), queued) {
                     job.execution.completion.set_error(error);
                     let _ = job.execution.completion.signal();
                 }
@@ -1757,8 +1789,17 @@ impl WorkItem for Execution {
                 continue;
             }
             if engine.jobs.is_empty() {
-                engine.running = false;
-                return;
+                // Stop only if no job arrived since this pass drained the
+                // inbox; run_job sees `running` cleared and queues a new pump.
+                let mut inbox = this.device.inbox.lock();
+                if inbox.jobs.is_empty() {
+                    inbox.running = false;
+                    return;
+                }
+                drop(inbox);
+                drop(runtime);
+                drop(engine);
+                continue;
             }
             let timeout_ms = runtime.watchdog_remaining_ms();
             drop(runtime);
@@ -1803,42 +1844,41 @@ impl sched::JobImpl for SubmissionJob {
             return Err(EIO);
         }
         let fence = execution.completion.clone();
-        let mut engine = execution.device.engine.lock();
-        let result = (|| -> Result {
+        // Allocate before taking the inbox lock: it is held only to append.
+        let running = (|| -> Result<Running> {
             let mut history = [KVec::new(), KVec::new()];
             for events in &mut history {
                 events.reserve(65, GFP_KERNEL)?;
             }
-            engine.jobs.push(
-                Running {
-                    execution: execution.clone(),
-                    next: 0,
-                    first: 0,
-                    last: 0,
-                    busy: 0,
-                    why: 0,
-                    kick: 0,
-                    irq: 0,
-                    rx: 0,
-                    wake: 0,
-                    seen: 0,
-                    pending: 0,
-                    error: None,
-                    history,
-                },
-                GFP_KERNEL,
-            )?;
-            Ok(())
+            Ok(Running {
+                execution: execution.clone(),
+                next: 0,
+                first: 0,
+                last: 0,
+                busy: 0,
+                why: 0,
+                kick: 0,
+                irq: 0,
+                rx: 0,
+                wake: 0,
+                seen: 0,
+                pending: 0,
+                error: None,
+                history,
+            })
         })();
-        if let Err(error) = result {
+        let mut inbox = execution.device.inbox.lock();
+        if let Err(error) = running.and_then(|r| inbox.jobs.push(r, GFP_KERNEL).map_err(Into::into)) {
+            drop(inbox);
             execution.completion.set_error(error);
             let _ = execution.completion.signal();
             return Err(error);
         }
-        if !engine.running {
-            engine.running = true;
+        if !inbox.running {
+            inbox.running = true;
             let _ = workqueue::system_dfl().enqueue(execution.clone());
         }
+        drop(inbox);
         // A running worker may be asleep waiting for firmware on another
         // queue. New ready work must wake it even if no GPU event arrives.
         execution.device.notifications.notify(false);
