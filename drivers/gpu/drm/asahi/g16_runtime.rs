@@ -414,6 +414,21 @@ impl Bootstrap {
         }
     }
 
+    /// Work storage must stay inside the 4 GiB windows that alias it for the
+    /// GPU (0x71/0x72_0000_0000 + offset): Work arenas grow from WORK_BASE,
+    /// and every other firmware object (queue identities, TVB pools) takes
+    /// its VA from OBJECT_BASE above the window. Before #174 they shared one
+    /// cursor, so context churn (about 0.4 MiB per queue and VM) pushed new
+    /// Work past the window after enough contexts in one boot: CTS on #173
+    /// failed renders with ENOSPC at offset 5.3 GiB.
+    fn work_space_left(&self, render: bool) -> bool {
+        let index = usize::from(render);
+        let stride = if render { 0x1c000 } else { 0x8000 };
+        !self.free_work[index].is_empty()
+            || !self.work_arenas[index].is_empty()
+            || self.next_work_va + 16 * stride <= WORK_BASE + WORK_WINDOW
+    }
+
     /// Lease Work storage until notifier/driver stamps and transport retire.
     /// Backing stays mapped. Queue-owned wrapping stamps outlive reused Work,
     /// so a pending dependency never follows a recycled completion address.
@@ -433,6 +448,9 @@ impl Bootstrap {
         if self.work_arenas[index].is_empty() {
             let base = self.next_work_va;
             let end = base.checked_add(16 * stride).ok_or(ENOSPC)?;
+            if end > WORK_BASE + WORK_WINDOW {
+                return Err(ENOSPC);
+            }
             // Work VA only grows; a steady rise under constant load means
             // leaked Work allocations.
             pr_info!(
@@ -655,8 +673,8 @@ impl Bootstrap {
     fn prepare_queues(&mut self, owner: &mut FirmwareQueues) -> Result {
         if owner.lanes.is_none() {
             self.recycle_queues()?;
-            let identity = self.next_work_va;
-            self.next_work_va = identity.checked_add(0x24000).ok_or(ENOSPC)?;
+            let identity = self.next_object_va;
+            self.next_object_va = identity.checked_add(0x24000).ok_or(ENOSPC)?;
             let recycled = self.free_queues.pop();
             let base = recycled.unwrap_or(identity);
             let lanes = match self.init_queues(owner, base, identity, recycled.is_none()) {
@@ -747,6 +765,16 @@ impl Bootstrap {
     ) -> Result {
         if self.render_failed {
             return Err(EIO);
+        }
+        // Work storage is bounded by its GPU alias window. When the window is
+        // full, outstanding Works return storage as they retire, so admission
+        // waits; with nothing in flight it can never clear, so fail.
+        if !self.work_space_left(render) {
+            if self.flights.is_empty() {
+                return Err(ENOSPC);
+            }
+            self.report_pressure(64, "Work storage");
+            return Err(EBUSY);
         }
         // Check scarce resources before allocating any per-Work storage.
         // Commands in either persistent VM root can share its live ASID.
@@ -2117,8 +2145,8 @@ impl Bootstrap {
             Some(index) => index,
             None => {
                 self.tvb_pools.reserve(1, GFP_KERNEL)?;
-                let base = self.next_work_va;
-                self.next_work_va = base.checked_add(0x44000).ok_or(ENOSPC)?;
+                let base = self.next_object_va;
+                self.next_object_va = base.checked_add(0x44000).ok_or(ENOSPC)?;
                 let pool = crate::g16_tvb::Tvb::new(
                     self._firmware_space.as_mut().ok_or(EIO)?,
                     client,
@@ -2228,7 +2256,7 @@ impl Bootstrap {
         }
         a.tiling_firmware_stamp = lanes[0].firmware_stamp();
         a.fragment_firmware_stamp = lanes[1].firmware_stamp();
-        let alias = 0x72_0000_0000 + (va - 0xffff_fc22_0000_0000);
+        let alias = 0x72_0000_0000 + (va - WORK_BASE);
         if alias + 0x8000 > 0x73_0000_0000 {
             return Err(ENOSPC);
         }
@@ -2755,7 +2783,7 @@ impl Bootstrap {
         }
         let ordinal = queue.compute_count;
         let work = self.allocate_work(false)?;
-        let alias = 0x71_0000_0000 + (work - 0xffff_fc22_0000_0000);
+        let alias = 0x71_0000_0000 + (work - WORK_BASE);
         if alias + 0x4000 > 0x72_0000_0000 {
             return Err(ENOSPC);
         }
@@ -3036,6 +3064,14 @@ impl Bootstrap {
         Ok(())
     }
 }
+
+/// Firmware VA of the first Work arena; Work offsets from here alias into the
+/// GPU windows at 0x71_0000_0000 (compute) and 0x72_0000_0000 (render).
+pub(crate) const WORK_BASE: u64 = 0xffff_fc22_0000_0000;
+/// Size of each alias window.
+pub(crate) const WORK_WINDOW: u64 = 0x1_0000_0000;
+/// Firmware VA for queue identities and TVB pools, above the Work window.
+pub(crate) const OBJECT_BASE: u64 = WORK_BASE + WORK_WINDOW;
 
 static DUMPED_RENDERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

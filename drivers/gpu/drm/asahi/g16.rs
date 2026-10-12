@@ -252,6 +252,8 @@ pub(crate) struct Bootstrap {
     stale_next: usize,
     recent_ring: render_runtime::RenderRing,
     next_work_va: u64,
+    /// Queue identities and TVB pools; see render_runtime::OBJECT_BASE.
+    next_object_va: u64,
     work_arenas: [core::ops::Range<u64>; 2],
     free_work: [KVec<u64>; 2],
     compute_publication: u64,
@@ -756,7 +758,8 @@ impl Bootstrap {
             },
             stale_next: 0,
             recent_ring: render_runtime::RenderRing::new(),
-            next_work_va: 0xffff_fc22_0000_0000,
+            next_work_va: render_runtime::WORK_BASE,
+            next_object_va: render_runtime::OBJECT_BASE,
             work_arenas: [0..0, 0..0],
             free_work: [KVec::new(), KVec::new()],
             compute_publication: crate::module_parameters::fw_counter_start.value(),
