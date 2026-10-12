@@ -346,6 +346,9 @@ pub(crate) fn init_caps(queue: u32, lane: u32) -> Result {
 /// per pump pass after admission.
 pub(crate) static EARLY_SIGNAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
+/// How much of a reused scratch lease to zero (asahi_m4.scratch_zero).
+pub(crate) static SCRATCH_ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+
 /// A 0/1 debugfs switch over a static.
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
@@ -359,6 +362,7 @@ impl FlagKnob {
     pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
     pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };
     pub(crate) const SAFETY_POLL_MS: Self = Self { cell: &SAFETY_POLL_MS, name: "safety_poll_ms", max: 10000 };
+    pub(crate) const SCRATCH_ZERO: Self = Self { cell: &SCRATCH_ZERO, name: "scratch_zero", max: 2 };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {

@@ -161,7 +161,8 @@ impl AddressSpace {
             .checked_add(tpc)
             .and_then(|n| n.checked_add(5 * UAT_PGSZ))
             .ok_or(ENOMEM)?;
-        let scratch = self.lease_scratch(true, size)?;
+        // Only the trailing metadata pages may need clearing (scratch_zero=1).
+        let scratch = self.lease_scratch(true, size, tilemap + tpc)?;
         let base = scratch.range.start;
         p.tilemap = base;
         p.tpc = base + tilemap as u64;
@@ -191,14 +192,15 @@ impl AddressSpace {
         p: &mut crate::g16_compute::Parameters,
     ) -> Result<Scratch> {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_PREPARE_COMPUTE);
-        let scratch = self.lease_scratch(false, 0x24000)?;
+        let scratch = self.lease_scratch(false, 0x24000, 0x20000)?;
         let base = scratch.range.start;
         p.scratch = base;
         p.marker = base + 0x20000;
         Ok(scratch)
     }
 
-    fn lease_scratch(&mut self, render: bool, size: usize) -> Result<Scratch> {
+    /// `metadata`: the lease offset from which scratch_zero=1 still clears.
+    fn lease_scratch(&mut self, render: bool, size: usize, metadata: usize) -> Result<Scratch> {
         if size == 0 || size & (UAT_PGSZ - 1) != 0 {
             return Err(EINVAL);
         }
@@ -217,9 +219,15 @@ impl AddressSpace {
             } else {
                 self.scratch_free[index][slot].start = end;
             }
-            // All previous GPU writes have retired. Reinitialize the entire
-            // leased range without touching PTEs or neighbouring active jobs.
-            for va in (start..end).step_by(UAT_PGSZ) {
+            // All previous GPU writes have retired. Reinitialize the leased
+            // range (all of it by default, as fresh pages are zeroed) without
+            // touching PTEs or neighbouring active jobs.
+            let clear_from = match crate::g16_timeline::SCRATCH_ZERO.load(core::sync::atomic::Ordering::Relaxed) {
+                0 => end,
+                1 => (start + metadata as u64).min(end),
+                _ => start,
+            };
+            for va in (clear_from..end).step_by(UAT_PGSZ) {
                 let page = self.pages.get(&va).ok_or(EIO)?;
                 page.with_page_mapped(|ptr| {
                     // SAFETY: The lease owns this full page exclusively.
