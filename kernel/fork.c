@@ -1185,6 +1185,7 @@ EXPORT_SYMBOL_IF_KUNIT(mm_alloc);
 
 static inline void __mmput(struct mm_struct *mm)
 {
+	{ /* P3S remote MM context scope: must end before mmdrop() frees @mm */
 	P3S_CONTEXT_REMOTE_MM(mm);
 	VM_BUG_ON(atomic_read(&mm->mm_users));
 
@@ -1204,6 +1205,7 @@ static inline void __mmput(struct mm_struct *mm)
 		module_put(mm->binfmt->module);
 	lru_gen_del_mm(mm);
 	futex_hash_free(mm);
+	} /* end P3S remote MM context scope */
 	mmdrop(mm);
 }
 
