@@ -698,56 +698,120 @@ impl FirmwareSpace {
         size: usize,
         mut update: impl FnMut(*mut u8, usize, usize),
     ) -> Result {
+        self.update_batch(&[(va, size)], |_, ptr, offset, size| update(ptr, offset, size))
+    }
+
+    /// Several host-owned writes with one barrier pair, the region resolved
+    /// again only when a destination leaves the previous one. Nothing in a
+    /// batch is visible to firmware before the queue publication that follows
+    /// it (flush), which has its own barrier.
+    pub(crate) fn write_batch(&mut self, writes: &[(u64, &[u8])]) -> Result {
+        let mut ranges = KVec::with_capacity(writes.len(), GFP_KERNEL)?;
+        for &(va, bytes) in writes {
+            ranges.push((va, bytes.len()), GFP_KERNEL)?;
+        }
+        self.update_batch(&ranges, |which, ptr, offset, size| {
+            let bytes = writes[which].1;
+            // SAFETY: update_batch supplies an exclusively host-owned
+            // destination and a range within this write's source slice.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), ptr, size) };
+        })
+    }
+
+    /// The region holding `va..va + size`, reusing `last` when it does.
+    fn region_from<'a>(
+        &'a self,
+        last: Option<&'a FirmwareRegion>,
+        va: u64,
+        size: usize,
+    ) -> Result<&'a FirmwareRegion> {
+        match last {
+            Some(r)
+                if va >= r.va
+                    && va
+                        .checked_add(size as u64)
+                        .is_some_and(|end| end <= r.va + (r.pages.len() * UAT_PGSZ) as u64) =>
+            {
+                Ok(r)
+            }
+            _ => self.region(va, size),
+        }
+    }
+
+    /// Update host-owned bytes, preserving adjacent firmware-owned cache lines.
+    /// Cache maintenance completes once per batch, not once per page or write.
+    fn update_batch(
+        &mut self,
+        ranges: &[(u64, usize)],
+        mut update: impl FnMut(usize, *mut u8, usize, usize),
+    ) -> Result {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_LIVE);
         let maint = crate::g16_timeline::fw_cache_maint();
-        let region = self.region(va, size)?;
-        if size == 0 {
-            return Ok(());
+        let mut last = None;
+        // Validate every destination before touching any of them.
+        for &(va, size) in ranges {
+            last = Some(self.region_from(last, va, size)?);
         }
-        let start = (va - region.va) as usize;
-        let end = start + size;
-        let first = start / UAT_PGSZ;
-        let last = (end - 1) / UAT_PGSZ;
-        for index in first..=last {
-            // Unpublished initialization is still authoritative in CPU cache.
-            if region.dirty_pages[index].get() || !maint {
-                continue;
-            }
-            let base = index * UAT_PGSZ;
-            let within = start.saturating_sub(base);
-            let limit = (end - base).min(UAT_PGSZ);
-            region.pages[index].with_page_mapped(|p| {
-                for off in (within & !63..limit).step_by(64) {
-                    // SAFETY: These cache lines lie within the mapped page.
-                    unsafe { core::arch::asm!("dc civac, {addr}", addr = in(reg) p.add(off)) };
+        if maint {
+            for &(va, size) in ranges {
+                if size == 0 {
+                    continue;
                 }
-            });
+                let region = self.region_from(last, va, size)?;
+                last = Some(region);
+                let start = (va - region.va) as usize;
+                let end = start + size;
+                for index in start / UAT_PGSZ..=(end - 1) / UAT_PGSZ {
+                    // Unpublished initialization is still authoritative in CPU cache.
+                    if region.dirty_pages[index].get() {
+                        continue;
+                    }
+                    let base = index * UAT_PGSZ;
+                    let within = start.saturating_sub(base);
+                    let limit = (end - base).min(UAT_PGSZ);
+                    region.pages[index].with_page_mapped(|p| {
+                        for off in (within & !63..limit).step_by(64) {
+                            // SAFETY: These cache lines lie within the mapped page.
+                            unsafe { core::arch::asm!("dc civac, {addr}", addr = in(reg) p.add(off)) };
+                        }
+                    });
+                }
+            }
         }
         crate::mem::sync();
-        for index in first..=last {
-            let base = index * UAT_PGSZ;
-            let within = start.saturating_sub(base);
-            let limit = (end - base).min(UAT_PGSZ);
-            let dirty = region.dirty_pages[index].replace(false);
-            region.pages[index].with_page_mapped(|p| {
-                // SAFETY: The checked range lies in this mapped page. The
-                // caller owns these bytes; neighboring firmware bytes were
-                // invalidated before the batch's completion barrier above.
-                unsafe { update(p.add(within), base + within - start, limit - within) };
-                // Publish all initialization on a dirty page, including zeros
-                // outside this write. Published pages need only touched lines.
-                let lines = if !maint {
-                    0..0
-                } else if dirty {
-                    0..UAT_PGSZ
-                } else {
-                    (within & !63)..limit
-                };
-                for off in lines.step_by(64) {
-                    // SAFETY: The cache line lies in this mapped page.
-                    unsafe { core::arch::asm!("dc cvac, {addr}", addr = in(reg) p.add(off)) };
-                }
-            });
+        for (which, &(va, size)) in ranges.iter().enumerate() {
+            if size == 0 {
+                continue;
+            }
+            let region = self.region_from(last, va, size)?;
+            last = Some(region);
+            let start = (va - region.va) as usize;
+            let end = start + size;
+            for index in start / UAT_PGSZ..=(end - 1) / UAT_PGSZ {
+                let base = index * UAT_PGSZ;
+                let within = start.saturating_sub(base);
+                let limit = (end - base).min(UAT_PGSZ);
+                let dirty = region.dirty_pages[index].replace(false);
+                region.pages[index].with_page_mapped(|p| {
+                    // SAFETY: The checked range lies in this mapped page. The
+                    // caller owns these bytes; neighboring firmware bytes were
+                    // invalidated before the batch's completion barrier above.
+                    unsafe { update(which, p.add(within), base + within - start, limit - within) };
+                    // Publish all initialization on a dirty page, including zeros
+                    // outside this write. Published pages need only touched lines.
+                    let lines = if !maint {
+                        0..0
+                    } else if dirty {
+                        0..UAT_PGSZ
+                    } else {
+                        (within & !63)..limit
+                    };
+                    for off in lines.step_by(64) {
+                        // SAFETY: The cache line lies in this mapped page.
+                        unsafe { core::arch::asm!("dc cvac, {addr}", addr = in(reg) p.add(off)) };
+                    }
+                });
+            }
         }
         crate::mem::sync();
         Ok(())

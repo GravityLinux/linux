@@ -2670,97 +2670,104 @@ impl Bootstrap {
                 % 0x500,
             (firsts[1] + 2 + stage_dependencies[1].iter().flatten().count() as u32) % 0x500,
         ];
-        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        if a.event_control == render_notifier(lanes) {
-            // Shared notifier: count this render's tiling and fragment Works
-            // into the queue's cumulative total. Firmware counts completions
-            // at +0xc and writes the lanes' driver stamps as they retire.
-            fw.write_live(a.event_control + 0x24, &(a.context_id as u32).to_le_bytes())?;
-            fw.write_live(
-                a.event_count_array,
-                &queue.notified_works.wrapping_add(2).to_le_bytes(),
-            )?;
-        } else {
-            fw.write_live(a.event_control, &a.event_count_array.to_le_bytes())?;
-            fw.write_live(
-                a.event_control + 8,
-                &(a.fragment_stamp as u32).to_le_bytes(),
-            )?;
-            fw.write_live(a.event_control + 12, &0u32.to_le_bytes())?;
-            fw.write_live(a.event_control + 0x10, &0x50u32.to_le_bytes())?;
-            fw.write_live(a.event_control + 0x24, &(a.context_id as u32).to_le_bytes())?;
-            fw.write_live(a.event_count_array, &2u32.to_le_bytes())?;
-            fw.write_live(
-                a.tiling_driver_stamp,
-                &g16_stamp::previous(a.tiling_stamp as u32).to_le_bytes(),
-            )?;
-            fw.write_live(
-                a.fragment_driver_stamp,
-                &g16_stamp::previous(a.fragment_stamp as u32).to_le_bytes(),
-            )?;
-        }
-        // The queue lanes persist independently of the physical work channel.
+        // Every byte this render publishes, written as one batch: one region
+        // lookup per destination region and one barrier pair, rather than a
+        // lookup and two barriers for each of about twenty writes.
+        let shared = a.event_control == render_notifier(lanes);
+        let context = (a.context_id as u32).to_le_bytes();
+        let notified = queue.notified_works.wrapping_add(2).to_le_bytes();
+        let count_array = a.event_count_array.to_le_bytes();
+        let fragment_stamp = (a.fragment_stamp as u32).to_le_bytes();
+        let zero = 0u32.to_le_bytes();
+        let flags = 0x50u32.to_le_bytes();
+        let two = 2u32.to_le_bytes();
+        let tiling_previous = g16_stamp::previous(a.tiling_stamp as u32).to_le_bytes();
+        let fragment_previous = g16_stamp::previous(a.fragment_stamp as u32).to_le_bytes();
+        let preludes = [a.tiling_prelude(blocks), a.fragment_prelude()];
+        let tiling_micro = a.tiling_microsequence();
+        let fragment_micro = a.fragment_microsequence();
+        // At most two dependency items and four ring entries per stage.
+        let mut items = [[[0u8; 0x40]; 2]; 2];
+        let mut entries = [[[0u8; 8]; 4]; 2];
+        let mut item_counts = [0usize; 2];
+        let mut entry_counts = [0usize; 2];
+        let render_kind = crate::module_parameters::dependency_kind.value();
         for stage in 0..2 {
-            let Lane { ring, .. } = lanes[stage];
-            let prelude = if stage == 0 {
-                a.tiling_prelude
+            let (prelude, work) = if stage == 0 {
+                (a.tiling_prelude, a.tiling_work)
             } else {
-                a.fragment_prelude
+                (a.fragment_prelude, a.fragment_work)
             };
-            let work = if stage == 0 {
-                a.tiling_work
+            let (stamp, uuid) = if stage == 0 {
+                (a.tiling_stamp, a.tiling_uuid)
             } else {
-                a.fragment_work
+                (a.fragment_stamp, a.fragment_uuid)
             };
-            let micro = if stage == 0 {
-                a.tiling_microsequence
-            } else {
-                a.fragment_microsequence
-            };
-            fw.write_live(
-                prelude,
-                &if stage == 0 {
-                    a.tiling_prelude(blocks)
-                } else {
-                    a.fragment_prelude()
-                },
-            )?;
-            fw.write_live(work, if stage == 0 { ta } else { frag })?;
-            if stage == 0 {
-                fw.write_live(micro, &a.tiling_microsequence())?;
-            } else {
-                fw.write_live(micro, &a.fragment_microsequence())?;
-            }
-            let mut pos = firsts[stage];
             // The prelude page leaves +0x40..+0xc0 free before its
             // microsequence. All barrier bytes share the Work's lifetime.
-            let render_kind = crate::module_parameters::dependency_kind.value();
             let deps = stage_dependencies[stage]
                 .iter()
                 .enumerate()
                 .filter_map(|(slot, dep)| dep.map(|d| (if slot == 0 { render_kind } else { 1 }, d)));
             for (index, (kind, dep)) in deps.enumerate() {
-                let address = prelude + 0x40 + index as u64 * 0x40;
-                let (stamp, uuid) = if stage == 0 {
-                    (a.tiling_stamp, a.tiling_uuid)
-                } else {
-                    (a.fragment_stamp, a.fragment_uuid)
-                };
-                fw.write_live(
-                    address,
-                    &g16_fw::queue::dependency(
-                        dep.address, dep.value, dep.event, stamp as u32, uuid as u32, kind,
-                    ),
-                )?;
-                fw.write_live(ring + u64::from(pos) * 8, &address.to_le_bytes())?;
-                pos = (pos + 1) % 0x500;
+                items[stage][index] = g16_fw::queue::dependency(
+                    dep.address, dep.value, dep.event, stamp as u32, uuid as u32, kind,
+                );
+                entries[stage][entry_counts[stage]] = (prelude + 0x40 + index as u64 * 0x40).to_le_bytes();
+                item_counts[stage] += 1;
+                entry_counts[stage] += 1;
             }
             if stage == 1 || initbm {
-                fw.write_live(ring + u64::from(pos) * 8, &prelude.to_le_bytes())?;
-                pos = (pos + 1) % 0x500;
+                entries[stage][entry_counts[stage]] = prelude.to_le_bytes();
+                entry_counts[stage] += 1;
             }
-            fw.write_live(ring + u64::from(pos) * 8, &work.to_le_bytes())?;
+            entries[stage][entry_counts[stage]] = work.to_le_bytes();
+            entry_counts[stage] += 1;
         }
+        // At most 8 notifier writes and 9 per stage.
+        let mut writes: KVec<(u64, &[u8])> = KVec::with_capacity(32, GFP_KERNEL)?;
+        macro_rules! push {
+            ($va:expr, $bytes:expr) => {
+                writes.push_within_capacity(($va, $bytes)).map_err(|_| ENOMEM)
+            };
+        }
+        if shared {
+            // Shared notifier: count this render's tiling and fragment Works
+            // into the queue's cumulative total. Firmware counts completions
+            // at +0xc and writes the lanes' driver stamps as they retire.
+            push!(a.event_control + 0x24, &context)?;
+            push!(a.event_count_array, &notified)?;
+        } else {
+            push!(a.event_control, &count_array)?;
+            push!(a.event_control + 8, &fragment_stamp)?;
+            push!(a.event_control + 12, &zero)?;
+            push!(a.event_control + 0x10, &flags)?;
+            push!(a.event_control + 0x24, &context)?;
+            push!(a.event_count_array, &two)?;
+            push!(a.tiling_driver_stamp, &tiling_previous)?;
+            push!(a.fragment_driver_stamp, &fragment_previous)?;
+        }
+        // The queue lanes persist independently of the physical work channel.
+        for stage in 0..2 {
+            let Lane { ring, .. } = lanes[stage];
+            let (prelude, work, micro) = if stage == 0 {
+                (a.tiling_prelude, a.tiling_work, a.tiling_microsequence)
+            } else {
+                (a.fragment_prelude, a.fragment_work, a.fragment_microsequence)
+            };
+            push!(prelude, &preludes[stage])?;
+            push!(work, if stage == 0 { ta } else { frag })?;
+            push!(micro, if stage == 0 { &tiling_micro[..] } else { &fragment_micro[..] })?;
+            for index in 0..item_counts[stage] {
+                push!(prelude + 0x40 + index as u64 * 0x40, &items[stage][index])?;
+            }
+            // Ring entries are contiguous except where the ring wraps.
+            for (n, entry) in entries[stage][..entry_counts[stage]].iter().enumerate() {
+                let pos = (firsts[stage] + n as u32) % 0x500;
+                push!(ring + u64::from(pos) * 8, entry)?;
+            }
+        }
+        self._firmware_space.as_mut().ok_or(EIO)?.write_batch(&writes)?;
         let mut epochs = [0; 2];
         for stage in [1usize, 0] {
             let mut lane = lanes[stage];
