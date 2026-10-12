@@ -1925,6 +1925,8 @@ impl Bootstrap {
                             && fw.read_u64(base + 0x30)? == 0
                             && fw.read_u64(base + 0x14)? != 0
                         {
+                            crate::g16_timeline::PARTIAL_RENDERS
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             pr_info!(
                                 "G16: firmware Start3D partial render queue {:#x}\n",
                                 fw.read_u64(base + 0x24)?
@@ -2965,6 +2967,12 @@ impl Bootstrap {
                     return Err(EIO);
                 }
                 let grown = pool.grow(fw, client, a.context_id as u8)?;
+                {
+                    use crate::g16_timeline as tl;
+                    use core::sync::atomic::Ordering::Relaxed;
+                    tl::TVB_REQUESTS.fetch_add(1, Relaxed);
+                    if grown { &tl::TVB_GROWN } else { &tl::TVB_REFUSED }.fetch_add(1, Relaxed);
+                }
                 dev_info!(
                     self.dev.as_ref(),
                     "G16: TVB slot {} blocks {} growth {} subpipe {}\n",
@@ -3003,6 +3011,8 @@ impl Bootstrap {
                 {
                     return Err(EIO);
                 }
+                crate::g16_timeline::TVB_MEMORY_LIMIT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 reply[..4].copy_from_slice(&9u32.to_le_bytes());
                 reply[4..8].copy_from_slice(&1u32.to_le_bytes());
                 reply[8..16].copy_from_slice(&a.fragment_queue.to_le_bytes());
