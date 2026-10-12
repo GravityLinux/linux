@@ -306,6 +306,110 @@ impl Flight {
     }
 }
 
+/// Per-lane totals of the unretired flights on that lane.
+struct LaneBook {
+    pointers: u64,
+    /// Flights using the lane.
+    works: u32,
+    /// Works plus the dependency items they queued here (`Flight::lane_load`).
+    load: u32,
+    /// Works plus all their dependencies, for flights whose first lane this
+    /// is: one queue's total is the sum over its lanes (`QUEUE_CAP`).
+    owned: u32,
+}
+
+/// A compact view of `flights` for admission, kept in step at their only
+/// push and removal sites, so reserve_flight never walks the flights
+/// themselves. Also caches the work channels' transport cursors: the tail
+/// is written only by this driver, and stale read/done cursors are behind
+/// the real ones, so a cached view can only under-report ring room.
+pub(crate) struct Ledger {
+    lanes: KVec<LaneBook>,
+    /// (lane pointers, ring head) per flight and lane.
+    heads: KVec<(u64, u32)>,
+    /// (channel, transport target) per flight and channel.
+    targets: KVec<(usize, u32)>,
+    /// Per work channel: read, done, tail.
+    cursors: [Option<[u32; 3]>; 12],
+}
+
+impl Ledger {
+    pub(crate) fn new() -> Self {
+        Self { lanes: KVec::new(), heads: KVec::new(), targets: KVec::new(), cursors: [None; 12] }
+    }
+
+    fn lane(&self, pointers: u64) -> Option<&LaneBook> {
+        self.lanes.iter().find(|l| l.pointers == pointers)
+    }
+
+    /// Room for one more flight, so `add` cannot fail after publication.
+    fn reserve(&mut self) -> Result {
+        self.lanes.reserve(2, GFP_KERNEL)?;
+        self.heads.reserve(2, GFP_KERNEL)?;
+        self.targets.reserve(2, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    fn add(&mut self, f: &Flight) -> Result {
+        let dependencies = f.dependencies.iter().flatten().count() as u32;
+        for (index, (&(pointers, head), items)) in f.queues.iter().zip(f.lane_items).enumerate() {
+            if pointers == 0 {
+                continue;
+            }
+            let book = match self.lanes.iter().position(|l| l.pointers == pointers) {
+                Some(i) => &mut self.lanes[i],
+                None => {
+                    self.lanes
+                        .push_within_capacity(LaneBook { pointers, works: 0, load: 0, owned: 0 })
+                        .map_err(|_| ENOMEM)?;
+                    self.lanes.last_mut().ok_or(EIO)?
+                }
+            };
+            book.works += 1;
+            book.load += 1 + items;
+            if index == 0 {
+                book.owned += 1 + dependencies;
+            }
+            self.heads.push_within_capacity((pointers, head)).map_err(|_| ENOMEM)?;
+        }
+        for &(channel, target) in &f.channels {
+            if channel != usize::MAX {
+                self.targets.push_within_capacity((channel, target)).map_err(|_| ENOMEM)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Never allocates (retirement).
+    fn remove(&mut self, f: &Flight) -> Result {
+        let dependencies = f.dependencies.iter().flatten().count() as u32;
+        for (index, (&(pointers, head), items)) in f.queues.iter().zip(f.lane_items).enumerate() {
+            if pointers == 0 {
+                continue;
+            }
+            let i = self.lanes.iter().position(|l| l.pointers == pointers).ok_or(EIO)?;
+            let book = &mut self.lanes[i];
+            book.works = book.works.checked_sub(1).ok_or(EIO)?;
+            book.load = book.load.checked_sub(1 + items).ok_or(EIO)?;
+            if index == 0 {
+                book.owned = book.owned.checked_sub(1 + dependencies).ok_or(EIO)?;
+            }
+            if book.works == 0 {
+                self.lanes.swap_remove(i);
+            }
+            let i = self.heads.iter().position(|&e| e == (pointers, head)).ok_or(EIO)?;
+            self.heads.swap_remove(i);
+        }
+        for &(channel, target) in &f.channels {
+            if channel != usize::MAX {
+                let i = self.targets.iter().position(|&e| e == (channel, target)).ok_or(EIO)?;
+                self.targets.swap_remove(i);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One channel message for all staged commands on this firmware queue.
 /// Its epoch remains stable while head advances, so every flight can retain
 /// the correct transport-retirement target before the batch is published.
@@ -792,14 +896,10 @@ impl Bootstrap {
         let cap = crate::g16_timeline::QUEUE_CAP.load(Ordering::Relaxed) as usize;
         if cap != 0 {
             if let Some(lanes) = &queue.lanes {
-                let ours = |f: &&Flight| {
-                    f.queues.iter().any(|&(p, _)| lanes.iter().any(|l| l.pointers == p))
-                };
-                let outstanding: usize = self
-                    .flights
+                let outstanding: usize = lanes
                     .iter()
-                    .filter(ours)
-                    .map(|f| 1 + f.dependencies.iter().flatten().count())
+                    .filter_map(|l| self.ledger.lane(l.pointers))
+                    .map(|b| b.owned as usize)
                     .sum();
                 let new = entries.iter().copied().max().unwrap_or(1) as usize;
                 if outstanding + new > cap {
@@ -809,20 +909,21 @@ impl Bootstrap {
             }
         }
         let stages: &[usize] = if render { &[0, 1] } else { &[2] };
-        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
-        let guard = self._sgx.try_access().ok_or(ENODEV)?;
         for &stage in stages {
             let channel = queue.priority as usize * 3 + stage;
-            let route = &config.channels[channel];
-            let read =
-                guard.try_read32(0xd64000 + (route.state[0] - 0xffff_fc20_0002_8000) as usize)?;
-            let done =
-                guard.try_read32(0xd64000 + (route.state[1] - 0xffff_fc20_0002_8000) as usize)?;
-            let tail =
-                guard.try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize)?;
-            if read >= 256 || done >= 256 || tail >= 256 {
-                return Err(EIO);
+            let staged_count = self
+                .publications
+                .iter()
+                .filter(|p| p.channel == channel)
+                .count() as u32;
+            let mut cursors = self.ledger.cursors[channel];
+            if !cursors.is_some_and(|[read, done, tail]| {
+                ring_room((tail + staged_count) & 255, read, done, 1, 256)
+            }) {
+                cursors = Some(self.read_channel(channel)?);
+                self.ledger.cursors[channel] = cursors;
             }
+            let [read, done, tail] = cursors.ok_or(EIO)?;
             let staged = self
                 .publications
                 .iter()
@@ -846,11 +947,12 @@ impl Bootstrap {
             // Bound transport epochs, not the number of Works sharing each
             // epoch. A coalesced batch consumes only one channel-ring slot.
             let next = (tail + staged + u32::from(!coalesced)) & 255;
-            if self.flights.iter().any(|f| {
-                f.channels
-                    .iter()
-                    .any(|&(c, target)| c == channel && !reached(next, target, 256))
-            }) {
+            if self
+                .ledger
+                .targets
+                .iter()
+                .any(|&(c, target)| c == channel && !reached(next, target, 256))
+            {
                 self.report_pressure(2, "channel");
                 return Err(EBUSY);
             }
@@ -889,12 +991,7 @@ impl Bootstrap {
                 // with at most 64 command buffers in flight per queue.
                 let cap = crate::module_parameters::max_lane_works.value() as usize;
                 if cap != 0
-                    && self
-                        .flights
-                        .iter()
-                        .filter(|f| f.queues.iter().any(|&(pointers, _)| pointers == lane.pointers))
-                        .count()
-                        >= cap
+                    && self.ledger.lane(lane.pointers).map_or(0, |b| b.works as usize) >= cap
                 {
                     self.report_pressure(16, "workqueue");
                     return Err(EBUSY);
@@ -904,7 +1001,7 @@ impl Bootstrap {
                 // the items queued on it (preludes are not Works).
                 let cap = crate::g16_timeline::LANE_CAP.load(Ordering::Relaxed) as usize;
                 if cap != 0 {
-                    let load: usize = self.flights.iter().map(|f| f.lane_load(lane.pointers)).sum();
+                    let load = self.ledger.lane(lane.pointers).map_or(0, |b| b.load as usize);
                     // A fragment Work may carry the render item it moved there.
                     let new = if stage == 1 { 2 } else { entries[stage] as usize };
                     if load + new > cap {
@@ -913,20 +1010,44 @@ impl Bootstrap {
                     }
                 }
                 let next = (lane.head + entries[stage]) % 0x500;
-                if self.flights.iter().any(|f| {
-                    f.queues
-                        .iter()
-                        .any(|&(pointers, head)| pointers == lane.pointers && !reached(next, head, 0x500))
-                }) {
+                if self
+                    .ledger
+                    .heads
+                    .iter()
+                    .any(|&(pointers, head)| pointers == lane.pointers && !reached(next, head, 0x500))
+                {
                     self.report_pressure(16, "workqueue");
                     return Err(EBUSY);
                 }
             }
         }
-        drop(guard);
         self.flights.reserve(1, GFP_KERNEL)?;
+        self.ledger.reserve()?;
         self.publications.reserve(stages.len(), GFP_KERNEL)?;
         Ok(())
+    }
+
+    /// Read a work channel's transport cursors from the device. The driver
+    /// is the tail's only writer: a cached tail that disagrees means that
+    /// assumption broke.
+    fn read_channel(&self, channel: usize) -> Result<[u32; 3]> {
+        let route = g16_fw::work_channel(g16_fw::BUNDLE_ADDRESS, channel);
+        let guard = self._sgx.try_access().ok_or(ENODEV)?;
+        let read =
+            guard.try_read32(0xd64000 + (route.state[0] - 0xffff_fc20_0002_8000) as usize)?;
+        let done =
+            guard.try_read32(0xd64000 + (route.state[1] - 0xffff_fc20_0002_8000) as usize)?;
+        let tail =
+            guard.try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize)?;
+        if read >= 256 || done >= 256 || tail >= 256 {
+            return Err(EIO);
+        }
+        if let Some([_, _, cached]) = self.ledger.cursors[channel] {
+            if cached != tail {
+                pr_warn!("G16: channel {} tail {} differs from the cached {}\n", channel, tail, cached);
+            }
+        }
+        Ok([read, done, tail])
     }
 
     /// Stage a queue head; multiple Works share one transport message.
@@ -946,15 +1067,14 @@ impl Bootstrap {
             p.sequence = sequence;
             return Ok(p.epoch);
         }
-        let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
-        let route = &config.channels[channel];
-        let guard = self._sgx.try_access().ok_or(ENODEV)?;
-        let tail =
-            guard.try_read32(0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize)?;
-        if tail >= 256 {
-            return Err(EIO);
-        }
-        drop(guard);
+        let tail = match self.ledger.cursors[channel] {
+            Some([_, _, tail]) => tail,
+            None => {
+                let cursors = self.read_channel(channel)?;
+                self.ledger.cursors[channel] = Some(cursors);
+                cursors[2]
+            }
+        };
         let reserved = self
             .publications
             .iter()
@@ -984,7 +1104,7 @@ impl Bootstrap {
         self.render_failed = true;
         let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        let mut tails = [None; 12];
+        let mut tails: [Option<u32>; 12] = [None; 12];
         let mut kicks = 0u32;
         // Fragment transports must precede tiling, matching normal publication.
         for stage in [1usize, 0, 2] {
@@ -1016,6 +1136,9 @@ impl Bootstrap {
                         tail,
                         0xd60000 + (route.state[2] - 0xffff_fc20_0002_0000) as usize,
                     )?;
+                    if let Some(cursors) = &mut self.ledger.cursors[channel] {
+                        cursors[2] = tail;
+                    }
                 }
             }
         }
@@ -1229,7 +1352,7 @@ impl Bootstrap {
         for flight in self.flights.iter().take(24) {
             // blocked: bit 1 notifier, 2 ring, 3 channel, 4 control reply.
             dev_err!(self.dev.as_ref(), "G16: hang flight Work={:#x} context={} age_ms={} render={} stream={:#x} ordinal={} blocked={:#x} notifier={:?} tgid={} comm={}\n",
-                     flight.id, flight.context, flight.started.elapsed().as_millis(),
+                     flight.id, flight.context, self.flight_ms(flight, Instant::now()),
                      flight.render.is_some(), flight.stream, flight.ordinal, flight.blocked,
                      flight.notifier_count.map(|(addr, total)| (word(addr), total)), flight.tgid,
                      comm_str(&flight.comm));
@@ -1282,7 +1405,7 @@ impl Bootstrap {
         let _ = self.dump_hang_state();
         for flight in self.flights.iter().take(16) {
             dev_err!(self.dev.as_ref(), "G16: pending Work={:#x} context={} age_ms={} render={}\n",
-                     flight.id, flight.context, flight.started.elapsed().as_millis(),
+                     flight.id, flight.context, self.flight_ms(flight, Instant::now()),
                      flight.render.is_some());
             for (stage, stamp) in flight.stamps.iter().enumerate() {
                 if let Some(stamp) = stamp {
@@ -1569,6 +1692,7 @@ impl Bootstrap {
             drop(owner);
             self.context_users[flight.context as usize] -= 1;
             let flight = self.flights.remove(index).map_err(|_| EIO)?;
+            self.ledger.remove(&flight)?;
             let root = match &flight.render {
                 Some(render) => render.root,
                 None => flight.client.lock().roots().low,
@@ -1601,10 +1725,8 @@ impl Bootstrap {
             // Queued commands can legitimately wait longer than one Work's
             // timeout. Watch for a lack of retirement progress, rather than
             // charging every command for all its predecessors' execution.
-            let now = Instant::now();
-            for pending in &mut self.flights {
-                pending.started = now;
-            }
+            // One timestamp for all of them, not a write to every flight.
+            self.progress = Some(Instant::now());
             let (id, limited) = self.retired.pop().ok_or(EIO)?;
             return Ok(Some((id, if limited { Err(ENOMEM) } else { Ok(()) })));
         }
@@ -1620,10 +1742,11 @@ impl Bootstrap {
             crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_WEDGE, before);
             checked?;
         }
+        let now = Instant::now();
         if let Some(flight) = self
             .flights
             .iter()
-            .find(|f| f.started.elapsed().as_millis() >= 10000)
+            .find(|f| self.flight_ms(f, now) >= 10000)
         {
             dev_err!(
                 self.dev.as_ref(),
@@ -1641,19 +1764,29 @@ impl Bootstrap {
     /// Notifications do not extend the watchdog. Only retirement progress
     /// resets it, so trace traffic cannot keep a stuck command alive.
     /// Age of the oldest flight since the last retirement progress (ms).
+    /// A flight's age since the later of its publication and the latest
+    /// retirement progress.
+    fn flight_ms(&self, flight: &Flight, now: Instant<Monotonic>) -> i64 {
+        let age = now - flight.started;
+        self.progress.map_or(age, |p| age.min(now - p)).as_millis()
+    }
+
     pub(crate) fn oldest_flight_ms(&self) -> u64 {
+        // One clock read for all flights.
+        let now = Instant::now();
         self.flights
             .iter()
-            .map(|flight| flight.started.elapsed().as_millis() as u64)
+            .map(|flight| self.flight_ms(flight, now) as u64)
             .max()
             .unwrap_or(0)
     }
 
     pub(crate) fn watchdog_remaining_ms(&self) -> u32 {
+        let now = Instant::now();
         let watchdog = self
             .flights
             .iter()
-            .map(|flight| (10000 - flight.started.elapsed().as_millis()).clamp(1, 10000) as u32)
+            .map(|flight| (10000 - self.flight_ms(flight, now)).clamp(1, 10000) as u32)
             .min()
             .unwrap_or(10000);
         // Wedge detection samples render progress a few times per window.
@@ -2486,6 +2619,9 @@ impl Bootstrap {
             },
             GFP_KERNEL,
         )?;
+        // Capacity was reserved with the flight in reserve_flight.
+        let flight = self.flights.last().ok_or(EIO)?;
+        self.ledger.add(flight)?;
         self.render_failed = false;
         self.batch_works += 1;
         self.trace_publication("render", va)?;
@@ -2917,6 +3053,9 @@ impl Bootstrap {
             },
             GFP_KERNEL,
         )?;
+        // Capacity was reserved with the flight in reserve_flight.
+        let flight = self.flights.last().ok_or(EIO)?;
+        self.ledger.add(flight)?;
         self.render_failed = false;
         self.batch_works += 1;
         self.trace_publication("compute", a.work)?;
@@ -3613,7 +3752,7 @@ impl Bootstrap {
             dev_err!(self.dev.as_ref(),
                 "G16: A4 wedge: Work {:#x} context {} stream {:#x} ordinal {} age {} ms, no fragment progress for {} ms; {}\n",
                 flight.id, flight.context, flight.stream, flight.ordinal,
-                flight.started.elapsed().as_millis(), (now - self.wedge_since.unwrap_or(now)).as_millis(),
+                self.flight_ms(flight, now), (now - self.wedge_since.unwrap_or(now)).as_millis(),
                 match (recover, self.wedge_rung) {
                     (false, _) => "detection only (wedge_recover=0)",
                     (true, 0) => "R1: re-kicking its 3D lane",

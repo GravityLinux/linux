@@ -273,6 +273,11 @@ pub(crate) struct Bootstrap {
     /// Flights retired by the latest scan, returned one per retire() call.
     retired: KVec<(u64, bool)>,
     publications: KVec<render_runtime::Publication>,
+    /// Admission's compact view of `flights` and cached channel cursors.
+    ledger: KBox<render_runtime::Ledger>,
+    /// The latest retirement progress; the watchdog measures each flight
+    /// from the later of this and its publication.
+    progress: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     batch_works: usize,
     context_roots: [Option<crate::g16_vm::Roots>; 64],
     context_users: [u32; 64],
@@ -773,6 +778,8 @@ impl Bootstrap {
             flights: KVec::new(),
             retired: KVec::new(),
             publications: KVec::new(),
+            ledger: KBox::new(render_runtime::Ledger::new(), GFP_KERNEL)?,
+            progress: None,
             batch_works: 0,
             context_roots: [None; 64],
             context_users: [0; 64],

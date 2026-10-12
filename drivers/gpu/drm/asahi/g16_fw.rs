@@ -96,33 +96,40 @@ pub(crate) struct MainConfig {
     pub(crate) unaligned: u64,
 }
 
+const WORK_RINGS: [u64; 12] = [
+    0x10240, 0x16240, 0x1c240, 0xea40, 0x14a40, 0x1aa40, 0xd240, 0x13240, 0x19240, 0xba40,
+    0x11a40, 0x17a40,
+];
+const WORK_STATES: [(u64, u64); 12] = [
+    (0, 0),
+    (0x40, 0x20),
+    (0x80, 0x40),
+    (0x10, 8),
+    (0x50, 0x28),
+    (0x90, 0x48),
+    (0x20, 0x10),
+    (0x60, 0x30),
+    (0xa0, 0x50),
+    (0x30, 0x18),
+    (0x70, 0x38),
+    (0xb0, 0x58),
+];
+
+/// One work channel's route (priority * 3 + stage), without building the
+/// whole configuration: the submission path needs only this.
+pub(crate) fn work_channel(bundle: u64, i: usize) -> Channel {
+    let a = 0xffff_fc20_0002_8000 + WORK_STATES[i].0;
+    Channel {
+        state: [a, a + 8, 0xffff_fc20_0002_0000 + WORK_STATES[i].1],
+        ring: bundle + WORK_RINGS[i],
+    }
+}
+
 impl MainConfig {
     pub(crate) fn bootstrap(bundle: u64) -> Self {
-        let rings = [
-            0x10240, 0x16240, 0x1c240, 0xea40, 0x14a40, 0x1aa40, 0xd240, 0x13240, 0x19240, 0xba40,
-            0x11a40, 0x17a40,
-        ];
-        let states = [
-            (0, 0),
-            (0x40, 0x20),
-            (0x80, 0x40),
-            (0x10, 8),
-            (0x50, 0x28),
-            (0x90, 0x48),
-            (0x20, 0x10),
-            (0x60, 0x30),
-            (0xa0, 0x50),
-            (0x30, 0x18),
-            (0x70, 0x38),
-            (0xb0, 0x58),
-        ];
         let channels = core::array::from_fn(|i| {
             if i < 12 {
-                let a = 0xffff_fc20_0002_8000 + states[i].0;
-                Channel {
-                    state: [a, a + 8, 0xffff_fc20_0002_0000 + states[i].1],
-                    ring: bundle + rings[i],
-                }
+                work_channel(bundle, i)
             } else {
                 let (state, ring) = match i {
                     12 => (
