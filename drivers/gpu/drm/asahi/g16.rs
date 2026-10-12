@@ -255,7 +255,9 @@ pub(crate) struct Bootstrap {
     /// Queue identities and TVB pools; see render_runtime::OBJECT_BASE.
     next_object_va: u64,
     work_arenas: [core::ops::Range<u64>; 2],
-    free_work: [KVec<u64>; 2],
+    /// Retired Work slots: VA and the client root their alias was last
+    /// mapped into (the device alias is mapped on first use).
+    free_work: [KVec<(u64, u64)>; 2],
     compute_publication: u64,
     queue_events: Arc<core::sync::atomic::AtomicU64>,
     /// Queue storage returned by dropped queues, awaiting context destruction.

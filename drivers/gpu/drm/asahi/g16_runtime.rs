@@ -536,14 +536,16 @@ impl Bootstrap {
     /// Lease Work storage until notifier/driver stamps and transport retire.
     /// Backing stays mapped. Queue-owned wrapping stamps outlive reused Work,
     /// so a pending dependency never follows a recycled completion address.
-    fn allocate_work(&mut self, render: bool) -> Result<u64> {
+    /// A Work slot and, for a reused one, the client root its alias is
+    /// already mapped into; the device alias exists for every reused slot.
+    fn allocate_work(&mut self, render: bool) -> Result<(u64, Option<u64>)> {
         use crate::pgtable::prot::{PROT_FW_PRIV_RW, PROT_FW_SHARED_RW};
         if self.retire_log.capacity() < RETIRE_LOG {
             self.retire_log.reserve(RETIRE_LOG, GFP_KERNEL)?;
         }
         let index = usize::from(render);
-        if let Some(va) = self.free_work[index].pop() {
-            return Ok(va);
+        if let Some((va, root)) = self.free_work[index].pop() {
+            return Ok((va, Some(root)));
         }
         // Retirement must not allocate. Space for every outstanding lease
         // also covers all of them completing before another acquisition.
@@ -582,7 +584,7 @@ impl Bootstrap {
         }
         let va = self.work_arenas[index].start;
         self.work_arenas[index].start += stride;
-        Ok(va)
+        Ok((va, None))
     }
 
     /// Collect storage whose context destruction firmware has consumed. Retire
@@ -1721,7 +1723,7 @@ impl Bootstrap {
             }
             self.retire_next = self.retire_next.wrapping_add(1);
             flight.client.lock().release_scratch(flight.scratch)?;
-            self.free_work[usize::from(render_work)].push(id, GFP_KERNEL)?;
+            self.free_work[usize::from(render_work)].push((id, root), GFP_KERNEL)?;
             self.retired.push_within_capacity((id, limited)).map_err(|_| ENOMEM)?;
         }
         crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_SCAN, scan_before);
@@ -2015,6 +2017,13 @@ impl Bootstrap {
     pub(crate) fn release_render_vm(&mut self, space: g16_vm::Roots) -> Result {
         if self.render_failed {
             return Err(EIO);
+        }
+        // A later VM can reuse this root's address: forget which free slots
+        // have their alias mapped in it.
+        for slots in &mut self.free_work {
+            for slot in slots.iter_mut().filter(|(_, root)| *root == space.low) {
+                slot.1 = 0;
+            }
         }
         for index in 1..64 {
             if self.context_roots[index].is_some_and(|r| r.low == space.low) {
@@ -2372,7 +2381,7 @@ impl Bootstrap {
         // within each lane, even when other queues publish between them.
         a.fragment_stamp = u64::from(g16_stamp::value(queue_ordinal, 0x100));
         a.tiling_stamp = u64::from(g16_stamp::value(queue_ordinal, 0xc00));
-        let va = self.allocate_work(true)?;
+        let (va, aliased) = self.allocate_work(true)?;
         a.tiling_shared_tail = va + 0x10000;
         a.fragment_shared_tail = va + 0x14000;
         // The notifier pass stores driver stamps, then sends the IRQ after
@@ -2399,12 +2408,22 @@ impl Bootstrap {
             return Err(ENOSPC);
         }
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
+        // A reused slot keeps its device alias, and its client alias when it
+        // returns to the same root: skip those page-table walks.
+        let client_mapped = aliased == Some(space.low);
         for stage in 0..2u64 {
             let work_page = va + stage * 0x8000;
             let register_page = alias + stage * 0x4000;
-            let pa = fw.physical(work_page)?;
+            if aliased.is_none() || !client_mapped {
+                let pa = fw.physical(work_page)?;
+                if aliased.is_none() {
+                    self._address_space.as_mut().ok_or(EIO)?.map_work_alias(register_page, pa)?;
+                }
+                if !client_mapped {
+                    client.map_work_alias(register_page, pa)?;
+                }
+            }
             for view in [self._address_space.as_mut().ok_or(EIO)?, &mut *client] {
-                view.map_work_alias(register_page, pa)?;
                 view.sync();
             }
             if stage == 0 {
@@ -2930,7 +2949,7 @@ impl Bootstrap {
             return Err(EINVAL);
         }
         let ordinal = queue.compute_count;
-        let work = self.allocate_work(false)?;
+        let (work, aliased) = self.allocate_work(false)?;
         let alias = 0x71_0000_0000 + (work - WORK_BASE);
         if alias + 0x4000 > 0x72_0000_0000 {
             return Err(ENOSPC);
@@ -2939,12 +2958,17 @@ impl Bootstrap {
         // The upper half of the zeroed Work page is GPU-addressable storage.
         params.save_area = alias + 0x2000;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        let pa = fw.physical(work)?;
-        self._address_space
-            .as_mut()
-            .ok_or(EIO)?
-            .map_work_alias(alias, pa)?;
-        client.map_work_alias(alias, pa)?;
+        // As for renders: reused slots skip aliases that already exist.
+        if aliased.is_none() || aliased != Some(space.low) {
+            let pa = fw.physical(work)?;
+            if aliased.is_none() {
+                self._address_space
+                    .as_mut()
+                    .ok_or(EIO)?
+                    .map_work_alias(alias, pa)?;
+            }
+            client.map_work_alias(alias, pa)?;
+        }
         fw.zero_live(work + 0x2000, 0x2000)?;
         let mut a = compute::Addresses::publication(self.compute_publication, ordinal, work, alias);
         a.queue = lane.queue;
