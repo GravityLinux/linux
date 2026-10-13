@@ -7481,8 +7481,7 @@ void print_vma_addr(char *prefix, unsigned long ip)
 	vma = vma_lookup(mm, ip);
 	if (vma && vma->vm_file) {
 		struct file *f = vma->vm_file;
-		ip -= vma->vm_start;
-		ip += vma_start_pgoff(vma) << PAGE_SHIFT;
+		ip = vma_file_offset_at(vma, ip);
 		printk("%s%pD[%lx,%lx+%lx]", prefix, f, ip,
 				vma->vm_start,
 				vma->vm_end - vma->vm_start);

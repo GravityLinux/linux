@@ -246,7 +246,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		struct address_space *mapping)
 {
 	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
-	pgoff_t end_index = linear_page_index(vma, end) - 1;
+	pgoff_t end_index = linear_page_index(vma, end - 1);
 	struct folio *folio;
 	struct swap_io_ctx ctx = {};
 
@@ -262,8 +262,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		if (!softleaf_is_swap(entry))
 			continue;
 
-		addr = vma->vm_start +
-			((xas.xa_index - vma_start_pgoff(vma)) << PAGE_SHIFT);
+		addr = vma_pgoff_to_address(vma, xas.xa_index);
 		xas_pause(&xas);
 		rcu_read_unlock();
 
@@ -327,8 +326,7 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
 	 */
 	mark_mmap_lock_dropped(madv_behavior);
 	get_file(file);
-	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+	offset = vma_file_offset_at(vma, start);
 	mmap_read_unlock(mm);
 	vfs_fadvise(file, offset, end - start, POSIX_FADV_WILLNEED);
 	fput(file);
@@ -1032,8 +1030,7 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
 	if (!vma_is_shared_maywrite(vma))
 		return -EACCES;
 
-	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+	offset = vma_file_offset_at(vma, start);
 
 	/*
 	 * Filesystem's fallocate may need to take i_rwsem.  We need to
