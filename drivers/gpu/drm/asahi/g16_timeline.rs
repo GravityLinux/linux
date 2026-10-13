@@ -469,3 +469,70 @@ pub(crate) static TVB_GROWN: core::sync::atomic::AtomicU64 = core::sync::atomic:
 pub(crate) static TVB_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static TVB_MEMORY_LIMIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static PARTIAL_RENDERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Debug: read-only view of the firmware regions that live as long as the
+/// firmware (debugfs `asahi_m4/fw_mem`), for sampling the firmware's own
+/// state (power and performance controllers, statistics) while work runs.
+/// File offset = firmware VA - `FW_MEM_BASE`; offsets and lengths are whole
+/// 32-bit words, and a read stops at the first unmapped page (ENXIO if that
+/// is the first). Reads take no driver lock and do no cache maintenance
+/// (firmware memory is coherent; see `fw_cache_maint`).
+pub(crate) const FW_MEM_BASE: u64 = 0xffff_fc00_0000_0000;
+
+pub(crate) struct FwMem {
+    /// Page VA and backing page, sorted by VA.
+    pages: KVec<(u64, kernel::addr::PhysicalAddr)>,
+}
+
+impl FwMem {
+    /// The pages must stay allocated for as long as this view exists.
+    pub(crate) fn new(pages: KVec<(u64, kernel::addr::PhysicalAddr)>) -> Self {
+        Self { pages }
+    }
+}
+
+impl BinaryWriter for FwMem {
+    fn write_to_slice(
+        &self,
+        writer: &mut UserSliceWriter,
+        offset: &mut file::Offset,
+    ) -> Result<usize> {
+        const PGSZ: usize = crate::pgtable::UAT_PGSZ;
+        let start = u64::try_from(*offset).map_err(|_| EINVAL)?;
+        if start & 3 != 0 {
+            return Err(EINVAL);
+        }
+        let want = writer.len().min(0x40000) & !3;
+        let mut buf = crate::g16_platform::zeroed(want)?;
+        let mut va = FW_MEM_BASE.checked_add(start).ok_or(EINVAL)?;
+        let mut done = 0;
+        while done < want {
+            let page_va = va & !(PGSZ as u64 - 1);
+            let Ok(index) = self.pages.binary_search_by_key(&page_va, |p| p.0) else {
+                break;
+            };
+            let within = (va - page_va) as usize;
+            let n = (PGSZ - within).min(want - done);
+            // SAFETY: the page is one of the firmware's bootstrap regions,
+            // never released, and freed only after this file is removed.
+            let page = unsafe { kernel::page::Page::borrow_phys_unchecked(&self.pages[index].1) };
+            page.with_pointer_into_page(within, n, |p| {
+                for word in 0..n / 4 {
+                    // SAFETY: the aligned word lies in this mapped page;
+                    // firmware may write it concurrently, hence volatile.
+                    let value = unsafe { p.add(word * 4).cast::<u32>().read_volatile() };
+                    buf[done + word * 4..done + word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+                }
+                Ok(())
+            })?;
+            done += n;
+            va += n as u64;
+        }
+        if done == 0 && want != 0 {
+            return Err(ENXIO);
+        }
+        writer.write_slice(&buf[..done])?;
+        *offset += done as file::Offset;
+        Ok(done)
+    }
+}

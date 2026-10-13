@@ -833,6 +833,17 @@ impl FirmwareSpace {
         Ok(u64::from(self.read_u32(va)?) | (u64::from(self.read_u32(va + 4)?) << 32))
     }
 
+    /// Debug (debugfs `fw_mem`): the page-aligned VA and physical address of
+    /// each page of the region at `va`, which must be one never released.
+    pub(crate) fn region_pages(&self, va: u64) -> Result<KVec<(u64, kernel::addr::PhysicalAddr)>> {
+        let region = self.regions.get(&va).ok_or(EINVAL)?;
+        let mut pages = KVec::with_capacity(region.pages.len(), GFP_KERNEL)?;
+        for (i, page) in region.pages.iter().enumerate() {
+            pages.push((va + (i * UAT_PGSZ) as u64, page.phys()), GFP_KERNEL)?;
+        }
+        Ok(pages)
+    }
+
     /// Called only after the context is drained and its hardware roots detached.
     pub(crate) fn release_region(&mut self, va: u64) -> Result {
         let size = self.regions.get(&va).ok_or(EINVAL)?.pages.len() * UAT_PGSZ;

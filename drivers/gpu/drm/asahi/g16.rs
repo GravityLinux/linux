@@ -297,6 +297,45 @@ pub(crate) struct Bootstrap {
 // RTKit callbacks access only their independently synchronized callback data.
 unsafe impl Send for Bootstrap {}
 
+/// Firmware-private heaps allocated at bootstrap, never released.
+const FIRMWARE_HEAPS: [(u64, usize); 18] = [
+    (0xffff_fc20_c002_0000, 0x8c000),
+    (0xffff_fc20_c00b_0000, 0xc0000),
+    (0xffff_fc20_c017_8000, 0x94000),
+    (0xffff_fc20_c021_0000, 0x84000),
+    (0xffff_fc20_c029_8000, 0xac000),
+    (0xffff_fc20_c034_8000, 0x4000),
+    (0xffff_fc20_c035_0000, 0x4000),
+    (0xffff_fc20_c035_8000, 0x8000),
+    (0xffff_fc20_c036_8000, 0x8000),
+    (0xffff_fc20_c037_8000, 0xc000),
+    (0xffff_fc20_c038_8000, 0x34000),
+    (0xffff_fc20_c03c_0000, 0xc4000),
+    (0xffff_fc20_c048_8000, 0x34000),
+    (0xffff_fc20_c04c_0000, 0x10000),
+    (0xffff_fc20_c051_0000, 0x4000),
+    (0xffff_fc20_c053_0000, 0x4000),
+    (0xffff_fc20_c05e_8000, 0x4000),
+    (0xffff_fc20_c05e_c000, 0x4000),
+];
+
+/// Shared single pages allocated at bootstrap, never released.
+const SHARED_PAGES: [u64; 13] = [
+    0xffff_fc20_0011_0000,
+    0xffff_fc20_0011_8000,
+    0xffff_fc20_0012_0000,
+    0xffff_fc20_0012_8000,
+    0xffff_fc20_0013_0000,
+    0xffff_fc20_0015_0000,
+    0xffff_fc20_0014_0000,
+    0xffff_fc20_001b_0000,
+    0xffff_fc20_001c_0000,
+    0xffff_fc20_001c_4000,
+    0xffff_fc20_001c_8000,
+    0xffff_fc20_001c_c000,
+    0xffff_fc20_c052_4000,
+];
+
 impl Drop for Bootstrap {
     fn drop(&mut self) {
         if let Err(e) = self._rtkit.as_mut().shutdown() {
@@ -315,6 +354,33 @@ impl Drop for Bootstrap {
 }
 
 impl Bootstrap {
+    /// Debug (debugfs `fw_mem`): pages of the firmware regions allocated at
+    /// bootstrap and never released, sorted by VA.
+    pub(crate) fn firmware_pages(&self) -> Result<KVec<(u64, kernel::addr::PhysicalAddr)>> {
+        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+        let pointers = crate::g16_fw::RootPointers::bootstrap();
+        let mut pages = KVec::new();
+        let fixed = [
+            crate::g16_fw::ROOT_ADDRESS,
+            crate::g16_fw::BUNDLE_ADDRESS,
+            0xffff_fc20_0003_0000,
+            pointers.region_a,
+            pointers.region_c,
+            0xffff_fc20_c050_0000,
+            0xffff_fc20_001b_8000,
+            crate::g16_compute::QUEUE,
+            crate::g16_compute::SHARED,
+        ];
+        let heaps = FIRMWARE_HEAPS.iter().map(|(va, _)| *va);
+        for va in Iterator::chain(Iterator::chain(fixed.into_iter(), heaps), SHARED_PAGES) {
+            for page in fw.region_pages(va)? {
+                pages.push(page, GFP_KERNEL)?;
+            }
+        }
+        pages.sort_unstable_by_key(|p| p.0);
+        Ok(pages)
+    }
+
     pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<Self> {
         validate_boot_resources(pdev)?;
         let platform = crate::g16_platform::Platform::new(pdev.as_ref())?;
@@ -501,43 +567,10 @@ impl Bootstrap {
             PAGE_SIZE as usize,
             crate::pgtable::prot::PROT_FW_SHARED_RW,
         )?;
-        for (va, size) in [
-            (0xffff_fc20_c002_0000, 0x8c000),
-            (0xffff_fc20_c00b_0000, 0xc0000),
-            (0xffff_fc20_c017_8000, 0x94000),
-            (0xffff_fc20_c021_0000, 0x84000),
-            (0xffff_fc20_c029_8000, 0xac000),
-            (0xffff_fc20_c034_8000, 0x4000),
-            (0xffff_fc20_c035_0000, 0x4000),
-            (0xffff_fc20_c035_8000, 0x8000),
-            (0xffff_fc20_c036_8000, 0x8000),
-            (0xffff_fc20_c037_8000, 0xc000),
-            (0xffff_fc20_c038_8000, 0x34000),
-            (0xffff_fc20_c03c_0000, 0xc4000),
-            (0xffff_fc20_c048_8000, 0x34000),
-            (0xffff_fc20_c04c_0000, 0x10000),
-            (0xffff_fc20_c051_0000, 0x4000),
-            (0xffff_fc20_c053_0000, 0x4000),
-            (0xffff_fc20_c05e_8000, 0x4000),
-            (0xffff_fc20_c05e_c000, 0x4000),
-        ] {
+        for (va, size) in FIRMWARE_HEAPS {
             firmware_space.alloc(va, size, crate::pgtable::prot::PROT_FW_PRIV_RW)?;
         }
-        for va in [
-            0xffff_fc20_0011_0000,
-            0xffff_fc20_0011_8000,
-            0xffff_fc20_0012_0000,
-            0xffff_fc20_0012_8000,
-            0xffff_fc20_0013_0000,
-            0xffff_fc20_0015_0000,
-            0xffff_fc20_0014_0000,
-            0xffff_fc20_001b_0000,
-            0xffff_fc20_001c_0000,
-            0xffff_fc20_001c_4000,
-            0xffff_fc20_001c_8000,
-            0xffff_fc20_001c_c000,
-            0xffff_fc20_c052_4000,
-        ] {
+        for va in SHARED_PAGES {
             firmware_space.alloc(
                 va,
                 PAGE_SIZE as usize,

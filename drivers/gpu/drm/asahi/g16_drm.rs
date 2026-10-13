@@ -143,6 +143,9 @@ pub(crate) struct Data {
     admission: Mutex<KVec<dma_fence::Fence>>,
     failed: AtomicBool,
     notifications: Arc<crate::g16::Notifications>,
+    /// Debug view of the firmware's memory; declared before `runtime` so it
+    /// is removed before the firmware regions can be freed.
+    _fw_mem: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FwMem>>>,
     #[pin]
     runtime: Mutex<crate::g16::Bootstrap>,
     #[pin]
@@ -296,6 +299,13 @@ pub(crate) fn register<'a>(
         dir.read_only_file(c_str!("publish_profile"), crate::g16_timeline::Profile),
         GFP_KERNEL,
     )?);
+    let fw_mem = KBox::pin_init(
+        dir.read_binary_file(
+            c_str!("fw_mem"),
+            crate::g16_timeline::FwMem::new(runtime.firmware_pages()?),
+        ),
+        GFP_KERNEL,
+    )?;
     let data = try_pin_init!(Data {
         gpu_revision: runtime.gpu_revision,
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
@@ -303,6 +313,7 @@ pub(crate) fn register<'a>(
         admission <- kernel::new_mutex!(KVec::new()),
         failed: AtomicBool::new(false),
         notifications: runtime.notifications.clone(),
+        _fw_mem: fw_mem,
         runtime <- kernel::new_mutex!(runtime),
         engine <- kernel::new_mutex!(Engine { cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
         inbox <- kernel::new_mutex!(Inbox { running: false, jobs: KVec::new() }),
