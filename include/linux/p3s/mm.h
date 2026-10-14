@@ -50,6 +50,16 @@ static inline void mm_init_pte_shift(struct mm_struct *mm,
 	bool use_4kb = false;
 
 	/*
+	 * fork(): @p is the new child and dup_mmap() copies the parent's page
+	 * tables into @mm, so keep the parent's page size from the start. The
+	 * policy below only applies to the new mm of an execve().
+	 */
+	if (p && p != current && current->mm) {
+		mm_set_pte_shift(mm, mm_pte_shift(current->mm));
+		return;
+	}
+
+	/*
 	 * In ALTERNATE mode, assign 4KB to odd PIDs and 16KB to even PIDs
 	 * based strictly on PID parity rather than inheriting parent pte_shift,
 	 * ensuring child tasks alternate regardless of what init or parent ran.
