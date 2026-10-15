@@ -1092,7 +1092,8 @@ int iommu_dma_mmap_noncontiguous(struct device *dev, struct vm_area_struct *vma,
 {
 	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
 
-	if (vma->vm_pgoff >= count || vma_pages(vma) > count - vma->vm_pgoff)
+	if (vma->vm_pgoff >= count ||
+	    vma_kernel_pages(vma) > count - vma->vm_pgoff)
 		return -ENXIO;
 	return vm_map_pages(vma, sgt_handle(sgt)->pages, count);
 }
@@ -1710,7 +1711,7 @@ int iommu_dma_mmap(struct device *dev, struct vm_area_struct *vma,
 	if (dma_mmap_from_dev_coherent(dev, vma, cpu_addr, size, &ret))
 		return ret;
 
-	if (off >= nr_pages || vma_pages(vma) > nr_pages - off)
+	if (off >= nr_pages || vma_kernel_pages(vma) > nr_pages - off)
 		return -ENXIO;
 
 	if (is_vmalloc_addr(cpu_addr)) {
