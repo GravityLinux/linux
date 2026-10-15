@@ -3071,11 +3071,11 @@ static int remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
 	lazy_mmu_mode_enable();
 	do {
 		BUG_ON(!pte_none(ptep_get(pte)));
-		if (!pfn_modify_allowed(pfn, prot)) {
+		if (!pfn_modify_allowed(mm_frame_pfn(mm, pfn), prot)) {
 			err = -EACCES;
 			break;
 		}
-		set_pte_at(mm, addr, pte, pte_mkspecial(pfn_pte(pfn, prot)));
+		set_pte_at(mm, addr, pte, pte_mkspecial(mm_frame_pte(mm, pfn, prot)));
 		pfn++;
 	} while (pte++, addr += PAGE_SIZE, addr != end);
 	lazy_mmu_mode_disable();
@@ -3185,6 +3185,7 @@ static int remap_pfn_range_internal(struct vm_area_struct *vma, unsigned long ad
 	VM_WARN_ON_ONCE(!vma_test_all_mask(vma, VMA_REMAP_FLAGS));
 
 	BUG_ON(addr >= end);
+	pfn = vma_remap_frame(vma, addr, pfn);
 	pfn -= addr >> PAGE_SHIFT;
 	pgd = pgd_offset(mm, addr);
 	flush_cache_range(vma, addr, end);
@@ -3373,7 +3374,7 @@ int remap_pfn_range_complete(struct vm_area_struct *vma,
 	return do_remap_pfn_range(vma, start, pfn, size, prot);
 }
 
-static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
+static int __simple_ioremap_prep(unsigned long vm_kpages, pgoff_t vm_pgoff,
 				 phys_addr_t start_phys, unsigned long size,
 				 unsigned long *pfnp)
 {
@@ -3387,9 +3388,9 @@ static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
 	 * but we've historically allowed it because IO memory might
 	 * just have smaller alignment.
 	 */
-	size += start_phys & ~PAGE_MASK;
-	pfn = start_phys >> PAGE_SHIFT;
-	pages = (size + ~PAGE_MASK) >> PAGE_SHIFT;
+	size += start_phys & ~PAGE_MASK_KERNEL;
+	pfn = start_phys >> PAGE_SHIFT_KERNEL;
+	pages = (size + ~PAGE_MASK_KERNEL) >> PAGE_SHIFT_KERNEL;
 	if (pfn + pages < pfn)
 		return -EINVAL;
 
@@ -3400,7 +3401,7 @@ static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
 	pages -= vm_pgoff;
 
 	/* Can we fit all of the mapping? */
-	if ((vm_len >> PAGE_SHIFT) > pages)
+	if (vm_kpages > pages)
 		return -EINVAL;
 
 	*pfnp = pfn;
@@ -3415,7 +3416,7 @@ int simple_ioremap_prepare(struct vm_area_desc *desc)
 	unsigned long pfn;
 	int err;
 
-	err = __simple_ioremap_prep(vma_desc_size(desc), desc->pgoff,
+	err = __simple_ioremap_prep(vma_desc_kernel_pages(desc), desc->pgoff,
 				    start, size, &pfn);
 	if (err)
 		return err;
@@ -3448,8 +3449,8 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	unsigned long pfn;
 	int err;
 
-	err = __simple_ioremap_prep(vm_len, vma_start_pgoff(vma), start, len,
-				    &pfn);
+	err = __simple_ioremap_prep(vma_kernel_pages(vma), vma_start_pgoff(vma),
+				    start, len, &pfn);
 	if (err)
 		return err;
 

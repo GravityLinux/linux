@@ -1191,6 +1191,7 @@ void compat_set_desc_from_vma(struct vm_area_desc *desc,
 	desc->file = (struct file *)file;
 	desc->start = vma->vm_start;
 	desc->end = vma->vm_end;
+	vma_desc_set_slice_off(desc, vma_slice_off(vma));
 
 	desc->pgoff = vma_start_pgoff(vma);
 	desc->vm_file = vma->vm_file;

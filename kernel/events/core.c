@@ -7164,7 +7164,7 @@ static const struct vm_operations_struct perf_mmap_vmops = {
 
 static int map_range(struct perf_buffer *rb, struct vm_area_struct *vma)
 {
-	unsigned long nr_pages = vma_pages(vma);
+	unsigned long nr_pages = vma_kernel_pages(vma);
 	int err = 0;
 	unsigned long pagenum;
 
@@ -7455,6 +7455,9 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 
 	if (!(vma->vm_flags & VM_SHARED))
+		return -EINVAL;
+
+	if (vma_slice_off(vma))
 		return -EINVAL;
 
 	ret = security_perf_event_read(event);

@@ -2504,6 +2504,7 @@ static void set_desc_from_map(struct vm_area_desc *desc,
 {
 	desc->start = map->addr;
 	desc->end = map->end;
+	vma_desc_set_slice_off(desc, map->slice_off);
 
 	desc->pgoff = map->pgoff;
 	desc->vm_file = map->file;

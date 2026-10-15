@@ -893,6 +893,9 @@ struct vm_area_desc {
 	struct file *file; /* May vary from vm_file in stacked callers. */
 	unsigned long start;
 	unsigned long end;
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+	unsigned short slice_off;	/* vm_slice_off of the new VMA */
+#endif
 
 	/* Mutable fields. Populated with initial state. */
 	pgoff_t pgoff;

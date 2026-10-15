@@ -93,10 +93,12 @@ static inline void p3s_anon_rmap_range(const struct folio *folio,
  * @folio: Folio being walked
  * @address: vma_address() of @folio in @vma; the start of the walk on return
  *
- * In a 4KB anonymous VMA, whose page offsets count 4KB pages, the walk
- * starts at the first address of @folio's window in @vma. Returns true
- * for a VMA that holds no part of the window, which the widened lookup
- * can find in any mm.
+ * In a 4KB anonymous VMA without a file, whose page offsets count 4KB
+ * pages, the walk starts at the first address of @folio's window in @vma.
+ * A private mapping of /dev/zero indexes its folios by file page instead,
+ * as vma_linear_page_index() does, so vma_address() already finds them.
+ * Returns true for a VMA that holds no part of the window, which the
+ * widened lookup can find in any mm.
  */
 static inline bool p3s_anon_rmap_skip(const struct vm_area_struct *vma,
 				      const struct folio *folio,
@@ -105,7 +107,7 @@ static inline bool p3s_anon_rmap_skip(const struct vm_area_struct *vma,
 	if (!IS_ENABLED(CONFIG_ARM64_PER_PROCESS_PAGE_SIZE) ||
 	    folio_test_large(folio))
 		return false;
-	if (vma_is_p3s_4k(vma) && !vma->vm_ops)
+	if (vma_is_p3s_4k(vma) && !vma->vm_ops && !vma->vm_file)
 		*address = vma_anon_slice_window(vma, folio_pgoff(folio));
 	return *address == -EFAULT;
 }
@@ -187,17 +189,18 @@ static inline unsigned long vma_folio_nr_ptes(const struct vm_area_struct *vma,
  * @pgoff: Index of the page (page_pgoff())
  * @addr: Virtual address the page is mapped at
  *
- * In a 4KB anonymous VMA, the index of a small folio is that of the slice
- * that faulted first, and its other slices are mapped in the same 16KB
- * window, so compare the windows. Elsewhere the index must match
- * linear_page_index() exactly.
+ * In a 4KB anonymous VMA without a file, the index of a small folio is
+ * that of the slice that faulted first, and its other slices are mapped in
+ * the same 16KB window, so compare the windows. Elsewhere, including
+ * private mappings of /dev/zero, whose folios are indexed by file page,
+ * the index must match linear_page_index() exactly.
  */
 static inline bool vma_anon_index_matches(const struct vm_area_struct *vma,
 					  pgoff_t pgoff, unsigned long addr)
 {
 	unsigned long first;
 
-	if (!vma_is_p3s_4k(vma) || vma->vm_ops)
+	if (!vma_is_p3s_4k(vma) || vma->vm_ops || vma->vm_file)
 		return pgoff == vma_linear_page_index(vma, addr);
 
 	first = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT_4KB);
