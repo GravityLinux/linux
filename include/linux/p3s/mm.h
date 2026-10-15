@@ -77,6 +77,27 @@ static inline void mm_init_pte_shift(struct mm_struct *mm,
 	mm_set_pte_shift(mm, use_4kb ? PAGE_SHIFT_4KB : PAGE_SHIFT_KERNEL);
 }
 
+/*
+ * mm_reader_pages - Express a page count of @mm in pages of the reader
+ * @mm: mm_struct the pages belong to
+ * @nr: Number of pages of mm_pte_size(@mm) bytes
+ *
+ * /proc/<pid>/statm and /proc/<pid>/stat report memory in pages, which the
+ * reading task converts with its own page size. Scale @nr from the page
+ * size of @mm to that of current, rounding up, so that 4KB compatibility
+ * and native readers both see the right amount of memory.
+ */
+static inline unsigned long mm_reader_pages(const struct mm_struct *mm,
+					    unsigned long nr)
+{
+	unsigned int shift = mm_pte_shift(mm);
+	unsigned int reader = mm_pte_shift(current->mm);
+
+	if (shift >= reader)
+		return nr << (shift - reader);
+	return DIV_ROUND_UP(nr, 1UL << (reader - shift));
+}
+
 #else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
 
 static inline bool personality_4kb_pages(unsigned long pers)
@@ -96,6 +117,12 @@ static inline void mm_set_pte_shift(struct mm_struct *mm, unsigned int shift)
 static inline void mm_init_pte_shift(struct mm_struct *mm,
 				     const struct task_struct *p)
 {
+}
+
+static inline unsigned long mm_reader_pages(const struct mm_struct *mm,
+					    unsigned long nr)
+{
+	return nr;
 }
 
 #endif /* CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */

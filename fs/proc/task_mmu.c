@@ -102,13 +102,13 @@ unsigned long task_statm(struct mm_struct *mm,
 {
 	P3S_CONTEXT_REMOTE_MM(mm);
 
-	*shared = get_mm_counter_sum(mm, MM_FILEPAGES) +
-			get_mm_counter_sum(mm, MM_SHMEMPAGES);
-	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
-								>> PAGE_SHIFT;
-	*data = mm->data_vm + mm->stack_vm;
-	*resident = *shared + get_mm_counter_sum(mm, MM_ANONPAGES);
-	return mm->total_vm;
+	*shared = mm_reader_pages(mm, get_mm_counter_sum(mm, MM_FILEPAGES) +
+			get_mm_counter_sum(mm, MM_SHMEMPAGES));
+	*text = mm_reader_pages(mm, (round_up(mm->end_code, mm_pte_size(mm)) -
+			round_down(mm->start_code, mm_pte_size(mm))) >> mm_pte_shift(mm));
+	*data = mm_reader_pages(mm, mm->data_vm + mm->stack_vm);
+	*resident = *shared + mm_reader_pages(mm, get_mm_counter_sum(mm, MM_ANONPAGES));
+	return mm_reader_pages(mm, mm->total_vm);
 }
 
 #ifdef CONFIG_NUMA
