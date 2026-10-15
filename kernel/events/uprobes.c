@@ -139,6 +139,10 @@ static bool valid_vma(struct vm_area_struct *vma, bool is_register)
 	if (is_register)
 		flags |= VM_WRITE;
 
+	/* Breakpoints are written at kernel page offsets */
+	if (vma_is_p3s_4k(vma))
+		return false;
+
 	return vma->vm_file && (vma->vm_flags & flags) == VM_MAYEXEC;
 }
 
