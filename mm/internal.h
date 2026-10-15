@@ -22,6 +22,7 @@
 /* Internal core VMA manipulation functions. */
 #include "vma.h"
 #include "p3s/filemap.h"
+#include "p3s/pgtable.h"
 
 struct folio_batch;
 struct hstate;

@@ -1149,7 +1149,8 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 	rss[MM_ANONPAGES]++;
 
 	/* All done, just insert the new page copy in the child */
-	pte = folio_mk_pte(new_folio, dst_vma->vm_page_prot);
+	pte = vma_pte_add_slice(dst_vma, addr,
+				folio_mk_pte(new_folio, dst_vma->vm_page_prot));
 	pte = maybe_mkwrite(pte_mkdirty(pte), dst_vma);
 	if (userfaultfd_protected(dst_vma) && pte_uffd(ptep_get(src_pte))) {
 		/* The uffd bit needs to be delivered to the dest pte as well */
@@ -3703,6 +3704,7 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
 {
 	int ret;
 	void *kaddr;
+	void *dst_addr;
 	void __user *uaddr;
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
@@ -3720,7 +3722,10 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
 	 * just copying from the original user address. If that
 	 * fails, we just zero-fill it. Live with it.
 	 */
+	if (vma_is_p3s_4k(vma))
+		clear_user_highpage(dst, addr);
 	kaddr = kmap_local_page(dst);
+	dst_addr = kaddr + vma_slice_offset(vma, addr) * mm_pte_size(mm);
 	pagefault_disable();
 	uaddr = (void __user *)(addr & PAGE_MASK);
 
@@ -3755,7 +3760,7 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
 	 * in which case we just give up and fill the result with
 	 * zeroes.
 	 */
-	if (__copy_from_user_inatomic(kaddr, uaddr, PAGE_SIZE)) {
+	if (__copy_from_user_inatomic(dst_addr, uaddr, PAGE_SIZE)) {
 		if (vmf->pte)
 			goto warn;
 
@@ -3773,7 +3778,7 @@ static inline int __wp_page_copy_user(struct page *dst, struct page *src,
 		 * The same page can be mapped back since last copy attempt.
 		 * Try to copy again under PTL.
 		 */
-		if (__copy_from_user_inatomic(kaddr, uaddr, PAGE_SIZE)) {
+		if (__copy_from_user_inatomic(dst_addr, uaddr, PAGE_SIZE)) {
 			/*
 			 * Give a warn in case there can be some obscure
 			 * use-case
@@ -4066,7 +4071,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			inc_mm_counter(mm, MM_ANONPAGES);
 		}
 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
-		entry = folio_mk_pte(new_folio, vma->vm_page_prot);
+		entry = vma_pte_add_slice(vma, vmf->address,
+					  folio_mk_pte(new_folio, vma->vm_page_prot));
 		entry = pte_sw_mkyoung(entry);
 		if (unlikely(unshare)) {
 			if (pte_soft_dirty(vmf->orig_pte))
@@ -5404,7 +5410,8 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
 		bool uffd_wp)
 {
 	const unsigned int nr_pages = folio_nr_pages(folio);
-	pte_t entry = folio_mk_pte(folio, vma->vm_page_prot);
+	pte_t entry = vma_pte_add_slice(vma, addr,
+					folio_mk_pte(folio, vma->vm_page_prot));
 
 	entry = pte_sw_mkyoung(entry);
 
@@ -5716,7 +5723,7 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
 	pte_t entry;
 
 	flush_icache_pages(vma, page, nr);
-	entry = mk_pte(page, vma->vm_page_prot);
+	entry = vma_pte_add_slice(vma, addr, mk_pte(page, vma->vm_page_prot));
 
 	if (prefault && arch_wants_old_prefaulted_pte())
 		entry = pte_mkold(entry);
@@ -5831,7 +5838,8 @@ fallback:
 	nr_pages = folio_nr_pages(folio);
 
 	/* Using per-page fault to maintain the uffd semantics */
-	if (unlikely(userfaultfd_armed(vma)) || unlikely(needs_fallback)) {
+	if (unlikely(userfaultfd_armed(vma)) || unlikely(needs_fallback) ||
+	    vma_is_p3s_4k(vma)) {
 		nr_pages = 1;
 	} else if (nr_pages > 1) {
 		pgoff_t idx = folio_page_idx(folio, page);
