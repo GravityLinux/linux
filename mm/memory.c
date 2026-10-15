@@ -2526,6 +2526,8 @@ static int insert_page_into_pte_locked(struct vm_area_struct *vma, pte_t *pte,
 		inc_mm_counter(vma->vm_mm, mm_counter_file(folio));
 		folio_add_file_rmap_pte(folio, page, vma);
 	}
+
+	pteval = vma_pte_add_slice(vma, addr, pteval);
 	set_pte_at(vma->vm_mm, addr, pte, pteval);
 	return 0;
 }
@@ -2854,6 +2856,8 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 		entry = pte_mkyoung(entry);
 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 	}
+
+	entry = vma_pte_add_slice(vma, addr, entry);
 
 	set_pte_at(mm, addr, pte, entry);
 	update_mmu_cache(vma, addr, pte); /* XXX: why not for insert_page? */
