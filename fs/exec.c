@@ -453,6 +453,7 @@ static int bprm_stack_limits(struct linux_binprm *bprm)
 static int copy_strings(int argc, struct user_arg_ptr argv,
 			struct linux_binprm *bprm)
 {
+	unsigned long psize = mm_pte_size(bprm->mm);
 	struct page *kmapped_page = NULL;
 	char *kaddr = NULL;
 	unsigned long kpos = 0;
@@ -492,9 +493,9 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 			}
 			cond_resched();
 
-			offset = pos % PAGE_SIZE;
+			offset = pos % psize;
 			if (offset == 0)
-				offset = PAGE_SIZE;
+				offset = psize;
 
 			bytes_to_copy = offset;
 			if (bytes_to_copy > len)
@@ -505,7 +506,7 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 			str -= bytes_to_copy;
 			len -= bytes_to_copy;
 
-			if (!kmapped_page || kpos != (pos & PAGE_MASK)) {
+			if (!kmapped_page || kpos != (pos & ~(psize - 1))) {
 				struct page *page;
 
 				page = get_arg_page(bprm, pos, 1);
@@ -521,10 +522,11 @@ static int copy_strings(int argc, struct user_arg_ptr argv,
 				}
 				kmapped_page = page;
 				kaddr = kmap_local_page(kmapped_page);
-				kpos = pos & PAGE_MASK;
+				kpos = pos & ~(psize - 1);
 				flush_arg_page(bprm, kpos, kmapped_page);
 			}
-			if (copy_from_user(kaddr+offset, str, bytes_to_copy)) {
+			if (copy_from_user(kaddr + offset_in_page(pos), str,
+					   bytes_to_copy)) {
 				ret = -EFAULT;
 				goto out;
 			}
@@ -561,7 +563,8 @@ int copy_string_kernel(const char *arg, struct linux_binprm *bprm)
 
 	while (len > 0) {
 		unsigned int bytes_to_copy = min(len,
-				min_not_zero(offset_in_page(pos), PAGE_SIZE));
+				min_not_zero(pos & ~mm_pte_mask(bprm->mm),
+					     mm_pte_size(bprm->mm)));
 		struct page *page;
 
 		pos -= bytes_to_copy;
@@ -1725,7 +1728,7 @@ static int prepare_binprm(struct linux_binprm *bprm)
  */
 int remove_arg_zero(struct linux_binprm *bprm)
 {
-	unsigned long offset;
+	unsigned long offset, end;
 	char *kaddr;
 	struct page *page;
 
@@ -1734,18 +1737,19 @@ int remove_arg_zero(struct linux_binprm *bprm)
 
 	do {
 		offset = bprm->p & ~PAGE_MASK;
+		end = (offset & mm_pte_mask(bprm->mm)) + mm_pte_size(bprm->mm);
 		page = get_arg_page(bprm, bprm->p, 0);
 		if (!page)
 			return -EFAULT;
 		kaddr = kmap_local_page(page);
 
-		for (; offset < PAGE_SIZE && kaddr[offset];
+		for (; offset < end && kaddr[offset];
 				offset++, bprm->p++)
 			;
 
 		kunmap_local(kaddr);
 		put_arg_page(page);
-	} while (offset == PAGE_SIZE);
+	} while (offset == end);
 
 	bprm->p++;
 	bprm->argc--;
