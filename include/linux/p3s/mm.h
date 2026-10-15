@@ -109,6 +109,31 @@ static inline bool mm_is_p3s_4k(const struct mm_struct *mm)
 	return mm_pte_shift(mm) != PAGE_SHIFT_KERNEL;
 }
 
+/*
+ * p3s_err - Log a P3S error against the current task, ratelimited
+ */
+#define p3s_err(fmt, ...)						\
+	pr_err_ratelimited("p3s [%i (%s)]: " fmt, task_pid_nr(current),	\
+			   current->comm, ##__VA_ARGS__)
+
+/*
+ * p3s_4k_unsupported - Check if a feature is unsupported for @mm
+ * @mm: mm_struct the calling feature would operate on
+ *
+ * Features that cannot work in a 4KB compatibility mm refuse to run for
+ * it. Returns mm_is_p3s_4k(@mm) and logs the refusal with the name of the
+ * calling function, so that refusals hit in production can be identified.
+ */
+#define p3s_4k_unsupported(mm)						\
+({									\
+	bool __p3s_4k = mm_is_p3s_4k(mm);				\
+									\
+	if (unlikely(__p3s_4k))						\
+		p3s_err("%s: unsupported in 4KB compatibility mode\n",	\
+			__func__);					\
+	__p3s_4k;							\
+})
+
 static inline unsigned long mm_pmd_size(const struct mm_struct *mm)
 {
 	return mm_is_p3s_4k(mm) ? PMD_SIZE_4KB : PMD_SIZE;
