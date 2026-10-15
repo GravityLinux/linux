@@ -509,6 +509,247 @@ static inline unsigned int p3s_uffd_move_nr_slices(struct vm_area_struct *vma,
 }
 #endif /* CONFIG_USERFAULTFD */
 
+/*
+ * p3s_wp_can_reuse_anon_folio - Check that a write fault can reuse @folio
+ * @folio: Small anonymous folio that @pte maps
+ * @vma: Pointer to struct vm_area_struct
+ * @addr: Faulting virtual address
+ * @pte: Faulting PTE, with the page table lock held
+ *
+ * The 4KB variant of wp_can_reuse_anon_folio(): up to four slice PTEs of
+ * the window at @addr can map @folio, so it can be reused only if they
+ * hold all of its mappings and references. As there, the folio lock is
+ * only trylocked, the swap cache is freed if possible, and the anon_vma of
+ * a reusable folio is moved to @vma.
+ */
+static inline bool p3s_wp_can_reuse_anon_folio(struct folio *folio,
+					       struct vm_area_struct *vma,
+					       unsigned long addr,
+					       pte_t *pte)
+{
+	unsigned int nr_slices, local_slice_count;
+	unsigned long start_addr;
+	pte_t *pte_base;
+
+	if (folio_test_ksm(folio))
+		return false;
+
+	vma_folio_slice_bounds(vma, addr, &nr_slices, &start_addr);
+
+	/*
+	 * Early check: local slices cannot exceed total folio refcount.
+	 * Max expected transient refcount is nr_slices + 1 (swapcache) + 1 (LRU).
+	 */
+	if (folio_ref_count(folio) > nr_slices + 2)
+		return false;
+
+	if (!folio_test_lru(folio))
+		lru_add_drain();
+
+	if (folio_ref_count(folio) > nr_slices + folio_test_swapcache(folio))
+		return false;
+
+	if (!folio_trylock(folio))
+		return false;
+
+	if (folio_test_swapcache(folio))
+		folio_free_swap(folio);
+
+	if (folio_test_ksm(folio)) {
+		folio_unlock(folio);
+		return false;
+	}
+
+	pte_base = pte - ((addr - start_addr) >> PAGE_SHIFT_4KB);
+	local_slice_count = p3s_count_folio_slices(vma, pte_base, start_addr,
+						   nr_slices, folio);
+
+	if (local_slice_count != folio_mapcount(folio) ||
+	    local_slice_count != folio_ref_count(folio)) {
+		folio_unlock(folio);
+		return false;
+	}
+
+	folio_move_anon_rmap(folio, vma);
+	folio_unlock(folio);
+	return true;
+}
+
+/*
+ * p3s_wp_slice_bounds - Get the slice window that a COW redirects
+ * @old_folio: Folio being copied, or NULL for the zero page
+ * @vmf: Fault information
+ * @nr_slices: Output number of slices in the window
+ * @start_addr: Output address of the first slice
+ *
+ * Returns true if the COW of @old_folio redirects all the slice PTEs that
+ * map it: a small anonymous folio in a 4KB VMA without userfaultfd, on a
+ * write fault (not an unshare) in a window of more than one slice.
+ */
+static inline bool p3s_wp_slice_bounds(struct folio *old_folio,
+				       struct vm_fault *vmf,
+				       unsigned int *nr_slices,
+				       unsigned long *start_addr)
+{
+	struct vm_area_struct *vma = vmf->vma;
+
+	if (!vma_is_p3s_4k(vma) || !old_folio ||
+	    !folio_test_anon(old_folio) || folio_test_large(old_folio) ||
+	    unlikely(userfaultfd_armed(vma)) || (vmf->flags & FAULT_FLAG_UNSHARE))
+		return false;
+
+	vma_folio_slice_bounds(vma, vmf->address, nr_slices, start_addr);
+	return *nr_slices > 1;
+}
+
+/*
+ * p3s_wp_mk_sibling_pte - Make the PTE of a sibling slice that a COW redirects
+ * @vma: Pointer to struct vm_area_struct
+ * @entry: New PTE, mapping the sibling's slice of the copy
+ * @old: The sibling's previous PTE, as ptep_clear_flush() returned it
+ *
+ * Only the faulting PTE is being written, so a sibling keeps the access,
+ * dirty and soft-dirty bits of the PTE that it replaces, as on swap-in. On
+ * arm64 vm_page_prot sets the access flag and pte_sw_mkyoung() does nothing,
+ * so an old sibling needs pte_mkold(). The copy is exclusive, so the sibling
+ * is writable unless soft-dirty tracking must see its first write. uffd-wp
+ * needs no check, as p3s_wp_slice_bounds() skips userfaultfd-armed VMAs.
+ */
+static inline pte_t p3s_wp_mk_sibling_pte(struct vm_area_struct *vma,
+					  pte_t entry, pte_t old)
+{
+	if (!pte_young(old))
+		entry = pte_mkold(entry);
+	if (pte_dirty(old))
+		entry = pte_mkdirty(entry);
+	if (pte_soft_dirty(old))
+		entry = pte_mksoft_dirty(entry);
+	if (!pte_needs_soft_dirty_wp(vma, entry))
+		entry = maybe_mkwrite(entry, vma);
+	return entry;
+}
+
+/*
+ * p3s_wp_widen_range - Widen the MMU notifier range of a COW to its slices
+ * @old_folio: Source shared folio, or NULL for the zero page
+ * @vmf: Fault information
+ * @start: In/out start of the range, the faulting 4KB page
+ * @end: In/out end of the range
+ *
+ * p3s_wp_install_folio_slices() redirects every slice PTE of @old_folio in
+ * the window to the new folio, so secondary MMUs must drop their
+ * translations of all of them, not only of the faulting page. Covering
+ * slices that turn out not to map @old_folio only adds invalidation.
+ */
+static inline void p3s_wp_widen_range(struct folio *old_folio,
+				      struct vm_fault *vmf,
+				      unsigned long *start, unsigned long *end)
+{
+	unsigned int nr_slices;
+	unsigned long first;
+
+	if (!p3s_wp_slice_bounds(old_folio, vmf, &nr_slices, &first))
+		return;
+	*start = first;
+	*end = first + ((unsigned long)nr_slices << PAGE_SHIFT_4KB);
+}
+
+/*
+ * p3s_wp_install_folio_slices - Map a COW copy at every slice of the old folio
+ * @new_folio: Copy of @old_folio, holding its allocation reference
+ * @old_folio: Folio that the faulting PTE maps, or NULL for the zero page
+ * @vmf: Fault information; page table lock held, *vmf->pte == vmf->orig_pte
+ *
+ * wp_page_copy() copied the whole 16KB folio, so redirect every PTE of the
+ * window at vmf->address (clamped to the VMA and the PTE table) that maps
+ * @old_folio to its slice of @new_folio, not only the faulting one. PTEs
+ * that map anything else are left alone:
+ *
+ *            slice 0    slice 1    slice 2    slice 3
+ *          ┌──────────┬──────────┬──────────┬──────────┐
+ *  before  │  old[0]  │  old[1]  │  other   │  old[3]  │  fault on slice 1
+ *          ├──────────┼──────────┼──────────┼──────────┤
+ *  after   │  new[0]  │  new[1]  │  other   │  new[3]  │  new: @new_folio
+ *          └──────────┴──────────┴──────────┴──────────┘
+ *
+ * Only the faulting PTE is made young and dirty, as wp_page_copy() makes
+ * it. The siblings keep the state of the PTEs that they replace
+ * (p3s_wp_mk_sibling_pte()).
+ *
+ * The allocation reference of @new_folio goes to the first PTE, and one
+ * more is taken per further PTE. @old_folio loses one reference per
+ * redirected PTE except the faulting one, whose reference wp_page_copy()
+ * drops. The caller widened its MMU notifier range to the window with
+ * p3s_wp_widen_range().
+ *
+ * Returns false, having changed nothing, if wp_page_copy() must install
+ * only the faulting PTE.
+ */
+static inline bool p3s_wp_install_folio_slices(struct folio *new_folio,
+					       struct folio *old_folio,
+					       struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned int nr_slices, i, redirected = 0;
+	unsigned long start_addr;
+	int mapped_slices;
+	pte_t *pte_base;
+
+	if (!p3s_wp_slice_bounds(old_folio, vmf, &nr_slices, &start_addr))
+		return false;
+
+	pte_base = vmf->pte - ((vmf->address - start_addr) >> PAGE_SHIFT_4KB);
+	mapped_slices = p3s_count_folio_slices(vma, pte_base, start_addr,
+					       nr_slices, old_folio);
+
+	folio_add_new_anon_rmap(new_folio, vma, start_addr, RMAP_EXCLUSIVE);
+	if (mapped_slices > 1)
+		folio_ref_add(new_folio, mapped_slices - 1);
+	folio_add_lru_vma(new_folio, vma);
+
+	for (i = 0; i < nr_slices; i++) {
+		unsigned long slice_addr = start_addr + (i << PAGE_SHIFT_4KB);
+		pte_t *ptep = pte_base + i;
+		pte_t ptent = ptep_get(ptep);
+		pte_t entry;
+
+		if (!p3s_pte_maps_folio(vma, slice_addr, ptent, old_folio))
+			continue;
+
+		/*
+		 * folio_add_new_anon_rmap() accounted the first mapping; the
+		 * rmap also mlocks the folio once per slice in a VM_LOCKED VMA.
+		 */
+		if (redirected++)
+			folio_add_anon_rmap_pte(new_folio, &new_folio->page, vma,
+						slice_addr, RMAP_EXCLUSIVE);
+
+		flush_cache_page(vma, slice_addr, pte_pfn(ptent));
+		ptent = ptep_clear_flush(vma, slice_addr, ptep);
+
+		entry = vma_pte_add_slice(vma, slice_addr,
+					  folio_mk_pte(new_folio, vma->vm_page_prot));
+		if (ptep == vmf->pte) {
+			entry = pte_sw_mkyoung(entry);
+			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+		} else {
+			entry = p3s_wp_mk_sibling_pte(vma, entry, ptent);
+		}
+
+		set_pte_at(mm, slice_addr, ptep, entry);
+		update_mmu_cache_range(vmf, vma, slice_addr, ptep, 1);
+
+		folio_remove_rmap_pte(old_folio, &old_folio->page, vma);
+	}
+
+	/* The sibling PTEs held these references: drop them after unmapping */
+	if (mapped_slices > 1)
+		folio_put_refs(old_folio, mapped_slices - 1);
+
+	return true;
+}
+
 #else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
 
 static inline bool p3s_anon_reuse_sibling_slice(struct vm_fault *vmf,
@@ -559,6 +800,27 @@ static inline unsigned int p3s_uffd_move_nr_slices(struct vm_area_struct *vma,
 	return 1;
 }
 #endif
+
+static inline bool p3s_wp_can_reuse_anon_folio(struct folio *folio,
+					       struct vm_area_struct *vma,
+					       unsigned long addr,
+					       pte_t *pte)
+{
+	return false;
+}
+
+static inline bool p3s_wp_install_folio_slices(struct folio *new_folio,
+					       struct folio *old_folio,
+					       struct vm_fault *vmf)
+{
+	return false;
+}
+
+static inline void p3s_wp_widen_range(struct folio *old_folio,
+				      struct vm_fault *vmf,
+				      unsigned long *start, unsigned long *end)
+{
+}
 
 #endif /* CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
 
