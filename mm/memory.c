@@ -4497,10 +4497,8 @@ static inline void unmap_mapping_range_tree(struct address_space *mapping,
 	mapping_rmap_tree_foreach(vma, mapping, first_index, last_index) {
 		const pgoff_t start_idx = max(first_index, vma_start_pgoff(vma));
 		const pgoff_t end_idx = min(last_index, vma_last_pgoff(vma)) + 1;
-		const pgoff_t offset = start_idx - vma_start_pgoff(vma);
-		const unsigned long offset_bytes = offset << PAGE_SHIFT;
-		const unsigned long start = vma->vm_start + offset_bytes;
-		const unsigned long size = (end_idx - start_idx) << PAGE_SHIFT;
+		const unsigned long start = vma_pgoff_to_address(vma, start_idx);
+		const unsigned long size = vma_pgoff_to_address(vma, end_idx) - start;
 
 		tlb_gather_mmu(&tlb, vma->vm_mm);
 		zap_vma_range_batched(&tlb, vma, start, size, details);
