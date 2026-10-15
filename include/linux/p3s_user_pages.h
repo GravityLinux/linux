@@ -6,8 +6,11 @@
  * <linux/p3s_user_pages.h> must ONLY be included as the last header in
  * C source files (.c) that opt into dynamic PAGE_SIZE for user address
  * spaces. It must NEVER be included in header files (.h).
+ *
+ * fs/compat_binfmt_elf.c defines ELF_COMPAT and includes fs/binfmt_elf.c,
+ * which raises the include level, so the check is skipped there.
  */
-#if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ > 1
+#if !defined(ELF_COMPAT) && defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ > 1
 #error "Must not include <linux/p3s_user_pages.h> from header files"
 #endif
 
