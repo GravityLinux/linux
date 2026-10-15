@@ -89,6 +89,7 @@
 #include "pgalloc-track.h"
 #include "internal.h"
 #include "swap.h"
+#include <linux/p3s_user_pages.h>
 
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
@@ -299,6 +300,7 @@ void free_pgd_range(struct mmu_gather *tlb,
 			unsigned long addr, unsigned long end,
 			unsigned long floor, unsigned long ceiling)
 {
+	P3S_CONTEXT_REMOTE_MM(tlb->mm);
 	pgd_t *pgd;
 	unsigned long next;
 
@@ -372,6 +374,7 @@ void free_pgd_range(struct mmu_gather *tlb,
  */
 void free_pgtables(struct mmu_gather *tlb, struct unmap_desc *unmap)
 {
+	P3S_CONTEXT_REMOTE_MM(tlb->mm);
 	struct unlink_vma_file_batch vb;
 	struct ma_state *mas = unmap->mas;
 	struct vm_area_struct *vma = unmap->first;
@@ -561,6 +564,7 @@ static void ptval_bytes_to_hex_str(char *buf, size_t buf_size, const void *entry
 
 static void __print_bad_page_map_pgtable(struct mm_struct *mm, unsigned long addr)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	char pgd_str[PTVAL_STR_MAX];
 	char p4d_str[PTVAL_STR_MAX];
 	char pud_str[PTVAL_STR_MAX];
@@ -1588,6 +1592,7 @@ vma_needs_copy(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 int
 copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 {
+	P3S_CONTEXT_REMOTE_MM(src_vma->vm_mm);
 	pgd_t *src_pgd, *dst_pgd;
 	unsigned long addr = src_vma->vm_start;
 	unsigned long end = src_vma->vm_end;
@@ -2207,6 +2212,7 @@ static void __zap_vma_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		unsigned long start, unsigned long end,
 		struct zap_details *details)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	const bool reaping = details && details->reaping;
 
 	VM_WARN_ON_ONCE(start >= end || !range_in_vma(vma, start, end));
@@ -2401,6 +2407,7 @@ EXPORT_SYMBOL_GPL(zap_special_vma_range);
 
 static pmd_t *walk_to_pmd(struct mm_struct *mm, unsigned long addr)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
@@ -2424,6 +2431,7 @@ static pmd_t *walk_to_pmd(struct mm_struct *mm, unsigned long addr)
 pte_t *get_locked_pte(struct mm_struct *mm, unsigned long addr,
 		      spinlock_t **ptl)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	pmd_t *pmd = walk_to_pmd(mm, addr);
 
 	if (!pmd)
@@ -2631,6 +2639,7 @@ out:
 int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	const unsigned long nr_pages = *num;
 	const unsigned long end = addr + PAGE_SIZE * nr_pages;
 
@@ -2712,6 +2721,8 @@ EXPORT_SYMBOL(map_kernel_pages_complete);
 int vm_insert_page(struct vm_area_struct *vma, unsigned long addr,
 			struct page *page)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
+
 	if (addr < vma->vm_start || addr >= vma->vm_end)
 		return -EFAULT;
 	if (!(vma->vm_flags & VM_MIXEDMAP)) {
@@ -2739,6 +2750,7 @@ EXPORT_SYMBOL(vm_insert_page);
 static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 				unsigned long num, unsigned long offset)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	unsigned long count = vma_pages(vma);
 	unsigned long uaddr = vma->vm_start;
 
@@ -3154,6 +3166,7 @@ static int get_remap_pgoff(bool is_cow, unsigned long addr,
 static int remap_pfn_range_internal(struct vm_area_struct *vma, unsigned long addr,
 		unsigned long pfn, unsigned long size, pgprot_t prot)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	pgd_t *pgd;
 	unsigned long next;
 	unsigned long end = addr + PAGE_ALIGN(size);
@@ -3596,6 +3609,7 @@ static int __apply_to_page_range(struct mm_struct *mm, unsigned long addr,
 				 unsigned long size, pte_fn_t fn,
 				 void *data, bool create)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	pgd_t *pgd;
 	unsigned long start = addr, next;
 	unsigned long end = addr + size;
@@ -4579,13 +4593,13 @@ EXPORT_SYMBOL_GPL(unmap_mapping_pages);
 void unmap_mapping_range(struct address_space *mapping,
 		loff_t const holebegin, loff_t const holelen, int even_cows)
 {
-	pgoff_t hba = (pgoff_t)(holebegin) >> PAGE_SHIFT;
-	pgoff_t hlen = ((pgoff_t)(holelen) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	pgoff_t hba = (pgoff_t)(holebegin) >> PAGE_SHIFT_KERNEL;
+	pgoff_t hlen = ((pgoff_t)(holelen) + PAGE_SIZE_KERNEL - 1) >> PAGE_SHIFT_KERNEL;
 
 	/* Check for overflow. */
 	if (sizeof(holelen) > sizeof(hlen)) {
 		long long holeend =
-			(holebegin + holelen + PAGE_SIZE - 1) >> PAGE_SHIFT;
+			(holebegin + holelen + PAGE_SIZE_KERNEL - 1) >> PAGE_SHIFT_KERNEL;
 		if (holeend & ~(long long)ULONG_MAX)
 			hlen = ULONG_MAX - hba + 1;
 	}
@@ -5790,7 +5804,7 @@ fallback:
 		struct address_space *mapping = vma->vm_file->f_mapping;
 		pgoff_t file_end;
 
-		file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+		file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE_KERNEL);
 
 		/*
 		 * Do not allow to map with PTEs beyond i_size and with PMD
@@ -5872,12 +5886,12 @@ unlock:
 }
 
 static unsigned long fault_around_pages __read_mostly =
-	65536 >> PAGE_SHIFT;
+	65536 >> PAGE_SHIFT_KERNEL;
 
 #ifdef CONFIG_DEBUG_FS
 static int fault_around_bytes_get(void *data, u64 *val)
 {
-	*val = fault_around_pages << PAGE_SHIFT;
+	*val = fault_around_pages << PAGE_SHIFT_KERNEL;
 	return 0;
 }
 
@@ -5887,15 +5901,15 @@ static int fault_around_bytes_get(void *data, u64 *val)
  */
 static int fault_around_bytes_set(void *data, u64 val)
 {
-	if (val / PAGE_SIZE > PTRS_PER_PTE)
+	if (val / PAGE_SIZE_KERNEL > PTRS_PER_PTE)
 		return -EINVAL;
 
 	/*
 	 * The minimum value is 1 page, however this results in no fault-around
 	 * at all. See should_fault_around().
 	 */
-	val = max(val, PAGE_SIZE);
-	fault_around_pages = rounddown_pow_of_two(val) >> PAGE_SHIFT;
+	val = max_t(u64, val, PAGE_SIZE_KERNEL);
+	fault_around_pages = rounddown_pow_of_two(val) >> PAGE_SHIFT_KERNEL;
 
 	return 0;
 }
@@ -6604,6 +6618,7 @@ unlock:
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		unsigned long address, unsigned int flags)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	struct vm_fault vmf = {
 		.vma = vma,
 		.address = address & PAGE_MASK,
@@ -7042,6 +7057,8 @@ int follow_pfnmap_start(struct follow_pfnmap_args *args)
 	unsigned long address = args->address;
 	struct mm_struct *mm = vma->vm_mm;
 	spinlock_t *lock;
+
+	P3S_CONTEXT_REMOTE_MM(mm);
 	pgd_t *pgdp;
 	p4d_t *p4dp, p4d;
 	pud_t *pudp, pud;
@@ -7156,6 +7173,7 @@ EXPORT_SYMBOL_GPL(follow_pfnmap_end);
 int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 			void *buf, int len, int write)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	resource_size_t phys_addr;
 	pgprot_t prot = __pgprot(0);
 	void __iomem *maddr;
@@ -7210,6 +7228,7 @@ EXPORT_SYMBOL_GPL(generic_access_phys);
 static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
 			      void *buf, int len, unsigned int gup_flags)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	void *old_buf = buf;
 	int write = gup_flags & FOLL_WRITE;
 
@@ -7334,6 +7353,7 @@ EXPORT_SYMBOL_GPL(access_process_vm);
 static int __copy_remote_vm_str(struct mm_struct *mm, unsigned long addr,
 				void *buf, int len, unsigned int gup_flags)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	void *old_buf = buf;
 	int err = 0;
 
@@ -7659,6 +7679,7 @@ static int copy_subpage(unsigned long addr, int idx, void *arg)
 int copy_user_large_folio(struct folio *dst, struct folio *src,
 			  unsigned long addr_hint, struct vm_area_struct *vma)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	unsigned int nr_pages = folio_nr_pages(dst);
 	struct copy_subpage_arg arg = {
 		.dst = dst,
@@ -7679,7 +7700,7 @@ long copy_folio_from_user(struct folio *dst_folio,
 	void *kaddr;
 	unsigned long i, rc = 0;
 	unsigned int nr_pages = folio_nr_pages(dst_folio);
-	unsigned long ret_val = nr_pages * PAGE_SIZE;
+	unsigned long ret_val = nr_pages * PAGE_SIZE_KERNEL;
 	struct page *subpage;
 
 	for (i = 0; i < nr_pages; i++) {
@@ -7687,12 +7708,12 @@ long copy_folio_from_user(struct folio *dst_folio,
 		kaddr = kmap_local_page(subpage);
 		if (!allow_pagefault)
 			pagefault_disable();
-		rc = copy_from_user(kaddr, usr_src + i * PAGE_SIZE, PAGE_SIZE);
+		rc = copy_from_user(kaddr, usr_src + i * PAGE_SIZE_KERNEL, PAGE_SIZE_KERNEL);
 		if (!allow_pagefault)
 			pagefault_enable();
 		kunmap_local(kaddr);
 
-		ret_val -= (PAGE_SIZE - rc);
+		ret_val -= (PAGE_SIZE_KERNEL - rc);
 		if (rc)
 			break;
 
