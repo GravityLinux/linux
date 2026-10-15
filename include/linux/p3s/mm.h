@@ -176,6 +176,21 @@ static inline unsigned int mm_slices_per_page(const struct mm_struct *mm)
 	return 1U << (PAGE_SHIFT_KERNEL - mm_pte_shift(mm));
 }
 
+/*
+ * mm_kernel_pages - Express a page count of @mm in kernel pages
+ * @mm: mm_struct the pages belong to
+ * @nr: Number of pages of mm_pte_size(@mm) bytes
+ *
+ * The RSS and VM counters of a 4KB compatibility mm count 4KB pages. Code
+ * that converts them with PAGE_SIZE, or accumulates them across tasks,
+ * must first convert them to kernel pages. Rounds up.
+ */
+static inline unsigned long mm_kernel_pages(const struct mm_struct *mm,
+					    unsigned long nr)
+{
+	return DIV_ROUND_UP(nr, mm_slices_per_page(mm));
+}
+
 static inline unsigned long mm_offset_in_page(const struct mm_struct *mm,
 					      unsigned long addr)
 {
