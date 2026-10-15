@@ -4,6 +4,7 @@
 
 #include <linux/highmem.h>
 #include <linux/mm.h>
+#include <linux/oom.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
@@ -103,6 +104,39 @@ static inline struct folio *p3s_anon_folio_lookaround_pte(struct vm_area_struct 
 }
 
 /*
+ * p3s_anon_folio_zero_slice - Zero the subpage slice of @folio backing @addr
+ * @folio: Existing anonymous folio about to be mapped at @addr
+ * @vma: Pointer to struct vm_area_struct
+ * @addr: Virtual address of the slice being mapped
+ *
+ * A slice reused through sibling lookaround may still hold the contents of
+ * an earlier mapping of the same slice that was zapped (for example by
+ * MADV_DONTNEED or a partial munmap()) while sibling slices kept the folio
+ * alive. Anonymous faults must observe zero-fill semantics, so clear the
+ * slice before it is mapped again. In a PROT_MTE mapping clear its
+ * allocation tags as well: mte_sync_tags() does not reinitialise the tags
+ * of a host page that is already tagged.
+ */
+static inline void p3s_anon_folio_zero_slice(struct folio *folio,
+					     struct vm_area_struct *vma,
+					     unsigned long addr)
+{
+	unsigned long offset;
+	void *kaddr;
+
+	offset = (unsigned long)vma_slice_offset(vma, addr) << PAGE_SHIFT_4KB;
+	kaddr = folio_address(folio) + offset;
+	if (vma->vm_flags & VM_MTE)
+		mte_zero_clear_slice_tags(kaddr);
+	else
+		memset(kaddr, 0, PAGE_SIZE_4KB);
+	flush_dcache_folio(folio);
+
+	/* Order the clear before the PTE, as __folio_mark_uptodate() does */
+	smp_wmb();
+}
+
+/*
  * p3s_anon_folio_reuse - Update accounting when reusing an existing folio
  * @folio: Anonymous folio being reused
  * @vma: Pointer to struct vm_area_struct
@@ -118,6 +152,124 @@ static inline void p3s_anon_folio_reuse(struct folio *folio,
 {
 	folio_add_anon_rmap_pte(folio, &folio->page, vma, addr, RMAP_NONE);
 	inc_mm_counter(vma->vm_mm, MM_ANONPAGES);
+}
+
+/*
+ * p3s_anon_mk_slice_pte - Map the faulting slice of a sibling folio
+ * @vmf: Fault information; page table lock held, faulting slice not mapped
+ * @folio: Sibling folio returned by p3s_anon_folio_lookaround_pte()
+ *
+ * Zero the slice and account the new mapping without allocating a new
+ * folio. Returns the PTE for the caller to install.
+ */
+static inline pte_t p3s_anon_mk_slice_pte(struct vm_fault *vmf,
+					  struct folio *folio)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	pte_t entry;
+
+	p3s_anon_folio_zero_slice(folio, vma, vmf->address);
+
+	entry = vma_pte_add_slice(vma, vmf->address,
+				  folio_mk_pte(folio, vma->vm_page_prot));
+	entry = pte_sw_mkyoung(entry);
+	if (vma->vm_flags & VM_WRITE)
+		entry = pte_mkwrite(pte_mkdirty(entry), vma);
+
+	p3s_anon_folio_reuse(folio, vma, vmf->address);
+	return entry;
+}
+
+/*
+ * p3s_anon_reuse_sibling_slice - Map a fault onto a sibling's 16KB folio
+ * @vmf: Fault information (pte not mapped, not locked)
+ * @ret: Fault result if the fault was handled
+ *
+ * In a 4KB compatibility process, an anonymous fault on a subpage slice
+ * whose 16KB host folio is already mapped by a sibling slice maps that
+ * folio instead of allocating a new one. Returns true if the fault was
+ * handled. Userfaultfd-missing VMAs and faults on PTE markers (e.g.
+ * uffd-wp) take the regular path. A fault handled here does not reach the
+ * android_vh_do_anonymous_page vendor hook, which do_anonymous_page() only
+ * calls for a newly allocated folio.
+ */
+static inline bool p3s_anon_reuse_sibling_slice(struct vm_fault *vmf,
+						vm_fault_t *ret)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct folio *folio;
+	pte_t entry;
+
+	*ret = 0;
+	if (!vma_is_p3s_4k(vma) || userfaultfd_missing(vma) ||
+	    ((vmf->flags & FAULT_FLAG_ORIG_PTE_VALID) && !pte_none(vmf->orig_pte)))
+		return false;
+
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+				       &vmf->ptl);
+	if (!vmf->pte)
+		return true;
+	if (!pte_none(ptep_get(vmf->pte))) {
+		update_mmu_tlb(vma, vmf->address, vmf->pte);
+		goto unlock;
+	}
+
+	folio = p3s_anon_folio_lookaround_pte(vma, vmf->pte, vmf->address);
+	if (!folio) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		vmf->pte = NULL;
+		return false;
+	}
+
+	*ret = check_stable_address_space(vma->vm_mm);
+	if (*ret) {
+		folio_put(folio);
+		goto unlock;
+	}
+	entry = p3s_anon_mk_slice_pte(vmf, folio);
+	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+unlock:
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return true;
+}
+
+/*
+ * p3s_anon_reuse_racing_sibling - Map a sibling folio instead of a new one
+ * @vmf: Fault information; page table lock held, faulting slice not mapped
+ * @foliop: Newly allocated folio, replaced by the sibling folio if found
+ * @entry: Set to the PTE of the faulting slice if a sibling folio is found
+ *
+ * do_anonymous_page() normally finds a sibling folio before it allocates
+ * one (p3s_anon_reuse_sibling_slice()). This lookaround catches a sibling
+ * slice mapped while the new folio was being allocated, and serves faults
+ * on uffd-wp markers, which skip the early lookaround:
+ *
+ *   ┌─────────┬─────────┬─────────┬─────────┐
+ *   │ slice 0 │  @vmf   │ slice 2 │  none   │  PTEs of the 16KB window
+ *   └────┬────┴────┬────┴────┬────┴─────────┘
+ *        ▼         ▼         ▼
+ *   ┌─────────┬─────────┬─────────┬─────────┐
+ *   │    0    │    1    │    2    │    3    │  slices of the sibling folio
+ *   └─────────┴─────────┴─────────┴─────────┘
+ *
+ * Returns true if the sibling folio replaced the new folio, which is then
+ * freed after the android_vh_do_anonymous_page vendor hook has seen it.
+ */
+static inline bool p3s_anon_reuse_racing_sibling(struct vm_fault *vmf,
+						 struct folio **foliop,
+						 pte_t *entry)
+{
+	struct folio *folio;
+
+	folio = p3s_anon_folio_lookaround_pte(vmf->vma, vmf->pte, vmf->address);
+	if (!folio)
+		return false;
+
+	folio_put(*foliop);
+	*foliop = folio;
+	*entry = p3s_anon_mk_slice_pte(vmf, folio);
+	return true;
 }
 
 #ifdef CONFIG_USERFAULTFD
@@ -235,6 +387,19 @@ static inline unsigned int p3s_uffd_move_nr_slices(struct vm_area_struct *vma,
 #endif /* CONFIG_USERFAULTFD */
 
 #else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
+
+static inline bool p3s_anon_reuse_sibling_slice(struct vm_fault *vmf,
+						vm_fault_t *ret)
+{
+	return false;
+}
+
+static inline bool p3s_anon_reuse_racing_sibling(struct vm_fault *vmf,
+						 struct folio **foliop,
+						 pte_t *entry)
+{
+	return false;
+}
 
 #ifdef CONFIG_USERFAULTFD
 static inline bool p3s_uffd_install_anon_folio(struct vm_area_struct *dst_vma,
