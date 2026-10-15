@@ -7290,12 +7290,10 @@ static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
 				break;
 		} else {
 			folio = page_folio(page);
-			bytes = len;
-			offset = addr & (PAGE_SIZE-1);
-			if (bytes > PAGE_SIZE-offset)
-				bytes = PAGE_SIZE-offset;
+			vma_remote_access_chunk(vma, addr, len, &offset, &bytes);
 
-			maddr = kmap_local_folio(folio, folio_page_idx(folio, page) * PAGE_SIZE);
+			maddr = kmap_local_folio(folio,
+						 folio_page_idx(folio, page) * PAGE_SIZE_KERNEL);
 			if (write) {
 				copy_to_user_page(vma, page, addr,
 						  maddr + offset, buf, bytes);
@@ -7401,12 +7399,9 @@ static int __copy_remote_vm_str(struct mm_struct *mm, unsigned long addr,
 		}
 
 		folio = page_folio(page);
-		bytes = len;
-		offset = addr & (PAGE_SIZE - 1);
-		if (bytes > PAGE_SIZE - offset)
-			bytes = PAGE_SIZE - offset;
+		vma_remote_access_chunk(vma, addr, len, &offset, &bytes);
 
-		maddr = kmap_local_folio(folio, folio_page_idx(folio, page) * PAGE_SIZE);
+		maddr = kmap_local_folio(folio, folio_page_idx(folio, page) * PAGE_SIZE_KERNEL);
 		retval = strscpy(buf, maddr + offset, bytes);
 		if (retval >= 0) {
 			/* Found the end of the string */
@@ -7423,7 +7418,7 @@ static int __copy_remote_vm_str(struct mm_struct *mm, unsigned long addr,
 		 */
 		if (bytes != len) {
 			addr += bytes - 1;
-			copy_from_user_page(vma, page, addr, buf, maddr + (PAGE_SIZE - 1), 1);
+			copy_from_user_page(vma, page, addr, buf, maddr + offset + bytes - 1, 1);
 			buf += 1;
 			addr += 1;
 		}
