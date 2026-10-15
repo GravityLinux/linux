@@ -70,4 +70,21 @@ static inline pte_t mm_frame_pte(const struct mm_struct *mm,
 				(frame & P3S_SLICE_MASK) << PAGE_SHIFT_4KB);
 }
 
+/*
+ * vma_pfnmap_phys - Physical address of the frame a PFN mapping maps
+ * @vma: Pointer to struct vm_area_struct
+ * @addr: Virtual address within @vma
+ * @pfn: Kernel page frame number found by follow_pfnmap_start()
+ *
+ * Adds the slice that a 4KB compatibility VMA maps at @addr, as set up by
+ * remap_pfn_range() and insert_pfn().
+ */
+static inline phys_addr_t vma_pfnmap_phys(const struct vm_area_struct *vma,
+					  unsigned long addr,
+					  unsigned long pfn)
+{
+	return ((phys_addr_t)pfn << PAGE_SHIFT_KERNEL) +
+	       ((phys_addr_t)vma_slice_offset(vma, addr) << PAGE_SHIFT_4KB);
+}
+
 #endif /* __MM_P3S_PGTABLE_H */
