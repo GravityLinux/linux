@@ -16,7 +16,7 @@ use kernel::drm::{
     gem::{shmem, BaseObject, DriverObject},
     ioctl,
 };
-use kernel::sync::{Arc, Mutex};
+use kernel::sync::{Arc, CondVar, Mutex, MutexGuard};
 use kernel::sync::aref::ARef;
 use kernel::uaccess::{UserPtr, UserSlice};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
@@ -92,6 +92,9 @@ struct Vm {
     /// mapping.
     snapshot: Option<Arc<KVVec<Mapping>>>,
     pending: KVec<dma_fence::Fence>,
+    // Count overlapping drains. Submit to this VM sleeps until all finish;
+    // unrelated file ioctls and other VMs can still acquire file state.
+    draining: u32,
     reservation: ARef<Object>,
     render_support: Option<Arc<crate::g16::Support>>,
     render_ready: bool,
@@ -322,19 +325,26 @@ impl DriverObject for Buffer {
     }
 
     fn close(obj: &Object, file: &DrmFile) {
-        // Mesa may reuse this virtual address after GEM_CLOSE. Hold the file
-        // state against new submissions, and retire only VMs using this BO.
-        // Workers never acquire file state while completing their fences.
+        // Mesa may reuse this virtual address after GEM_CLOSE. Retire only
+        // VMs using this BO; hold file state for the final idle check and PTE
+        // edits, but release it while waiting for completion.
         let inner = file.inner();
         if inner.device.failed.load(Ordering::Acquire) {
             return;
         }
         let exiting = current_exiting();
         let mut state = inner.state.lock();
-        for vm in &mut state.vms {
-            if !vm.mappings.iter().any(|m| core::ptr::eq(&*m.obj, obj)) {
-                continue;
-            }
+        let mut cursor = 0;
+        loop {
+            // IDs never repeat. Re-find after each wait: another ioctl may
+            // destroy a VM or swap_remove an earlier vector entry meanwhile.
+            let Some(id) = state.vms.iter()
+                .filter(|vm| vm.id > cursor && vm.mappings.iter()
+                    .any(|m| core::ptr::eq(&*m.obj, obj)))
+                .map(|vm| vm.id).min()
+            else { break };
+            cursor = id;
+            let vm = state.vms.iter_mut().find(|vm| vm.id == id).unwrap();
             if vm.render_broken {
                 // Already failed: its mappings stay until the file goes
                 // away, and waiting again per object would only multiply
@@ -355,7 +365,12 @@ impl DriverObject for Buffer {
             // A live close: wait at most CLOSE_DRAIN_MS. Only a fatal signal
             // ends the wait early (the process is then exiting anyway); any
             // other signal is ignored, so a healthy client's VM stays usable.
-            if let Err(error) = drain_within(&mut vm.pending, CLOSE_DRAIN_MS, true /* killable */) {
+            let (relocked, result) = drain_vm(state, id, CLOSE_DRAIN_MS, true /* killable */, &inner.drained);
+            state = relocked;
+            let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) else {
+                continue;
+            };
+            if let Err(error) = result {
                 // This VM's own work hasn't completed: typically a job still
                 // waiting on an input fence that never signaled, or a hung
                 // client. Its mappings keep the backing pinned, so late DMA
@@ -420,6 +435,8 @@ pub(crate) struct File {
     device: DeviceRef,
     id: u64,
     state: Arc<Mutex<FileState>>,
+    #[pin]
+    drained: CondVar,
 }
 impl drm::file::DriverFile for File {
     type Driver = Driver;
@@ -428,6 +445,7 @@ impl drm::file::DriverFile for File {
             try_pin_init!(Self {
                 device: device.into(),
                 id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+                drained <- kernel::new_condvar!("m4-file-drain"),
                 state: Arc::pin_init(
                     kernel::new_mutex!(FileState {
                         next_vm: 1,
@@ -586,6 +604,7 @@ impl File {
                 mappings: KVVec::new(),
                 snapshot: None,
                 pending: KVec::new(),
+                draining: 0,
                 reservation,
                 render_support: None,
                 render_ready: false,
@@ -690,6 +709,9 @@ impl File {
             return Err(EINVAL);
         }
         let inner = file.inner();
+        // A later record may drain with state dropped, exposing earlier edits.
+        // The list is not atomic across that wait (nor was it on error);
+        // userspace must synchronize sparse binds with its submissions.
         let mut state = inner.state.lock();
         if !state.vms.iter().any(|vm| vm.id == data.vm_id && vm.visible) {
             return Err(ENOENT);
@@ -894,102 +916,122 @@ impl File {
         }
         let inner = file.inner();
         let mut state = inner.state.lock();
-        let vm = state
-            .vms
-            .iter_mut()
-            .find(|vm| vm.id == data.vm_id && vm.visible)
-            .ok_or(ENOENT)?;
+        if !state.vms.iter().any(|vm| vm.id == data.vm_id && vm.visible) {
+            return Err(ENOENT);
+        }
         for _ in 0..data.num_binds {
             let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(data.stride as usize)?;
-            let (flags, handle, offset, size, address) =
-                (bind.flags, bind.handle, bind.offset, bind.range, bind.addr);
-            let end = address.checked_add(size).ok_or(EINVAL)?;
-            if size == 0
-                || (address | size | offset) & 0x3fff != 0
-                || address < 0x4000
-                || end > VM_END
-                || (address < vm.kernel.end && end > vm.kernel.start)
-                || (address < 0x73_0000_0000 && end > 0x71_0000_0000)
-                || [
-                    (0x7000000000, 0x7000400000),
-                    (0x7000408000, 0x7000418000),
-                    (0x7000420000, 0x7002cb8000),
-                    (0x7003108000, 0x7005180000),
-                ]
-                .iter()
-                .any(|(base, limit)| address < *limit && end > *base)
-                || compute::private_ranges()
+            loop {
+                if device.failed.load(Ordering::Acquire) {
+                    return Err(EIO);
+                }
+                let vm = state.vms.iter_mut()
+                    .find(|vm| vm.id == data.vm_id && vm.visible).ok_or(ENOENT)?;
+                let (flags, handle, offset, size, address) =
+                    (bind.flags, bind.handle, bind.offset, bind.range, bind.addr);
+                let end = address.checked_add(size).ok_or(EINVAL)?;
+                if size == 0
+                    || (address | size | offset) & 0x3fff != 0
+                    || address < 0x4000
+                    || end > VM_END
+                    || (address < vm.kernel.end && end > vm.kernel.start)
+                    || (address < 0x73_0000_0000 && end > 0x71_0000_0000)
+                    || [
+                        (0x7000000000, 0x7000400000),
+                        (0x7000408000, 0x7000418000),
+                        (0x7000420000, 0x7002cb8000),
+                        (0x7003108000, 0x7005180000),
+                    ]
                     .iter()
-                    .any(|(base, len)| address < base + *len as u64 && end > *base)
-                || render::fixed_ranges()
-                    .iter()
-                    .any(|(base, len)| address < base + *len as u64 && end > *base)
-            {
-                return Err(EINVAL);
-            }
-            if flags == uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND {
-                if handle != 0 || offset != 0 {
+                    .any(|(base, limit)| address < *limit && end > *base)
+                    || compute::private_ranges()
+                        .iter()
+                        .any(|(base, len)| address < base + *len as u64 && end > *base)
+                    || render::fixed_ranges()
+                        .iter()
+                        .any(|(base, len)| address < base + *len as u64 && end > *base)
+                {
                     return Err(EINVAL);
                 }
-                // Only this VM can reference the removed mapping. Fresh
-                // binds never wait for hardware, including on this VM.
-                drain(&mut vm.pending)?;
-                let runtime = device.runtime.lock();
-                vm.unmap(address..end, &runtime)?;
-                continue;
-            }
-            let read = flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
-            let write = flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
-            let single = flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
-            if flags & !0xe != 0 || (!read && !write) {
-                return Err(EINVAL);
-            }
-            let bo = Object::lookup_handle(file, handle)?;
-            if bo.vm != 0 && (bo.vm != vm.id || bo.owner != inner.id) {
-                return Err(EINVAL);
-            }
-            if offset
-                .checked_add(if single { 0x4000 } else { size })
-                .ok_or(EINVAL)?
-                > bo.size() as u64
-            {
-                return Err(EINVAL);
-            }
-            let access = match (read, write) {
-                (true, true) => crate::pgtable::prot::PROT_GPU_SHARED_RW,
-                (true, false) => crate::pgtable::prot::PROT_GPU_SHARED_RO,
-                _ => crate::pgtable::prot::PROT_GPU_SHARED_WO,
-            };
-            // A bind replaces whatever the range held, as sparse residency
-            // and address replay rebind reserved ranges. Remove only the
-            // overlapping parts of existing mappings.
-            let mut overlaps = KVec::new();
-            for m in vm.mappings.iter() {
-                if address < m.range.end && end > m.range.start {
-                    overlaps.push(
-                        m.range.start.max(address)..m.range.end.min(end),
-                        GFP_KERNEL,
-                    )?;
+                if flags == uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_UNBIND {
+                    if handle != 0 || offset != 0 {
+                        return Err(EINVAL);
+                    }
+                    // Only this VM can reference the removed mapping. Fresh
+                    // binds never wait for hardware, including on this VM.
+                    if !vm.pending.is_empty() {
+                        let (relocked, result) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
+                        state = relocked;
+                        result?;
+                        // State stayed locked after the idle check. Revalidate
+                        // visibility and mappings changed by concurrent ioctls.
+                        continue;
+                    }
+                    let runtime = device.runtime.lock();
+                    vm.unmap(address..end, &runtime)?;
+                    break;
                 }
-            }
-            if !overlaps.is_empty() {
-                drain(&mut vm.pending)?;
-                let runtime = device.runtime.lock();
-                for range in overlaps.iter() {
-                    vm.unmap(range.clone(), &runtime)?;
+                let read = flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
+                let write = flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
+                let single = flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE != 0;
+                if flags & !0xe != 0 || (!read && !write) {
+                    return Err(EINVAL);
                 }
+                let bo = Object::lookup_handle(file, handle)?;
+                if bo.vm != 0 && (bo.vm != vm.id || bo.owner != inner.id) {
+                    return Err(EINVAL);
+                }
+                if offset
+                    .checked_add(if single { 0x4000 } else { size })
+                    .ok_or(EINVAL)?
+                    > bo.size() as u64
+                {
+                    return Err(EINVAL);
+                }
+                let access = match (read, write) {
+                    (true, true) => crate::pgtable::prot::PROT_GPU_SHARED_RW,
+                    (true, false) => crate::pgtable::prot::PROT_GPU_SHARED_RO,
+                    _ => crate::pgtable::prot::PROT_GPU_SHARED_WO,
+                };
+                // A bind replaces whatever the range held, as sparse residency
+                // and address replay rebind reserved ranges. Remove only the
+                // overlapping parts of existing mappings.
+                let mut overlaps = KVec::new();
+                for m in vm.mappings.iter() {
+                    if address < m.range.end && end > m.range.start {
+                        overlaps.push(
+                            m.range.start.max(address)..m.range.end.min(end),
+                            GFP_KERNEL,
+                        )?;
+                    }
+                }
+                if !overlaps.is_empty() {
+                    if !vm.pending.is_empty() {
+                        let (relocked, result) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
+                        state = relocked;
+                        result?;
+                        // State stayed locked after the idle check. Revalidate
+                        // visibility and mappings changed by concurrent ioctls.
+                        continue;
+                    }
+                    let runtime = device.runtime.lock();
+                    for range in overlaps.iter() {
+                        vm.unmap(range.clone(), &runtime)?;
+                    }
+                }
+                let runtime = device.runtime.lock();
+                vm.map(
+                    address..end,
+                    offset,
+                    bo.clone(),
+                    bo.sg_table(reg.pdev.as_ref())?,
+                    access,
+                    flags & 6,
+                    single,
+                    &runtime,
+                )?;
+                break;
             }
-            let runtime = device.runtime.lock();
-            vm.map(
-                address..end,
-                offset,
-                bo.clone(),
-                bo.sg_table(reg.pdev.as_ref())?,
-                access,
-                flags & 6,
-                single,
-                &runtime,
-            )?;
         }
         Ok(0)
     }
@@ -1238,10 +1280,7 @@ impl Vm {
 
 static FENCE_KEY: Pin<&kernel::sync::LockClassKey> = kernel::static_lock_class!();
 
-/// Wait only for actual worker completion, including on scheduler timeout.
-/// Callers hold admission or the affected file state, preventing new uses
-/// of the mappings protected by these fences.
-/// Diagnostics: the calling process's name, for hang reports.
+/// The calling process's name, for hang reports.
 fn current_comm() -> [u8; 16] {
     let task = kernel::current!();
     let leader = task.group_leader();
@@ -1290,6 +1329,68 @@ fn drain_within(pending: &mut KVec<dma_fence::Fence>, ms: u32, killable: bool) -
     }
     pending.clear();
     Ok(())
+}
+
+/// Block new submissions to this VM before dropping file state for waits.
+/// Overlapping drains share a counter: only the last one releases submitters.
+/// Return with state held through the caller's PTE edits, so clearing the
+/// barrier cannot let a new submit race those edits. No VM reference or vector
+/// index survives an unlock; all retries share one overall timeout.
+fn drain_vm<'a>(
+    mut state: MutexGuard<'a, FileState>,
+    id: u32,
+    ms: u32,
+    killable: bool,
+    changed: &CondVar,
+) -> (MutexGuard<'a, FileState>, Result) {
+    let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) else {
+        return (state, Err(ENOENT));
+    };
+    let Some(draining) = vm.draining.checked_add(1) else {
+        return (state, Err(EOVERFLOW));
+    };
+    vm.draining = draining;
+    let mutex = state.lock_ref();
+    let start = kernel::time::Instant::<kernel::time::Monotonic>::now();
+    let result = loop {
+        let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) else {
+            break Err(ENOENT);
+        };
+        vm.pending.retain(|f| {
+            // SAFETY: The vector owns each fence reference during the query.
+            !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+        });
+        let Some(fence) = vm.pending.first().cloned() else {
+            break Ok(());
+        };
+        let left = i64::from(ms) - start.elapsed().as_millis();
+        if left <= 0 {
+            break Err(ETIMEDOUT);
+        }
+        let step = kernel::time::msecs_to_jiffies(
+            if killable { left.min(100) } else { left } as u32,
+        );
+        drop(state);
+        // SAFETY: The local clone owns the fence throughout the unlocked wait.
+        let result = unsafe { bindings::dma_fence_wait_timeout(fence.raw(), false, step as _) };
+        state = mutex.lock();
+        if result < 0 {
+            break Err(Error::from_errno(result as i32));
+        }
+        if result == 0 && killable && fatal_signal_pending() {
+            break Err(EINTR);
+        }
+    };
+    if let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) {
+        vm.draining -= 1;
+        if vm.draining != 0 {
+            return (state, result);
+        }
+    }
+    // Also wake after VM removal: submit must re-find its queue and VM.
+    // Success, timeout and signal exits all release this drain's barrier.
+    changed.notify_all();
+    (state, result)
 }
 
 /// Whether the calling task has SIGKILL pending (fatal_signal_pending()).
@@ -2028,17 +2129,36 @@ impl File {
                 .count() as u32;
         }
         let inner = file.inner();
-        let mut admission = device.admission.lock();
-        if device.failed.load(Ordering::Acquire) {
-            return Err(EIO);
-        }
+        let (mut admission, mut state) = loop {
+            let admission = device.admission.lock();
+            if device.failed.load(Ordering::Acquire) {
+                return Err(EIO);
+            }
+            let mut state = inner.state.lock();
+            let queue = state.queues.iter()
+                .find(|q| q.id == data.queue_id).ok_or(ENOENT)?;
+            let vm = state.vms.iter().find(|vm| vm.id == queue.vm).ok_or(ENOENT)?;
+            if vm.draining == 0 {
+                break (admission, state);
+            }
+            // Wait atomically with state dropped. Drop admission as well:
+            // holding it would block submissions to unrelated VMs and other
+            // files and teardown paths that need admission before state.
+            drop(admission);
+            // No submission state has been published yet; let a signalled
+            // submitter leave without waiting for the drainer's whole budget.
+            if inner.drained.wait_interruptible(&mut state) {
+                return Err(ERESTARTSYS);
+            }
+            drop(state);
+            // Reacquire in admission -> state order and re-find both IDs.
+        };
         // Completed records no longer need lifetime bookkeeping.
         admission.retain(|f| {
             // SAFETY: The vector retains a live reference while queried.
             !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
         });
         admission.reserve(1, GFP_KERNEL)?;
-        let mut state = inner.state.lock();
         let queue = state
             .queues
             .iter()
