@@ -243,6 +243,20 @@ pub(crate) fn fw_cache_maint() -> bool {
     FW_CACHE_MAINT.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// Shared bounded text read; individual knobs retain their accepted syntax.
+fn knob_text<'a>(reader: &mut kernel::uaccess::UserSliceReader, buf: &'a mut [u8; 8]) -> Result<&'a str> {
+    let n = reader.len();
+    if n == 0 || n > buf.len() {
+        return Err(EINVAL);
+    }
+    reader.read_slice(&mut buf[..n])?;
+    Ok(core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?.trim())
+}
+
+fn knob_u32(reader: &mut kernel::uaccess::UserSliceReader) -> Result<u32> {
+    knob_text(reader, &mut [0; 8])?.parse().map_err(|_| EINVAL)
+}
+
 /// The debugfs view of `FW_CACHE_MAINT` (accepts 0 or 1).
 pub(crate) struct MaintKnob;
 
@@ -254,13 +268,8 @@ impl kernel::debugfs::Writer for MaintKnob {
 
 impl kernel::debugfs::Reader for MaintKnob {
     fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
-        let mut buf = [0u8; 8];
-        let n = reader.len();
-        if n == 0 || n > buf.len() {
-            return Err(EINVAL);
-        }
-        reader.read_slice(&mut buf[..n])?;
-        let value = match core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?.trim() {
+        let mut buf = [0; 8];
+        let value = match knob_text(reader, &mut buf)? {
             "0" => 0,
             "1" => 1,
             _ => return Err(EINVAL),
@@ -305,17 +314,7 @@ impl kernel::debugfs::Writer for CapKnob {
 impl kernel::debugfs::Reader for CapKnob {
     fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
         use core::sync::atomic::Ordering::Relaxed;
-        let mut buf = [0u8; 8];
-        let n = reader.len();
-        if n == 0 || n > buf.len() {
-            return Err(EINVAL);
-        }
-        reader.read_slice(&mut buf[..n])?;
-        let value: u32 = core::str::from_utf8(&buf[..n])
-            .map_err(|_| EINVAL)?
-            .trim()
-            .parse()
-            .map_err(|_| EINVAL)?;
+        let value = knob_u32(reader)?;
         let (queue, lane) = if self.lane {
             (QUEUE_CAP.load(Relaxed), value)
         } else {
@@ -357,6 +356,10 @@ pub(crate) struct FlagKnob {
 }
 
 impl FlagKnob {
+    pub(crate) fn init(&self, value: u32) {
+        self.cell.store(value.min(self.max), core::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal", max: 2 };
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
     pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
@@ -373,17 +376,7 @@ impl kernel::debugfs::Writer for FlagKnob {
 
 impl kernel::debugfs::Reader for FlagKnob {
     fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
-        let mut buf = [0u8; 8];
-        let n = reader.len();
-        if n == 0 || n > buf.len() {
-            return Err(EINVAL);
-        }
-        reader.read_slice(&mut buf[..n])?;
-        let value: u32 = core::str::from_utf8(&buf[..n])
-            .map_err(|_| EINVAL)?
-            .trim()
-            .parse()
-            .map_err(|_| EINVAL)?;
+        let value = knob_u32(reader)?;
         if value > self.max {
             return Err(EINVAL);
         }

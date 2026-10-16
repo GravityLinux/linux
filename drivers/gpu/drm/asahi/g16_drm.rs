@@ -161,13 +161,8 @@ pub(crate) struct Data {
     _profile: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>>,
     _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
-    _early: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
-    _dep_elide: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
+    _flags: KVec<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>>,
     _dep_stats: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::DepStats>>>,
-    _read_opt: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
-    _safety_poll: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
-    _scratch_zero: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
-    _profile_knob: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>,
     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
 }
@@ -231,56 +226,22 @@ pub(crate) fn register<'a>(
         dir.read_write_file(c_str!("lane_cap"), crate::g16_timeline::CapKnob::LANE),
         GFP_KERNEL,
     )?;
-    crate::g16_timeline::EARLY_SIGNAL.store(
-        crate::module_parameters::early_signal.value().min(2),
-        Ordering::Relaxed,
-    );
-    crate::g16_timeline::PROFILE.store(
-        crate::module_parameters::profile.value().min(1),
-        Ordering::Relaxed,
-    );
-    let profile_knob = KBox::pin_init(
-        dir.read_write_file(c_str!("profile"), crate::g16_timeline::FlagKnob::PROFILE),
-        GFP_KERNEL,
-    )?;
-    crate::g16_timeline::DEP_ELIDE.store(
-        crate::module_parameters::dep_elide.value().min(7),
-        Ordering::Relaxed,
-    );
-    let dep_elide = KBox::pin_init(
-        dir.read_write_file(c_str!("dep_elide"), crate::g16_timeline::FlagKnob::DEP_ELIDE),
-        GFP_KERNEL,
-    )?;
-    crate::g16_timeline::READ_OPT.store(
-        crate::module_parameters::read_opt.value().min(1),
-        Ordering::Relaxed,
-    );
-    let read_opt = KBox::pin_init(
-        dir.read_write_file(c_str!("read_opt"), crate::g16_timeline::FlagKnob::READ_OPT),
-        GFP_KERNEL,
-    )?;
-    crate::g16_timeline::SAFETY_POLL_MS.store(
-        crate::module_parameters::safety_poll_ms.value().min(10000),
-        Ordering::Relaxed,
-    );
-    let safety_poll = KBox::pin_init(
-        dir.read_write_file(c_str!("safety_poll_ms"), crate::g16_timeline::FlagKnob::SAFETY_POLL_MS),
-        GFP_KERNEL,
-    )?;
-    crate::g16_timeline::SCRATCH_ZERO.store(
-        crate::module_parameters::scratch_zero.value().min(2),
-        Ordering::Relaxed,
-    );
-    let scratch_zero = KBox::pin_init(
-        dir.read_write_file(c_str!("scratch_zero"), crate::g16_timeline::FlagKnob::SCRATCH_ZERO),
-        GFP_KERNEL,
-    )?;
+    use crate::g16_timeline::FlagKnob;
+    let knobs = [
+        (c_str!("early_signal"), FlagKnob::EARLY_SIGNAL, crate::module_parameters::early_signal.value()),
+        (c_str!("profile"), FlagKnob::PROFILE, crate::module_parameters::profile.value()),
+        (c_str!("dep_elide"), FlagKnob::DEP_ELIDE, crate::module_parameters::dep_elide.value()),
+        (c_str!("read_opt"), FlagKnob::READ_OPT, crate::module_parameters::read_opt.value()),
+        (c_str!("safety_poll_ms"), FlagKnob::SAFETY_POLL_MS, crate::module_parameters::safety_poll_ms.value()),
+        (c_str!("scratch_zero"), FlagKnob::SCRATCH_ZERO, crate::module_parameters::scratch_zero.value()),
+    ];
+    let mut flags = KVec::with_capacity(knobs.len(), GFP_KERNEL)?;
+    for (name, knob, value) in knobs {
+        knob.init(value);
+        flags.push(KBox::pin_init(dir.read_write_file(name, knob), GFP_KERNEL)?, GFP_KERNEL)?;
+    }
     let dep_stats = KBox::pin_init(
         dir.read_only_file(c_str!("dep_stats"), crate::g16_timeline::DepStats),
-        GFP_KERNEL,
-    )?;
-    let early = KBox::pin_init(
-        dir.read_write_file(c_str!("early_signal"), crate::g16_timeline::FlagKnob::EARLY_SIGNAL),
         GFP_KERNEL,
     )?;
     let maint = KBox::pin_init(
@@ -321,13 +282,8 @@ pub(crate) fn register<'a>(
         _profile: profile,
         _maint: maint,
         _queue_cap: queue_cap,
-        _early: early,
-        _dep_elide: dep_elide,
+        _flags: flags,
         _dep_stats: dep_stats,
-        _read_opt: read_opt,
-        _safety_poll: safety_poll,
-        _scratch_zero: scratch_zero,
-        _profile_knob: profile_knob,
         _lane_cap: lane_cap,
         _debugfs: dir, });
     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
