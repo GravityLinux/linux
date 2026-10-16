@@ -5,6 +5,8 @@
 //! T8132 compute work and microsequence encoding. All links are supplied by
 //! the owner of the work allocation, independently of Rust structure layout.
 
+use crate::util::{put32 as u32_at, put64 as u64_at};
+
 pub(crate) const QUEUE: u64 = 0xffff_fc20_c500_0000;
 pub(crate) const STATS: u64 = QUEUE + 0x8000;
 pub(crate) const SHARED: u64 = 0xffff_fc20_0200_0000;
@@ -58,12 +60,6 @@ pub(crate) fn support() -> [u8; 0x100] {
     out
 }
 
-fn u32_at(out: &mut [u8], off: usize, value: u32) {
-    out[off..off + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn u64_at(out: &mut [u8], off: usize, value: u64) {
-    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Parameters {

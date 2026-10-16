@@ -5,6 +5,8 @@
 //! G16 firmware initialization descriptors, serialized independently of Rust
 //! structure alignment. Fields follow the source-built m1n1 G16 model.
 
+use crate::util::{put64};
+
 #[path = "g16_queue.rs"]
 pub(crate) mod queue;
 
@@ -76,9 +78,6 @@ pub(crate) fn operand_page(index: usize) -> u64 {
     0x70_0042_0000 + (index / 512) as u64 * 0x208000 + (index % 512) as u64 * 0x1000
 }
 
-fn put64(out: &mut [u8], offset: usize, value: u64) {
-    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
 
 /// Three independent cursor addresses followed by the ring address.
 pub(crate) struct Channel {

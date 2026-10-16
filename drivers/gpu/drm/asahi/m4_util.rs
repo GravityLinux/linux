@@ -65,3 +65,12 @@ impl<'a> Reader<'a> {
         self.offset >= self.buffer.len()
     }
 }
+
+/// Write a firmware ABI word in little-endian byte order.
+pub(crate) fn put32(out: &mut [u8], offset: usize, value: u32) {
+    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+pub(crate) fn put64(out: &mut [u8], offset: usize, value: u64) {
+    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}

@@ -4,6 +4,8 @@
 //! Live platform inputs and initialization builders from g16g_platform.py and
 //! g16g_initdata.py. Firmware data is built from explicit bootloader properties.
 
+use crate::util::{put32, put64};
+
 use kernel::{c_str, device, of, prelude::*};
 
 const PAGE: u64 = 0x4000;
@@ -12,13 +14,7 @@ const REGISTER_LIMIT: u64 = 0xffff_fc21_8100_0000;
 const MCC_BASE: u64 = 0x2201c4000;
 const MCC_SIZE: u32 = 0x18000;
 
-pub(crate) fn put32(out: &mut [u8], offset: usize, value: u32) {
-    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
 
-pub(crate) fn put64(out: &mut [u8], offset: usize, value: u64) {
-    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
 
 pub(crate) fn zeroed(size: usize) -> Result<KVec<u8>> {
     let mut out = KVec::new();

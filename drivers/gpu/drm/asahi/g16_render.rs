@@ -6,6 +6,8 @@
 //! Ported from the open m1n1 G16/G17 register model. Addresses and lifecycle
 //! values are supplied by the runtime; geometry is derived from each render.
 
+use crate::util::{put32 as u32_at, put64 as u64_at};
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Parameters {
     pub(crate) vdm_barrier_fragment: bool,
@@ -383,12 +385,6 @@ pub(crate) fn pack_registers(records: &[(u32, u64)]) -> Option<[u8; 0x600]> {
     Some(out)
 }
 
-fn u32_at(out: &mut [u8], offset: usize, value: u32) {
-    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn u64_at(out: &mut [u8], offset: usize, value: u64) {
-    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Addresses {

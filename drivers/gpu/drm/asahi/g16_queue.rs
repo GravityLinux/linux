@@ -4,12 +4,8 @@
 
 //! G16 queue transport fields, independent of allocation addresses.
 
-fn u32_at(out: &mut [u8], offset: usize, value: u32) {
-    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn u64_at(out: &mut [u8], offset: usize, value: u64) {
-    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
+use crate::util::{put32 as u32_at, put64 as u64_at};
+
 
 pub(crate) struct Queue {
     pub(crate) pointers: u64,

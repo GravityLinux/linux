@@ -7,8 +7,10 @@
 use crate::{
     f32,
     float::F32,
-    g16_platform::{adt_word, put32, put64, zeroed, Platform},
+    g16_platform::{adt_word, zeroed, Platform},
 };
+use crate::util::{put32, put64};
+
 use kernel::{c_str, prelude::*};
 
 fn putf(out: &mut [u8], offset: usize, value: F32) -> Result {
