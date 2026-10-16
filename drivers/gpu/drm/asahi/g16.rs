@@ -211,23 +211,9 @@ const BOOT_JOBS: u64 = 0xffff_fc20_0000_0030;
 const BOOT_CONTEXT: u64 = 0xffff_fc20_c050_8080;
 const BOOT_BARRIER: u64 = 0xffff_fc20_c052_0080;
 
-pub(crate) struct Bootstrap {
-    dev: ARef<platform::Device>,
-    pub(crate) notifications: Arc<Notifications>,
-    _rtkit: Pin<KBox<rtkit::RtKit<BootOps>>>,
-    _asc: DevresIoMem<0x4000>,
-    _sgx: DevresIoMem<0x4000000>,
-    _handoff: io::mem::Mem,
-    _address_space: Option<crate::g16_vm::AddressSpace>,
-    _firmware_space: Option<crate::g16_vm::FirmwareSpace>,
-    _opening_client: Option<crate::g16_vm::AddressSpace>,
-    timestamp_ranges: KVec<core::ops::Range<u64>>,
-    opening_notification_pending: bool,
-    pub(crate) gpu_revision: u32,
-    pub(crate) core_mask: u32,
-    pub(crate) maximum_frequency_khz: u32,
-    tvb_pools: KVec<crate::g16_tvb::Tvb>,
-    render_publication: u64,
+/// Hang evidence is always available, independently of runtime tracing knobs.
+/// Keep its state on the heap rather than growing the firmware probe frame.
+struct Diagnostics {
     /// A4 wedge detection state (check_wedge).
     wedge_since: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     /// read_opt: when check_wedge last sampled (it reads every render
@@ -251,6 +237,32 @@ pub(crate) struct Bootstrap {
     stale_recent: KVec<(i64, u64, u32, u32, u32, bool)>,
     stale_next: usize,
     recent_ring: render_runtime::RenderRing,
+    pressure_reported: core::sync::atomic::AtomicU64,
+    /// Backpressure bits seen since the last take_pressure() (timeline=1).
+    pressure_seen: core::sync::atomic::AtomicU64,
+    hold_key: core::sync::atomic::AtomicU64,
+    hold_since_ns: core::sync::atomic::AtomicI64,
+    hold_near_misses: core::sync::atomic::AtomicU32,
+}
+
+pub(crate) struct Bootstrap {
+    dev: ARef<platform::Device>,
+    pub(crate) notifications: Arc<Notifications>,
+    _rtkit: Pin<KBox<rtkit::RtKit<BootOps>>>,
+    _asc: DevresIoMem<0x4000>,
+    _sgx: DevresIoMem<0x4000000>,
+    _handoff: io::mem::Mem,
+    _address_space: Option<crate::g16_vm::AddressSpace>,
+    _firmware_space: Option<crate::g16_vm::FirmwareSpace>,
+    _opening_client: Option<crate::g16_vm::AddressSpace>,
+    timestamp_ranges: KVec<core::ops::Range<u64>>,
+    opening_notification_pending: bool,
+    pub(crate) gpu_revision: u32,
+    pub(crate) core_mask: u32,
+    pub(crate) maximum_frequency_khz: u32,
+    tvb_pools: KVec<crate::g16_tvb::Tvb>,
+    render_publication: u64,
+    diagnostics: KBox<Diagnostics>,
     next_work_va: u64,
     /// Queue identities and TVB pools; see render_runtime::OBJECT_BASE.
     next_object_va: u64,
@@ -283,12 +295,6 @@ pub(crate) struct Bootstrap {
     batch_works: usize,
     context_roots: [Option<crate::g16_vm::Roots>; 64],
     context_users: [u32; 64],
-    pressure_reported: core::sync::atomic::AtomicU64,
-    /// Backpressure bits seen since the last take_pressure() (timeline=1).
-    pressure_seen: core::sync::atomic::AtomicU64,
-    hold_key: core::sync::atomic::AtomicU64,
-    hold_since_ns: core::sync::atomic::AtomicI64,
-    hold_near_misses: core::sync::atomic::AtomicU32,
     render_support: kernel::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 
@@ -757,23 +763,7 @@ impl Bootstrap {
             "G16: Linux-built root/main descriptors mapped at {:#x}; not yet published\n",
             crate::g16_fw::ROOT_ADDRESS
         );
-        let mut session = Self {
-            dev: pdev.into(),
-            notifications,
-            _rtkit: rtkit,
-            _asc: asc,
-            _sgx: sgx,
-            _handoff: handoff,
-            _address_space: Some(address_space),
-            _firmware_space: Some(firmware_space),
-            _opening_client: Some(opening_client),
-            timestamp_ranges: KVec::new(),
-            opening_notification_pending: true,
-            gpu_revision,
-            core_mask: platform.core_mask,
-            maximum_frequency_khz: platform.max_frequency() * 1000,
-            tvb_pools: KVec::new(),
-            render_publication: crate::module_parameters::fw_counter_start.value(),
+        let diagnostics = KBox::init(try_init!(Diagnostics {
             wedge_since: None,
             wedge_sampled: None,
             wedge_signature: 0,
@@ -798,6 +788,30 @@ impl Bootstrap {
             },
             stale_next: 0,
             recent_ring: render_runtime::RenderRing::new(),
+            pressure_reported: core::sync::atomic::AtomicU64::new(0),
+            pressure_seen: core::sync::atomic::AtomicU64::new(0),
+            hold_key: core::sync::atomic::AtomicU64::new(0),
+            hold_since_ns: core::sync::atomic::AtomicI64::new(0),
+            hold_near_misses: core::sync::atomic::AtomicU32::new(0),
+        }), GFP_KERNEL)?;
+        let mut session = Self {
+            dev: pdev.into(),
+            notifications,
+            _rtkit: rtkit,
+            _asc: asc,
+            _sgx: sgx,
+            _handoff: handoff,
+            _address_space: Some(address_space),
+            _firmware_space: Some(firmware_space),
+            _opening_client: Some(opening_client),
+            timestamp_ranges: KVec::new(),
+            opening_notification_pending: true,
+            gpu_revision,
+            core_mask: platform.core_mask,
+            maximum_frequency_khz: platform.max_frequency() * 1000,
+            tvb_pools: KVec::new(),
+            render_publication: crate::module_parameters::fw_counter_start.value(),
+            diagnostics,
             next_work_va: render_runtime::WORK_BASE,
             next_object_va: render_runtime::OBJECT_BASE,
             work_arenas: [0..0, 0..0],
@@ -818,11 +832,6 @@ impl Bootstrap {
             batch_works: 0,
             context_roots: [None; 64],
             context_users: [0; 64],
-            pressure_reported: core::sync::atomic::AtomicU64::new(0),
-            pressure_seen: core::sync::atomic::AtomicU64::new(0),
-            hold_key: core::sync::atomic::AtomicU64::new(0),
-            hold_since_ns: core::sync::atomic::AtomicI64::new(0),
-            hold_near_misses: core::sync::atomic::AtomicU32::new(0),
             render_support: kernel::sync::Arc::new(
                 core::sync::atomic::AtomicU64::new(0),
                 GFP_KERNEL,

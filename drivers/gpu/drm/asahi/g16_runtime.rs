@@ -439,11 +439,11 @@ impl Bootstrap {
     /// and logged as a near miss.
     fn hold_check(&self, kind: &str, dep: &Stamp, now: u32, done: bool) -> Result {
         let key = dep.address ^ (u64::from(dep.value) << 32).rotate_left(16);
-        let recorded = self.hold_key.load(Ordering::Relaxed);
+        let recorded = self.diagnostics.hold_key.load(Ordering::Relaxed);
         if done {
             if recorded == key {
-                self.hold_key.store(0, Ordering::Relaxed);
-                let misses = self.hold_near_misses.fetch_add(1, Ordering::Relaxed) + 1;
+                self.diagnostics.hold_key.store(0, Ordering::Relaxed);
+                let misses = self.diagnostics.hold_near_misses.fetch_add(1, Ordering::Relaxed) + 1;
                 if misses <= 16 {
                     dev_info!(self.dev.as_ref(),
                               "G16: {} wait on stamp {:#x} want {:#x} resolved after being unreachable with nothing in flight (near miss #{})\n",
@@ -454,20 +454,20 @@ impl Bootstrap {
         }
         if !self.flights.is_empty() {
             if recorded == key {
-                self.hold_key.store(0, Ordering::Relaxed);
+                self.diagnostics.hold_key.store(0, Ordering::Relaxed);
             }
             return Ok(());
         }
         let now_ns = monotonic_ns();
         if recorded != key {
-            self.hold_key.store(key, Ordering::Relaxed);
-            self.hold_since_ns.store(now_ns, Ordering::Relaxed);
+            self.diagnostics.hold_key.store(key, Ordering::Relaxed);
+            self.diagnostics.hold_since_ns.store(now_ns, Ordering::Relaxed);
             return Ok(());
         }
-        if now_ns - self.hold_since_ns.load(Ordering::Relaxed) < 1_000_000_000 {
+        if now_ns - self.diagnostics.hold_since_ns.load(Ordering::Relaxed) < 1_000_000_000 {
             return Ok(());
         }
-        self.hold_key.store(0, Ordering::Relaxed);
+        self.diagnostics.hold_key.store(0, Ordering::Relaxed);
         dev_err!(
             self.dev.as_ref(),
             "G16: {} wait on stamp {:#x} want {:#x} (now {:#x}, event {}) unreachable with nothing in flight for 1 s; failing the command\n",
@@ -478,11 +478,11 @@ impl Bootstrap {
 
     /// Backpressure bits recorded since the previous call (timeline=1).
     pub(crate) fn take_pressure(&self) -> u64 {
-        self.pressure_seen.swap(0, Ordering::Relaxed)
+        self.diagnostics.pressure_seen.swap(0, Ordering::Relaxed)
     }
 
     fn report_pressure(&self, bit: u64, resource: &str) {
-        self.pressure_seen.fetch_or(bit, Ordering::Relaxed);
+        self.diagnostics.pressure_seen.fetch_or(bit, Ordering::Relaxed);
         // Every resource here is released when work retires. Backpressure with
         // nothing in flight can therefore never clear: it means an accounting
         // leak, and submission stalls indefinitely with an idle GPU. Always
@@ -490,7 +490,7 @@ impl Bootstrap {
         // ring and scene pressure under load stays behind fw_trace & 2.
         let persistent = bit & (1 | 8) != 0 || self.flights.is_empty();
         if (persistent || crate::module_parameters::fw_trace.value() & 2 != 0)
-            && self.pressure_reported.fetch_or(bit, Ordering::Relaxed) & bit == 0
+            && self.diagnostics.pressure_reported.fetch_or(bit, Ordering::Relaxed) & bit == 0
         {
             let asids = (1..64).filter(|&i| self.context_users[i] != 0).count();
             dev_info!(
@@ -526,8 +526,8 @@ impl Bootstrap {
     /// already mapped into; the device alias exists for every reused slot.
     fn allocate_work(&mut self, render: bool) -> Result<(u64, Option<u64>)> {
         use crate::pgtable::prot::{PROT_FW_PRIV_RW, PROT_FW_SHARED_RW};
-        if self.retire_log.capacity() < RETIRE_LOG {
-            self.retire_log.reserve(RETIRE_LOG, GFP_KERNEL)?;
+        if self.diagnostics.retire_log.capacity() < RETIRE_LOG {
+            self.diagnostics.retire_log.reserve(RETIRE_LOG, GFP_KERNEL)?;
         }
         let index = usize::from(render);
         if let Some((va, root)) = self.free_work[index].pop() {
@@ -1687,12 +1687,13 @@ impl Bootstrap {
                 retired: Instant::now(),
             };
             // Retirement must not allocate: capacity is reserved up front.
-            if self.retire_log.len() < RETIRE_LOG {
-                let _ = self.retire_log.push_within_capacity(entry);
+            if self.diagnostics.retire_log.len() < RETIRE_LOG {
+                let _ = self.diagnostics.retire_log.push_within_capacity(entry);
             } else {
-                self.retire_log[self.retire_next % RETIRE_LOG] = entry;
+                let slot = self.diagnostics.retire_next % RETIRE_LOG;
+                self.diagnostics.retire_log[slot] = entry;
             }
-            self.retire_next = self.retire_next.wrapping_add(1);
+            self.diagnostics.retire_next = self.diagnostics.retire_next.wrapping_add(1);
             flight.client.lock().release_scratch(flight.scratch)?;
             self.free_work[usize::from(render_work)].push((id, root), GFP_KERNEL)?;
             self.retired.push_within_capacity((id, limited)).map_err(|_| ENOMEM)?;
@@ -1712,9 +1713,9 @@ impl Bootstrap {
         // 2 s), not one per pump pass: each sample reads two stamps per
         // outstanding render and 36 channel registers.
         let sample = !crate::g16_timeline::read_opt()
-            || self.wedge_sampled.is_none_or(|t| t.elapsed().as_millis() >= 50);
+            || self.diagnostics.wedge_sampled.is_none_or(|t| t.elapsed().as_millis() >= 50);
         if sample {
-            self.wedge_sampled = Some(Instant::now());
+            self.diagnostics.wedge_sampled = Some(Instant::now());
             let before = crate::g16_timeline::reads();
             let checked = self.check_wedge();
             crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_WEDGE, before);
@@ -1771,7 +1772,7 @@ impl Bootstrap {
         // A recorded unreachable hold is re-checked within its grace second.
         let watchdog = if self.flights.iter().any(|f| f.render.is_some()) {
             watchdog.min(250)
-        } else if self.hold_key.load(Ordering::Relaxed) != 0 {
+        } else if self.diagnostics.hold_key.load(Ordering::Relaxed) != 0 {
             watchdog.min(500)
         } else {
             watchdog
@@ -1925,7 +1926,7 @@ impl Bootstrap {
         }
         crate::mem::sync();
         if let Some(next) = roots {
-            self.handovers[index] = Some(Handover {
+            self.diagnostics.handovers[index] = Some(Handover {
                 at: Instant::now(),
                 previous: self.context_roots[index].map_or(0, |r| r.low),
                 next: next.low,
@@ -3362,7 +3363,7 @@ impl Bootstrap {
     fn dump_render(&mut self, a: &render::Addresses, tgid: (i32, [u8; 16]), vm_root: u64, stream: u64, ordinal: u64, pages: [(u32, u64, u64); 8], ta: &[u8], frag: &[u8]) {
         let recent = crate::module_parameters::dump_render_recent.value() as usize;
         if recent != 0 {
-            self.recent_ring.record(recent, RenderDump::new(a, tgid, vm_root, stream, ordinal, pages), ta, frag);
+            self.diagnostics.recent_ring.record(recent, RenderDump::new(a, tgid, vm_root, stream, ordinal, pages), ta, frag);
         }
         let ring = crate::module_parameters::dump_render_buffered.value() as usize;
         let enabled = ring != 0 || crate::module_parameters::dump_render_to.value() != 0;
@@ -3373,7 +3374,7 @@ impl Bootstrap {
             if crate::module_parameters::dump_render_to.value() != 0 && !dump_window(ordinal) {
                 return;
             }
-            self.render_ring.record(ring, RenderDump::new(a, tgid, vm_root, stream, ordinal, pages), ta, frag);
+            self.diagnostics.render_ring.record(ring, RenderDump::new(a, tgid, vm_root, stream, ordinal, pages), ta, frag);
             return;
         }
         if !dump_window(ordinal) {
@@ -3392,19 +3393,19 @@ impl Bootstrap {
         let now = monotonic_ns();
         pr_info!("G16: render rings printed at={}.{:06}\n", now / 1_000_000_000, (now % 1_000_000_000) / 1000);
         if crate::module_parameters::dump_render_buffered.value() != 0
-            && self.render_ring.print("ring", |_| true) == 0
+            && self.diagnostics.render_ring.print("ring", |_| true) == 0
         {
-            pr_info!("G16: ring holds no matching renders ({} recorded since boot)\n", self.render_ring.next);
+            pr_info!("G16: ring holds no matching renders ({} recorded since boot)\n", self.diagnostics.render_ring.next);
         }
         if crate::module_parameters::dump_render_recent.value() == 0 {
             return;
         }
         // Everything submitted just before the hang, on every context and
         // VM; each header names its tgid, VM, context and size.
-        let printed = self.recent_ring.print("recent", |_| true);
+        let printed = self.diagnostics.recent_ring.print("recent", |_| true);
         pr_info!(
             "G16: recent renders: {} printed ({} recorded since boot)\n",
-            printed, self.recent_ring.next
+            printed, self.diagnostics.recent_ring.next
         );
     }
 
@@ -3416,19 +3417,19 @@ impl Bootstrap {
             pr_info!(
                 "G16: event summary at={}.{:06} (VM {:#x} detached): {} stale ({} live, {} live on own predecessor) of {} waits since boot\n",
                 now / 1_000_000_000, (now % 1_000_000_000) / 1000, vm_root,
-                self.stale_event_tags, self.stale_live_tags, self.stale_live_own_tags, self.dependency_waits
+                self.diagnostics.stale_event_tags, self.diagnostics.stale_live_tags, self.diagnostics.stale_live_own_tags, self.diagnostics.dependency_waits
             );
         }
         if crate::module_parameters::dump_render_buffered.value() != 0 {
-            let printed = self.render_ring.print("exit", |e| e.vm_root == vm_root);
+            let printed = self.diagnostics.render_ring.print("exit", |e| e.vm_root == vm_root);
             // Always say so, so an empty result is not mistaken for no hook.
             pr_info!(
                 "G16: exit ring vm root {:#x}: {} matching renders printed, {} recorded since boot\n",
-                vm_root, printed, self.render_ring.next
+                vm_root, printed, self.diagnostics.render_ring.next
             );
         }
-        self.render_ring.forget(vm_root);
-        self.recent_ring.forget(vm_root);
+        self.diagnostics.render_ring.forget(vm_root);
+        self.diagnostics.recent_ring.forget(vm_root);
     }
 }
 
@@ -3471,14 +3472,14 @@ impl Bootstrap {
         for flight in self.flights.iter().filter(|f| f.render.is_some()).take(8) {
             let slot = flight.context as usize;
             let root = flight.render.as_ref().map_or(0, |r| r.root);
-            match self.handovers.get(slot).copied().flatten() {
+            match self.diagnostics.handovers.get(slot).copied().flatten() {
                 Some(h) => {
                     let other = if h.next == root { "" } else { " (not to this Work's VM)" };
                     dev_err!(self.dev.as_ref(),
                         "G16: hang history Work={:#x} slot {}: rebound {:#x} -> {:#x} {} us before submit{}\n",
                         flight.id, slot, h.previous, h.next, micros(flight.started, h.at),
                         other);
-                    if let Some(r) = self.retire_log.iter()
+                    if let Some(r) = self.diagnostics.retire_log.iter()
                         .filter(|r| r.context as usize == slot && r.root == h.previous)
                         .max_by_key(|r| micros(r.retired, flight.started))
                     {
@@ -3491,7 +3492,7 @@ impl Bootstrap {
                 None => dev_err!(self.dev.as_ref(),
                     "G16: hang history Work={:#x} slot {}: no rebind recorded\n", flight.id, slot),
             }
-            match self.retire_log.iter().filter(|r| r.work == flight.id).max_by_key(|r| micros(r.retired, flight.started)) {
+            match self.diagnostics.retire_log.iter().filter(|r| r.work == flight.id).max_by_key(|r| micros(r.retired, flight.started)) {
                 Some(r) => dev_err!(self.dev.as_ref(),
                     "G16: hang history   Work memory last used by tgid={} comm={} slot {} ordinal={} vm {:#x}: submitted {} us and retired {} us before this submit\n",
                     r.tgid, comm_str(&r.comm), r.context, r.ordinal, r.root,
@@ -3541,10 +3542,10 @@ impl Bootstrap {
     /// Diagnostics: the event a lane's queue signals now, by the lane's
     /// firmware stamp address (the address cross-queue waits name).
     fn set_lane_event(&mut self, stamp: u64, event: u32) {
-        if let Some(entry) = self.lane_events.iter_mut().find(|e| e.0 == stamp) {
+        if let Some(entry) = self.diagnostics.lane_events.iter_mut().find(|e| e.0 == stamp) {
             entry.1 = event;
         } else {
-            let _ = self.lane_events.push((stamp, event), GFP_KERNEL);
+            let _ = self.diagnostics.lane_events.push((stamp, event), GFP_KERNEL);
         }
     }
 
@@ -3553,29 +3554,29 @@ impl Bootstrap {
     #[inline(never)]
     fn note_dependency_events(&mut self, dependencies: &[Option<Stamp>; 2], own: [u64; 3]) {
         for dep in dependencies.iter().flatten() {
-            let Some(&(_, current)) = self.lane_events.iter().find(|e| e.0 == dep.address) else {
+            let Some(&(_, current)) = self.diagnostics.lane_events.iter().find(|e| e.0 == dep.address) else {
                 continue;
             };
-            self.dependency_waits = self.dependency_waits.wrapping_add(1);
+            self.diagnostics.dependency_waits = self.diagnostics.dependency_waits.wrapping_add(1);
             if current != dep.event {
-                self.stale_event_tags = self.stale_event_tags.wrapping_add(1);
+                self.diagnostics.stale_event_tags = self.diagnostics.stale_event_tags.wrapping_add(1);
                 // Is the stale tag's index live for some other queue right
                 // now (its event fires for them), or free?
                 let index = dep.event.wrapping_sub(32) / 3;
                 let live = index < 32
                     && self.queue_events.load(Ordering::Acquire) & (1 << index) != 0;
                 if live {
-                    self.stale_live_tags = self.stale_live_tags.wrapping_add(1);
+                    self.diagnostics.stale_live_tags = self.diagnostics.stale_live_tags.wrapping_add(1);
                     // A wait on the publishing queue's own lane: its
                     // predecessor Work, published before an idle gap.
                     if own.contains(&dep.address) {
-                        self.stale_live_own_tags = self.stale_live_own_tags.wrapping_add(1);
+                        self.diagnostics.stale_live_own_tags = self.diagnostics.stale_live_own_tags.wrapping_add(1);
                     }
                 }
-                let slot = self.stale_next % self.stale_recent.len();
-                self.stale_recent[slot] = (monotonic_ns(), dep.address, dep.value, dep.event, current, live);
-                self.stale_next = self.stale_next.wrapping_add(1);
-                if crate::module_parameters::fw_trace.value() & 256 != 0 && self.stale_event_tags <= 64 {
+                let slot = self.diagnostics.stale_next % self.diagnostics.stale_recent.len();
+                self.diagnostics.stale_recent[slot] = (monotonic_ns(), dep.address, dep.value, dep.event, current, live);
+                self.diagnostics.stale_next = self.diagnostics.stale_next.wrapping_add(1);
+                if crate::module_parameters::fw_trace.value() & 256 != 0 && self.diagnostics.stale_event_tags <= 64 {
                     pr_info!(
                         "G16: stale event tag: wait on {:#x} want {:#x} names event {}, its queue now holds {}{}\n",
                         dep.address, dep.value, dep.event, current,
@@ -3589,19 +3590,19 @@ impl Bootstrap {
     /// Hang report: stale-tag totals and the event each known lane holds.
     fn print_lane_events(&self) {
         dev_err!(self.dev.as_ref(), "G16: hang events: {} stale ({} on an index live for another queue, {} of those on the queue's own predecessor) of {} waits since boot; events in use {:#010x}\n",
-                 self.stale_event_tags, self.stale_live_tags, self.stale_live_own_tags, self.dependency_waits,
+                 self.diagnostics.stale_event_tags, self.diagnostics.stale_live_tags, self.diagnostics.stale_live_own_tags, self.diagnostics.dependency_waits,
                  self.queue_events.load(Ordering::Acquire) & 0xffff_ffff);
         // The most recent stale tags, oldest first.
-        let len = self.stale_recent.len();
-        let count = self.stale_next.min(len);
+        let len = self.diagnostics.stale_recent.len();
+        let count = self.diagnostics.stale_next.min(len);
         for i in 0..count {
-            let (at, stamp, value, tag, current, live) = self.stale_recent[(self.stale_next - count + i) % len];
+            let (at, stamp, value, tag, current, live) = self.diagnostics.stale_recent[(self.diagnostics.stale_next - count + i) % len];
             dev_err!(self.dev.as_ref(), "G16: hang stale tag at={}.{:06} wait on {:#x} want {:#x} names event {}, queue holds {}{}\n",
                      at / 1_000_000_000, (at % 1_000_000_000) / 1000, stamp, value, tag, current,
                      if live { " (live for another queue)" } else { "" });
         }
         let mut line = KVec::new();
-        for &(stamp, event) in self.lane_events.iter().take(96) {
+        for &(stamp, event) in self.diagnostics.lane_events.iter().take(96) {
             if line.push((stamp, event), GFP_KERNEL).is_err() {
                 break;
             }
@@ -3656,13 +3657,13 @@ impl Bootstrap {
             })
         };
         let Some(index) = stuck.filter(|_| drained) else {
-            self.wedge_since = None;
-            self.wedge_rung = 0;
+            self.diagnostics.wedge_since = None;
+            self.diagnostics.wedge_rung = 0;
             return Ok(());
         };
         let now = Instant::now();
-        match self.wedge_since {
-            Some(since) if signature == self.wedge_signature => {
+        match self.diagnostics.wedge_since {
+            Some(since) if signature == self.diagnostics.wedge_signature => {
                 let wedge_ms = u64::from(crate::module_parameters::wedge_ms.value().max(100));
                 if (now - since).as_millis() < wedge_ms as i64 {
                     return Ok(());
@@ -3670,31 +3671,31 @@ impl Bootstrap {
             }
             _ => {
                 // First sighting, or some fragment stamp moved: restart.
-                self.wedge_since = Some(now);
-                self.wedge_signature = signature;
+                self.diagnostics.wedge_since = Some(now);
+                self.diagnostics.wedge_signature = signature;
                 return Ok(());
             }
         }
         let flight = &self.flights[index];
         let owner = flight.owner.clone();
         let recover = crate::module_parameters::wedge_recover.value() != 0;
-        if self.wedge_rung < 3 {
+        if self.diagnostics.wedge_rung < 3 {
             dev_err!(self.dev.as_ref(),
                 "G16: A4 wedge: Work {:#x} context {} stream {:#x} ordinal {} age {} ms, no fragment progress for {} ms; {}\n",
                 flight.id, flight.context, flight.stream, flight.ordinal,
-                self.flight_ms(flight, now), (now - self.wedge_since.unwrap_or(now)).as_millis(),
-                match (recover, self.wedge_rung) {
+                self.flight_ms(flight, now), (now - self.diagnostics.wedge_since.unwrap_or(now)).as_millis(),
+                match (recover, self.diagnostics.wedge_rung) {
                     (false, _) => "detection only (wedge_recover=0)",
                     (true, 0) => "R1: re-kicking its 3D lane",
                     (true, 1) => "R2: re-kicking every render queue's TA and 3D lanes",
                     _ => "ladder exhausted, leaving it to the watchdog",
                 });
         }
-        if !recover || self.wedge_rung >= 2 {
-            self.wedge_rung = 3;
+        if !recover || self.diagnostics.wedge_rung >= 2 {
+            self.diagnostics.wedge_rung = 3;
             return Ok(());
         }
-        if self.wedge_rung == 0 {
+        if self.diagnostics.wedge_rung == 0 {
             self.rekick(&owner, &[1])?;
         } else {
             let mut owners = KVec::new();
@@ -3708,8 +3709,8 @@ impl Bootstrap {
             }
         }
         self.flush()?;
-        self.wedge_rung += 1;
-        self.wedge_since = Some(Instant::now());
+        self.diagnostics.wedge_rung += 1;
+        self.diagnostics.wedge_since = Some(Instant::now());
         Ok(())
     }
 
