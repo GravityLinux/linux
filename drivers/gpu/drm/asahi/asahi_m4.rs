@@ -201,10 +201,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Identify the GPU without starting firmware or registering DRM",
         },
-        work_timestamps: u32 {
-            default: 0,
-            description: "Per-Work firmware profiling timestamp slots (0: shared end stamp only, as macOS)",
-        },
         region_c_layout: u32 {
             default: 0,
             description: "Debug: region C host tunables as macOS 25G83 holds them (0: original)",

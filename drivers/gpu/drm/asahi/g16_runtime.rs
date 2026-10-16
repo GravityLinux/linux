@@ -2399,20 +2399,11 @@ impl Bootstrap {
         frag.extend_with(0xcc0, 0u8, GFP_KERNEL)?;
         params.tiling_work(&a, &mut ta).ok_or(EINVAL)?;
         params.fragment_work(&a, &mut frag).ok_or(EINVAL)?;
-        // Keep firmware's internal profiling destinations distinct from the
-        // explicit user timestamp slots used for UAPI completion above.
-        if crate::module_parameters::work_timestamps.value() != 0 {
-            ta[0x8c8..0x8d0].copy_from_slice(&(va + 0x100).to_le_bytes());
-            ta[0x8d0..0x8d8].copy_from_slice(&(va + 0x108).to_le_bytes());
-            frag[0xc10..0xc18].copy_from_slice(&(va + 0x110).to_le_bytes());
-            frag[0xc18..0xc20].copy_from_slice(&(va + 0x118).to_le_bytes());
-        } else {
-            // As macOS: no per-Work start or tiling-end profiling stamps; the
-            // fragment end stamp goes to one location shared by the queue.
-            ta[0x8c8..0x8d8].fill(0);
-            frag[0xc10..0xc18].fill(0);
-            frag[0xc18..0xc20].copy_from_slice(&(lanes[1].pointers + 0x2080).to_le_bytes());
-        }
+        // No per-Work start or tiling-end profiling stamps; fragment end
+        // uses one location shared by the queue, separate from UAPI timestamps.
+        ta[0x8c8..0x8d8].fill(0);
+        frag[0xc10..0xc18].fill(0);
+        frag[0xc18..0xc20].copy_from_slice(&(lanes[1].pointers + 0x2080).to_le_bytes());
         if crate::module_parameters::fw_trace.value() & 128 != 0
             && !CONFIG_DUMPED.swap(true, Ordering::Relaxed)
         {
