@@ -139,9 +139,6 @@ fn render_notifier_count(lanes: &[Lane; 3]) -> u64 {
     lanes[0].pointers + 0x2040
 }
 
-fn shared_notifier() -> bool {
-    crate::module_parameters::shared_notifier.value() != 0
-}
 
 /// Reserve three distinct event IDs while this queue has unfinished work.
 /// Idle queues release their lease, so creating idle queues does not consume
@@ -2339,20 +2336,13 @@ impl Bootstrap {
         // The notifier pass stores driver stamps, then sends the IRQ after
         // a DSB. These destinations must be firmware-uncached: a DSB does
         // not clean a cached stamp, leaving Linux asleep on stale memory.
-        let shared = shared_notifier();
-        if shared {
-            // One notifier and one stamp per lane for the whole queue, as
-            // macOS does: the notifier pass then does not walk each Work.
-            a.event_control = render_notifier(lanes);
-            a.event_count_array = render_notifier_count(lanes);
-            a.tiling_driver_stamp = lanes[0].driver_stamp();
-            a.fragment_driver_stamp = lanes[1].driver_stamp();
-        } else {
-            a.event_control = va + 0x200;
-            a.event_count_array = va + 0x300;
-            a.tiling_driver_stamp = va + 0x18000;
-            a.fragment_driver_stamp = va + 0x18040;
-        }
+        // One notifier and one stamp per lane for the whole queue, as
+        // macOS does: the notifier pass then does not walk each Work.
+        a.event_control = render_notifier(lanes);
+        a.event_count_array = render_notifier_count(lanes);
+        a.tiling_driver_stamp = lanes[0].driver_stamp();
+        a.fragment_driver_stamp = lanes[1].driver_stamp();
+
         a.tiling_firmware_stamp = lanes[0].firmware_stamp();
         a.fragment_firmware_stamp = lanes[1].firmware_stamp();
         let alias = 0x72_0000_0000 + (va - WORK_BASE);
@@ -2520,12 +2510,8 @@ impl Bootstrap {
         support.submissions.store(next_submitted, Ordering::Relaxed);
         self.render_publication = self.render_publication.wrapping_add(1);
         queue.render_count = queue_ordinal.wrapping_add(1);
-        let notifier_count = if shared {
-            queue.notified_works = queue.notified_works.wrapping_add(2);
-            Some((a.event_control + 0xc, queue.notified_works))
-        } else {
-            None
-        };
+        queue.notified_works = queue.notified_works.wrapping_add(2);
+        let notifier_count = Some((a.event_control + 0xc, queue.notified_works));
         let lanes = queue.lanes.as_mut().ok_or(EIO)?;
         for stage in 0..2 {
             lanes[stage].head = heads[stage];
@@ -2644,16 +2630,8 @@ impl Bootstrap {
         // Every byte this render publishes, written as one batch: one region
         // lookup per destination region and one barrier pair, rather than a
         // lookup and two barriers for each of about twenty writes.
-        let shared = a.event_control == render_notifier(lanes);
         let context = (a.context_id as u32).to_le_bytes();
         let notified = queue.notified_works.wrapping_add(2).to_le_bytes();
-        let count_array = a.event_count_array.to_le_bytes();
-        let fragment_stamp = (a.fragment_stamp as u32).to_le_bytes();
-        let zero = 0u32.to_le_bytes();
-        let flags = 0x50u32.to_le_bytes();
-        let two = 2u32.to_le_bytes();
-        let tiling_previous = g16_stamp::previous(a.tiling_stamp as u32).to_le_bytes();
-        let fragment_previous = g16_stamp::previous(a.fragment_stamp as u32).to_le_bytes();
         let preludes = [a.tiling_prelude(blocks), a.fragment_prelude()];
         let tiling_micro = a.tiling_microsequence();
         let fragment_micro = a.fragment_microsequence();
@@ -2702,22 +2680,12 @@ impl Bootstrap {
                 writes.push_within_capacity(($va, $bytes)).map_err(|_| ENOMEM)
             };
         }
-        if shared {
-            // Shared notifier: count this render's tiling and fragment Works
-            // into the queue's cumulative total. Firmware counts completions
-            // at +0xc and writes the lanes' driver stamps as they retire.
-            push!(a.event_control + 0x24, &context)?;
-            push!(a.event_count_array, &notified)?;
-        } else {
-            push!(a.event_control, &count_array)?;
-            push!(a.event_control + 8, &fragment_stamp)?;
-            push!(a.event_control + 12, &zero)?;
-            push!(a.event_control + 0x10, &flags)?;
-            push!(a.event_control + 0x24, &context)?;
-            push!(a.event_count_array, &two)?;
-            push!(a.tiling_driver_stamp, &tiling_previous)?;
-            push!(a.fragment_driver_stamp, &fragment_previous)?;
-        }
+        // Shared notifier: count this render's tiling and fragment Works
+        // into the queue's cumulative total. Firmware counts completions
+        // at +0xc and writes the lanes' driver stamps as they retire.
+        push!(a.event_control + 0x24, &context)?;
+        push!(a.event_count_array, &notified)?;
+
         // The queue lanes persist independently of the physical work channel.
         for stage in 0..2 {
             let Lane { ring, .. } = lanes[stage];

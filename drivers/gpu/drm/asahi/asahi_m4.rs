@@ -225,10 +225,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug render-to-render barriers: 1=apply every render's vdm_barrier at fragment, 2=omit fragment waits already ordered by the queue's fragment lane",
         },
-        shared_notifier: u32 {
-            default: 1,
-            description: "Renders share one notifier and driver stamp per queue lane, as on macOS (0: one per Work)",
-        },
         notifier_flush: u32 {
             default: 0,
             description: "Tiling Work notifier-stamp flush flag (macOS writes 0; this driver previously wrote 1)",
