@@ -1348,8 +1348,8 @@ impl Bootstrap {
                      comm_str(&flight.comm));
             for (stage, stamp) in flight.stamps.iter().enumerate() {
                 if let Some(stamp) = stamp {
-                    dev_err!(self.dev.as_ref(), "G16:   stage {} fw stamp {:#x}={:#x} want {:#x}\n",
-                             stage, stamp.address, word(stamp.address), stamp.value);
+                    dev_err!(self.dev.as_ref(), "G16:   stage {} event {} fw stamp {:#x}={:#x} want {:#x}\n",
+                             stage, stamp.event, stamp.address, word(stamp.address), stamp.value);
                 }
             }
             for stamp in flight.driver_stamps.iter().flatten() {
@@ -1393,21 +1393,6 @@ impl Bootstrap {
                      offset, fw.read_u64(base + offset)?);
         }
         let _ = self.dump_hang_state();
-        for flight in self.flights.iter().take(16) {
-            dev_err!(self.dev.as_ref(), "G16: pending Work={:#x} context={} age_ms={} render={}\n",
-                     flight.id, flight.context, self.flight_ms(flight, Instant::now()),
-                     flight.render.is_some());
-            for (stage, stamp) in flight.stamps.iter().enumerate() {
-                if let Some(stamp) = stamp {
-                    let (pointers, head) = flight.queues[stage];
-                    dev_err!(self.dev.as_ref(),
-                             "G16: stage={} event={} stamp={:#x} actual={:#x} expected={:#x} pointers={:#x} read={} done={} target={}\n",
-                             stage, stamp.event, stamp.address, fw.read_u32(stamp.address)?,
-                             stamp.value, pointers, fw.read_u32(pointers)?,
-                             fw.read_u32(pointers + 0x30)?, head);
-                }
-            }
-        }
         Ok(())
     }
 
