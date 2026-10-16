@@ -158,7 +158,7 @@ pub(crate) struct Data {
     /// timeline=1/2: the record ring and its debugfs file (dropped before the
     /// directory).
     timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
-    _profile: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>>,
+    _profile: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>,
     _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _flags: KVec<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>>,
@@ -256,10 +256,10 @@ pub(crate) fn register<'a>(
     } else {
         None
     };
-    let profile = Some(KBox::pin_init(
+    let profile = KBox::pin_init(
         dir.read_only_file(c_str!("publish_profile"), crate::g16_timeline::Profile),
         GFP_KERNEL,
-    )?);
+    )?;
     let fw_mem = KBox::pin_init(
         dir.read_binary_file(
             c_str!("fw_mem"),
@@ -1040,8 +1040,11 @@ impl File {
 
 impl Vm {
     fn detach(&self, runtime: &mut crate::g16::Bootstrap) -> Result {
-        runtime.flush_render_ring(self.space.lock().roots().low);
-        runtime.release_render_vm(self.space.lock().roots())?;
+        {
+            let space = self.space.lock();
+            runtime.flush_render_ring(space.roots().low);
+            runtime.release_render_vm(space.roots())?;
+        }
         let compute = self.compute_space.lock();
         runtime.release_render_vm(compute.roots())?;
         Ok(())
