@@ -2235,18 +2235,25 @@ impl File {
                 return Err(EIO);
             }
             if renders != 0 && !vm.render_ready {
-                vm.render_broken = true;
-                vm.space
-                    .lock()
-                    .alloc_render_private(vm.kernel.start, vm.kernel.end)?;
                 let pool =
                     render::OperandPool::new(vm.kernel.start, vm.kernel.end).ok_or(EINVAL)?;
-                vm.render_support = Some(Arc::new(
+                // Acquire scarce support and its Arc before editing this
+                // root. ENOSPC/ENOMEM here must not quarantine a healthy VM.
+                let support = Arc::new(
                     runtime.acquire_render_support(&pool)?,
                     GFP_KERNEL,
-                )?);
+                )?;
+                if let Err(error) = vm.space.lock()
+                    .alloc_render_private(vm.kernel.start, vm.kernel.end)
+                {
+                    // The unpublished graph owns every partial allocation
+                    // and resumes on ENOMEM. Structural/PTE inconsistencies
+                    // still quarantine the VM; do not mask those failures.
+                    vm.render_broken = error != ENOMEM;
+                    return Err(error);
+                }
+                vm.render_support = Some(support);
                 vm.render_ready = true;
-                vm.render_broken = false;
             }
             if computes != 0 && !vm.compute_ready {
                 vm.render_broken = true;

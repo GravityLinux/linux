@@ -104,8 +104,9 @@ impl AddressSpace {
     }
 
     /// Build backend-only render storage before this root is published.
-    /// Allocation failures leave any acquired pages owned by this address space;
-    /// callers discard the unpublished VM rather than reusing a partial graph.
+    /// ENOMEM may leave a partial graph, all owned here. This root has never
+    /// rendered: retry can finish missing pages/PTEs and reinitialize storage
+    /// before its first publication. Never replace a conflicting mapping.
     pub(crate) fn alloc_render_private(&mut self, start: u64, end: u64) -> Result {
         use crate::g16_render as render;
         let mut params = render::Parameters::default();
@@ -116,7 +117,19 @@ impl AddressSpace {
             return Err(ENOMEM);
         }
         self.render_arena = Arena::new(remaining);
-        self.alloc_low(start, render::PRIVATE_SIZE, prot::PROT_GPU_SHARED_RW)?;
+        for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
+            let va = start + offset as u64;
+            if self.pages.get(&va).is_none() {
+                if self.low.translate(va)?.is_some() {
+                    return Err(EEXIST);
+                }
+                let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+                clean_page(&page);
+                self.pages.try_create_and_insert(va, page, GFP_KERNEL)?;
+            }
+            let physical = self.pages.get(&va).ok_or(EIO)?.phys();
+            self.map_render_page(va, physical)?;
+        }
         for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
             let va = start + offset as u64;
             let page = self.pages.get(&va).ok_or(EIO)?;
@@ -131,23 +144,29 @@ impl AddressSpace {
         for (alias, offset, size) in render::private_aliases(&pool) {
             for page in (0..size).step_by(UAT_PGSZ) {
                 let va = alias + page as u64;
-                if self.low.translate(va)?.is_some() {
-                    return Err(EEXIST);
-                }
                 let physical = self
                     .low
                     .translate(start + offset + page as u64)?
                     .ok_or(EIO)?;
-                self.low.map_pages(
-                    va..va + UAT_PGSZ as u64,
-                    physical,
-                    prot::PROT_GPU_SHARED_RW,
-                    false,
-                )?;
+                self.map_render_page(va, physical)?;
             }
         }
         self.sync();
         Ok(())
+    }
+
+    /// A failed first-render allocation can already own this exact PTE.
+    fn map_render_page(&mut self, va: u64, physical: u64) -> Result {
+        match self.low.translate(va)? {
+            Some(existing) if existing == physical => Ok(()),
+            Some(_) => Err(EEXIST),
+            None => self.low.map_pages(
+                va..va + UAT_PGSZ as u64,
+                physical,
+                prot::PROT_GPU_SHARED_RW,
+                false,
+            ),
+        }
     }
 
     /// Each active render exclusively leases tile metadata and save storage.
