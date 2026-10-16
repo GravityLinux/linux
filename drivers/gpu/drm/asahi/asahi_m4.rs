@@ -225,10 +225,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug render-to-render barriers: 1=apply every render's vdm_barrier at fragment, 2=omit fragment waits already ordered by the queue's fragment lane",
         },
-        notifier_flush: u32 {
-            default: 0,
-            description: "Tiling Work notifier-stamp flush flag (macOS writes 0; this driver previously wrote 1)",
-        },
         render_preempt: u32 {
             default: 1,
             description: "1 lets firmware suspend and restart TA/3D work (preemptible render queues); 0 gives them compute's non-preemptible profile",
