@@ -46,17 +46,6 @@ pub(crate) struct FirmwareQueues {
 /// Cumulative per-queue counts of kernel-resolved dependencies.
 #[derive(Default)]
 struct DependencyStats {
-    /// Renders admitted whose tiling stage waited on an earlier fragment
-    /// stamp in the kernel (render_deps=1: the vertex-consumer order).
-    ta_ordered: u64,
-    /// Admission attempts deferred (EBUSY) because that fragment stamp was
-    /// not yet reached; retries are counted each time.
-    ta_held: u64,
-    /// Render admissions deferred on a compute or other-queue stamp.
-    cross_held: u64,
-    /// Fragment-stage waits on the queue's own fragment lane dropped as
-    /// already ordered by the lane.
-    lane_dropped: u64,
     /// Compute admissions deferred on another queue's stamp.
     compute_held: u64,
     /// Works admitted after at least one deferral, and the total time from
@@ -86,16 +75,12 @@ impl Drop for FirmwareQueues {
     fn drop(&mut self) {
         let d = &self.deps;
         if crate::module_parameters::dep_stats.value() != 0
-            && d.ta_ordered + d.ta_held + d.cross_held + d.lane_dropped + d.compute_held != 0
+            && d.compute_held != 0
         {
             pr_info!(
-                "G16: queue deps renders={} computes={} ta_ordered={} ta_held={} cross_held={} lane_dropped={} compute_held={} held_works={} held_us={}\n",
+                "G16: queue deps renders={} computes={} compute_held={} held_works={} held_us={}\n",
                 self.render_count,
                 self.compute_count,
-                d.ta_ordered,
-                d.ta_held,
-                d.cross_held,
-                d.lane_dropped,
                 d.compute_held,
                 d.held_works,
                 d.held_us
@@ -2183,54 +2168,19 @@ impl Bootstrap {
         params: &render::Parameters,
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<[Option<Stamp>; 2]> {
-        if crate::module_parameters::render_deps.value() == 0 {
-            crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
-            let own_fragment = queue.lanes.as_ref().map(|lanes| lanes[1].firmware_stamp());
-            let mut kept = *dependencies;
-            for (slot, dep) in dependencies.iter().enumerate() {
-                let Some(dep) = dep else { continue };
-                let lane = Self::render_item_lane(params, slot);
-                let same_lane = lane == 1 && own_fragment == Some(dep.address);
-                if self.elide_item(queue, lane, dep, same_lane)? {
-                    kept[slot] = None;
-                }
-            }
-            return Ok(kept);
-        }
-        let fragment_stage = params.vdm_barrier_fragment
-            || crate::module_parameters::render_barrier.value() & 1 != 0;
+        crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
         let own_fragment = queue.lanes.as_ref().map(|lanes| lanes[1].firmware_stamp());
-        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-        let mut ta_ordered = false;
-        let mut lane_dropped = false;
+        let mut kept = *dependencies;
         for (slot, dep) in dependencies.iter().enumerate() {
             let Some(dep) = dep else { continue };
-            // Slot 0 is the render dependency: on the fragment stage with a
-            // fragment barrier, else on the tiling stage. Slot 1 (compute) is
-            // always a tiling-stage wait.
-            let lane_ordered = slot == 0 && fragment_stage && own_fragment == Some(dep.address);
-            let ta_wait = slot == 0 && !fragment_stage && own_fragment == Some(dep.address);
-            let now = if lane_ordered { 0 } else { fw.read_u32(dep.address)? };
-            let done = lane_ordered || g16_stamp::reached(now, dep.value);
-            if !lane_ordered {
-                self.hold_check("render", dep, now, done)?;
+            let lane = Self::render_item_lane(params, slot);
+            let same_lane = lane == 1 && own_fragment == Some(dep.address);
+            if self.elide_item(queue, lane, dep, same_lane)? {
+                kept[slot] = None;
             }
-            if !done {
-                if ta_wait {
-                    queue.deps.ta_held += 1;
-                } else {
-                    queue.deps.cross_held += 1;
-                }
-                queue.deps.defer();
-                return Err(EBUSY);
-            }
-            ta_ordered |= ta_wait;
-            lane_dropped |= lane_ordered;
         }
-        queue.deps.ta_ordered += u64::from(ta_ordered);
-        queue.deps.lane_dropped += u64::from(lane_dropped);
-        queue.deps.admit();
-        Ok([None; 2])
+        Ok(kept)
+
     }
 
     pub(crate) fn submit_render(
