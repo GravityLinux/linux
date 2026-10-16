@@ -269,6 +269,14 @@ impl UatPageTable {
         crate::mem::sync();
     }
 
+    /// Publish changed global mappings, then forget the completed ranges.
+    pub(crate) fn publish(&self) {
+        self.sync();
+        self.invalidate(None);
+        crate::mem::sync();
+        self.clear_invalidations();
+    }
+
     /// Record before editing so an allocation failure cannot hide a changed
     /// mapping. Adjacent edits share one invalidation interval.
     fn changed(&mut self, range: Range<u64>) -> Result {

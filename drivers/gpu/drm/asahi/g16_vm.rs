@@ -510,10 +510,7 @@ impl FirmwareSpace {
 
     pub(crate) fn unmap_external(&mut self, range: core::ops::Range<u64>) -> Result {
         self.table.unmap_pages(range.clone())?;
-        self.table.sync();
-        self.table.invalidate(None);
-        crate::mem::sync();
-        self.table.clear_invalidations();
+        self.table.publish();
         self.external
             .retain(|r| r.start < range.start || r.end > range.end);
         Ok(())
@@ -582,10 +579,7 @@ impl FirmwareSpace {
                 if v != va {
                     self.table.unmap_pages(va..v)?;
                 }
-                self.table.sync();
-                self.table.invalidate(None);
-                crate::mem::sync();
-                self.table.clear_invalidations();
+                self.table.publish();
                 self.dirty_regions.get_mut().pop();
                 self.regions.remove(&va);
                 return Err(e);
@@ -848,10 +842,7 @@ impl FirmwareSpace {
     pub(crate) fn release_region(&mut self, va: u64) -> Result {
         let size = self.regions.get(&va).ok_or(EINVAL)?.pages.len() * UAT_PGSZ;
         self.table.unmap_pages(va..va + size as u64)?;
-        self.table.sync();
-        self.table.invalidate(None);
-        crate::mem::sync();
-        self.table.clear_invalidations();
+        self.table.publish();
         self.dirty_regions
             .get_mut()
             .retain(|pending| *pending != va);
@@ -890,10 +881,7 @@ impl FirmwareSpace {
                 }
             }
         }
-        self.table.sync();
-        self.table.invalidate(None);
-        crate::mem::sync();
-        self.table.clear_invalidations();
+        self.table.publish();
     }
 
     /// Find the preceding allocation in logarithmic time, then validate the
@@ -936,10 +924,7 @@ impl Drop for FirmwareSpace {
         for range in &self.external {
             let _ = self.table.unmap_pages(range.clone());
         }
-        self.table.sync();
-        self.table.invalidate(None);
-        crate::mem::sync();
-        self.table.clear_invalidations();
+        self.table.publish();
     }
 }
 
