@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * PMGR Power domains for the Apple T8142 "M5" SoC
+ *
+ * Only the domains used by the devices described so far are listed, without
+ * "apple,always-on". On T8142 some PMGR registers are write protected and
+ * writing them raises an SError: forcing the "msg" domain on, as the M4 tree
+ * does with "apple,always-on", crashes the boot, and turning on automatic
+ * power management on domains that the storage coprocessor depends on kills
+ * it. More domains will be added once they have been checked on hardware.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&pmgr {
+	ps_fpwm0: power-controller@330 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm0";
+	};
+
+	ps_uart_p: power-controller@398 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x398 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+	};
+
+	ps_uart0: power-controller@470 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x470 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart0";
+		power-domains = <&ps_uart_p>;
+	};
+};

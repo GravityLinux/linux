@@ -26,6 +26,7 @@ properties:
               - apple,t8015-spmi
               - apple,t8122-spmi
               - apple,t8132-spmi
+              - apple,t8142-spmi
           - const: apple,t8103-spmi
       - items:
           - enum:
