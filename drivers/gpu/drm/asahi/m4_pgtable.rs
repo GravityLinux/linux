@@ -16,11 +16,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel::rbtree::RBTree;
 use kernel::{addr::PhysicalAddr, error::Result, page::Page, prelude::*};
-#[cfg(CONFIG_DEV_COREDUMP)]
-use kernel::{
-    types::Owned,
-    uapi::{PF_R, PF_W, PF_X},
-};
 
 use crate::util::align;
 
@@ -53,14 +48,8 @@ const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
 const UAT_NON_GLOBAL: u64 = 1 << 11;
 const UAT_AP_SHIFT: u32 = 6;
-#[cfg(CONFIG_DEV_COREDUMP)]
-const UAT_AP_BITS: u64 = 3 << UAT_AP_SHIFT;
 const UAT_HIGH_BITS_SHIFT: u32 = 52;
-#[cfg(CONFIG_DEV_COREDUMP)]
-const UAT_HIGH_BITS: u64 = 0xfff << UAT_HIGH_BITS_SHIFT;
 const UAT_MEMATTR_SHIFT: u32 = 2;
-#[cfg(CONFIG_DEV_COREDUMP)]
-const UAT_MEMATTR_BITS: u64 = 7 << UAT_MEMATTR_SHIFT;
 
 const UAT_AF: u64 = 1 << 10;
 
@@ -76,8 +65,6 @@ const HIGH_BITS_PXN: u16 = 1 << 1;
 const HIGH_BITS_UXN: u16 = 1 << 2;
 const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
 
-#[cfg(CONFIG_DEV_COREDUMP)]
-pub(crate) const PTE_ADDR_BITS: u64 = (!UAT_PGMSK as u64) & (!UAT_HIGH_BITS);
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct Prot {
@@ -88,40 +75,17 @@ pub(crate) struct Prot {
 
 // Firmware + GPU access
 const PROT_FW_GPU_NA: Prot = Prot::from_bits(AP_FW_GPU, 0, 0);
-const _PROT_FW_GPU_RO: Prot = Prot::from_bits(AP_FW_GPU, 0, 1);
-const _PROT_FW_GPU_WO: Prot = Prot::from_bits(AP_FW_GPU, 1, 0);
 
 // Firmware only access
 const PROT_FW_RO: Prot = Prot::from_bits(AP_FW, 0, 0);
-const _PROT_FW_NA: Prot = Prot::from_bits(AP_FW, 0, 1);
 const PROT_FW_RW: Prot = Prot::from_bits(AP_FW, 1, 0);
 
 // GPU only access
 const PROT_GPU_RO: Prot = Prot::from_bits(AP_GPU, 0, 0);
 const PROT_GPU_WO: Prot = Prot::from_bits(AP_GPU, 0, 1);
 const PROT_GPU_RW: Prot = Prot::from_bits(AP_GPU, 1, 0);
-const _PROT_GPU_NA: Prot = Prot::from_bits(AP_GPU, 1, 1);
 
-#[cfg(CONFIG_DEV_COREDUMP)]
-const PF_RW: u32 = PF_R | PF_W;
-#[cfg(CONFIG_DEV_COREDUMP)]
-const PF_RX: u32 = PF_R | PF_X;
 
-// For crash dumps
-#[cfg(CONFIG_DEV_COREDUMP)]
-const PROT_TO_PERMS_FW: [[u32; 4]; 4] = [
-    [0, 0, 0, PF_RW],
-    [0, PF_RW, 0, PF_RW],
-    [PF_RX, PF_RX, 0, PF_R],
-    [PF_RX, PF_RW, 0, PF_R],
-];
-#[cfg(CONFIG_DEV_COREDUMP)]
-const PROT_TO_PERMS_OS: [[u32; 4]; 4] = [
-    [0, PF_R, PF_W, PF_RW],
-    [PF_R, 0, PF_RW, PF_RW],
-    [0, 0, 0, 0],
-    [0, 0, 0, 0],
-];
 
 pub(crate) mod prot {
     pub(crate) use super::Prot;
@@ -158,43 +122,7 @@ impl Prot {
         }
     }
 
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) const fn from_pte(pte: u64) -> Self {
-        Prot {
-            high_bits: (pte >> UAT_HIGH_BITS_SHIFT) as u16,
-            ap: ((pte & UAT_AP_BITS) >> UAT_AP_SHIFT) as u8,
-            memattr: ((pte & UAT_MEMATTR_BITS) >> UAT_MEMATTR_SHIFT) as u8,
-        }
-    }
 
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) const fn elf_flags(&self) -> u32 {
-        let ap = (self.ap & 3) as usize;
-        let uxn = if self.high_bits & HIGH_BITS_UXN != 0 {
-            1
-        } else {
-            0
-        };
-        let pxn = if self.high_bits & HIGH_BITS_PXN != 0 {
-            1
-        } else {
-            0
-        };
-        let gpu = self.high_bits & HIGH_BITS_GPU_ACCESS != 0;
-
-        // Format:
-        // [12 top bits of PTE] [12 bottom bits of PTE] [5 bits pad] [ELF RWX]
-        let mut perms = if gpu {
-            PROT_TO_PERMS_OS[ap][(uxn << 1) | pxn]
-        } else {
-            PROT_TO_PERMS_FW[ap][(uxn << 1) | pxn]
-        };
-
-        perms |= ((self.as_pte() >> 52) << 20) as u32;
-        perms |= ((self.as_pte() & 0xfff) << 8) as u32;
-
-        perms
-    }
 
     const fn memattr(&self, memattr: u8) -> Self {
         Self { memattr, ..*self }
@@ -214,12 +142,6 @@ impl Default for Prot {
     }
 }
 
-#[cfg(CONFIG_DEV_COREDUMP)]
-pub(crate) struct DumpedPage {
-    pub(crate) iova: u64,
-    pub(crate) pte: u64,
-    pub(crate) data: Option<Owned<Page>>,
-}
 
 enum Walk {
     Read,
@@ -625,39 +547,6 @@ impl UatPageTable {
         Ok(result)
     }
 
-    /// Save one existing leaf while a Work temporarily substitutes owned RAM.
-    #[cfg(test)]
-    pub(crate) fn leaf(&mut self, address: u64) -> Result<u64> {
-        if address & UAT_PGMSK as u64 != 0 {
-            return Err(EINVAL);
-        }
-        let mut value = 0;
-        self.with_pages(address..address + UAT_PGSZ as u64, Walk::Read, |_, ptes| {
-            value = ptes[0].load(Ordering::Relaxed);
-            Ok(())
-        })?;
-        if value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
-            return Err(EINVAL);
-        }
-        Ok(value)
-    }
-
-    /// Restore a leaf obtained from this VM by `leaf`, before its backing dies.
-    #[cfg(test)]
-    pub(crate) fn restore_leaf(&mut self, address: u64, value: u64) -> Result {
-        if address & UAT_PGMSK as u64 != 0 || value & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE {
-            return Err(EINVAL);
-        }
-        self.with_pages(
-            address..address + UAT_PGSZ as u64,
-            Walk::Write,
-            |_, ptes| {
-                ptes[0].store(value, Ordering::Relaxed);
-                Ok(())
-            },
-        )
-    }
-
     pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
         self.changed(iova_range.clone())?;
         pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
@@ -675,103 +564,6 @@ impl UatPageTable {
         })
     }
 
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    pub(crate) fn dump_pages(&mut self, iova_range: Range<u64>) -> Result<KVVec<DumpedPage>> {
-        let mut pages = KVVec::new();
-        let oas_mask = self.oas_mask;
-        let iova_base = self.va_range.start & !self.ias_mask;
-        self.with_pages(iova_range, Walk::Read, |iova, ptes| {
-            let iova = iova | iova_base;
-            for (idx, ppte) in ptes.iter().enumerate() {
-                let pte = ppte.load(Ordering::Relaxed);
-                if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
-                    continue;
-                }
-                let memattr = ((pte & UAT_MEMATTR_BITS) >> UAT_MEMATTR_SHIFT) as u8;
-
-                if !(memattr == MEMATTR_CACHED || memattr == MEMATTR_UNCACHED) {
-                    pages.push(
-                        DumpedPage {
-                            iova: iova + (idx * UAT_PGSZ) as u64,
-                            pte,
-                            data: None,
-                        },
-                        GFP_KERNEL,
-                    )?;
-                    continue;
-                }
-                let phys = pte & oas_mask & (!UAT_PGMSK as u64);
-                // SAFETY: GPU pages are either firmware/preallocated pages
-                // (which the kernel isn't concerned with and are either in
-                // the page map or not, and if they aren't, borrow_phys()
-                // will fail), or GPU page table pages (which we own),
-                // or GEM buffer pages (which are locked while they are
-                // mapped in the page table), so they should be safe to
-                // borrow.
-                //
-                // This does trust the firmware not to have any weird
-                // mappings in its own internal page tables, but since
-                // those are managed by the uPPL which is privileged anyway,
-                // this trust does not actually extend any trust boundary.
-                let src_page = match unsafe { Page::borrow_phys(&phys) } {
-                    Some(page) => page,
-                    None => {
-                        pages.push(
-                            DumpedPage {
-                                iova: iova + (idx * UAT_PGSZ) as u64,
-                                pte,
-                                data: None,
-                            },
-                            GFP_KERNEL,
-                        )?;
-                        continue;
-                    }
-                };
-                let dst_page = Page::alloc_page(GFP_KERNEL)?;
-                src_page.with_page_mapped(|psrc| -> Result {
-                    // SAFETY: This could technically still have a data race with the firmware
-                    // or other driver code (or even userspace with timestamp buffers), but while
-                    // the Rust language technically says this is UB, in the real world, using
-                    // atomic reads for this is guaranteed to never cause any harmful effects
-                    // other than possibly reading torn/unreliable data. At least on ARM64 anyway.
-                    //
-                    // (Yes, I checked with Rust people about this. ~~ Lina)
-                    //
-                    let src_items = unsafe {
-                        core::slice::from_raw_parts(
-                            psrc as *const AtomicU64,
-                            UAT_PGSZ / core::mem::size_of::<AtomicU64>(),
-                        )
-                    };
-                    dst_page.with_page_mapped(|pdst| -> Result {
-                        // SAFETY: We own the destination page, so it is safe to view its contents
-                        // as a u64 slice.
-                        let dst_items = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                pdst as *mut u64,
-                                UAT_PGSZ / core::mem::size_of::<u64>(),
-                            )
-                        };
-                        for (si, di) in src_items.iter().zip(dst_items.iter_mut()) {
-                            *di = si.load(Ordering::Relaxed);
-                        }
-                        Ok(())
-                    })?;
-                    Ok(())
-                })?;
-                pages.push(
-                    DumpedPage {
-                        iova: iova + (idx * UAT_PGSZ) as u64,
-                        pte,
-                        data: Some(dst_page),
-                    },
-                    GFP_KERNEL,
-                )?;
-            }
-            Ok(())
-        })?;
-        Ok(pages)
-    }
 }
 
 impl Drop for UatPageTable {
