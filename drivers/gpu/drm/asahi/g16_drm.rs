@@ -1467,6 +1467,32 @@ struct Inbox {
 }
 
 impl Engine {
+    /// Collect without removing anything if allocation fails, as before.
+    fn take_finished(&mut self) -> KVec<Running> {
+        let mut finished = KVec::new();
+        if finished.reserve(self.jobs.len(), GFP_KERNEL).is_err() {
+            return finished;
+        }
+        let mut index = 0;
+        while index < self.jobs.len() {
+            let job = &self.jobs[index];
+            if job.pending == 0
+                && (job.error.is_some() || job.next == job.execution.parameters.len())
+            {
+                let job = self.jobs.remove(index).expect("index in range");
+                finished.push_within_capacity(job).map_err(|_| ())
+                    .expect("reserved for every job");
+            } else {
+                index += 1;
+            }
+        }
+        // Removal shifts later entries; keep the admission cursor valid.
+        if self.cursor > self.jobs.len() {
+            self.cursor = 0;
+        }
+        finished
+    }
+
     /// Take the jobs drm_sched has run since the last pass, in order.
     /// On failure the jobs stay in the inbox for the error path to fail.
     fn admit(&mut self, inbox: &Mutex<Inbox>) -> Result {
@@ -1478,6 +1504,19 @@ impl Engine {
             self.jobs.push_within_capacity(job).map_err(|_| ENOMEM)?;
         }
         Ok(())
+    }
+}
+
+impl Execution {
+    /// Call only after dropping the engine and runtime locks.
+    fn signal_finished(&self, job: Running) {
+        if let Some(ring) = &self.device.timeline {
+            trace_record(ring, &job);
+        }
+        if let Some(error) = job.error {
+            job.execution.completion.set_error(error);
+        }
+        let _ = job.execution.completion.signal();
     }
 }
 
@@ -1556,43 +1595,19 @@ impl WorkItem for Execution {
             // Signal every finished job before admitting more work, with the
             // locks dropped: a completed fence must not wait behind a
             // publication pass. Upstream signals from its event path.
-            let mut finished = KVec::new();
-            if result.is_ok()
+            let mut finished = if result.is_ok()
                 && crate::g16_timeline::EARLY_SIGNAL.load(Ordering::Relaxed) == 1
-                && finished.reserve(engine.jobs.len(), GFP_KERNEL).is_ok()
             {
-                let mut index = 0;
-                while index < engine.jobs.len() {
-                    let j = &engine.jobs[index];
-                    if j.pending == 0
-                        && (j.error.is_some() || j.next == j.execution.parameters.len())
-                    {
-                        let job = engine.jobs.remove(index).expect("index in range");
-                        finished
-                            .push_within_capacity(job)
-                            .map_err(|_| ())
-                            .expect("reserved for every job");
-                    } else {
-                        index += 1;
-                    }
-                }
-                // Removal shifts later entries; keep the admission cursor valid.
-                if engine.cursor > engine.jobs.len() {
-                    engine.cursor = 0;
-                }
-            }
+                engine.take_finished()
+            } else {
+                KVec::new()
+            };
             let signalled = !finished.is_empty();
             if signalled {
                 drop(runtime);
                 drop(engine);
                 for job in finished.drain_all() {
-                    if let Some(ring) = &this.device.timeline {
-                        trace_record(ring, &job);
-                    }
-                    if let Some(error) = job.error {
-                        job.execution.completion.set_error(error);
-                    }
-                    let _ = job.execution.completion.signal();
+                    this.signal_finished(job);
                 }
                 engine = this.device.engine.lock();
                 runtime = this.device.runtime.lock();
@@ -1744,38 +1759,12 @@ impl WorkItem for Execution {
             // early_signal=2: publish first (above), then signal every
             // finished job in one batch with the locks dropped.
             if crate::g16_timeline::EARLY_SIGNAL.load(Ordering::Relaxed) == 2 {
-                let mut finished = KVec::new();
-                if finished.reserve(engine.jobs.len(), GFP_KERNEL).is_ok() {
-                    let mut index = 0;
-                    while index < engine.jobs.len() {
-                        let j = &engine.jobs[index];
-                        if j.pending == 0
-                            && (j.error.is_some() || j.next == j.execution.parameters.len())
-                        {
-                            let job = engine.jobs.remove(index).expect("index in range");
-                            finished
-                                .push_within_capacity(job)
-                                .map_err(|_| ())
-                                .expect("reserved for every job");
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    if engine.cursor > engine.jobs.len() {
-                        engine.cursor = 0;
-                    }
-                }
+                let mut finished = engine.take_finished();
                 if !finished.is_empty() {
                     drop(runtime);
                     drop(engine);
                     for job in finished.drain_all() {
-                        if let Some(ring) = &this.device.timeline {
-                            trace_record(ring, &job);
-                        }
-                        if let Some(error) = job.error {
-                            job.execution.completion.set_error(error);
-                        }
-                        let _ = job.execution.completion.signal();
+                        this.signal_finished(job);
                     }
                     continue;
                 }
@@ -1789,13 +1778,7 @@ impl WorkItem for Execution {
                     .expect("index found under engine lock");
                 drop(runtime);
                 drop(engine);
-                if let Some(ring) = &this.device.timeline {
-                    trace_record(ring, &job);
-                }
-                if let Some(error) = job.error {
-                    job.execution.completion.set_error(error);
-                }
-                let _ = job.execution.completion.signal();
+                this.signal_finished(job);
                 continue;
             }
             if engine.jobs.is_empty() {
