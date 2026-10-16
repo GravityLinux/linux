@@ -849,7 +849,24 @@ impl File {
                     .iter()
                     .position(|t| t.id == data.object_handle)
                     .ok_or(ENOENT)?;
+                let timestamp = &state.timestamps[index];
+                // Failed BIND rollback can retain an unpublished allocation
+                // without advancing next_timestamp. Match the reserved range,
+                // which stays unique even if that public ID is reused.
+                let retained = state
+                    .retained_timestamps
+                    .iter()
+                    .position(|t| t.base == timestamp.base && t.extent == timestamp.extent)
+                    .ok_or(EIO)?;
+                // Admission is held and drained above: no submitted work can
+                // still write this firmware mapping, or acquire it anew.
+                // Keep both backing references if unmapping fails, just as
+                // at file teardown, so a stale PTE never reaches freed RAM.
+                device.runtime.lock().release_timestamp(
+                    timestamp.base..timestamp.base + timestamp.extent,
+                )?;
                 state.timestamps.swap_remove(index);
+                state.retained_timestamps.swap_remove(retained);
             }
             _ => return Err(EINVAL),
         }
