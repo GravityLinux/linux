@@ -407,11 +407,7 @@ impl DriverObject for Buffer {
                 // unusable; other clients keep running.
                 vm.render_broken = true;
                 let task = kernel::current!();
-                // SAFETY: comm is a NUL-padded fixed array; a concurrent
-                // rename can at worst tear this log string.
-                let comm = unsafe { (*task.as_ptr()).comm };
-                let comm: [u8; 16] = core::array::from_fn(|i| comm[i] as u8);
-                let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+                let comm = crate::util::task_comm(&task);
                 // Where the unfinished work is: in the pump (issued or held on
                 // a stamp) or still in drm_sched waiting for its input fences.
                 let unsignaled = vm.pending.iter().filter(|f| {
@@ -434,7 +430,7 @@ impl DriverObject for Buffer {
                 }
                 pr_err!(
                     "G16: closing a GEM object: VM {} work didn't complete ({:?}) in {}[{}]; keeping its mappings and failing that VM's further submissions\n",
-                    vm.id, error, core::str::from_utf8(&comm[..len]).unwrap_or("?"), task.pid()
+                    vm.id, error, crate::util::comm_str(&comm), task.pid()
                 );
                 pr_err!(
                     "G16: VM {}: {} of {} submissions unfinished: {} in the pump ({} started), {} waiting for input fences\n",
@@ -613,17 +609,13 @@ impl File {
         if crate::module_parameters::debug_ctx.value() != 0 {
             let task = kernel::current!();
             let leader = task.group_leader();
-            // SAFETY: comm is a NUL-padded fixed array; a concurrent rename
-            // can at worst tear this debug string.
-            let comm = unsafe { (*leader.as_ptr()).comm };
-            let comm: [u8; 16] = core::array::from_fn(|i| comm[i] as u8);
-            let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+            let comm = crate::util::task_comm(leader);
             pr_info!(
                 "G16: file {} vm {} by tgid {} ({}): render root {:#x} compute root {:#x}\n",
                 inner.id,
                 id,
                 leader.pid(),
-                core::str::from_utf8(&comm[..len]).unwrap_or("?"),
+                crate::util::comm_str(&comm),
                 space.lock().roots().low,
                 compute_space.lock().roots().low
             );
@@ -1277,10 +1269,7 @@ static FENCE_KEY: Pin<&kernel::sync::LockClassKey> = kernel::static_lock_class!(
 fn current_comm() -> [u8; 16] {
     let task = kernel::current!();
     let leader = task.group_leader();
-    // SAFETY: comm is a NUL-padded fixed array; a concurrent rename can at
-    // worst tear this diagnostic string.
-    let comm = unsafe { (*leader.as_ptr()).comm };
-    core::array::from_fn(|i| comm[i] as u8)
+    crate::util::task_comm(leader)
 }
 
 fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {

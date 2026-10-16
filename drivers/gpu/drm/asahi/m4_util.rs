@@ -74,3 +74,16 @@ pub(crate) fn put32(out: &mut [u8], offset: usize, value: u32) {
 pub(crate) fn put64(out: &mut [u8], offset: usize, value: u64) {
     out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
+
+/// Snapshot a task name for diagnostics; callers choose thread or leader.
+pub(crate) fn task_comm(task: &kernel::task::Task) -> [u8; 16] {
+    // SAFETY: comm is a fixed array in the live task. A concurrent rename
+    // can at worst tear this diagnostic string.
+    let comm = unsafe { (*task.as_ptr()).comm };
+    core::array::from_fn(|i| comm[i] as u8)
+}
+
+pub(crate) fn comm_str(comm: &[u8; 16]) -> &str {
+    let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
+    core::str::from_utf8(&comm[..len]).unwrap_or("?")
+}

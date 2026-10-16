@@ -4,6 +4,8 @@
 
 //! G16 ring publication and independent firmware retirement.
 
+use crate::util::comm_str;
+
 use kernel::io::Io;
 use super::Bootstrap;
 use crate::{g16_compute as compute, g16_fw, g16_render as render, g16_stamp, g16_vm};
@@ -3446,10 +3448,6 @@ impl Bootstrap {
 }
 
 /// Diagnostics: a process name from a NUL-padded comm.
-fn comm_str(comm: &[u8; 16]) -> &str {
-    let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
-    core::str::from_utf8(&comm[..len]).unwrap_or("?")
-}
 
 /// Diagnostics: one retired Work, kept to explain later reuse of its slot
 /// and its Work memory in hang reports.
