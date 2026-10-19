@@ -108,7 +108,7 @@ impl Parameters {
             )
             && matches!(self.samples, 1 | 2 | 4)
             && self.tib_blocks <= 128
-            // macOS cycles 80 scene records; register 0x1c910 tracks the record.
+            // One scene per lease; register 0x1c910 tracks its cursor slot.
             && self.scene_slot < 80
             && (self.sampler_array == 0) == (self.sampler_count == 0)
             && self.sampler_array & 7 == 0
@@ -1118,7 +1118,11 @@ impl Addresses {
                 for (off, value) in [
                     (0, self.pool_slots + i as u64 * 4),
                     (8, self.buffer_manager_scene_list + i as u64 * 4),
-                    (0x28, 0x240000 + (i as u64 % 36) * 0x30),
+                    // Match submit_render_pool's scene offset. All 80 leases
+                    // have distinct records within the mapped 16-KiB page;
+                    // wrapping here aliases live scenes and disagrees with
+                    // the TA/3D registers for leases 36..79.
+                    (0x28, 0x240000 + i as u64 * 0x30),
                     (0x40, self.buffer_manager_block_control + 0x40),
                     (0x48, 0x100000000),
                 ] {

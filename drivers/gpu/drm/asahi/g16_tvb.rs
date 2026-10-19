@@ -14,7 +14,7 @@ use kernel::prelude::*;
 pub(crate) const MAX_BLOCKS: u32 = 6579;
 
 /// Scene records initialized in the pool (render::Addresses::private_page).
-/// macOS cycles all 80 of them in order on T8132.
+/// Each lease owns a distinct cursor and 48-byte scene record.
 const SCENES: u32 = 80;
 
 pub(crate) struct Tvb {
@@ -92,8 +92,7 @@ impl Tvb {
 
     pub(crate) fn reserve_scene(&mut self) -> Result<u32> {
         // Lease a scene record until both stages and their event replies have
-        // retired. Take them in order, as macOS does, so a record is reused
-        // as late as possible.
+        // retired. Take them in order so a record is reused as late as possible.
         for step in 0..SCENES {
             let index = (self.next_scene + step) % SCENES;
             if self.scenes & (1u128 << index) == 0 {
