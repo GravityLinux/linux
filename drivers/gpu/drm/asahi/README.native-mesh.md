@@ -6,7 +6,7 @@ is provided. The paired stream starts with complete native object/mesh state.
 The decoder runs only with the option enabled; ordinary streams are identified
 by their first packet, without searching their contents for native state.
 
-The admitted class has T16 mesh execution, one direct object workgroup,
+The admitted class has physical T16 or T32 mesh execution, one direct object workgroup,
 four-vertex storage and one triangle primitive. It supports 4–128 per-vertex
 32-bit scalar components, including XYZW. The two scalar counts and output-row
 count must agree: N components, N+1 rows, with no reserved upper bits. This
@@ -17,9 +17,15 @@ resource classes remain rejected. Single-sample, single-layer restrictions
 also remain in the runtime.
 
 Object dispatch total and local thread dimensions must match, and must be
-either (1,1,1) for the existing scalar carrier or (16,1,1) for physical T16.
+either (1,1,1) for the existing scalar carrier, (16,1,1) for physical T16,
+or (32,1,1) for physical T32.
 The mesh execution width in the state packet does not set the object dispatch
 width. Mismatched dimensions, other shapes and multiple workgroups are rejected.
+This bounds the parent object dispatch, not a child mesh grid exported by its
+shader. Physical T64/T128 state remains rejected; logical workgroups lowered
+by the compiler to physical T32 do not require those wider state values.
+T32 admission enables device qualification without changing payload sizes,
+scene ownership or the default-off gate; it is not a hardware pass by itself.
 
 This is bounded resource-class admission, not validation of arbitrary shader
 programs. Launches and their local-allocation instructions remain userspace

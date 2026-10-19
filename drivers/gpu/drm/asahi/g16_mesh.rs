@@ -33,7 +33,7 @@ pub(crate) enum DecodeError {
     Unsupported,
 }
 
-/// Admit the paired T16 class: four vertices' storage, one primitive and one
+/// Admit the paired T16/T32 class: four vertices' storage, one primitive and one
 /// direct object workgroup, with position and up to 124 per-vertex scalars.
 /// Primitive outputs, task payload and wider resource classes remain excluded.
 /// The packet budget bounds malformed streams, including a missing terminator.
@@ -82,7 +82,7 @@ pub(crate) fn decode(
         || state[3] != 0
         || state[8] != 1
         || state[9] != 0
-        || state[10] != 0x400810
+        || !matches!(state[10], 0x400810 | 0x400820)
         || state[11] != 0
         || state[12] != components + 1
     {
@@ -101,10 +101,10 @@ pub(crate) fn decode(
             1 if word & !0x2000_0013 == 0 => {} // G16 coherency barrier
             3 if word == 0x7000_0600 && !drew => {
                 // Exactly one object workgroup: total threads equal local
-                // threads. Keep the scalar carrier and admit physical T16.
+                // threads. Keep the scalar carrier and physical T16/T32.
                 let total = [next()?, next()?, next()?];
                 let local = [next()?, next()?, next()?];
-                if total != local || (local != [1, 1, 1] && local != [16, 1, 1]) {
+                if total != local || !matches!(local, [1, 1, 1] | [16, 1, 1] | [32, 1, 1]) {
                     return Err(DecodeError::Unsupported);
                 }
                 drew = true;

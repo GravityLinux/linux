@@ -34,10 +34,13 @@ fn native_packets_are_relocatable_and_bounded() {
 }
 
 #[test]
-fn object_dispatch_is_one_scalar_or_physical_t16_workgroup() {
+fn object_dispatch_is_one_scalar_or_physical_t16_t32_workgroup() {
     for base in [0x1004000000, 0x10d1233ffc] {
-        for width in [1, 16] {
+        for (mesh, width) in [
+            (16, 1), (16, 16), (16, 32), (32, 1), (32, 16), (32, 32),
+        ] {
             let mut words = stream();
+            words[11] = 0x400800 | mesh;
             words[18] = width;
             words[21] = width;
             assert_eq!(decode(&words, base), Ok(Some(Profile { payload: 0 })));
@@ -45,7 +48,7 @@ fn object_dispatch_is_one_scalar_or_physical_t16_workgroup() {
                 assert!(decode(&words[..len], base).is_err(), "truncated at {len}");
             }
             for index in 18..24 {
-                for value in [0, 1, 2, 15, 16, 17, 32, u32::MAX] {
+                for value in [0, 1, 2, 15, 16, 17, 31, 32, 33, 64, 128, u32::MAX] {
                     if value == words[index] {
                         continue;
                     }
@@ -56,7 +59,9 @@ fn object_dispatch_is_one_scalar_or_physical_t16_workgroup() {
             }
             // Matching total/local dimensions alone must not widen the class.
             for dimensions in [
-                [2, 1, 1], [32, 1, 1], [1, 16, 1], [1, 1, 16], [16, 2, 1], [16, 1, 2],
+                [2, 1, 1], [31, 1, 1], [33, 1, 1], [64, 1, 1], [128, 1, 1],
+                [1, 16, 1], [1, 1, 16], [16, 2, 1], [16, 1, 2],
+                [1, 32, 1], [1, 1, 32], [32, 2, 1], [32, 1, 2],
             ] {
                 let mut bad = words.clone();
                 bad[18..21].copy_from_slice(&dimensions);
@@ -67,6 +72,27 @@ fn object_dispatch_is_one_scalar_or_physical_t16_workgroup() {
             twice.pop();
             twice.extend_from_slice(&words[17..]);
             assert_eq!(decode(&twice, base), Err(DecodeError::Unsupported));
+        }
+    }
+}
+
+#[test]
+fn mesh_physical_width_accepts_only_exact_t16_t32_state() {
+    for width in 0..=255 {
+        let mut words = stream();
+        words[11] = 0x400800 | width;
+        let result = decode(&words, 0x1004000000);
+        if width == 16 || width == 32 {
+            assert_eq!(result, Ok(Some(Profile { payload: 0 })));
+        } else {
+            assert_eq!(result, Err(DecodeError::Unsupported));
+        }
+    }
+    for state in [0x400810, 0x400820] {
+        for bit in 0..32 {
+            let mut words = stream();
+            words[11] = state ^ (1 << bit);
+            assert_eq!(decode(&words, 0x1004000000), Err(DecodeError::Unsupported));
         }
     }
 }
@@ -129,7 +155,7 @@ fn attributes_do_not_admit_other_output_or_execution_classes() {
             (9, 0), // missing object stage
             (10, 1),
             (10, 1 << 30),  // more primitives, culling
-            (11, 0x400820), // wider mesh workgroup
+            (11, 0x400840), // physical T64 remains excluded
             (12, 1),        // primitive output components
             (18, 2),        // more than one direct object invocation
         ] {
@@ -149,7 +175,7 @@ fn reject_unqualified_resource_classes_and_packets() {
         (2, 0xd0),
         (9, 0),
         (10, 1),
-        (11, 0x400820),
+        (11, 0x400840),
         (12, 3),
         (13, 9),
         (17, 0x74000600),
