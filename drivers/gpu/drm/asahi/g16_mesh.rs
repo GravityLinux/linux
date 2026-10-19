@@ -34,7 +34,7 @@ pub(crate) enum DecodeError {
 }
 
 /// Admit the paired T16 class: four vertices' storage, one primitive and one
-/// direct object invocation, with position and up to 124 per-vertex scalars.
+/// direct object workgroup, with position and up to 124 per-vertex scalars.
 /// Primitive outputs, task payload and wider resource classes remain excluded.
 /// The packet budget bounds malformed streams, including a missing terminator.
 pub(crate) fn decode(
@@ -100,11 +100,12 @@ pub(crate) fn decode(
             }
             1 if word & !0x2000_0013 == 0 => {} // G16 coherency barrier
             3 if word == 0x7000_0600 && !drew => {
-                // Direct object grid and local dimensions, three words each.
-                for _ in 0..6 {
-                    if next()? != 1 {
-                        return Err(DecodeError::Unsupported);
-                    }
+                // Exactly one object workgroup: total threads equal local
+                // threads. Keep the scalar carrier and admit physical T16.
+                let total = [next()?, next()?, next()?];
+                let local = [next()?, next()?, next()?];
+                if total != local || (local != [1, 1, 1] && local != [16, 1, 1]) {
+                    return Err(DecodeError::Unsupported);
                 }
                 drew = true;
             }

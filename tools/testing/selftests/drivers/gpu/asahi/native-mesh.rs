@@ -3,7 +3,7 @@
 use g16_mesh::{DecodeError, Profile};
 
 fn stream() -> Vec<u32> {
-    // Source-authored T16, position-only state and direct one-group draw.
+    // T16 mesh state with the research carrier's scalar object dispatch.
     vec![
         0x40000d2c, 0x504, 0x10, 0, 0, 0x01000000, 0x22224, 0x01000000, 0x22220, 1, 0, 0x400810, 0,
         5, 0x500, 0x4001000, 0x20000013, 0x70000600, 1, 1, 1, 1, 1, 1, 0xc0000000,
@@ -31,6 +31,44 @@ fn native_packets_are_relocatable_and_bounded() {
     let mut words = stream()[..14].to_vec();
     words.extend(std::iter::repeat_n(0x20000013, 1100));
     assert_eq!(decode(&words, 0x1004000000), Err(DecodeError::Unsupported));
+}
+
+#[test]
+fn object_dispatch_is_one_scalar_or_physical_t16_workgroup() {
+    for base in [0x1004000000, 0x10d1233ffc] {
+        for width in [1, 16] {
+            let mut words = stream();
+            words[18] = width;
+            words[21] = width;
+            assert_eq!(decode(&words, base), Ok(Some(Profile { payload: 0 })));
+            for len in 0..words.len() {
+                assert!(decode(&words[..len], base).is_err(), "truncated at {len}");
+            }
+            for index in 18..24 {
+                for value in [0, 1, 2, 15, 16, 17, 32, u32::MAX] {
+                    if value == words[index] {
+                        continue;
+                    }
+                    let mut bad = words.clone();
+                    bad[index] = value;
+                    assert_eq!(decode(&bad, base), Err(DecodeError::Unsupported));
+                }
+            }
+            // Matching total/local dimensions alone must not widen the class.
+            for dimensions in [
+                [2, 1, 1], [32, 1, 1], [1, 16, 1], [1, 1, 16], [16, 2, 1], [16, 1, 2],
+            ] {
+                let mut bad = words.clone();
+                bad[18..21].copy_from_slice(&dimensions);
+                bad[21..24].copy_from_slice(&dimensions);
+                assert_eq!(decode(&bad, base), Err(DecodeError::Unsupported));
+            }
+            let mut twice = words.clone();
+            twice.pop();
+            twice.extend_from_slice(&words[17..]);
+            assert_eq!(decode(&twice, base), Err(DecodeError::Unsupported));
+        }
+    }
 }
 
 #[test]

@@ -6,7 +6,7 @@ is provided. The paired stream starts with complete native object/mesh state.
 The decoder runs only with the option enabled; ordinary streams are identified
 by their first packet, without searching their contents for native state.
 
-The admitted class has T16 mesh execution, one direct object invocation,
+The admitted class has T16 mesh execution, one direct object workgroup,
 four-vertex storage and one triangle primitive. It supports 4–128 per-vertex
 32-bit scalar components, including XYZW. The two scalar counts and output-row
 count must agree: N components, N+1 rows, with no reserved upper bits. This
@@ -15,6 +15,11 @@ Mesa launch to a power-of-two allocation (at most 4096). Task payload,
 per-primitive outputs, culling, multiple draws, indirect draws and wider
 resource classes remain rejected. Single-sample, single-layer restrictions
 also remain in the runtime.
+
+Object dispatch total and local thread dimensions must match, and must be
+either (1,1,1) for the existing scalar carrier or (16,1,1) for physical T16.
+The mesh execution width in the state packet does not set the object dispatch
+width. Mismatched dimensions, other shapes and multiple workgroups are rejected.
 
 This is bounded resource-class admission, not validation of arbitrary shader
 programs. Launches and their local-allocation instructions remain userspace
