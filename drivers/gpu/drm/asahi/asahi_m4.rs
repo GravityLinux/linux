@@ -196,7 +196,7 @@ kernel::module_platform_driver! {
         },
         native_mesh: u32 {
             default: 0,
-            description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16 position-only one-group profile; no capability advertisement",
+            description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16 per-vertex one-group profile; no capability advertisement",
         },
         dependency_kind: u32 {
             default: 1,

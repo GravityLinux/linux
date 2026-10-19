@@ -2,22 +2,35 @@
 
 `asahi_m4.native_mesh=1` is an explicitly paired kernel/userspace experiment.
 The default is **0 and must remain 0**. No capability bit or execution UAPI
-is provided. The paired stream starts with the native object/mesh state and
-currently supports only the T16 position-only, single-group resource class.
+is provided. The paired stream starts with complete native object/mesh state.
+The decoder runs only with the option enabled; ordinary streams are identified
+by their first packet, without searching their contents for native state.
 
-With the option enabled, **any render-node client can cause a runtime-wide
-quarantine** by submitting a mesh launch whose operand admission never receives
-a matching firmware reply. The ten-second admission timeout blocks all VMs
-until the device is reset. CPU producer waits also reduce ordinary submission
-pipelining. These availability costs are acceptable only for the opt-in
-experiment; this option must never become a default or an advertised feature.
+The admitted class has T16 mesh execution, one direct object invocation,
+four-vertex storage and one triangle primitive. It supports 4–128 per-vertex
+32-bit scalar components, including XYZW. The two scalar counts and output-row
+count must agree: N components, N+1 rows, with no reserved upper bits. This
+corresponds to 32 + 16*N local bytes (at most 2080), rounded up by the paired
+Mesa launch to a power-of-two allocation (at most 4096). Task payload,
+per-primitive outputs, culling, multiple draws, indirect draws and wider
+resource classes remain rejected. Single-sample, single-layer restrictions
+also remain in the runtime.
 
-File close waits for its pending admission while retaining the VM and support
-object. It polls event service with the runtime lock dropped between polls,
-without consuming retirement receipts. A reply permits normal detach; timeout
-or event-service failure retains the existing quarantine and mapping ownership.
+This is bounded resource-class admission, not validation of arbitrary shader
+programs. Launches and their local-allocation instructions remain userspace
+programs; the kernel does not assume a compiler-specific instruction sequence
+or fixed register assignment. The paired compiler must generate matching
+allocation, output and interpolation state. Attribute admission alone is not
+hardware qualification of attributes or the maximum component count.
 
-Payload-register interpretation, capacity, concurrent use and the lifetime of
-firmware registration across context-slot rebinds require device qualification.
-The latter must be tested by returning to an admitted VM after its old slot is
-assigned to another VM, then rendering normally in that new owner.
+All VMs initialize native support mode before first publication when opted in.
+The initialized 24-buffer operand pool serves both ordinary and native Work;
+there is no additional native buffer-admission request. Native payload storage
+is cleared, exclusive per render, and retained through completion. CPU producer
+waits still reduce ordinary submission pipelining. Keep this opt-in experiment
+disabled for normal use.
+
+Position-only H1, cold initialization, slot rebind, sequential draws through
+scene 7 and concurrent separate VMs passed the #82 device campaign. General
+payload sizing, attribute rendering, scene wraparound and simultaneous native
+renders on multiple queues in one VM require their own device qualification.

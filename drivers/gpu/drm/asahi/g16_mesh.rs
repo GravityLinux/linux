@@ -33,9 +33,9 @@ pub(crate) enum DecodeError {
     Unsupported,
 }
 
-/// Recognize only the currently qualified resource class: 16 mesh threads,
-/// position-only output, at most four vertices and one primitive, one direct
-/// object invocation. Broader output/resource classes need measured sizing.
+/// Admit the paired T16 class: four vertices' storage, one primitive and one
+/// direct object invocation, with position and up to 124 per-vertex scalars.
+/// Primitive outputs, task payload and wider resource classes remain excluded.
 /// The packet budget bounds malformed streams, including a missing terminator.
 pub(crate) fn decode(
     start: u64,
@@ -66,7 +66,17 @@ pub(crate) fn decode(
     for word in &mut state {
         *word = next()?;
     }
-    if state[0] != 0x504
+    // The low byte counts scalar vertex planes, including XYZW. The next byte
+    // includes the cull/header row as well. For the four-vertex storage class,
+    // each plane occupies 16 bytes, and word 13 repeats that row count. Require
+    // their relationship, rather than enumerating individual shader layouts.
+    // The paired Mesa limit is 128 components (2080 local bytes including the
+    // 32-byte count/index header). The uploaded launch rounds this allocation
+    // up to a power of two. This packet parser does not validate shader code or
+    // its local-allocation instructions.
+    let components = state[0] & 0xff;
+    if !(4..=128).contains(&components)
+        || state[0] != components | ((components + 1) << 8)
         || state[1] != 0x10
         || state[2] != 0
         || state[3] != 0
@@ -74,7 +84,7 @@ pub(crate) fn decode(
         || state[9] != 0
         || state[10] != 0x400810
         || state[11] != 0
-        || state[12] != 5
+        || state[12] != components + 1
     {
         return Err(DecodeError::Unsupported);
     }

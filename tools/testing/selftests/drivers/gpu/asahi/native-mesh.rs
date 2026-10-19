@@ -52,6 +52,59 @@ fn ordinary_data_is_not_searched_for_mesh_magic() {
 }
 
 #[test]
+fn vertex_attributes_accept_the_bounded_scalar_and_row_relationship() {
+    for components in 4..=128 {
+        let mut words = stream();
+        words[1] = components | ((components + 1) << 8);
+        words[13] = components + 1;
+        assert_eq!(
+            decode(&words, 0x1004003ffc),
+            Ok(Some(Profile { payload: 0 }))
+        );
+        // Cover all supported counts, including those between device fixtures.
+        for wrong_rows in [0, components, components + 2, u32::MAX] {
+            words[13] = wrong_rows;
+            assert_eq!(decode(&words, 0x1004003ffc), Err(DecodeError::Unsupported));
+        }
+        words[13] = components + 1;
+        for bit in 8..32 {
+            words[1] ^= 1 << bit;
+            assert_eq!(decode(&words, 0x1004003ffc), Err(DecodeError::Unsupported));
+            words[1] ^= 1 << bit;
+        }
+    }
+}
+
+#[test]
+fn attributes_do_not_admit_other_output_or_execution_classes() {
+    for components in (0..4).chain(129..=255) {
+        let mut words = stream();
+        words[1] = components | ((components + 1) << 8);
+        words[13] = components + 1;
+        assert_eq!(decode(&words, 0x1004000000), Err(DecodeError::Unsupported));
+    }
+    for components in [7, 12, 128] {
+        for (index, value) in [
+            (2, 0xd0), // primitive output mode
+            (3, 1),
+            (4, 1), // unqualified state/payload
+            (9, 0), // missing object stage
+            (10, 1),
+            (10, 1 << 30),  // more primitives, culling
+            (11, 0x400820), // wider mesh workgroup
+            (12, 1),        // primitive output components
+            (18, 2),        // more than one direct object invocation
+        ] {
+            let mut words = stream();
+            words[1] = components | ((components + 1) << 8);
+            words[13] = components + 1;
+            words[index] = value;
+            assert_eq!(decode(&words, 0x1004000000), Err(DecodeError::Unsupported));
+        }
+    }
+}
+
+#[test]
 fn reject_unqualified_resource_classes_and_packets() {
     for (index, value) in [
         (1, 0x605),
