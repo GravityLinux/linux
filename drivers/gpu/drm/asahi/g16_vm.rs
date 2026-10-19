@@ -63,6 +63,24 @@ impl AddressSpace {
         }
     }
 
+    /// Read a command word only while the execution owns its GEM mappings and
+    /// after its GPU producer dependencies have completed. Volatile access also
+    /// avoids creating Rust references to memory userspace can still write.
+    pub(crate) fn command_word(&mut self, va: u64) -> Result<u32> {
+        if va & 3 != 0 {
+            return Err(EINVAL);
+        }
+        let pa = self.low.translate(va)?.ok_or(EFAULT)?;
+        let base = pa & !(UAT_PGSZ as u64 - 1);
+        // SAFETY: the calling execution pins this VM's external mappings; the
+        // runtime/VM mutexes prevent unmapping for the duration of this borrow.
+        let page = unsafe { Page::borrow_phys(&base) }.ok_or(EFAULT)?;
+        page.with_pointer_into_page((pa - base) as usize, 4, |ptr| {
+            // SAFETY: the page helper checked the aligned word's bounds.
+            Ok(u32::from_le(unsafe { ptr.cast::<u32>().read_volatile() }))
+        })
+    }
+
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             low: UatPageTable::new_with_ias(OAS, IAS)?,
@@ -179,6 +197,9 @@ impl AddressSpace {
         let size = tilemap
             .checked_add(tpc)
             .and_then(|n| n.checked_add(5 * UAT_PGSZ))
+            .and_then(|n| n.checked_add(if p.mesh.is_some() {
+                crate::g16_mesh::Profile::PAYLOAD_BYTES
+            } else { 0 }))
             .ok_or(ENOMEM)?;
         // Only the trailing metadata pages may need clearing (scratch_zero=1).
         let scratch = self.lease_scratch(true, size, tilemap + tpc)?;
@@ -194,6 +215,14 @@ impl AddressSpace {
         p.ta_status = meta + 0x8000 + 0x240;
         p.fragment_status = meta + 0xc000 + 0x2c0;
         p.aux_fb = meta + 0x10000;
+        if let Some(mesh) = &mut p.mesh {
+            mesh.payload = meta + 0x14000;
+            // The lease lasts through both TA and fragment retirement. Clear
+            // the entire payload even when the ordinary scratch_zero knob is 0.
+            for offset in (0..crate::g16_mesh::Profile::PAYLOAD_BYTES).step_by(256) {
+                self.write_low(mesh.payload + offset as u64, &[0; 256])?;
+            }
+        }
         self.write_low(p.aux_fb + 0x600, &0x0000035b60000000u64.to_le_bytes())?;
         self.sync();
         Ok(scratch)

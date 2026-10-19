@@ -53,7 +53,7 @@ fixture += 'mod util {\n'
 for name in ('put32', 'put64'):
     fixture += item(util, r'pub\(crate\) fn ' + name + r'\(') + '\n'
 fixture += '}\n'
-for name in ('g16_render', 'g16_stamp'):
+for name in ('g16_render', 'g16_stamp', 'g16_mesh'):
     fixture += f'#[path = "{driver / (name + ".rs")}"] mod {name};\n'
 fixture += 'use g16_render as render;\n'
 fixture += re.search(r'const SCENES: u32 = .*?;', tvb).group() + '\n'

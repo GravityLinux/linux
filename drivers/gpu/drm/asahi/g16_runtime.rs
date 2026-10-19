@@ -8,7 +8,7 @@ use crate::util::comm_str;
 
 use kernel::io::Io;
 use super::Bootstrap;
-use crate::{g16_compute as compute, g16_fw, g16_render as render, g16_stamp, g16_vm};
+use crate::{g16_compute as compute, g16_fw, g16_mesh, g16_render as render, g16_stamp, g16_vm};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel::time::{Instant, Monotonic};
 use kernel::{
@@ -244,6 +244,7 @@ pub(crate) struct Stamp {
     pub(crate) value: u32,
     pub(crate) event: u32,
 }
+
 #[derive(Clone, Copy)]
 pub(crate) struct Receipt {
     pub(crate) id: u64,
@@ -1971,6 +1972,9 @@ impl Bootstrap {
         let mut page = KVec::new();
         page.extend_with(0x4000, 0u8, GFP_KERNEL)?;
         page[..0x100].copy_from_slice(&pool.support(3 + u64::from(index), a.render_shared_state));
+        if crate::module_parameters::native_mesh.value() == 1 {
+            render::initialize_native_support(&mut page[..0x100]);
+        }
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         fw.write_live(a.support, &page)?;
         // A reused lease starts its submitted-Work count afresh.
@@ -2260,6 +2264,37 @@ impl Bootstrap {
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<Receipt> {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_SUBMIT_RENDER);
+        if self.render_failed {
+            return Err(EIO);
+        }
+        let mut mesh_params;
+        let params = if crate::module_parameters::native_mesh.value() == 1 {
+            mesh_params = *params;
+            let params = &mut mesh_params;
+            // These are the raw producer dependencies, before same-lane wait
+            // elision. A firmware barrier alone cannot protect a CPU read.
+            let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+            for dep in dependencies.iter().flatten() {
+                if !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value) {
+                    return Err(EBUSY);
+                }
+            }
+            let mut client = owner.lock();
+            params.mesh = g16_mesh::decode(params.encoder, |va| client.command_word(va).ok())
+                .map_err(|error| match error {
+                    g16_mesh::DecodeError::Unmapped => EFAULT,
+                    g16_mesh::DecodeError::Unsupported => EOPNOTSUPP,
+                })?;
+            drop(client);
+            if params.mesh.is_some() && (params.samples != 1 || params.layers != 1) {
+                return Err(EOPNOTSUPP);
+            }
+            // The VM already owns and advertises all 24 operand buffers.
+            // This initialized pool serves both ordinary and native Work.
+            &mesh_params
+        } else {
+            params
+        };
         let mut queue = queues.lock();
         let resolved = self.resolve_render_dependencies(&mut queue, params, dependencies)?;
         let dependencies = &resolved;

@@ -10,6 +10,7 @@ use crate::util::{put32 as u32_at, put64 as u64_at};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Parameters {
+    pub(crate) mesh: Option<crate::g16_mesh::Profile>,
     pub(crate) vdm_barrier_fragment: bool,
     pub(crate) request_tvb_growth: bool,
     pub(crate) fragment_sync_grow: bool,
@@ -195,7 +196,7 @@ impl Parameters {
         };
         let deflake_1 = self.ta_offset(self.deflake_1);
         let record_index = 0x80001 + self.scene_slot * 4;
-        Some([
+        let mut registers = [
             (0x01748, 1),
             (0x10141, 512),
             (0x1c039, tilemap),
@@ -256,7 +257,7 @@ impl Parameters {
             (0x1ca30, self.cycle),
             (0x16c39, self.cycle),
             (0x1c910, record_index),
-            (0x0a5a1, self.tiling_gate),
+            (0x0a5a1, if self.mesh.is_some() { crate::g16_mesh::Profile::GATE } else { self.tiling_gate }),
             (0x0d419, 0x200000001),
             (0x1ca10, self.tiling_lifecycle),
             (0x014a1, self.tiling_lifecycle),
@@ -267,7 +268,14 @@ impl Parameters {
             (0x14308, self.completion_control),
             (0x14318, self.ta_status | 1),
             (0x01740, 1),
-        ])
+        ];
+        if let Some(mesh) = self.mesh {
+            // The extended TA list inserts the payload entry after 0x10799
+            // and omits the duplicate stamp at 0x10209. Order is significant.
+            registers.copy_within(56..65, 57);
+            registers[56] = (0x1ca48, mesh.payload_register()?);
+        }
+        Some(registers)
     }
 
     pub(crate) fn fragment_registers(&self) -> Option<[(u32, u64); 87]> {
@@ -648,8 +656,9 @@ impl Parameters {
         u64_at(&mut *out, 0x30, a.empty_buffer);
         out[0x40..0x640].copy_from_slice(&registers);
         u64_at(&mut *out, 0x740, a.tiling_register_alias);
-        out[0x748..0x74a].copy_from_slice(&(0x41u16).to_le_bytes());
-        out[0x74a..0x74c].copy_from_slice(&((0x41 * 0xc) as u16).to_le_bytes());
+        let count: u16 = if self.mesh.is_some() { 0x42 } else { 0x41 };
+        out[0x748..0x74a].copy_from_slice(&count.to_le_bytes());
+        out[0x74a..0x74c].copy_from_slice(&(count * 0xc).to_le_bytes());
         u64_at(&mut *out, 0x760, self.tpc);
         u64_at(&mut *out, 0x768, (g.size3 << 0x6) * self.layers);
         u64_at(&mut *out, 0x770, a.tiling_microsequence);
@@ -660,6 +669,7 @@ impl Parameters {
         u32_at(&mut *out, 0x780, a.fragment_stamp as u32);
         u64_at(&mut *out, 0x7a8, self.ta_offset(self.deflake_1));
         out[0x864] = u8::from(self.request_tvb_growth);
+        u32_at(&mut *out, 0x86c, u32::from(self.mesh.is_some()));
         u64_at(&mut *out, 0x840, self.tiling_lifecycle >> 0x20);
         u32_at(&mut *out, 0x848, 0xffffffff);
         u64_at(&mut *out, 0x84c, sampler_array);
@@ -680,7 +690,8 @@ impl Parameters {
         u64_at(
             &mut *out,
             0x908,
-            0xdaa0 | if self.layers > 1 { 1 << 62 } else { 0 },
+            (if self.mesh.is_some() { crate::g16_mesh::Profile::TA_SIZE } else { 0xdaa0 })
+                | if self.layers > 1 { 1 << 62 } else { 0 },
         );
         u64_at(&mut *out, 0x910, tagged_page(a.tiling_shared_tail));
         Some(())
@@ -862,6 +873,15 @@ impl OperandPool {
         u64_at(&mut out, 0x4c, shared);
         out
     }
+}
+
+/// Initialize the native pool mode before the support object is first used.
+/// These fields belong to the support lifetime, including ordinary renders
+/// preceding its first mesh render. Never rewrite a live firmware-owned header
+/// after publication. The complete operand pool is initialized before use.
+pub(crate) fn initialize_native_support(header: &mut [u8]) {
+    u32_at(header, 0x10, 2);
+    u32_at(header, 0x40, 4);
 }
 
 /// Only accelerator-derived aliases are outside the VM's kernel carveout.
