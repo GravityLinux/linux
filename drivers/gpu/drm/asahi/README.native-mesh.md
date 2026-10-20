@@ -18,7 +18,8 @@ also remain in the runtime.
 
 Object dispatch local thread dimensions must be either (1,1,1) for the existing
 scalar carrier, (16,1,1) for physical T16, or (32,1,1) for physical T32.
-Total thread dimensions must be nonzero multiples of the local dimensions.
+At `native_mesh=1`, total thread dimensions must equal the local dimensions.
+Only `native_mesh=2` admits nonzero multiples of the local dimensions.
 Thus (512,2,3) total / (16,1,1) local describes 32x2x3 parent workgroups.
 The mesh execution width in the state packet does not set the object dispatch
 width. Partial workgroups and other local shapes are rejected. This validates
@@ -63,3 +64,15 @@ Position-only H1, cold initialization, slot rebind, sequential draws through
 scene 7 and concurrent separate VMs passed the #82 device campaign. General
 payload sizing, attribute rendering, scene wraparound and simultaneous native
 renders on multiple queues in one VM require their own device qualification.
+
+### Admission modes
+
+`asahi_m4.native_mesh=0` remains the default and bypasses native parsing.
+`=1` retains the #85 one-parent class exactly: total XYZ equals local XYZ,
+with scalar, T16 or T32 object workgroups and T16/T32 mesh state.
+`=2` is the separate, unqualified multi-parent research mode; it admits
+nonzero total XYZ divisible by the supported local XYZ. Other values reject
+driver initialization. Both enabled modes initialize native support state.
+Multi-parent device use requires a guarded measurement of the 16 KiB native
+firmware payload's touched range versus parent count first. Host parser tests
+are not device qualification.

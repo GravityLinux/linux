@@ -387,9 +387,8 @@ impl Bootstrap {
     }
 
     pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<Self> {
-        if crate::module_parameters::native_mesh.value() > 1 {
-            return Err(EINVAL);
-        }
+        crate::g16_mesh::Mode::from_parameter(crate::module_parameters::native_mesh.value())
+            .ok_or(EINVAL)?;
         validate_boot_resources(pdev)?;
         let platform = crate::g16_platform::Platform::new(pdev.as_ref())?;
         // All board inputs are checked before any firmware is started.

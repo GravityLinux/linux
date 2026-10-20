@@ -30,6 +30,19 @@ def item(source, pattern):
     return source[start:end]
 
 
+# Check that validation, support initialization and submission use the same
+# tested mode mapping, and that submission passes that mode into the decoder.
+runtime = (driver / 'g16_runtime.rs').read_text()
+bootstrap = (driver / 'g16.rs').read_text()
+mode_expr = r'g16_mesh::Mode::from_parameter\(crate::module_parameters::native_mesh.value\(\)\)\s*\.ok_or\(EINVAL\)\?'
+assert re.search(mode_expr, bootstrap)
+assert re.search(r'if ' + mode_expr + r'\s*\.enabled\(\)\s*\{\s*render::initialize_native_support', runtime)
+assert re.search(r'let mesh_mode =\s*' + mode_expr + r';\s*let params = if mesh_mode.enabled\(\)', runtime)
+assert 'g16_mesh::decode(params.encoder, mesh_mode,' in runtime
+assert 'native_mesh.value() == 1' not in runtime
+params = (driver / 'asahi_m4.rs').read_text()
+assert re.search(r'native_mesh:\s*u32\s*\{\s*default: 0,', params)
+
 fixture = r'''
 #![allow(dead_code, non_upper_case_globals, unused_imports)]
 mod module_parameters {

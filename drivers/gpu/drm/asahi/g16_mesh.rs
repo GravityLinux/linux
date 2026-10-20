@@ -4,9 +4,31 @@
 //! Native object/mesh launch for the paired experiment.
 //!
 //! The render UAPI does not distinguish a user object shader from a stub that
-//! writes outputs. `native_mesh=1` selects the user-object convention. A paired
+//! writes outputs. `native_mesh=1/2` selects the user-object convention. A paired
 //! stream starts with a complete mesh state; there is no search for magic words
 //! inside shader data, PPP records, or ordinary vertex streams.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Disabled,
+    SingleParent,
+    MultipleParents,
+}
+
+impl Mode {
+    pub(crate) fn from_parameter(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::SingleParent),
+            2 => Some(Self::MultipleParents),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn enabled(self) -> bool {
+        self != Self::Disabled
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Profile {
@@ -36,14 +58,19 @@ pub(crate) enum DecodeError {
 /// Admit the paired T16/T32 class: four vertices' storage, one primitive and one
 /// direct object dispatch, with position and up to 124 per-vertex scalars.
 /// Primitive outputs, task payload and wider resource classes remain excluded.
-/// The dispatch grid may contain multiple complete physical object workgroups.
+/// Mode 1 retains the qualified one-parent class. Only mode 2 admits multiple
+/// complete physical object workgroups, pending device qualification.
 /// This does not bound the child grid computed by the object shader, nor prove
 /// that a particular aggregate workload fits the available GPU resources.
 /// The packet budget bounds malformed streams, including a missing terminator.
 pub(crate) fn decode(
     start: u64,
+    mode: Mode,
     mut read: impl FnMut(u64) -> Option<u32>,
 ) -> Result<Option<Profile>, DecodeError> {
+    if !mode.enabled() {
+        return Ok(None);
+    }
     let mut cursor = start;
     let mut remaining = 1024;
     let mut next = || {
@@ -109,6 +136,7 @@ pub(crate) fn decode(
                 let total = [next()?, next()?, next()?];
                 let local = [next()?, next()?, next()?];
                 if !matches!(local, [1, 1, 1] | [16, 1, 1] | [32, 1, 1])
+                    || (mode == Mode::SingleParent && total != local)
                     || total
                         .iter()
                         .zip(local)

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Included by test-native-mesh.py, together with the actual production methods.
-use g16_mesh::{DecodeError, Profile};
+use g16_mesh::{DecodeError, Mode, Profile};
 
 fn stream() -> Vec<u32> {
     // T16 mesh state with the research carrier's scalar object dispatch.
@@ -10,7 +10,31 @@ fn stream() -> Vec<u32> {
     ]
 }
 fn decode(words: &[u32], base: u64) -> std::result::Result<Option<Profile>, DecodeError> {
-    g16_mesh::decode(base, |va| words.get(((va - base) / 4) as usize).copied())
+    g16_mesh::decode(base, Mode::MultipleParents, |va| {
+        words.get(((va - base) / 4) as usize).copied()
+    })
+}
+
+#[test]
+fn mode_values_keep_disabled_and_single_parent_behavior_explicit() {
+    for (value, expected) in [
+        (0, Mode::Disabled),
+        (1, Mode::SingleParent),
+        (2, Mode::MultipleParents),
+    ] {
+        let mode = Mode::from_parameter(value).unwrap();
+        assert_eq!(mode, expected);
+        assert_eq!(mode.enabled(), value != 0);
+    }
+    for value in [3, 4, 255, u32::MAX] {
+        assert_eq!(Mode::from_parameter(value), None);
+    }
+    assert_eq!(
+        g16_mesh::decode(3, Mode::Disabled, |_| {
+            panic!("disabled native mode must not read command memory")
+        }),
+        Ok(None)
+    );
 }
 
 #[test]
@@ -52,6 +76,17 @@ fn object_dispatch_accepts_complete_scalar_or_physical_t16_t32_grids() {
             ] {
                 words[18..21].copy_from_slice(&[groups[0] * width, groups[1], groups[2]]);
                 assert_eq!(decode(&words, base), Ok(Some(Profile { payload: 0 })));
+                let single = g16_mesh::decode(base, Mode::SingleParent, |va| {
+                    words.get(((va - base) / 4) as usize).copied()
+                });
+                assert_eq!(
+                    single,
+                    if groups == [1, 1, 1] {
+                        Ok(Some(Profile { payload: 0 }))
+                    } else {
+                        Err(DecodeError::Unsupported)
+                    }
+                );
                 for len in 0..words.len() {
                     assert!(decode(&words[..len], base).is_err(), "truncated at {len}");
                 }
@@ -61,6 +96,7 @@ fn object_dispatch_accepts_complete_scalar_or_physical_t16_t32_grids() {
                     assert_eq!(decode(&bad, base), Err(DecodeError::Unsupported));
                 }
             }
+            words[18..21].copy_from_slice(&[width, 1, 1]);
             // Partial workgroups and wider/nonlinear local shapes stay out.
             if width > 1 {
                 for total in [1, width - 1, width + 1, 32 * width - 1, u32::MAX] {
@@ -134,7 +170,7 @@ fn child_grid_and_launch_backing_are_not_cpu_admission_inputs() {
         words[18] = 16;
         words[21] = 16;
         let mut reads = Vec::new();
-        let result = g16_mesh::decode(base, |va| {
+        let result = g16_mesh::decode(base, Mode::MultipleParents, |va| {
             reads.push(va);
             // All launch, argument, indirect and count-buffer backing is
             // intentionally absent from this CPU command-memory view.
@@ -156,7 +192,7 @@ fn ordinary_data_is_not_searched_for_mesh_magic() {
     let words = [0x4000002e, 0x40000d2c, 0x504, 0x10];
     let mut reads = 0;
     assert_eq!(
-        g16_mesh::decode(0x1004000000, |va| {
+        g16_mesh::decode(0x1004000000, Mode::MultipleParents, |va| {
             reads += 1;
             Some(words[((va - 0x1004000000) / 4) as usize])
         }),
