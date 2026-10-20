@@ -275,27 +275,13 @@ pub(super) struct Flight {
     lane_items: [u32; 2],
 }
 
-impl Flight {
-    /// Works plus firmware dependency items this flight holds on `lane`
-    /// (identified by its pointers): one Work per lane it uses, plus the items
-    /// queued there (a render's move to its fragment lane with
-    /// VDM_BARRIER_FRAGMENT).
-    fn lane_load(&self, lane: u64) -> usize {
-        self.queues
-            .iter()
-            .zip(self.lane_items)
-            .filter(|((pointers, _), _)| *pointers == lane && lane != 0)
-            .map(|(_, items)| 1 + items as usize)
-            .sum()
-    }
-}
-
 /// Per-lane totals of the unretired flights on that lane.
 struct LaneBook {
     pointers: u64,
     /// Flights using the lane.
     works: u32,
-    /// Works plus the dependency items they queued here (`Flight::lane_load`).
+    /// Works plus the dependency items they queued here: one per flight using
+    /// the lane, plus the items it queued on it.
     load: u32,
     /// Works plus all their dependencies, for flights whose first lane this
     /// is: one queue's total is the sum over its lanes (`QUEUE_CAP`).
