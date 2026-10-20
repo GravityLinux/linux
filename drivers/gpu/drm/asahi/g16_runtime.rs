@@ -2129,9 +2129,7 @@ impl Bootstrap {
     /// The lane a render's dependency item sits on: slot 0 (render) on the
     /// fragment lane with a fragment barrier, else the tiling lane.
     fn render_item_lane(params: &render::Parameters, slot: usize) -> usize {
-        let fragment = params.vdm_barrier_fragment
-            || crate::module_parameters::render_barrier.value() & 1 != 0;
-        usize::from(slot == 0 && fragment)
+        usize::from(slot == 0 && params.vdm_barrier_fragment)
     }
 
     fn resolve_render_dependencies(
@@ -2550,15 +2548,8 @@ impl Bootstrap {
         // Only the render dependency can move to fragment. Compute output
         // may feed the vertex stage, and input fences were already consumed
         // by the scheduler before either lane was published.
-        let mode = crate::module_parameters::render_barrier.value();
-        let vdm_barrier_fragment = vdm_barrier_fragment || mode & 1 != 0;
-        // A fragment-stage wait on this queue's own fragment lane is already
-        // satisfied by that lane's submission order.
-        let fragment_dependency = dependencies[0].filter(|d| {
-            mode & 2 == 0 || d.address != lanes[1].firmware_stamp()
-        });
         let stage_dependencies = if vdm_barrier_fragment {
-            [[None, dependencies[1]], [fragment_dependency, None]]
+            [[None, dependencies[1]], [dependencies[0], None]]
         } else {
             [*dependencies, [None, None]]
         };

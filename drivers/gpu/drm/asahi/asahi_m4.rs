@@ -201,10 +201,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 logs each VM's owning process and every firmware context slot rebind",
         },
-        render_barrier: u32 {
-            default: 0,
-            description: "Debug render-to-render barriers: 1=apply every render's vdm_barrier at fragment, 2=omit fragment waits already ordered by the queue's fragment lane",
-        },
         render_preempt: u32 {
             default: 1,
             description: "1 lets firmware suspend and restart TA/3D work (preemptible render queues); 0 gives them compute's non-preemptible profile",
