@@ -157,10 +157,6 @@ kernel::module_platform_driver! {
             default: 400,
             description: "Debug: at most this many renders are dumped per boot",
         },
-        event_affinity: u32 {
-            default: 0,
-            description: "Experiment: firmware event indices of idle queues. 0: an idle queue releases its index and takes the lowest free one when it next submits. 1: it retakes its previous index if free, else the next free index after the last one handed out (so a just-released index is not immediately given to another queue). 2: as 1, and a queue keeps its index while idle, for its whole lifetime (risks event exhaustion with more than 32 live queues; see backpressure logs)",
-        },
         wedge_ms: u32 {
             default: 2000,
             description: "A4 wedge detection window: a render with TA done and all waits met whose 3D never starts, with all channels drained and no fragment progress on any lane for this long",
