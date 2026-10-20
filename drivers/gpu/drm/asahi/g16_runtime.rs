@@ -2294,11 +2294,6 @@ impl Bootstrap {
         a.tiling_status_page = params.ta_status & !0x3fff;
         a.fragment_status_page = params.fragment_status & !0x3fff;
         let queue_ordinal = queue.render_count;
-        if crate::module_parameters::work_layout.value() & 8 != 0 && queue_ordinal % 40 != 0 {
-            // As macOS: only the first render of each 40-render cycle uses
-            // 0xd5 in this fragment register; the others use 0xb5.
-            params.fragment_gate = 0xb5_0040_0020;
-        }
         a.fragment_counter = queue_ordinal.wrapping_mul(2);
         a.tiling_counter = a.fragment_counter.wrapping_add(1);
         // Firmware's dependency graph requires consecutive stamp updates
@@ -2405,26 +2400,6 @@ impl Bootstrap {
                         );
                     }
                 }
-            }
-        }
-        let layout = crate::module_parameters::work_layout.value();
-        if layout & 1 != 0 {
-            // As macOS in steady state: no TVB growth request and neither
-            // fragment flag that this driver set unconditionally.
-            ta[0x864] = 0;
-            frag[0xba8..0xbac].fill(0);
-            frag[0xbdc..0xbe0].fill(0);
-        }
-        if layout & 2 != 0 && params.layers == 1 {
-            // As macOS: a render index modulo 40, and modulo 4 in the top
-            // bits of the support-page operands.
-            let index = queue_ordinal % 40;
-            ta[0x8a0..0x8a8].copy_from_slice(&index.to_le_bytes());
-            frag[0xbe8..0xbf0].copy_from_slice(&index.to_le_bytes());
-            for (bytes, offset) in [(&mut ta[..], 0x908usize), (&mut frag[..], 0xc50)] {
-                let mut word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_err(|_| EINVAL)?);
-                word = (word & !(3 << 62)) | ((queue_ordinal % 4) << 62);
-                bytes[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
             }
         }
         let vm_root = client.roots().low;
