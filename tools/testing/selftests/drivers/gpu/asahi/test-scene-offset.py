@@ -33,7 +33,6 @@ type Result<T> = std::result::Result<T, Error>;
 mod module_parameters {
     pub struct Parameter(u32);
     impl Parameter { pub fn value(&self) -> u32 { self.0 } }
-    pub static micro_layout: Parameter = Parameter(0);
     pub static notifier_flush: Parameter = Parameter(0);
 }
 // Only fragment_work uses this shim; the test calls the register builders.

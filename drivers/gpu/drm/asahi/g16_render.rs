@@ -464,21 +464,14 @@ impl Addresses {
             u64_at(&mut out, offset, value);
         }
         u32_at(&mut out, 0x44, self.context_id as u32);
-        if macos_counters() {
-            // As macOS: the setup command carries the scene slot, and the
-            // start command carries this Work's position in the queue.
-            u32_at(&mut out, 0x48, 1);
-            u32_at(&mut out, 0x58, self.scene() as u32);
-        } else {
-            u32_at(&mut out, 0x48, self.tiling_counter as u32);
-        }
+        u32_at(&mut out, 0x48, self.tiling_counter as u32);
         u64_at(&mut out, 0x50, self.buffer_manager_slot);
         u64_at(&mut out, 0x64, work + 0x784);
         u64_at(&mut out, 0x6c, work + 0x8a8);
         u32_at(&mut out, 0x7c, self.tiling_uuid as u32);
         u64_at(&mut out, 0x190, self.support);
         u64_at(&mut out, 0x1a8, self.tiling_status_page);
-        u64_at(&mut out, 0x1b8, if macos_counters() { self.tiling_counter as u32 as u64 } else { 1 });
+        u64_at(&mut out, 0x1b8, 1);
         u32_at(&mut out, 0x1c0, self.tiling_event as u32);
         u32_at(&mut out, 0x1cc, 0x80000003);
         for (offset, value) in [
@@ -554,13 +547,7 @@ impl Addresses {
             u64_at(&mut out, offset, value);
         }
         u32_at(&mut out, 0x5c, self.context_id as u32);
-        if macos_counters() {
-            u32_at(&mut out, 0x60, 1);
-            u32_at(&mut out, 0x70, self.scene() as u32);
-            u32_at(&mut out, 0x1d8, self.fragment_counter as u32);
-        } else {
-            u32_at(&mut out, 0x60, self.tiling_counter as u32);
-        }
+        u32_at(&mut out, 0x60, self.tiling_counter as u32);
         u64_at(&mut out, 0x68, self.buffer_manager_slot);
         u64_at(&mut out, 0x7c, work + 0xa58);
         u64_at(&mut out, 0x84, work + 0xbf0);
@@ -621,17 +608,6 @@ impl Addresses {
         u64_at(&mut out, 0x335, 0x110100000001);
         u32_at(&mut out, 0x344, 0x40000002);
         out
-    }
-}
-
-fn macos_counters() -> bool {
-    crate::module_parameters::micro_layout.value() != 0
-}
-
-impl Addresses {
-    /// Scene slot selected by this render's BufferThing record.
-    fn scene(&self) -> u64 {
-        (self.buffer_thing & 0x3fff) / 0x80
     }
 }
 

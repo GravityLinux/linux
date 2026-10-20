@@ -201,10 +201,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 logs each VM's owning process and every firmware context slot rebind",
         },
-        micro_layout: u32 {
-            default: 0,
-            description: "Microsequence scene and Work counter fields: 0=original, 1=as macOS (scene slot, per-Work counters)",
-        },
         render_barrier: u32 {
             default: 0,
             description: "Debug render-to-render barriers: 1=apply every render's vdm_barrier at fragment, 2=omit fragment waits already ordered by the queue's fragment lane",
