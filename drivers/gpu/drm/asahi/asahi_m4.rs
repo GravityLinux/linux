@@ -197,10 +197,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Identify the GPU without starting firmware or registering DRM",
         },
-        region_c_layout: u32 {
-            default: 0,
-            description: "Debug: region C host tunables as macOS 25G83 holds them (0: original)",
-        },
         work_layout: u32 {
             default: 0,
             description: "Work fields as macOS (debug): 1=no TVB growth request or fragment flags 0xba8/0xbdc, 2=render index rings, 4=completion control 3, 8=fragment gate 0xb5 after each 40-render cycle start",

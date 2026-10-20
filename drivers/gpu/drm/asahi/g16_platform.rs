@@ -380,37 +380,6 @@ impl Platform {
         for (off, value) in [(0x54, u16::MAX), (0x56, 40), (0x58, u16::MAX)] {
             out[off..off + 2].copy_from_slice(&value.to_le_bytes());
         }
-        if crate::module_parameters::region_c_layout.value() != 0 {
-            // Debug: the words macOS 26.6.2 (25G83) holds here once booted,
-            // observed under the hypervisor on this machine.
-            for (off, value, size) in [
-                (0x20, 0xbb800000000u64, 8),
-                (0x30, 0x100000001, 8),
-                (0x38, 0x7800000000, 8),
-                (0x58, 0x100000000ffff, 8),
-                (0x60, 0x3000000010000, 8),
-                (0x68, 0x10000, 8),
-                (0x80, 0x150e, 4),
-                (0x7c0, 0x4e200000000, 8),
-                (0x7c8, 0x3f4ccccd3f800000, 8),
-                (0x7d0, 0x3f6666663e4ccccd, 8),
-                (0x7d8, 0x3e8000003dcccccd, 8),
-                (0x7e0, 0x3f6666663f333333, 8),
-                (0x7e8, 0x100000006, 8),
-                (0x7f0, 0x6400000001, 8),
-                (0x7f8, 0x64, 8),
-                (0x988, 0x46749a15, 8),
-                (0x990, 0x61a80, 8),
-                (0x998, 0xa00000028, 8),
-                (0x9a0, 0x1000000fa, 8),
-                (0x9b8, 0x2800000002, 8),
-                (0x9c0, 0x5, 8),
-                (0x9c8, 0x3200000028, 8),
-                (0x9d0, 0x1, 8),
-            ] {
-                out[off..off + size].copy_from_slice(&value.to_le_bytes()[..size]);
-            }
-        }
         Ok(out)
     }
 }
