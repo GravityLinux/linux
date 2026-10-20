@@ -340,11 +340,6 @@ pub(crate) fn init_caps(queue: u32, lane: u32) -> Result {
     Ok(())
 }
 
-/// Signal finished jobs before each admission pass (asahi_m4.early_signal,
-/// runtime: debugfs `asahi_m4/early_signal`). 0 restores signalling one job
-/// per pump pass after admission.
-pub(crate) static EARLY_SIGNAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
-
 /// How much of a reused scratch lease to zero (asahi_m4.scratch_zero).
 pub(crate) static SCRATCH_ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
 
@@ -360,7 +355,6 @@ impl FlagKnob {
         self.cell.store(value.min(self.max), core::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) const EARLY_SIGNAL: Self = Self { cell: &EARLY_SIGNAL, name: "early_signal", max: 2 };
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
     pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
     pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };

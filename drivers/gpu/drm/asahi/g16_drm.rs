@@ -231,7 +231,6 @@ pub(crate) fn register<'a>(
     )?;
     use crate::g16_timeline::FlagKnob;
     let knobs = [
-        (c_str!("early_signal"), FlagKnob::EARLY_SIGNAL, crate::module_parameters::early_signal.value()),
         (c_str!("profile"), FlagKnob::PROFILE, crate::module_parameters::profile.value()),
         (c_str!("dep_elide"), FlagKnob::DEP_ELIDE, crate::module_parameters::dep_elide.value()),
         (c_str!("read_opt"), FlagKnob::READ_OPT, crate::module_parameters::read_opt.value()),
@@ -1672,9 +1671,7 @@ impl WorkItem for Execution {
             // Signal every finished job before admitting more work, with the
             // locks dropped: a completed fence must not wait behind a
             // publication pass. Upstream signals from its event path.
-            let mut finished = if result.is_ok()
-                && crate::g16_timeline::EARLY_SIGNAL.load(Ordering::Relaxed) == 1
-            {
+            let mut finished = if result.is_ok() {
                 engine.take_finished()
             } else {
                 KVec::new()
@@ -1832,19 +1829,6 @@ impl WorkItem for Execution {
                     let _ = job.execution.completion.signal();
                 }
                 return;
-            }
-            // early_signal=2: publish first (above), then signal every
-            // finished job in one batch with the locks dropped.
-            if crate::g16_timeline::EARLY_SIGNAL.load(Ordering::Relaxed) == 2 {
-                let mut finished = engine.take_finished();
-                if !finished.is_empty() {
-                    drop(runtime);
-                    drop(engine);
-                    for job in finished.drain_all() {
-                        this.signal_finished(job);
-                    }
-                    continue;
-                }
             }
             if let Some(index) = engine.jobs.iter().position(|j| {
                 j.pending == 0 && (j.error.is_some() || j.next == j.execution.parameters.len())

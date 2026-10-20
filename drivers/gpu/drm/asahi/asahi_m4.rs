@@ -233,10 +233,6 @@ kernel::module_platform_driver! {
             default: 6,
             description: "Bitmask: drop firmware dependency items that are redundant: 1 on the same lane's earlier Work, 2 already reached at publish, 4 already waited on by this lane's previous Work. Counters in debugfs asahi_m4/dep_stats. Runtime: debugfs asahi_m4/dep_elide",
         },
-        early_signal: u32 {
-            default: 1,
-            description: "Fence signalling order in the pump: 0 one finished submission per pass after admission (the earlier behaviour); 1 every finished submission before admission; 2 publish first, then every finished submission in one batch. Runtime: debugfs asahi_m4/early_signal",
-        },
         timeline_records: u32 {
             default: 131072,
             description: "Debug: timeline ring capacity in records (160 bytes each), allocated at probe only when timeline is nonzero",
