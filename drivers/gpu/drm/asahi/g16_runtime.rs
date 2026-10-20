@@ -865,7 +865,8 @@ impl Bootstrap {
         // The firmware stops completing a queue's Works (its shared notifier
         // stalls with the stamps already past, blocked=0x2) when too many
         // are outstanding: k24-cap129 (129 Works on a lane) and k69 on #108,
-        // whose compute_deps=2 adds firmware dependency items. Bound the
+        // where compute waits on the own render lanes add firmware dependency
+        // items. Bound the
         // whole queue's unretired Works plus their dependency items.
         let cap = crate::g16_timeline::QUEUE_CAP.load(Ordering::Relaxed) as usize;
         if cap != 0 {
@@ -2696,17 +2697,14 @@ impl Bootstrap {
     /// ordered by its ring. Any other awaited stamp must already be reached:
     /// otherwise return EBUSY, and the submission worker publishes what it
     /// has staged and retries after the next completion, holding back the
-    /// rest of this queue. compute_deps=0 keeps the firmware items.
+    /// rest of this queue.
     fn resolve_compute_dependencies(
         &self,
         queue: &mut FirmwareQueues,
         dependencies: &[Option<Stamp>; 2],
     ) -> Result<[Option<Stamp>; 2]> {
-        if crate::module_parameters::compute_deps.value() == 0 {
-            return Ok(*dependencies);
-        }
         let own_lane = queue.lanes.as_ref().map(|lanes| lanes[2].firmware_stamp());
-        // compute_deps=2: a wait on this queue's own render lanes (the
+        // A wait on this queue's own render lanes (the
         // render -> compute edge inside one submission) stays a firmware
         // item, so the firmware starts the compute right after the render
         // instead of after a host round trip. Other queues stay kernel-side.
@@ -2714,13 +2712,12 @@ impl Bootstrap {
             .lanes
             .as_ref()
             .map(|lanes| [lanes[0].firmware_stamp(), lanes[1].firmware_stamp()]);
-        let keep_own_render = crate::module_parameters::compute_deps.value() == 2;
         let mut kept = [None; 2];
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
         crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
         for (slot, dep) in dependencies.iter().enumerate() {
             let Some(dep) = dep else { continue };
-            if keep_own_render && own_render.is_some_and(|r| r.contains(&dep.address)) {
+            if own_render.is_some_and(|r| r.contains(&dep.address)) {
                 if !self.elide_item(queue, 2, dep, false)? {
                     kept[slot] = Some(*dep);
                 }

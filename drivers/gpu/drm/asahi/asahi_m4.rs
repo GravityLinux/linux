@@ -161,10 +161,6 @@ kernel::module_platform_driver! {
             default: 2000,
             description: "A4 wedge detection window: a render with TA done and all waits met whose 3D never starts, with all channels drained and no fragment progress on any lane for this long",
         },
-        compute_deps: u32 {
-            default: 2,
-            description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts); 2 as 1, but waits on the same queue's own render lanes stay firmware items (in-submission render -> compute edges without a host round trip)",
-        },
         max_queue_entries: u32 {
             default: 0,
             description: "Maximum unretired Works plus their firmware dependency items per queue (all lanes together) before submissions back off; 0 (default): unlimited, with max_lane_entries bounding each lane (production #149 used 96). Runtime: debugfs asahi_m4/queue_cap",
