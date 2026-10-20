@@ -356,7 +356,6 @@ impl FlagKnob {
     }
 
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
-    pub(crate) const DEP_ELIDE: Self = Self { cell: &DEP_ELIDE, name: "dep_elide", max: 7 };
     pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };
     pub(crate) const SAFETY_POLL_MS: Self = Self { cell: &SAFETY_POLL_MS, name: "safety_poll_ms", max: 10000 };
     pub(crate) const SCRATCH_ZERO: Self = Self { cell: &SCRATCH_ZERO, name: "scratch_zero", max: 2 };
@@ -380,14 +379,8 @@ impl kernel::debugfs::Reader for FlagKnob {
     }
 }
 
-/// Firmware dependency-item elision (asahi_m4.dep_elide, runtime: debugfs
-/// `asahi_m4/dep_elide`), a bitmask. An item is redundant when:
-/// 1: it waits on the same lane's earlier Work (lane order implies it);
-/// 2: its stamp has already been reached at publish (costs a firmware read);
-/// 4: this lane's previous Work already waited on that stamp or a later one
-///    (Works on a lane start in order).
-/// Counters in debugfs `asahi_m4/dep_stats` (category 2 only while bit 2 is set).
-pub(crate) static DEP_ELIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Firmware dependency-item counters (see elide_item), in debugfs
+/// `asahi_m4/dep_stats`.
 pub(crate) static DEP_ITEMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static DEP_SAME_LANE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static DEP_REACHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -403,7 +396,7 @@ impl kernel::debugfs::Writer for DepStats {
         use core::sync::atomic::Ordering::Relaxed;
         writeln!(
             f,
-            "works {}\nitems {}\nsame_lane {}\nrepeat {}\nreached {}\ndropped {}\ndep_elide {}\npoll_timeouts {}\npoll_retired {}\n\
+            "works {}\nitems {}\nsame_lane {}\nrepeat {}\nreached {}\ndropped {}\npoll_timeouts {}\npoll_retired {}\n\
              tvb_requests {}\ntvb_grown {}\ntvb_refused {}\ntvb_memory_limit {}\npartial_renders {}",
             DEP_WORKS.load(Relaxed),
             DEP_ITEMS.load(Relaxed),
@@ -411,7 +404,6 @@ impl kernel::debugfs::Writer for DepStats {
             DEP_REPEAT.load(Relaxed),
             DEP_REACHED.load(Relaxed),
             DEP_DROPPED.load(Relaxed),
-            DEP_ELIDE.load(Relaxed),
             POLL_TIMEOUTS.load(Relaxed),
             POLL_RETIRED.load(Relaxed),
             TVB_REQUESTS.load(Relaxed),
@@ -429,7 +421,7 @@ impl kernel::debugfs::Writer for DepStats {
 ///   they show no room (cursors only advance, so a stale view is conservative);
 /// - retirement reads the shared render-notifier count through the scan
 ///   snapshot;
-/// - dep_elide's already-reached test uses the last retire scan's values and
+/// - the dependency-item already-reached test uses the last retire scan's values and
 ///   keeps the item when the stamp wasn't seen there, with no read.
 pub(crate) static READ_OPT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 

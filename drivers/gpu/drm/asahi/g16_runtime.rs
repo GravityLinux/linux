@@ -34,7 +34,7 @@ pub(crate) struct FirmwareQueues {
     notified_works: u32,
     pub(crate) last: [Option<Stamp>; 2],
     /// Per lane (TA, 3D, compute), the latest stamps its published Works
-    /// waited on as firmware items, keyed by address (dep_elide bit 4).
+    /// waited on as firmware items, keyed by address.
     waited: [[Option<Stamp>; 2]; 3],
     /// read_opt: the last (read, done) cursors admission read per lane;
     /// u32::MAX until read. Cursors only advance, so a stale view
@@ -2087,22 +2087,25 @@ impl Bootstrap {
     /// let the worker retry after the next completion. The render then
     /// reaches the firmware with no dependency items; its internal TA-to-3D
     /// link is unchanged. render_deps=0 keeps the items.
-    /// dep_elide: count the item and decide whether to drop it.
+    /// Count a firmware dependency item and decide whether to drop it as
+    /// redundant: when this lane's previous Work already waited on that stamp
+    /// or a later one (Works on a lane start in order), or when the stamp has
+    /// already been reached at publish. An item on the same lane's earlier
+    /// Work is only counted: lane order implies it, but it is kept.
     fn elide_item(&self, queue: &FirmwareQueues, lane: usize, dep: &Stamp, same_lane: bool) -> Result<bool> {
         use crate::g16_timeline as t;
-        let mode = t::DEP_ELIDE.load(Ordering::Relaxed);
         t::DEP_ITEMS.fetch_add(1, Ordering::Relaxed);
         let drop = if same_lane {
             t::DEP_SAME_LANE.fetch_add(1, Ordering::Relaxed);
-            mode & 1 != 0
+            false
         } else if queue.waited[lane]
             .iter()
             .flatten()
             .any(|w| w.address == dep.address && g16_stamp::reached(w.value, dep.value))
         {
             t::DEP_REPEAT.fetch_add(1, Ordering::Relaxed);
-            mode & 4 != 0
-        } else if mode & 2 != 0 {
+            true
+        } else {
             let before = t::reads();
             let now = if t::read_opt() {
                 // The last retire scan's value: stamps only advance, so a
@@ -2117,8 +2120,6 @@ impl Bootstrap {
                 t::DEP_REACHED.fetch_add(1, Ordering::Relaxed);
             }
             reached
-        } else {
-            false
         };
         if drop {
             t::DEP_DROPPED.fetch_add(1, Ordering::Relaxed);
