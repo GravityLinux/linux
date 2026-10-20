@@ -2,13 +2,17 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Host tests of the real mesh parser, serializers, support and scratch setup.
 
-The ordinary-render byte comparison uses #214 from this repository's history.
-No device, kernel module, or external package is needed; rustc must be on PATH.
+The ordinary-render byte comparison uses g16_render.rs from the commit before
+native mesh support was added (the parent of the commit that added
+g16_mesh.rs), found in this checkout's git history; production #214 in the
+original history. Without git history the test is skipped. No device, kernel
+module, or external package is needed; rustc must be on PATH.
 """
 from pathlib import Path
 import os
 import re
 import subprocess
+import sys
 import tempfile
 
 root = next(p for p in Path(__file__).resolve().parents
@@ -63,12 +67,30 @@ tests = Path(__file__).with_name('native-mesh.rs').read_text()
 fixture += tests
 fixture = fixture.replace('/* PREPARE_RENDER */', item(vm, r'    pub\(crate\) fn prepare_render\('))
 
+def baseline_render():
+    """g16_render.rs as of the parent of the commit that added g16_mesh.rs."""
+    try:
+        added = subprocess.run(
+            ['git', 'log', '--diff-filter=A', '--format=%H', 'HEAD', '--',
+             'drivers/gpu/drm/asahi/g16_mesh.rs'],
+            cwd=root, text=True, capture_output=True, check=True).stdout.split()
+        if not added:
+            return None
+        return subprocess.run(
+            ['git', 'show', added[-1] + '^:drivers/gpu/drm/asahi/g16_render.rs'],
+            cwd=root, text=True, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+baseline = baseline_render()
+if baseline is None:
+    print('SKIP: no git history with the commit that added g16_mesh.rs; '
+          'the ordinary-render baseline is unavailable')
+    sys.exit(4)
+
 with tempfile.TemporaryDirectory(prefix='asahi-native-mesh-') as temp:
     temp = Path(temp)
-    baseline = subprocess.check_output([
-        'git', 'show',
-        '8385526e4c15d59a7d3a6fbc99e98189529ee5cf:drivers/gpu/drm/asahi/g16_render.rs'
-    ], cwd=root, text=True)
     (temp / 'baseline.rs').write_text(baseline)
     fixture += f'#[path = "{temp / "baseline.rs"}"] mod baseline;\n'
     (temp / 'test.rs').write_text(fixture)
