@@ -181,10 +181,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: GPU performance controller base pstate (0: ADT value; 10 is the top state)",
         },
-        tvb_growth: u32 {
-            default: 3,
-            description: "TVB growth factor per firmware allocation request (debug; 3 as Apple8)",
-        },
         tvb_max_blocks: u32 {
             default: 2193,
             description: "Maximum retained 128 KiB TVB blocks per context (11 through 6579)",

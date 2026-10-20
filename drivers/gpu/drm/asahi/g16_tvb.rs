@@ -145,8 +145,7 @@ impl Tvb {
         // pages. Give it the same 3x headroom used by Apple8's growth policy.
         // M4 expands its page list when it consumes this event's reply, so
         // publication stays on the verified allocation-event path.
-        let factor = (crate::module_parameters::tvb_growth.value()).max(2);
-        let mut new = old.saturating_mul(factor).min(limit).max(old);
+        let mut new = old.saturating_mul(3).min(limit).max(old);
         if new > fw.read_u32(a.buffer_manager + 0x38)? || new * 8 > 0x10000 || new * 16 > 0x1c000 {
             return Err(EIO);
         }
