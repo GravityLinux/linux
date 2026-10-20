@@ -727,11 +727,10 @@ impl Bootstrap {
             // Native TA/3D profiles allow firmware to suspend and restart
             // renders. Their Work/scratch leases survive until the final
             // notifier/driver stamp, including intervening partial runs.
-            // Compute remains non-preemptible, matching the M1/M2 driver.
-            // Preemptible renders can wedge the firmware when a compressed
-            // render is timesliced against other contexts (Dota 2 with two
-            // compositors, 2026-10-06), so they are off by default.
-            if stage == 2 || crate::module_parameters::render_preempt.value() == 0 {
+            // Compute remains non-preemptible, matching the M1/M2 driver;
+            // Metal's compute queues use the native preemptible profile.
+            let preemptible = stage != 2;
+            if !preemptible {
                 descriptor[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
                 descriptor[0x48..0x4c].copy_from_slice(&1u32.to_le_bytes());
             }
