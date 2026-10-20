@@ -220,7 +220,8 @@ struct Diagnostics {
     /// flight's stamps and every channel's registers).
     wedge_sampled: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     wedge_signature: u64,
-    wedge_rung: u32,
+    /// The current wedge has been logged.
+    wedge_reported: bool,
     /// Debug (dump_render_buffered): the most recent submitted renders,
     /// printed only by the hang report.
     render_ring: render_runtime::RenderRing,
@@ -767,7 +768,7 @@ impl Bootstrap {
             wedge_since: None,
             wedge_sampled: None,
             wedge_signature: 0,
-            wedge_rung: 0,
+            wedge_reported: false,
             render_ring: render_runtime::RenderRing::new(),
             retire_log: KVec::new(),
             retire_next: 0,

@@ -3574,9 +3574,7 @@ impl Bootstrap {
     /// whose TA is done and whose waits are all satisfied, while its 3D never
     /// starts, every channel is drained and no fragment stamp on any lane
     /// moves for wedge_ms. Firmware reports nothing for this state, so the
-    /// kernel detects it. wedge_recover=0 only logs the detection; 1 also
-    /// walks the recovery ladder: R1 re-kicks the stuck render's 3D lane, R2
-    /// re-kicks the TA and 3D lanes of every live render queue.
+    /// kernel detects it and logs it once; the 10 s watchdog handles it.
     fn check_wedge(&mut self) -> Result {
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
         let mut stuck = None;
@@ -3610,7 +3608,7 @@ impl Bootstrap {
         };
         let Some(index) = stuck.filter(|_| drained) else {
             self.diagnostics.wedge_since = None;
-            self.diagnostics.wedge_rung = 0;
+            self.diagnostics.wedge_reported = false;
             return Ok(());
         };
         let now = Instant::now();
@@ -3628,57 +3626,13 @@ impl Bootstrap {
                 return Ok(());
             }
         }
-        let flight = &self.flights[index];
-        let owner = flight.owner.clone();
-        let recover = crate::module_parameters::wedge_recover.value() != 0;
-        if self.diagnostics.wedge_rung < 3 {
+        if !self.diagnostics.wedge_reported {
+            let flight = &self.flights[index];
             dev_err!(self.dev.as_ref(),
-                "G16: A4 wedge: Work {:#x} context {} stream {:#x} ordinal {} age {} ms, no fragment progress for {} ms; {}\n",
+                "G16: A4 wedge: Work {:#x} context {} stream {:#x} ordinal {} age {} ms, no fragment progress for {} ms; detection only\n",
                 flight.id, flight.context, flight.stream, flight.ordinal,
-                self.flight_ms(flight, now), (now - self.diagnostics.wedge_since.unwrap_or(now)).as_millis(),
-                match (recover, self.diagnostics.wedge_rung) {
-                    (false, _) => "detection only (wedge_recover=0)",
-                    (true, 0) => "R1: re-kicking its 3D lane",
-                    (true, 1) => "R2: re-kicking every render queue's TA and 3D lanes",
-                    _ => "ladder exhausted, leaving it to the watchdog",
-                });
-        }
-        if !recover || self.diagnostics.wedge_rung >= 2 {
-            self.diagnostics.wedge_rung = 3;
-            return Ok(());
-        }
-        if self.diagnostics.wedge_rung == 0 {
-            self.rekick(&owner, &[1])?;
-        } else {
-            let mut owners = KVec::new();
-            for f in self.flights.iter().filter(|f| f.render.is_some()) {
-                if !owners.iter().any(|o: &Arc<Mutex<FirmwareQueues>>| Arc::ptr_eq(o, &f.owner)) {
-                    owners.push(f.owner.clone(), GFP_KERNEL)?;
-                }
-            }
-            for o in owners.iter() {
-                self.rekick(o, &[0, 1])?;
-            }
-        }
-        self.flush()?;
-        self.diagnostics.wedge_rung += 1;
-        self.diagnostics.wedge_since = Some(Instant::now());
-        Ok(())
-    }
-
-    /// Re-send a render queue's channel messages at its current heads, as a
-    /// fresh publication with no new Work: firmware re-reads the lane.
-    fn rekick(&mut self, owner: &Arc<Mutex<FirmwareQueues>>, stages: &[usize]) -> Result {
-        let (lanes, priority, events) = {
-            let q = owner.lock();
-            let Some(lanes) = q.lanes else { return Ok(()) };
-            (lanes, q.priority, [q.event(0).ok(), q.event(1).ok()])
-        };
-        for &stage in stages {
-            let Some(event) = events[stage] else { continue };
-            let mut lane = lanes[stage];
-            lane.new = false;
-            self.stage_queue(priority as usize * 3 + stage, lane, event, self.render_publication)?;
+                self.flight_ms(flight, now), (now - self.diagnostics.wedge_since.unwrap_or(now)).as_millis());
+            self.diagnostics.wedge_reported = true;
         }
         Ok(())
     }

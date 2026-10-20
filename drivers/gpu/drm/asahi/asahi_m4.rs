@@ -161,10 +161,6 @@ kernel::module_platform_driver! {
             default: 2000,
             description: "A4 wedge detection window: a render with TA done and all waits met whose 3D never starts, with all channels drained and no fragment progress on any lane for this long",
         },
-        wedge_recover: u32 {
-            default: 0,
-            description: "A4 wedge handling: 0 logs the detection only; 1 also re-kicks the stuck 3D lane (R1), then every render queue's TA and 3D lanes (R2), one rung per wedge_ms window, before the 10 s watchdog",
-        },
         compute_deps: u32 {
             default: 2,
             description: "Compute Work ordering against other queues: 1 waits in the kernel and submits Works without firmware dependency items (as Metal); 0 encodes firmware dependency items (the earlier behaviour, which can stall the firmware under heavy compute bursts); 2 as 1, but waits on the same queue's own render lanes stay firmware items (in-submission render -> compute edges without a host round trip)",
