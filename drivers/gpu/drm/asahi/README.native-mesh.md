@@ -6,26 +6,44 @@ is provided. The paired stream starts with complete native object/mesh state.
 The decoder runs only with the option enabled; ordinary streams are identified
 by their first packet, without searching their contents for native state.
 
-The admitted class has physical T16 or T32 mesh execution, one direct object workgroup,
+The admitted class has physical T16 or T32 mesh execution, one direct object dispatch,
 four-vertex storage and one triangle primitive. It supports 4–128 per-vertex
 32-bit scalar components, including XYZW. The two scalar counts and output-row
 count must agree: N components, N+1 rows, with no reserved upper bits. This
 corresponds to 32 + 16*N local bytes (at most 2080), rounded up by the paired
 Mesa launch to a power-of-two allocation (at most 4096). Task payload,
-per-primitive outputs, culling, multiple draws, indirect draws and wider
+per-primitive outputs, culling, multiple draws, hardware indirect packets and wider
 resource classes remain rejected. Single-sample, single-layer restrictions
 also remain in the runtime.
 
-Object dispatch total and local thread dimensions must match, and must be
-either (1,1,1) for the existing scalar carrier, (16,1,1) for physical T16,
-or (32,1,1) for physical T32.
+Object dispatch local thread dimensions must be either (1,1,1) for the existing
+scalar carrier, (16,1,1) for physical T16, or (32,1,1) for physical T32.
+Total thread dimensions must be nonzero multiples of the local dimensions.
+Thus (512,2,3) total / (16,1,1) local describes 32x2x3 parent workgroups.
 The mesh execution width in the state packet does not set the object dispatch
-width. Mismatched dimensions, other shapes and multiple workgroups are rejected.
-This bounds the parent object dispatch, not a child mesh grid exported by its
-shader. Physical T64/T128 state remains rejected; logical workgroups lowered
+width. Partial workgroups and other local shapes are rejected. This validates
+the parent packet shape, not a child mesh grid exported by its shader, nor an
+aggregate resource or workgroup-count limit. Physical T64/T128 state remains
+rejected; logical workgroups lowered
 by the compiler to physical T32 do not require those wider state values.
-T32 admission enables device qualification without changing payload sizes,
-scene ownership or the default-off gate; it is not a hardware pass by itself.
+T32 and multiple-parent admission enable device qualification without changing
+payload sizes, scene ownership or the default-off gate; neither is a hardware
+pass by itself. Multiple-parent use needs separate ordering and lifetime tests.
+
+A taskless API draw with N mesh workgroups can keep one object workgroup and
+read its child XYZ grid from a userspace GPU buffer. A future indirect API
+implementation can use that same packet with a GPU-produced grid. Neither
+requires a hardware indirect object packet or CPU reads of the grid/count
+buffer. Do not multiply parent dimensions by a taskless child grid. Indirect
+API semantics, producer synchronization, count/stride handling and zero-child
+completion still require userspace implementation and device qualification.
+The current hk native API gate excludes these broader API shapes independently
+of kernel admission. Hardware indirect/link packets and multiple draws in one
+stream remain rejected until their native packet contract is established.
+
+USC frame extents (for example mesh 64/64 versus Metal 16/16) are encoded by
+userspace in the launch record. The kernel passes the launch handles through;
+it does not read, size or validate those extents, or the local-allocation field.
 
 This is bounded resource-class admission, not validation of arbitrary shader
 programs. Launches and their local-allocation instructions remain userspace

@@ -34,8 +34,11 @@ pub(crate) enum DecodeError {
 }
 
 /// Admit the paired T16/T32 class: four vertices' storage, one primitive and one
-/// direct object workgroup, with position and up to 124 per-vertex scalars.
+/// direct object dispatch, with position and up to 124 per-vertex scalars.
 /// Primitive outputs, task payload and wider resource classes remain excluded.
+/// The dispatch grid may contain multiple complete physical object workgroups.
+/// This does not bound the child grid computed by the object shader, nor prove
+/// that a particular aggregate workload fits the available GPU resources.
 /// The packet budget bounds malformed streams, including a missing terminator.
 pub(crate) fn decode(
     start: u64,
@@ -100,11 +103,17 @@ pub(crate) fn decode(
             }
             1 if word & !0x2000_0013 == 0 => {} // G16 coherency barrier
             3 if word == 0x7000_0600 && !drew => {
-                // Exactly one object workgroup: total threads equal local
-                // threads. Keep the scalar carrier and physical T16/T32.
+                // Total threads describe a nonempty grid of complete object
+                // workgroups. Keep the scalar carrier and physical T16/T32,
+                // independently of the mesh width in the state packet.
                 let total = [next()?, next()?, next()?];
                 let local = [next()?, next()?, next()?];
-                if total != local || !matches!(local, [1, 1, 1] | [16, 1, 1] | [32, 1, 1]) {
+                if !matches!(local, [1, 1, 1] | [16, 1, 1] | [32, 1, 1])
+                    || total
+                        .iter()
+                        .zip(local)
+                        .any(|(&n, size)| n == 0 || n % size != 0)
+                {
                     return Err(DecodeError::Unsupported);
                 }
                 drew = true;

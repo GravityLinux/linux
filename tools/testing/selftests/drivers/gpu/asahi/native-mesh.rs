@@ -34,34 +34,58 @@ fn native_packets_are_relocatable_and_bounded() {
 }
 
 #[test]
-fn object_dispatch_is_one_scalar_or_physical_t16_t32_workgroup() {
+fn object_dispatch_accepts_complete_scalar_or_physical_t16_t32_grids() {
     for base in [0x1004000000, 0x10d1233ffc] {
-        for (mesh, width) in [
-            (16, 1), (16, 16), (16, 32), (32, 1), (32, 16), (32, 32),
-        ] {
+        for (mesh, width) in [(16, 1), (16, 16), (16, 32), (32, 1), (32, 16), (32, 32)] {
             let mut words = stream();
             words[11] = 0x400800 | mesh;
-            words[18] = width;
             words[21] = width;
-            assert_eq!(decode(&words, base), Ok(Some(Profile { payload: 0 })));
-            for len in 0..words.len() {
-                assert!(decode(&words[..len], base).is_err(), "truncated at {len}");
-            }
-            for index in 18..24 {
-                for value in [0, 1, 2, 15, 16, 17, 31, 32, 33, 64, 128, u32::MAX] {
-                    if value == words[index] {
-                        continue;
-                    }
+            for groups in [
+                [1, 1, 1],
+                [2, 1, 1],
+                [32, 1, 1],
+                [1, 2, 1],
+                [1, 1, 32],
+                [2, 3, 4],
+                [32, 32, 32],
+                [65535, 1, 1],
+            ] {
+                words[18..21].copy_from_slice(&[groups[0] * width, groups[1], groups[2]]);
+                assert_eq!(decode(&words, base), Ok(Some(Profile { payload: 0 })));
+                for len in 0..words.len() {
+                    assert!(decode(&words[..len], base).is_err(), "truncated at {len}");
+                }
+                for index in 18..21 {
                     let mut bad = words.clone();
-                    bad[index] = value;
+                    bad[index] = 0;
                     assert_eq!(decode(&bad, base), Err(DecodeError::Unsupported));
                 }
             }
-            // Matching total/local dimensions alone must not widen the class.
+            // Partial workgroups and wider/nonlinear local shapes stay out.
+            if width > 1 {
+                for total in [1, width - 1, width + 1, 32 * width - 1, u32::MAX] {
+                    let mut bad = words.clone();
+                    bad[18] = total;
+                    assert_eq!(decode(&bad, base), Err(DecodeError::Unsupported));
+                }
+            }
             for dimensions in [
-                [2, 1, 1], [31, 1, 1], [33, 1, 1], [64, 1, 1], [128, 1, 1],
-                [1, 16, 1], [1, 1, 16], [16, 2, 1], [16, 1, 2],
-                [1, 32, 1], [1, 1, 32], [32, 2, 1], [32, 1, 2],
+                [0, 1, 1],
+                [16, 0, 1],
+                [32, 1, 0],
+                [2, 1, 1],
+                [31, 1, 1],
+                [33, 1, 1],
+                [64, 1, 1],
+                [128, 1, 1],
+                [1, 16, 1],
+                [1, 1, 16],
+                [16, 2, 1],
+                [16, 1, 2],
+                [1, 32, 1],
+                [1, 1, 32],
+                [32, 2, 1],
+                [32, 1, 2],
             ] {
                 let mut bad = words.clone();
                 bad[18..21].copy_from_slice(&dimensions);
@@ -94,6 +118,36 @@ fn mesh_physical_width_accepts_only_exact_t16_t32_state() {
             words[11] = state ^ (1 << bit);
             assert_eq!(decode(&words, 0x1004000000), Err(DecodeError::Unsupported));
         }
+    }
+}
+
+#[test]
+fn child_grid_and_launch_backing_are_not_cpu_admission_inputs() {
+    // Direct API XYZ and indirect buffer XYZ both live behind the object
+    // launch's argument pointer. The GPU reads them after submission. Neither
+    // that pointer, the grid, nor the USC frame/allocation bytes are packet
+    // fields, and the parser must not chase them or snapshot a GPU-produced grid.
+    let base = 0x1004003ffc;
+    for mesh in [16, 32] {
+        let mut words = stream();
+        words[11] = 0x400800 | mesh;
+        words[18] = 16;
+        words[21] = 16;
+        let mut reads = Vec::new();
+        let result = g16_mesh::decode(base, |va| {
+            reads.push(va);
+            // All launch, argument, indirect and count-buffer backing is
+            // intentionally absent from this CPU command-memory view.
+            let offset: usize = va.checked_sub(base)?.try_into().ok()?;
+            words.get(offset / 4).copied()
+        });
+        assert_eq!(result, Ok(Some(Profile { payload: 0 })));
+        assert_eq!(
+            reads,
+            (0..words.len())
+                .map(|i| base + 4 * i as u64)
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -157,7 +211,7 @@ fn attributes_do_not_admit_other_output_or_execution_classes() {
             (10, 1 << 30),  // more primitives, culling
             (11, 0x400840), // physical T64 remains excluded
             (12, 1),        // primitive output components
-            (18, 2),        // more than one direct object invocation
+            (18, 0),        // empty parent dispatch
         ] {
             let mut words = stream();
             words[1] = components | ((components + 1) << 8);
@@ -179,7 +233,7 @@ fn reject_unqualified_resource_classes_and_packets() {
         (12, 3),
         (13, 9),
         (17, 0x74000600),
-        (18, 2),
+        (18, 0),
     ] {
         let mut words = stream();
         words[index] = value;
