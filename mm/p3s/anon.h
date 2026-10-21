@@ -3,6 +3,7 @@
 #define __MM_P3S_ANON_H
 
 #include <linux/highmem.h>
+#include <linux/leafops.h>
 #include <linux/mm.h>
 #include <linux/oom.h>
 #include <linux/pagemap.h>
@@ -10,6 +11,8 @@
 #include <linux/swap.h>
 #include <linux/userfaultfd_k.h>
 
+#include "../internal.h"
+#include "../swap.h"
 #include "pgtable.h"
 #include "rmap.h"
 
@@ -272,6 +275,126 @@ static inline bool p3s_anon_reuse_racing_sibling(struct vm_fault *vmf,
 	return true;
 }
 
+/*
+ * p3s_swapin_free_sibling_swap - Free the swap entries of sibling slices
+ * @vmf: Fault information, with the page table lock held
+ * @folio: Folio that do_swap_page() is about to map, locked
+ * @entry: Swap entry of the faulting PTE
+ *
+ * Reclaim replaced every PTE that mapped @folio with a swap PTE for @entry.
+ * Restore the siblings with the faulting slice; otherwise their swap PTEs
+ * keep @folio shared and each write copies its slice into a new folio:
+ *
+ *             slice 0   slice 1   slice 2   slice 3
+ *           ┌─────────┬─────────┬─────────┬─────────┐
+ *  before   │ swap E  │ swap E  │  none   │ swap E  │  fault on slice 1
+ *           ├─────────┼─────────┼─────────┼─────────┤
+ *  after    │  F[0]   │  F[1]   │  none   │  F[3]   │  F: @folio, E: @entry
+ *           └─────────┴─────────┴─────────┴─────────┘
+ *
+ * Drops the swap reference of each such sibling, so that do_swap_page()
+ * can free the swap cache (the locked @folio keeps @entry allocated until
+ * then), and returns their mask (0 and 3 above). None of them is
+ * exclusive: try_to_unmap_one() marks a swap PTE exclusive only while a
+ * single slice maps the folio.
+ */
+static inline unsigned long p3s_swapin_free_sibling_swap(struct vm_fault *vmf,
+							 struct folio *folio,
+							 swp_entry_t entry)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long start, mask = 0;
+	unsigned int nr_slices, i;
+	pte_t *pte_base;
+
+	if (!vma_is_p3s_4k(vma) || folio_test_large(folio) ||
+	    folio_test_ksm(folio) || !folio_test_swapcache(folio))
+		return 0;
+
+	vma_folio_slice_bounds(vma, vmf->address, &nr_slices, &start);
+	pte_base = vmf->pte - ((vmf->address - start) >> PAGE_SHIFT_4KB);
+	for (i = 0; i < nr_slices; i++) {
+		pte_t ptent = ptep_get(pte_base + i);
+
+		if (pte_base + i == vmf->pte || pte_none(ptent) ||
+		    pte_present(ptent) ||
+		    softleaf_from_pte(ptent).val != entry.val)
+			continue;
+		VM_WARN_ON_ONCE(pte_swp_exclusive(ptent));
+		folio_put_swap(folio, folio_page(folio, 0));
+		mask |= BIT(i);
+	}
+
+	return mask;
+}
+
+/*
+ * p3s_swapin_map_sibling_slices - Restore the slices swapped out with a folio
+ * @vmf: Fault information, with the page table lock held
+ * @folio: Folio that do_swap_page() mapped at the faulting address
+ * @mask: Slices returned by p3s_swapin_free_sibling_swap()
+ * @rmap_flags: RMAP_EXCLUSIVE if do_swap_page() mapped the folio exclusive
+ *
+ * Map each slice in @mask to its slice of @folio, keeping the soft-dirty
+ * and uffd-wp bits of its swap PTE. The slices come back only because they
+ * share the swap entry, so map them old where the architecture wants that
+ * for prefaulted PTEs, as fault-around does. Like the faulting PTE, a
+ * slice of an exclusive folio is mapped writable (clean) unless uffd-wp or
+ * soft-dirty tracking must see its first write; otherwise that write
+ * reuses the exclusive folio without a copy. The android_vh_do_swap_page
+ * vendor hook only sees the faulting PTE, not these slices.
+ */
+static inline void p3s_swapin_map_sibling_slices(struct vm_fault *vmf,
+						 struct folio *folio,
+						 unsigned long mask,
+						 rmap_t rmap_flags)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct page *page = folio_page(folio, 0);
+	unsigned int nr_slices, i;
+	unsigned long start;
+	pte_t *pte_base;
+
+	if (!mask)
+		return;
+
+	vma_folio_slice_bounds(vma, vmf->address, &nr_slices, &start);
+	pte_base = vmf->pte - ((vmf->address - start) >> PAGE_SHIFT_4KB);
+	for_each_set_bit(i, &mask, nr_slices) {
+		unsigned long addr = start + (i << PAGE_SHIFT_4KB);
+		pte_t orig_pte = ptep_get(pte_base + i);
+		bool rwp_restore = false;
+		pte_t pte;
+
+		pte = vma_pte_add_slice(vma, addr,
+					mk_pte(page, vma->vm_page_prot));
+		if (pte_swp_soft_dirty(orig_pte))
+			pte = pte_mksoft_dirty(pte);
+		if (pte_swp_uffd(orig_pte))
+			pte = pte_mkuffd(pte);
+		/* As for the faulting PTE: keep an RWP-protected slice trapping. */
+		if (pte_swp_uffd(orig_pte) && userfaultfd_rwp(vma)) {
+			pte = pte_modify(pte, PAGE_NONE);
+			rwp_restore = true;
+		}
+		if (arch_wants_old_prefaulted_pte())
+			pte = pte_mkold(pte);
+		if ((rmap_flags & RMAP_EXCLUSIVE) && !rwp_restore &&
+		    (vma->vm_flags & VM_WRITE) &&
+		    !userfaultfd_pte_wp(vma, pte) &&
+		    !pte_needs_soft_dirty_wp(vma, pte))
+			pte = pte_mkwrite(pte, vma);
+
+		folio_get(folio);
+		folio_add_anon_rmap_ptes(folio, page, 1, vma, addr, rmap_flags);
+		add_mm_counter(vma->vm_mm, MM_ANONPAGES, 1);
+		add_mm_counter(vma->vm_mm, MM_SWAPENTS, -1);
+		set_pte_at(vma->vm_mm, addr, pte_base + i, pte);
+		arch_do_swap_page_nr(vma->vm_mm, vma, addr, pte, pte, 1);
+		update_mmu_cache_range(vmf, vma, addr, pte_base + i, 1);
+	}
+}
+
 #ifdef CONFIG_USERFAULTFD
 /*
  * p3s_uffd_install_anon_folio - Look around and reuse existing folio slice for userfaultfd
@@ -320,7 +443,7 @@ static inline bool p3s_uffd_install_anon_folio(struct vm_area_struct *dst_vma,
 	if (writable)
 		*dst_pte_val = pte_mkwrite(*dst_pte_val, dst_vma);
 	if (flags & MFILL_ATOMIC_WP)
-		*dst_pte_val = pte_mkuffd_wp(*dst_pte_val);
+		*dst_pte_val = pte_mkuffd(*dst_pte_val);
 
 	folio_put(folio);
 	return true;
@@ -399,6 +522,20 @@ static inline bool p3s_anon_reuse_racing_sibling(struct vm_fault *vmf,
 						 pte_t *entry)
 {
 	return false;
+}
+
+static inline unsigned long p3s_swapin_free_sibling_swap(struct vm_fault *vmf,
+							 struct folio *folio,
+							 swp_entry_t entry)
+{
+	return 0;
+}
+
+static inline void p3s_swapin_map_sibling_slices(struct vm_fault *vmf,
+						 struct folio *folio,
+						 unsigned long mask,
+						 rmap_t rmap_flags)
+{
 }
 
 #ifdef CONFIG_USERFAULTFD
