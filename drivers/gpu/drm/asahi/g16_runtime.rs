@@ -33,6 +33,11 @@ pub(crate) struct FirmwareQueues {
     /// Render Works counted into the queue's shared notifier (two per render).
     notified_works: u32,
     pub(crate) last: [Option<Stamp>; 2],
+    /// A command on this queue was rejected before publication. Userspace
+    /// may split one submission into several jobs whose later parts rely on
+    /// queue order, so every later job on the queue fails with ECANCELED
+    /// instead of running without that command.
+    pub(crate) rejected: bool,
     /// Per lane (TA, 3D, compute), the latest stamps its published Works
     /// waited on as firmware items, keyed by address.
     waited: [[Option<Stamp>; 2]; 3],
@@ -189,6 +194,7 @@ impl FirmwareQueues {
             waited: [[None; 2]; 3],
             cursors: [const { core::cell::Cell::new((u32::MAX, u32::MAX)) }; 3],
             deps: DependencyStats::default(),
+            rejected: false,
         }
     }
 

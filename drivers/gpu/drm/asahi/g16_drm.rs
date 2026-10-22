@@ -2011,7 +2011,17 @@ impl WorkItem for Execution {
                             continue;
                         }
                         if job.history[0].is_empty() {
-                            let previous = job.execution.firmware.lock().last;
+                            let firmware = job.execution.firmware.lock();
+                            if firmware.rejected {
+                                // Queued behind a rejected command on this
+                                // queue: fail without publishing anything.
+                                drop(firmware);
+                                job.error = Some(ECANCELED);
+                                progress = true;
+                                continue;
+                            }
+                            let previous = firmware.last;
+                            drop(firmware);
                             for (history, stamp) in job.history.iter_mut().zip(previous) {
                                 history.push(stamp, GFP_KERNEL)?;
                             }
@@ -2057,10 +2067,11 @@ impl WorkItem for Execution {
                             }
                             Err(error) if !runtime.render_failed() => {
                                 pr_err!(
-                                    "G16: command {} preparation failed: {:?}\n",
+                                    "G16: command {} preparation failed: {:?}; later work on its queue is cancelled\n",
                                     job.next,
                                     error
                                 );
+                                execution.firmware.lock().rejected = true;
                                 job.error = Some(error);
                                 progress = true;
                                 continue;
