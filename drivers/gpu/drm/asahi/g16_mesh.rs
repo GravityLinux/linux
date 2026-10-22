@@ -8,6 +8,20 @@
 //! stream starts with a complete mesh state; there is no search for magic words
 //! inside shader data, PPP records, or ordinary vertex streams.
 
+/// Runtime copy of `asahi_m4.native_mesh`, writable from debugfs
+/// `asahi_m4/native_mesh` without a reboot. Each submission reads it once.
+/// A VM's support object latches the value at its first render (see
+/// `Support::native`); later changes never rewrite a published header.
+pub(crate) static NATIVE_MESH: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// The highest accepted `native_mesh` value.
+pub(crate) const MAX_MODE: u32 = 2;
+
+pub(crate) fn mode() -> u32 {
+    NATIVE_MESH.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Disabled,

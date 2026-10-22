@@ -35,9 +35,17 @@ def item(source, pattern):
 runtime = (driver / 'g16_runtime.rs').read_text()
 bootstrap = (driver / 'g16.rs').read_text()
 mode_expr = r'g16_mesh::Mode::from_parameter\(crate::module_parameters::native_mesh.value\(\)\)\s*\.ok_or\(EINVAL\)\?'
+# The boot value is validated once; support and submission read the runtime
+# copy (debugfs asahi_m4/native_mesh) through the same mapping.
+runtime_expr = r'g16_mesh::Mode::from_parameter\(g16_mesh::mode\(\)\)\s*\.ok_or\(EINVAL\)\?'
 assert re.search(mode_expr, bootstrap)
-assert re.search(r'if ' + mode_expr + r'\s*\.enabled\(\)\s*\{\s*render::initialize_native_support', runtime)
-assert re.search(r'let mesh_mode =\s*' + mode_expr + r';\s*let params = if mesh_mode.enabled\(\)', runtime)
+assert re.search(r'let native =\s*' + runtime_expr + r'\s*\.enabled\(\);', runtime)
+assert re.search(r'if lease\.native\s*\{\s*render::initialize_native_support', runtime)
+assert re.search(r'let mesh_mode =\s*' + runtime_expr + r';\s*let params = if mesh_mode.enabled\(\)', runtime)
+assert re.search(r'params\.mesh\.is_some\(\) && !support\.native', runtime)
+assert 'native_mesh.value()' not in runtime
+mesh = (driver / 'g16_mesh.rs').read_text()
+assert 'pub(crate) const MAX_MODE: u32 = 2;' in mesh
 assert 'g16_mesh::decode(params.encoder, mesh_mode,' in runtime
 assert 'native_mesh.value() == 1' not in runtime
 params = (driver / 'asahi_m4.rs').read_text()

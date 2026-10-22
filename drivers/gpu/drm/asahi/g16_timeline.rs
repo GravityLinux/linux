@@ -348,6 +348,11 @@ impl FlagKnob {
     pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", max: i32::MAX as u32 };
     pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", max: i32::MAX as u32 };
     pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", max: 4096 };
+    pub(crate) const NATIVE_MESH: Self = Self {
+        cell: &crate::g16_mesh::NATIVE_MESH,
+        name: "native_mesh",
+        max: crate::g16_mesh::MAX_MODE,
+    };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {

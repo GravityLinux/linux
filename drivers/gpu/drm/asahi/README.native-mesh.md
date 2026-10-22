@@ -53,7 +53,8 @@ or fixed register assignment. The paired compiler must generate matching
 allocation, output and interpolation state. Attribute admission alone is not
 hardware qualification of attributes or the maximum component count.
 
-All VMs initialize native support mode before first publication when opted in.
+A VM whose first render runs with the option enabled initializes native support
+mode before its first publication.
 The initialized 24-buffer operand pool serves both ordinary and native Work;
 there is no additional native buffer-admission request. Native payload storage
 is cleared, exclusive per render, and retained through completion. CPU producer
@@ -76,3 +77,33 @@ driver initialization. Both enabled modes initialize native support state.
 Multi-parent device use requires a guarded measurement of the 16 KiB native
 firmware payload's touched range versus parent count first. Host parser tests
 are not device qualification.
+
+## Switching at runtime
+
+The boot value only sets the initial state. As root, with debugfs mounted:
+
+```sh
+cat /sys/kernel/debug/asahi_m4/native_mesh       # current mode
+echo 1 > /sys/kernel/debug/asahi_m4/native_mesh  # one-parent mode (2: multi-parent)
+echo 0 > /sys/kernel/debug/asahi_m4/native_mesh  # back to the default
+```
+
+Values above the highest supported mode return EINVAL, and each change is
+logged as `G16: native_mesh=N`. Flipping is safe at any time, not only when
+idle:
+
+- Each submission reads the mode once. Work already queued keeps the decode
+  it was admitted with.
+- A VM's support header is set at its first render from the mode at that
+  moment and is never rewritten afterwards. A VM that first rendered with
+  the mode at 0 (KWin, for example) keeps working; if it submits a native
+  stream after the switch, the submission fails with EOPNOTSUPP instead of
+  running on an ordinary header.
+- Switching back to 0 returns every later submission to the ordinary path.
+  VMs that started in native mode keep their native support header, which
+  serves ordinary Work exactly as under a native_mesh=1 boot.
+- Switching between 1 and 2 changes only admission, from the next
+  submission on; both use the same native support header.
+
+So start a fresh process (a new VM) after enabling the mode. The module
+parameter is read-only in sysfs; use the debugfs file.

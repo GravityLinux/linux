@@ -91,9 +91,7 @@ impl Bootstrap {
             return Err(EIO);
         }
         let mut mesh_params;
-        let mesh_mode =
-            g16_mesh::Mode::from_parameter(crate::module_parameters::native_mesh.value())
-                .ok_or(EINVAL)?;
+        let mesh_mode = g16_mesh::Mode::from_parameter(g16_mesh::mode()).ok_or(EINVAL)?;
         let params = if mesh_mode.enabled() {
             mesh_params = *params;
             let params = &mut mesh_params;
@@ -114,6 +112,11 @@ impl Bootstrap {
                 })?;
             drop(client);
             if params.mesh.is_some() && (params.samples != 1 || params.layers != 1) {
+                return Err(EOPNOTSUPP);
+            }
+            // A VM that first rendered with native_mesh=0 keeps its ordinary
+            // support header, which cannot run a native stream.
+            if params.mesh.is_some() && !support.native {
                 return Err(EOPNOTSUPP);
             }
             // The VM already owns and advertises all 24 operand buffers.

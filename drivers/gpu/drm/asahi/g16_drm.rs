@@ -285,6 +285,7 @@ pub(crate) fn register<'a>(
         (c_str!("fail_prep"), FlagKnob::FAIL_PREP, 0),
         (c_str!("fail_retire"), FlagKnob::FAIL_RETIRE, 0),
         (c_str!("fail_skip"), FlagKnob::FAIL_SKIP, 0),
+        (c_str!("native_mesh"), FlagKnob::NATIVE_MESH, crate::module_parameters::native_mesh.value()),
     ];
     let mut flags = KVec::with_capacity(knobs.len(), GFP_KERNEL)?;
     for (name, knob, value) in knobs {

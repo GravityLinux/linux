@@ -462,6 +462,9 @@ pub(crate) struct Support {
     slots: Arc<AtomicU64>,
     index: u32,
     submissions: AtomicU64,
+    /// Initialized in native pool mode (native_mesh was nonzero when this VM
+    /// first rendered). Fixed for the support lifetime.
+    native: bool,
 }
 impl Support {
     pub(crate) fn address(&self) -> u64 {
