@@ -1810,6 +1810,16 @@ struct Issued {
     id: u64,
     owner: u64,
 }
+impl crate::g16_queue_fail::QueueJob for Running {
+    type Error = Error;
+    fn same_queue(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.execution.firmware, &other.execution.firmware)
+    }
+    fn error_mut(&mut self) -> &mut Option<Error> {
+        &mut self.error
+    }
+}
+
 struct Engine {
     cursor: usize,
     jobs: KVec<Running>,
@@ -1918,11 +1928,25 @@ impl WorkItem for Execution {
                 })? {
                     let index = engine.issued.iter().position(|r| r.id == id).ok_or(EIO)?;
                     let issued = engine.issued.remove(index).map_err(|_| EIO)?;
-                    let job = engine
+                    let at = engine
                         .jobs
-                        .iter_mut()
-                        .find(|r| r.execution.id == issued.owner)
+                        .iter()
+                        .position(|r| r.execution.id == issued.owner)
                         .ok_or(EIO)?;
+                    if let Err(error) = result {
+                        pr_warn!(
+                            "G16: execution {} completed with {:?}; later work on its queue is cancelled\n",
+                            engine.jobs[at].execution.id,
+                            error
+                        );
+                        // Later jobs on this queue may already be published,
+                        // so the publication latch alone cannot stop them.
+                        // They complete with ECANCELED instead of reporting
+                        // success over this job's incomplete output.
+                        engine.jobs[at].execution.firmware.lock().rejected = true;
+                        crate::g16_queue_fail::cancel_later(&mut engine.jobs, at, ECANCELED);
+                    }
+                    let job = &mut engine.jobs[at];
                     job.pending -= 1;
                     if job.pending == 0 && crate::module_parameters::timeline.value() >= 2 {
                         let n = &this.device.notifications;
@@ -2464,6 +2488,11 @@ impl File {
         // completion must never subsume an earlier dependency in DRM.
         let unique = dma_fence::FenceContexts::new(1, c_str!("asahi_m4"), FENCE_KEY)?
             .new_fence(0, Completion)?;
+        // A queue that has failed work stays failed: refuse new work instead
+        // of accepting jobs that can only complete with ECANCELED.
+        if queue.firmware.lock().rejected {
+            return Err(ECANCELED);
+        }
         let vm_id = queue.vm;
         let firmware = queue.firmware.clone();
         let mut timestamps = KVec::new();

@@ -15,6 +15,7 @@ mod g16_drm;
 mod g16_fw;
 mod g16_platform;
 mod g16_power;
+mod g16_queue_fail;
 mod g16_render;
 mod g16_stamp;
 mod g16_timeline;
