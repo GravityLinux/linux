@@ -807,7 +807,6 @@ impl File {
         if data.pad != 0 {
             return Err(EINVAL);
         }
-        let mut admission = device.admission.lock();
         let inner = file.inner();
         let mut state = inner.state.lock();
         let index = state
@@ -820,7 +819,17 @@ impl File {
             // They retain this VM until the last queue is destroyed.
             state.vms[index].visible = false;
         } else {
-            drain(&mut admission)?;
+            // No queue can submit to this VM any more, so only its own
+            // pending work can still use its tables. Other clients' work
+            // never touches them: don't wait for the whole device.
+            let (relocked, result, _) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
+            state = relocked;
+            result?;
+            let index = state
+                .vms
+                .iter()
+                .position(|v| v.id == data.vm_id && v.visible)
+                .ok_or(ENOENT)?;
             state.vms[index].detach(&mut device.runtime.lock())?;
             state.vms.swap_remove(index);
         }
@@ -932,7 +941,6 @@ impl File {
         if data.pad != 0 {
             return Err(EINVAL);
         }
-        let mut admission = device.admission.lock();
         let inner = file.inner();
         let queue = {
             let mut state = inner.state.lock();
@@ -943,14 +951,25 @@ impl File {
                 .ok_or(ENOENT)?;
             state.queues.swap_remove(index)
         };
-        // Cancel dependency-blocked jobs before waiting on their lifetime
-        // fences. Scheduler destruction must run outside the file-state lock.
+        // Cancel dependency-blocked jobs. Scheduler destruction must run
+        // outside the file-state lock. The queue's firmware storage needs no
+        // wait here: its in-flight Executions hold it until they retire
+        // (QueueStorage), and no other queue references it.
         let vm_id = queue.vm;
         drop(queue);
-        drain(&mut admission)?;
         let mut state = inner.state.lock();
-        if !state.queues.iter().any(|q| q.vm == vm_id) {
-            if let Some(index) = state.vms.iter().position(|v| v.id == vm_id && !v.visible) {
+        let last = |state: &FileState| {
+            !state.queues.iter().any(|q| q.vm == vm_id)
+                && state.vms.iter().any(|v| v.id == vm_id && !v.visible)
+        };
+        if last(&state) {
+            // The last queue of an already destroyed VM: detach it once the
+            // VM's own work has finished, never waiting for other clients.
+            let (relocked, result, _) = drain_vm(state, vm_id, 35000, false, &inner.drained);
+            state = relocked;
+            result?;
+            if last(&state) {
+                let index = state.vms.iter().position(|v| v.id == vm_id).ok_or(ENOENT)?;
                 state.vms[index].detach(&mut device.runtime.lock())?;
                 state.vms.swap_remove(index);
             }
@@ -968,8 +987,8 @@ impl File {
         if data.pad != 0 || data.vm_id != 0 {
             return Err(EINVAL);
         }
-        let mut admission = device.admission.lock();
-        drain(&mut admission)?;
+        // A new timestamp mapping is unused, so binding never waits. Unbinding
+        // waits only for this file's own work (below), never other clients'.
         let inner = file.inner();
         let mut state = inner.state.lock();
         match data.op {
@@ -1050,7 +1069,25 @@ impl File {
                     .iter()
                     .position(|t| t.id == data.object_handle)
                     .ok_or(ENOENT)?;
-                let timestamp = &state.timestamps[index];
+                // Unpublish first: no later submission can resolve it, while
+                // the retained copy keeps the firmware mapping and backing.
+                let timestamp = state.timestamps.swap_remove(index);
+                // Only this file's submissions can reference the binding. Wait
+                // for each of its VMs' own work (progress-based), not for
+                // every client's. On failure the mapping stays retained, and
+                // file teardown handles it as before.
+                let mut ids = KVec::new();
+                for vm in state.vms.iter() {
+                    ids.push(vm.id, GFP_KERNEL)?;
+                }
+                for id in ids {
+                    let (relocked, result, _) = drain_vm(state, id, 35000, false, &inner.drained);
+                    state = relocked;
+                    match result {
+                        Err(error) if error != ENOENT => return Err(error),
+                        _ => {}
+                    }
+                }
                 // Failed BIND rollback can retain an unpublished allocation
                 // without advancing next_timestamp. Match the reserved range,
                 // which stays unique even if that public ID is reused.
@@ -1059,14 +1096,11 @@ impl File {
                     .iter()
                     .position(|t| t.base == timestamp.base && t.extent == timestamp.extent)
                     .ok_or(EIO)?;
-                // Admission is held and drained above: no submitted work can
-                // still write this firmware mapping, or acquire it anew.
-                // Keep both backing references if unmapping fails, just as
-                // at file teardown, so a stale PTE never reaches freed RAM.
+                // Keep the retained backing reference if unmapping fails, just
+                // as at file teardown, so a stale PTE never reaches freed RAM.
                 device.runtime.lock().release_timestamp(
                     timestamp.base..timestamp.base + timestamp.extent,
                 )?;
-                state.timestamps.swap_remove(index);
                 state.retained_timestamps.swap_remove(retained);
             }
             _ => return Err(EINVAL),
@@ -1506,10 +1540,6 @@ fn current_comm() -> [u8; 16] {
     let task = kernel::current!();
     let leader = task.group_leader();
     crate::util::task_comm(leader)
-}
-
-fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
-    drain_within(pending, 35000, crate::g16_drain::CAP_MS, false).0
 }
 
 /// Milliseconds since `start`.
