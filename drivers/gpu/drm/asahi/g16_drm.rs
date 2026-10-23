@@ -78,27 +78,37 @@ struct Mapping {
     offset: u64,
     single: bool,
     obj: ARef<Object>,
+    /// Its object was closed while work was queued: the PTEs stay until the
+    /// reaper unmaps them (see g16_deferred), but nothing new may use it.
+    closing: bool,
+}
+
+impl crate::g16_deferred::Span for Mapping {
+    fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+    fn permissions(&self) -> u32 {
+        self.permissions
+    }
+    fn closing(&self) -> bool {
+        self.closing
+    }
 }
 
 impl Mapping {
     fn cover(mappings: &[Self], start: u64, size: u64, permissions: u32) -> Result {
-        let end = start.checked_add(size).ok_or(EINVAL)?;
-        if size == 0 {
-            return Err(EINVAL);
+        if crate::g16_deferred::covered(mappings, start, size, permissions) {
+            Ok(())
+        } else {
+            Err(EINVAL)
         }
-        // `mappings` is sorted by address and never overlaps, so the only
-        // candidate for `cursor` is the first mapping ending after it.
-        let mut cursor = start;
-        while cursor < end {
-            let index = mappings.partition_point(|m| m.range.end <= cursor);
-            let mapping = mappings
-                .get(index)
-                .filter(|m| m.range.contains(&cursor) && m.permissions & permissions == permissions)
-                .ok_or(EINVAL)?;
-            cursor = end.min(mapping.range.end);
-        }
-        Ok(())
     }
+}
+
+/// A GEM close deferred until every fence pending at the close has signaled.
+struct Deferred {
+    obj: ARef<Object>,
+    fences: KVec<dma_fence::Fence>,
 }
 
 struct Vm {
@@ -124,6 +134,8 @@ struct Vm {
     render_ready: bool,
     compute_ready: bool,
     render_broken: bool,
+    /// Closes waiting for their snapshot to complete (see g16_deferred).
+    deferred: KVec<Deferred>,
 }
 
 /// Retain submit-time GEM and timestamp bindings until actual completion.
@@ -141,6 +153,8 @@ struct FileState {
     timestamps: KVec<TimestampBuffer>,
     retained_timestamps: KVec<TimestampBuffer>,
     vms: KVec<Vm>,
+    /// Set by file teardown: the reaper must no longer touch the VMs.
+    closed: bool,
 }
 
 struct Queue {
@@ -356,6 +370,9 @@ impl DriverObject for Buffer {
         }
         let exiting = current_exiting();
         let mut state = inner.state.lock();
+        if inner.reaper.armed.load(Ordering::Relaxed) {
+            reap(&mut state, &inner.device, &inner.reaper.armed);
+        }
         let mut cursor = 0;
         loop {
             // IDs never repeat. Re-find after each wait: another ioctl may
@@ -384,7 +401,49 @@ impl DriverObject for Buffer {
                 vm.render_broken = true;
                 continue;
             }
-            // A live close: wait while the VM's work keeps retiring, failing
+            // A live close with work queued: don't wait. Keep the object's
+            // PTEs (its pages are already kept by the queued submissions)
+            // until everything pending now has completed, then the reaper
+            // unmaps them. Nothing new may use them meanwhile (closing).
+            vm.pending.retain(|f| {
+                // SAFETY: The vector owns each fence reference during the query.
+                !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+            });
+            if !vm.pending.is_empty() && crate::g16_deferred::admit(vm.deferred.len()) {
+                let mut fences = KVec::new();
+                let object = vm.mappings.iter()
+                    .find(|m| core::ptr::eq(&*m.obj, obj))
+                    .map(|m| m.obj.clone());
+                if let Some(object) = object {
+                    if fences.extend_from_slice(&vm.pending, GFP_KERNEL).is_ok()
+                        && vm.deferred.reserve(1, GFP_KERNEL).is_ok()
+                    {
+                        for m in vm.mappings.iter_mut().filter(|m| core::ptr::eq(&*m.obj, obj)) {
+                            m.closing = true;
+                        }
+                        // Reserved above: cannot fail.
+                        let _ = vm.deferred.push_within_capacity(Deferred { obj: object, fences });
+                        // Pairs with signal_finished: it signals (a fully
+                        // ordered bit set), then loads `armed`. If the snapshot
+                        // completed before this store, it may have missed us;
+                        // check once ourselves. The fence orders the store
+                        // before the plain loads in dma_fence_is_signaled
+                        // (store buffering), so one side always sees the other.
+                        inner.reaper.armed.store(true, Ordering::SeqCst);
+                        core::sync::atomic::fence(Ordering::SeqCst);
+                        let done = vm.deferred.last().is_some_and(|e| crate::g16_deferred::ready(e.fences.iter().map(|f| {
+                            // SAFETY: The entry owns each fence reference during the query.
+                            unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+                        })));
+                        if done {
+                            let _ = workqueue::system_dfl().enqueue(inner.reaper.clone());
+                        }
+                        continue;
+                    }
+                }
+                // Out of memory or the entry cap: fall back to waiting.
+            }
+            // Fallback: wait while the VM's work keeps retiring, failing
             // once none of its fences signals for CLOSE_DRAIN_MS (see
             // drain_within). Only a fatal signal ends the wait early (the
             // process is then exiting anyway); any other signal is ignored,
@@ -463,41 +522,123 @@ pub(crate) struct File {
     device: DeviceRef,
     id: u64,
     state: Arc<Mutex<FileState>>,
+    reaper: Arc<Reaper>,
     #[pin]
     drained: CondVar,
 }
 impl drm::file::DriverFile for File {
     type Driver = Driver;
     fn open(device: &Device) -> Result<Pin<KBox<Self>>> {
+        let state = Arc::pin_init(
+            kernel::new_mutex!(FileState {
+                next_vm: 1,
+                next_queue: 1,
+                next_timestamp: 1,
+                queues: KVec::new(),
+                timestamps: KVec::new(),
+                retained_timestamps: KVec::new(),
+                vms: KVec::new(),
+                closed: false,
+            }),
+            GFP_KERNEL,
+        )?;
+        let reaper_state = state.clone();
+        let reaper = Arc::pin_init(
+            try_pin_init!(Reaper {
+                device: device.into(),
+                state: reaper_state,
+                armed: AtomicBool::new(false),
+                work <- new_work!("m4-reaper"),
+            }),
+            GFP_KERNEL,
+        )?;
         KBox::pin_init(
             try_pin_init!(Self {
                 device: device.into(),
                 id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
                 drained <- kernel::new_condvar!("m4-file-drain"),
-                state: Arc::pin_init(
-                    kernel::new_mutex!(FileState {
-                        next_vm: 1,
-                        next_queue: 1,
-                        next_timestamp: 1,
-                        queues: KVec::new(),
-                        timestamps: KVec::new(),
-                        retained_timestamps: KVec::new(),
-                        vms: KVec::new()
-                    }),
-                    GFP_KERNEL
-                )?,
+                state,
+                reaper,
             }),
             GFP_KERNEL,
         )
     }
 }
 
+/// Unmaps a file's deferred GEM closes once their snapshots complete. Every
+/// fence in a snapshot is one of this file's job fences, so the pump queues
+/// this work when it signals a job of an armed file (signal_finished); file
+/// ioctls also reap opportunistically. Holds the file state, not the File.
+#[pin_data]
+struct Reaper {
+    device: DeviceRef,
+    state: Arc<Mutex<FileState>>,
+    /// Some VM of this file has deferred closes. Changed under file state.
+    armed: AtomicBool,
+    #[pin]
+    work: Work<Reaper>,
+}
+
+impl_has_work! { impl HasWork<Self> for Reaper { self.work } }
+
+impl WorkItem for Reaper {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        let mut state = this.state.lock();
+        reap(&mut state, &this.device, &this.armed);
+    }
+}
+
+/// Unmap every deferred close whose snapshot has completed; disarm the
+/// reaper once none remain. Called with file state held.
+fn reap(state: &mut FileState, device: &Device, armed: &AtomicBool) {
+    if state.closed || device.failed.load(Ordering::Acquire) {
+        return;
+    }
+    let mut runtime = None;
+    let mut left = false;
+    for vm in state.vms.iter_mut() {
+        let mut index = 0;
+        while index < vm.deferred.len() {
+            let done = crate::g16_deferred::ready(vm.deferred[index].fences.iter().map(|f| {
+                // SAFETY: The entry owns each fence reference during the query.
+                unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+            }));
+            if !done {
+                left = true;
+                index += 1;
+                continue;
+            }
+            let entry = vm.deferred.swap_remove(index);
+            let runtime = runtime.get_or_insert_with(|| device.runtime.lock());
+            if let Err(error) = vm.unmap_object(&entry.obj, runtime) {
+                // Page tables may be partly edited: stop the device, as a
+                // failed close-time unbind always has.
+                device.failed.store(true, Ordering::Release);
+                pr_err!("G16: failed to unbind a deferred closed GEM object: {:?}\n", error);
+                return;
+            }
+        }
+    }
+    if !left {
+        armed.store(false, Ordering::Relaxed);
+    }
+}
+
 #[pinned_drop]
 impl PinnedDrop for File {
     fn drop(self: Pin<&mut Self>) {
+        // From here on a queued reaper leaves the VMs alone: teardown below
+        // drains every pending fence, so deferred closes need no reaping.
         // Entity destruction cancels dependency-blocked jobs. Never hold the
         // state lock while DRM waits for scheduler callbacks.
-        let queues = core::mem::take(&mut self.state.lock().queues);
+        let queues = {
+            let mut state = self.state.lock();
+            state.closed = true;
+            self.reaper.armed.store(false, Ordering::Relaxed);
+            core::mem::take(&mut state.queues)
+        };
         drop(queues);
         // Wait only for this file's own work. Other clients' fences don't
         // protect anything torn down here.
@@ -647,6 +788,7 @@ impl File {
                 render_ready: false,
                 compute_ready: false,
                 render_broken: false,
+                deferred: KVec::new(),
             },
             GFP_KERNEL,
         )?;
@@ -956,6 +1098,9 @@ impl File {
         if !state.vms.iter().any(|vm| vm.id == data.vm_id && vm.visible) {
             return Err(ENOENT);
         }
+        if inner.reaper.armed.load(Ordering::Relaxed) {
+            reap(&mut state, device, &inner.reaper.armed);
+        }
         for _ in 0..data.num_binds {
             let bind: uapi::drm_asahi_gem_bind_op = reader.read_up_to(data.stride as usize)?;
             loop {
@@ -1040,6 +1185,31 @@ impl File {
                             m.range.start.max(address)..m.range.end.min(end),
                             GFP_KERNEL,
                         )?;
+                    }
+                }
+                if crate::g16_deferred::overlap(&vm.mappings, address, end)
+                    == crate::g16_deferred::Overlap::Deferred
+                {
+                    // Only closed objects overlap (an address reused after
+                    // GEM_CLOSE): wait for their own snapshots, not for the
+                    // whole VM, then reap and revalidate. Closing mappings no
+                    // entry tracks (none expected) take the rule below.
+                    let mut fences = KVec::new();
+                    for entry in vm.deferred.iter() {
+                        if vm.mappings.iter().any(|m| {
+                            m.closing && core::ptr::eq(&*m.obj, &*entry.obj)
+                                && address < m.range.end && end > m.range.start
+                        }) {
+                            fences.extend_from_slice(&entry.fences, GFP_KERNEL)?;
+                        }
+                    }
+                    if !fences.is_empty() {
+                        drop(state);
+                        let (result, _) = drain_within(&mut fences, 35000, crate::g16_drain::CAP_MS, false);
+                        state = inner.state.lock();
+                        result?;
+                        reap(&mut state, device, &inner.reaper.armed);
+                        continue;
                     }
                 }
                 if !overlaps.is_empty() {
@@ -1197,6 +1367,7 @@ impl Vm {
                 offset: bo_offset,
                 single,
                 obj,
+                closing: false,
             },
             GFP_KERNEL,
         )?;
@@ -1247,6 +1418,18 @@ impl Vm {
         }
     }
 
+    /// Unmap every mapping of `obj`: a closed object whose deferred
+    /// snapshot completed, or whose VM has drained.
+    fn unmap_object(&mut self, obj: &Object, runtime: &crate::g16::Bootstrap) -> Result {
+        while let Some(range) = self.mappings.iter()
+            .find(|m| core::ptr::eq(&*m.obj, obj))
+            .map(|m| m.range.clone())
+        {
+            self.unmap(range, runtime)?;
+        }
+        Ok(())
+    }
+
     fn unmap(&mut self, range: Range<u64>, runtime: &crate::g16::Bootstrap) -> Result {
         self.snapshot = None;
         // Callers drain this VM's jobs and hold file state against new uses.
@@ -1267,6 +1450,7 @@ impl Vm {
             permissions: m.permissions,
             single: m.single,
             obj: m.obj.clone(),
+            closing: m.closing,
         });
         if right.is_some() {
             self.mappings.reserve(1, GFP_KERNEL)?;
@@ -1479,6 +1663,8 @@ struct Execution {
     barriers: KVec<[u16; 2]>,
     device: DeviceRef,
     _owner: Arc<Mutex<FileState>>,
+    /// This job's file reaper, queued after its fence signals when armed.
+    reaper: Arc<Reaper>,
     render_space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     space: Arc<Mutex<crate::g16_vm::AddressSpace>>,
     _bindings: Bindings,
@@ -1655,6 +1841,12 @@ impl Execution {
             job.execution.completion.set_error(error);
         }
         let _ = job.execution.completion.signal();
+        // A deferred GEM close of this file may wait for this fence. Pairs
+        // with the SeqCst store in Object::close.
+        let reaper = &job.execution.reaper;
+        if reaper.armed.load(Ordering::SeqCst) {
+            let _ = workqueue::system_dfl().enqueue(reaper.clone());
+        }
     }
 }
 
@@ -2352,7 +2544,7 @@ impl File {
         let execution = Arc::pin_init(
             try_pin_init!(Execution {
                 id: NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed), firmware, barriers,
-                device: device.into(), _owner: inner.state.clone(),
+                device: device.into(), _owner: inner.state.clone(), reaper: inner.reaper.clone(),
                 render_space: vm.space.clone(), space: vm.compute_space.clone(), _bindings: bindings,
                 support: vm.render_support.clone(),
                 parameters, timestamps, completion: worker_completion,

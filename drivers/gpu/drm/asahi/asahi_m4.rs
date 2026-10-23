@@ -9,6 +9,7 @@ mod float;
 mod g16;
 mod g16_alloc;
 mod g16_compute;
+mod g16_deferred;
 mod g16_drain;
 mod g16_drm;
 mod g16_fw;
