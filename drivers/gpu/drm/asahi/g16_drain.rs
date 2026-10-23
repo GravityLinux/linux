@@ -49,12 +49,13 @@ pub(crate) struct Clock {
 
 impl Clock {
     /// Start a drain of `remaining` fences with a no-progress budget of
-    /// `budget_ms`. The cap is at least the budget.
-    pub(crate) fn new(remaining: usize, budget_ms: u32) -> Self {
+    /// `budget_ms` and an overall cap of `cap_ms` (callers sharing one
+    /// deadline pass what is left of it; at least 1 ms).
+    pub(crate) fn new(remaining: usize, budget_ms: u32, cap_ms: i64) -> Self {
         let budget_ms = i64::from(budget_ms).max(1);
         Self {
             budget_ms,
-            cap_ms: CAP_MS.max(budget_ms),
+            cap_ms: cap_ms.max(1),
             initial: remaining,
             remaining,
             last_progress_ms: 0,

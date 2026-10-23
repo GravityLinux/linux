@@ -503,10 +503,14 @@ impl PinnedDrop for File {
         // protect anything torn down here.
         let mut state = self.state.lock();
         let mut drained = true;
+        // One deadline for the whole file: VMs that keep retiring can't add
+        // up to more than CAP_MS of uninterruptible exit.
+        let start = kernel::time::Instant::<kernel::time::Monotonic>::now();
         for vm in state.vms.iter_mut() {
             // Not interruptible: a killed process has a fatal signal
             // pending, and giving up early would leak its pages.
-            let (result, stats) = drain_within(&mut vm.pending, CLOSE_DRAIN_MS, false);
+            let cap = crate::g16_drain::CAP_MS - since_ms(&start);
+            let (result, stats) = drain_within(&mut vm.pending, CLOSE_DRAIN_MS, cap, false);
             if let Err(error) = result {
                 pr_err!(
                     "G16: closing a client: VM {} drain {:?} after {} ms: {} fences signaled, {} still pending, none in the last {} ms\n",
@@ -1321,7 +1325,7 @@ fn current_comm() -> [u8; 16] {
 }
 
 fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
-    drain_within(pending, 35000, false).0
+    drain_within(pending, 35000, crate::g16_drain::CAP_MS, false).0
 }
 
 /// Milliseconds since `start`.
@@ -1330,20 +1334,21 @@ fn since_ms(start: &kernel::time::Instant<kernel::time::Monotonic>) -> i64 {
 }
 
 /// Wait for every fence in `pending`, failing with ETIMEDOUT once none has
-/// signaled for `ms` (or at g16_drain::CAP_MS overall), not after `ms` in
-/// total: slow work that keeps retiring is not a failure. With `killable`,
-/// a fatal signal ends the wait early with EINTR; other signals are ignored,
+/// signaled for `ms` (or after `cap_ms` overall), not after `ms` in total:
+/// slow work that keeps retiring is not a failure. With `killable`, a fatal
+/// signal ends the wait early with EINTR; other signals are ignored,
 /// since a GEM close can't be restarted (DRM has already removed the handle)
 /// and failing a live client's VM because of SIGIO or a timer would break a
 /// healthy process.
 fn drain_within(
     pending: &mut KVec<dma_fence::Fence>,
     ms: u32,
+    cap_ms: i64,
     killable: bool,
 ) -> (Result, crate::g16_drain::Stats) {
     use crate::g16_drain::{Clock, Verdict};
     let start = kernel::time::Instant::<kernel::time::Monotonic>::now();
-    let mut clock = Clock::new(pending.len(), ms);
+    let mut clock = Clock::new(pending.len(), ms, cap_ms);
     let result = loop {
         pending.retain(|f| {
             // SAFETY: The vector owns each fence reference during the query.
@@ -1403,7 +1408,7 @@ fn drain_vm<'a>(
             !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
         });
         let remaining = vm.pending.len();
-        let clock = clock.get_or_insert_with(|| Clock::new(remaining, ms));
+        let clock = clock.get_or_insert_with(|| Clock::new(remaining, ms, crate::g16_drain::CAP_MS));
         let left = match clock.update(since_ms(&start), remaining) {
             Verdict::Done => break Ok(()),
             Verdict::NoProgress | Verdict::Capped => break Err(ETIMEDOUT),
