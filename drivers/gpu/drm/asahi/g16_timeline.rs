@@ -438,6 +438,10 @@ pub(crate) fn read_opt() -> bool {
 pub(crate) static SAFETY_POLL_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(50);
 pub(crate) static POLL_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static POLL_RETIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Rate limit for "retired 0" poll warnings (slow work, not a fault): the
+/// CNTVCT tick of the last one printed, and how many were skipped since.
+pub(crate) static SLOW_POLL_REPORTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static SLOW_POLL_SUPPRESSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// TVB counters in dep_stats: firmware allocation requests (render Event 6),
 /// those answered with growth or refused (at tvb_max_blocks or under memory

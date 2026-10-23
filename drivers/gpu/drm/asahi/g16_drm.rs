@@ -384,10 +384,12 @@ impl DriverObject for Buffer {
                 vm.render_broken = true;
                 continue;
             }
-            // A live close: wait at most CLOSE_DRAIN_MS. Only a fatal signal
-            // ends the wait early (the process is then exiting anyway); any
-            // other signal is ignored, so a healthy client's VM stays usable.
-            let (relocked, result) = drain_vm(state, id, CLOSE_DRAIN_MS, true /* killable */, &inner.drained);
+            // A live close: wait while the VM's work keeps retiring, failing
+            // once none of its fences signals for CLOSE_DRAIN_MS (see
+            // drain_within). Only a fatal signal ends the wait early (the
+            // process is then exiting anyway); any other signal is ignored,
+            // so a healthy client's VM stays usable.
+            let (relocked, result, stats) = drain_vm(state, id, CLOSE_DRAIN_MS, true /* killable */, &inner.drained);
             state = relocked;
             let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) else {
                 continue;
@@ -428,6 +430,10 @@ impl DriverObject for Buffer {
                 pr_err!(
                     "G16: VM {}: {} of {} submissions unfinished: {} in the pump ({} started), {} waiting for input fences\n",
                     vm.id, unsignaled, vm.pending.len(), pumped, issued, unsignaled.saturating_sub(pumped)
+                );
+                pr_err!(
+                    "G16: VM {}: drain gave up after {} ms: {} of its fences signaled during the wait, none in the last {} ms\n",
+                    vm.id, stats.waited_ms, stats.signaled, stats.idle_ms
                 );
                 continue;
             }
@@ -500,7 +506,12 @@ impl PinnedDrop for File {
         for vm in state.vms.iter_mut() {
             // Not interruptible: a killed process has a fatal signal
             // pending, and giving up early would leak its pages.
-            if drain_within(&mut vm.pending, CLOSE_DRAIN_MS, false).is_err() {
+            let (result, stats) = drain_within(&mut vm.pending, CLOSE_DRAIN_MS, false);
+            if let Err(error) = result {
+                pr_err!(
+                    "G16: closing a client: VM {} drain {:?} after {} ms: {} fences signaled, {} still pending, none in the last {} ms\n",
+                    vm.id, error, stats.waited_ms, stats.signaled, stats.remaining, stats.idle_ms
+                );
                 drained = false;
             }
         }
@@ -982,7 +993,7 @@ impl File {
                     // Only this VM can reference the removed mapping. Fresh
                     // binds never wait for hardware, including on this VM.
                     if !vm.pending.is_empty() {
-                        let (relocked, result) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
+                        let (relocked, result, _) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
                         state = relocked;
                         result?;
                         // State stayed locked after the idle check. Revalidate
@@ -1029,7 +1040,7 @@ impl File {
                 }
                 if !overlaps.is_empty() {
                     if !vm.pending.is_empty() {
-                        let (relocked, result) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
+                        let (relocked, result, _) = drain_vm(state, data.vm_id, 35000, false, &inner.drained);
                         state = relocked;
                         result?;
                         // State stayed locked after the idle check. Revalidate
@@ -1310,70 +1321,79 @@ fn current_comm() -> [u8; 16] {
 }
 
 fn drain(pending: &mut KVec<dma_fence::Fence>) -> Result {
-    drain_within(pending, 35000, false)
+    drain_within(pending, 35000, false).0
 }
 
-/// Wait for every fence in `pending` within one overall budget of `ms`.
-/// With `killable`, a fatal signal ends the wait early with EINTR; other
-/// signals are ignored, since a GEM close can't be restarted (DRM has
-/// already removed the handle) and failing a live client's VM because of
-/// SIGIO or a timer would break a healthy process.
-fn drain_within(pending: &mut KVec<dma_fence::Fence>, ms: u32, killable: bool) -> Result {
-    let mut left = kernel::time::msecs_to_jiffies(ms) as core::ffi::c_long;
-    // Re-check for a fatal signal this often while waiting.
-    let slice = if killable {
-        kernel::time::msecs_to_jiffies(100) as core::ffi::c_long
-    } else {
-        left
-    };
-    for fence in pending.iter() {
-        loop {
-            let step = left.min(slice).max(1);
-            // SAFETY: Each entry owns its fence reference throughout the wait.
-            let result = unsafe { bindings::dma_fence_wait_timeout(fence.raw(), false, step as _) };
-            if result < 0 {
-                return Err(Error::from_errno(result as i32));
-            }
-            if result > 0 {
-                // dma_fence_wait_timeout returns the jiffies of `step` left
-                // (at least 1), so `left` stays positive.
-                left -= step - result as core::ffi::c_long;
-                break;
-            }
-            left -= step;
-            if left <= 0 {
-                return Err(ETIMEDOUT);
-            }
-            if killable && fatal_signal_pending() {
-                return Err(EINTR);
-            }
+/// Milliseconds since `start`.
+fn since_ms(start: &kernel::time::Instant<kernel::time::Monotonic>) -> i64 {
+    start.elapsed().as_millis()
+}
+
+/// Wait for every fence in `pending`, failing with ETIMEDOUT once none has
+/// signaled for `ms` (or at g16_drain::CAP_MS overall), not after `ms` in
+/// total: slow work that keeps retiring is not a failure. With `killable`,
+/// a fatal signal ends the wait early with EINTR; other signals are ignored,
+/// since a GEM close can't be restarted (DRM has already removed the handle)
+/// and failing a live client's VM because of SIGIO or a timer would break a
+/// healthy process.
+fn drain_within(
+    pending: &mut KVec<dma_fence::Fence>,
+    ms: u32,
+    killable: bool,
+) -> (Result, crate::g16_drain::Stats) {
+    use crate::g16_drain::{Clock, Verdict};
+    let start = kernel::time::Instant::<kernel::time::Monotonic>::now();
+    let mut clock = Clock::new(pending.len(), ms);
+    let result = loop {
+        pending.retain(|f| {
+            // SAFETY: The vector owns each fence reference during the query.
+            !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
+        });
+        let left = match clock.update(since_ms(&start), pending.len()) {
+            Verdict::Done => break Ok(()),
+            Verdict::NoProgress | Verdict::Capped => break Err(ETIMEDOUT),
+            Verdict::Wait(left) => left,
+        };
+        // Re-check the whole set at least once a second (another fence may
+        // signal first) and for a fatal signal every 100 ms.
+        let step = kernel::time::msecs_to_jiffies(left.min(if killable { 100 } else { 1000 }) as u32);
+        let Some(fence) = pending.first() else { break Ok(()) };
+        // SAFETY: The vector owns the fence reference throughout the wait.
+        let result = unsafe { bindings::dma_fence_wait_timeout(fence.raw(), false, step.max(1) as _) };
+        if result < 0 {
+            break Err(Error::from_errno(result as i32));
         }
-    }
-    pending.clear();
-    Ok(())
+        if result == 0 && killable && fatal_signal_pending() {
+            break Err(EINTR);
+        }
+    };
+    (result, clock.stats())
 }
 
 /// Block new submissions to this VM before dropping file state for waits.
 /// Overlapping drains share a counter: only the last one releases submitters.
 /// Return with state held through the caller's PTE edits, so clearing the
 /// barrier cannot let a new submit race those edits. No VM reference or vector
-/// index survives an unlock; all retries share one overall timeout.
+/// index survives an unlock. The drain fails once none of the VM's fences has
+/// signaled for `ms` (see drain_within); retries share one progress clock.
 fn drain_vm<'a>(
     mut state: MutexGuard<'a, FileState>,
     id: u32,
     ms: u32,
     killable: bool,
     changed: &CondVar,
-) -> (MutexGuard<'a, FileState>, Result) {
+) -> (MutexGuard<'a, FileState>, Result, crate::g16_drain::Stats) {
+    use crate::g16_drain::{Clock, Stats, Verdict};
     let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) else {
-        return (state, Err(ENOENT));
+        return (state, Err(ENOENT), Stats::default());
     };
     let Some(draining) = vm.draining.checked_add(1) else {
-        return (state, Err(EOVERFLOW));
+        return (state, Err(EOVERFLOW), Stats::default());
     };
     vm.draining = draining;
     let mutex = state.lock_ref();
     let start = kernel::time::Instant::<kernel::time::Monotonic>::now();
+    let mut clock = None;
     let result = loop {
         let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) else {
             break Err(ENOENT);
@@ -1382,19 +1402,22 @@ fn drain_vm<'a>(
             // SAFETY: The vector owns each fence reference during the query.
             !unsafe { bindings::dma_fence_is_signaled(f.raw()) }
         });
+        let remaining = vm.pending.len();
+        let clock = clock.get_or_insert_with(|| Clock::new(remaining, ms));
+        let left = match clock.update(since_ms(&start), remaining) {
+            Verdict::Done => break Ok(()),
+            Verdict::NoProgress | Verdict::Capped => break Err(ETIMEDOUT),
+            Verdict::Wait(left) => left,
+        };
         let Some(fence) = vm.pending.first().cloned() else {
             break Ok(());
         };
-        let left = i64::from(ms) - start.elapsed().as_millis();
-        if left <= 0 {
-            break Err(ETIMEDOUT);
-        }
-        let step = kernel::time::msecs_to_jiffies(
-            if killable { left.min(100) } else { left } as u32,
-        );
+        // Re-check the whole set at least once a second (another fence may
+        // signal first) and for a fatal signal every 100 ms.
+        let step = kernel::time::msecs_to_jiffies(left.min(if killable { 100 } else { 1000 }) as u32);
         drop(state);
         // SAFETY: The local clone owns the fence throughout the unlocked wait.
-        let result = unsafe { bindings::dma_fence_wait_timeout(fence.raw(), false, step as _) };
+        let result = unsafe { bindings::dma_fence_wait_timeout(fence.raw(), false, step.max(1) as _) };
         state = mutex.lock();
         if result < 0 {
             break Err(Error::from_errno(result as i32));
@@ -1403,16 +1426,17 @@ fn drain_vm<'a>(
             break Err(EINTR);
         }
     };
+    let stats = clock.map_or_else(Stats::default, |c| c.stats());
     if let Some(vm) = state.vms.iter_mut().find(|vm| vm.id == id) {
         vm.draining -= 1;
         if vm.draining != 0 {
-            return (state, result);
+            return (state, result, stats);
         }
     }
     // Also wake after VM removal: submit must re-find its queue and VM.
     // Success, timeout and signal exits all release this drain's barrier.
     changed.notify_all();
-    (state, result)
+    (state, result, stats)
 }
 
 /// Whether the calling task has SIGKILL pending (fatal_signal_pending()).
@@ -1426,8 +1450,10 @@ fn fatal_signal_pending() -> bool {
     }
 }
 
-/// A healthy issued Work finishes within the 10 s firmware watchdog, or the
-/// device fails anyway; past this only unissued (stuck) work can remain.
+/// No-progress budget for close-time drains. A healthy issued Work finishes
+/// within the 10 s firmware watchdog, or the device fails anyway; a VM none of
+/// whose fences signals for longer is stuck or starved. Deep queues of slow
+/// work may take longer in total while they keep retiring.
 const CLOSE_DRAIN_MS: u32 = 12000;
 
 /// Whether the calling task is exiting (DRM releases its GEM handles).
@@ -1475,6 +1501,14 @@ struct Trace {
 }
 
 /// The CPU's virtual counter (1 GHz on T8132).
+/// CNTVCT ticks per second.
+fn tick_hz() -> u64 {
+    let value: u64;
+    // SAFETY: Reading CNTFRQ_EL0 has no side effects.
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) value) };
+    value
+}
+
 pub(crate) fn ticks() -> u64 {
     let value: u64;
     // SAFETY: Reading CNTVCT_EL0 has no side effects.
@@ -1680,13 +1714,28 @@ impl WorkItem for Execution {
                     t::POLL_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     t::POLL_RETIRED.fetch_add(u64::from(polled_retired), Ordering::Relaxed);
                     // A safety poll every few ms is routine; report only polls
-                    // that found finished work, or long waits.
-                    if polled_retired != 0 || age >= 1000 {
+                    // that found finished work, or long waits. Long waits with
+                    // nothing retired are slow work (the retirement watchdog
+                    // reports hangs): at most one line per 10 s.
+                    if polled_retired != 0 {
                         pr_warn!(
                             "G16: notification wait timed out; polling retired {} Work(s), oldest flight {} ms\n",
                             polled_retired,
                             age
                         );
+                    } else if age >= 1000 {
+                        let now = ticks();
+                        let last = t::SLOW_POLL_REPORTED.load(Ordering::Relaxed);
+                        if last == 0 || now.wrapping_sub(last) >= 10 * tick_hz() {
+                            t::SLOW_POLL_REPORTED.store(now, Ordering::Relaxed);
+                            pr_warn!(
+                                "G16: notification wait timed out; polling retired 0 Work(s), oldest flight {} ms ({} similar suppressed)\n",
+                                age,
+                                t::SLOW_POLL_SUPPRESSED.swap(0, Ordering::Relaxed)
+                            );
+                        } else {
+                            t::SLOW_POLL_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 Ok(progress)
