@@ -1074,8 +1074,9 @@ impl File {
                 let timestamp = state.timestamps.swap_remove(index);
                 // Only this file's submissions can reference the binding. Wait
                 // for each of its VMs' own work (progress-based), not for
-                // every client's. On failure the mapping stays retained, and
-                // file teardown handles it as before.
+                // every client's. On failure the handle is already gone: the
+                // mapping stays retained until file teardown, and a retry of
+                // this UNBIND returns ENOENT.
                 let mut ids = KVec::new();
                 for vm in state.vms.iter() {
                     ids.push(vm.id, GFP_KERNEL)?;
