@@ -188,7 +188,10 @@ pub(crate) fn decode(
 /// - word 1: n | (n + 1) << 8, 4 <= n <= 128
 /// - word 2: 0xd0 with primitive data (C > 0), otherwise 0x10
 /// - word 10: (P - 1) | (ceil(P / 16) - 1) << 16, 1 <= P <= 512, no culling
-/// - word 11: T16 or T32 mesh state, as in modes 1 and 2
+/// - word 11: T16 or T32 mesh state, as in modes 1 and 2. Physical W64
+///   (0x400840) only for one probe shape: 4 vertex planes, one primitive, no
+///   primitive data, one vertex quad. That admits the W64 study's streams
+///   and qualifies neither W64 completion nor the fixed TA support resources.
 /// - word 12: P * C, 0 <= C <= 128
 /// - word 13: 1 + ceil(V / 4) * n, 1 <= V <= 256
 ///
@@ -199,6 +202,16 @@ pub(crate) fn decode(
 /// payload is not a packet field. Its exclusive storage is fixed at 16 KiB,
 /// the largest payload in the study. Everything is computed from the 13 words
 /// already read, so this adds no command-memory reads.
+/// The one research shape admitted at physical W64 (see `research_state`).
+fn w64_probe(state: &[u32; 13]) -> bool {
+    state[10] == 0x400840
+        && state[0] == 0x504
+        && state[1] == 0x10
+        && state[9] == 0
+        && state[11] == 0
+        && state[12] == 5
+}
+
 fn research_state(state: &[u32; 13]) -> bool {
     let planes = state[0] & 0xff;
     let primitives = (state[9] & 0xffff) + 1;
@@ -211,7 +224,7 @@ fn research_state(state: &[u32; 13]) -> bool {
         || state[8] != 1
         || primitives > 512
         || state[9] != (primitives - 1) | ((primitives.div_ceil(16) - 1) << 16)
-        || !matches!(state[10], 0x400810 | 0x400820)
+        || !(matches!(state[10], 0x400810 | 0x400820) || w64_probe(state))
     {
         return false;
     }

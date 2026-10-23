@@ -455,6 +455,33 @@ fn modes_one_and_two_are_unchanged_by_research_admission() {
     }
 }
 
+#[test]
+fn research_mode_admits_physical_w64_only_for_the_probe_shape() {
+    const W64: u32 = 0x400840;
+    for draw in DRAWS {
+        // The W64 study's shape: 4 planes, one primitive, one quad, no data.
+        let mut words = research(4, 1, 1, 0, draw);
+        words[11] = W64;
+        assert_eq!(decode_mode(&words, Mode::Research), ACCEPT);
+        for mode in [Mode::SingleParent, Mode::MultipleParents] {
+            assert_eq!(decode_mode(&words, mode), REJECT);
+        }
+        // Any other model shape stays T16/T32-only at W64.
+        for (n, p, q, c) in [(5, 1, 1, 0), (4, 2, 1, 0), (4, 1, 2, 0), (5, 1, 1, 1)] {
+            let mut wide = research(n, p, q, c, draw);
+            assert_eq!(decode_mode(&wide, Mode::Research), ACCEPT);
+            wide[11] = W64;
+            assert_eq!(decode_mode(&wide, Mode::Research), REJECT, "n{n} P{p} q{q} C{c}");
+        }
+        // Wider physical widths and other mesh state words stay rejected.
+        for state in [0x400880, 0x400900, 0x400841, 0x400040] {
+            let mut bad = words.clone();
+            bad[11] = state;
+            assert_eq!(decode_mode(&bad, Mode::Research), REJECT);
+        }
+    }
+}
+
 fn read32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
