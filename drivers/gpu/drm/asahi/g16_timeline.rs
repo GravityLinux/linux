@@ -343,6 +343,34 @@ pub(crate) fn init_caps(queue: u32, lane: u32) -> Result {
 /// How much of a reused scratch lease to zero (asahi_m4.scratch_zero).
 pub(crate) static SCRATCH_ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
 
+/// Test: one-shot failure injection for queue-failure tests (debugfs
+/// `fail_prep`, `fail_retire`, `fail_skip`). Writing a TGID arms the next
+/// command of that process to fail preparation with EINVAL, or to retire
+/// with ENOMEM as a TVB memory-limit render does, after letting `fail_skip`
+/// matching commands pass. 0 (default) disarms; nothing else is affected.
+pub(crate) static FAIL_PREP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static FAIL_RETIRE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static FAIL_SKIP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Whether an armed injection in `cell` fires for a command of `tgid`;
+/// firing disarms it.
+pub(crate) fn take_injection(cell: &core::sync::atomic::AtomicU32, tgid: i32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let armed = cell.load(Relaxed);
+    if armed == 0 || armed as i32 != tgid {
+        return false;
+    }
+    if FAIL_SKIP.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)).is_ok() {
+        return false;
+    }
+    let fired = cell.compare_exchange(armed, 0, Relaxed, Relaxed).is_ok();
+    if fired {
+        pr_info!("G16: injected {} failure for tgid {}\n",
+                 if core::ptr::eq(cell, &FAIL_PREP) { "preparation" } else { "retirement" }, tgid);
+    }
+    fired
+}
+
 /// A 0/1 debugfs switch over a static.
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
@@ -359,6 +387,9 @@ impl FlagKnob {
     pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };
     pub(crate) const SAFETY_POLL_MS: Self = Self { cell: &SAFETY_POLL_MS, name: "safety_poll_ms", max: 10000 };
     pub(crate) const SCRATCH_ZERO: Self = Self { cell: &SCRATCH_ZERO, name: "scratch_zero", max: 2 };
+    pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", max: i32::MAX as u32 };
+    pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", max: i32::MAX as u32 };
+    pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", max: 4096 };
 }
 
 impl kernel::debugfs::Writer for FlagKnob {

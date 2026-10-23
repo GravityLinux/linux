@@ -273,6 +273,9 @@ pub(crate) fn register<'a>(
         (c_str!("read_opt"), FlagKnob::READ_OPT, crate::module_parameters::read_opt.value()),
         (c_str!("safety_poll_ms"), FlagKnob::SAFETY_POLL_MS, crate::module_parameters::safety_poll_ms.value()),
         (c_str!("scratch_zero"), FlagKnob::SCRATCH_ZERO, crate::module_parameters::scratch_zero.value()),
+        (c_str!("fail_prep"), FlagKnob::FAIL_PREP, 0),
+        (c_str!("fail_retire"), FlagKnob::FAIL_RETIRE, 0),
+        (c_str!("fail_skip"), FlagKnob::FAIL_SKIP, 0),
     ];
     let mut flags = KVec::with_capacity(knobs.len(), GFP_KERNEL)?;
     for (name, knob, value) in knobs {
@@ -1738,13 +1741,17 @@ pub(crate) fn ticks() -> u64 {
     value
 }
 
-fn trace_record(ring: &crate::g16_timeline::Ring, job: &Running) {
-    let t = &job.execution.trace;
-    let pid = match job.execution.parameters.first() {
+fn execution_tgid(execution: &Execution) -> i32 {
+    match execution.parameters.first() {
         Some(Parameters::Render(p)) => p.tgid,
         Some(Parameters::Compute(p)) => p.tgid,
         None => 0,
-    };
+    }
+}
+
+fn trace_record(ring: &crate::g16_timeline::Ring, job: &Running) {
+    let t = &job.execution.trace;
+    let pid = execution_tgid(&job.execution);
     ring.push(&crate::g16_timeline::Record {
         exec: job.execution.id,
         pid: pid as u32,
@@ -1933,6 +1940,17 @@ impl WorkItem for Execution {
                         .iter()
                         .position(|r| r.execution.id == issued.owner)
                         .ok_or(EIO)?;
+                    let result = match result {
+                        Ok(())
+                            if crate::g16_timeline::take_injection(
+                                &crate::g16_timeline::FAIL_RETIRE,
+                                execution_tgid(&engine.jobs[at].execution),
+                            ) =>
+                        {
+                            Err(ENOMEM)
+                        }
+                        result => result,
+                    };
                     if let Err(error) = result {
                         pr_warn!(
                             "G16: execution {} completed with {:?}; later work on its queue is cancelled\n",
@@ -2060,7 +2078,12 @@ impl WorkItem for Execution {
                         engine.issued.reserve(1, GFP_KERNEL)?;
                         let job = &mut engine.jobs[index];
                         crate::mem::sync();
+                        let injected = crate::g16_timeline::take_injection(
+                            &crate::g16_timeline::FAIL_PREP,
+                            execution_tgid(&execution),
+                        );
                         let receipt = match &execution.parameters[job.next] {
+                            _ if injected => Err(EINVAL),
                             Parameters::Render(p) => runtime.submit_render(
                                 execution.firmware.clone(),
                                 execution.render_space.clone(),
