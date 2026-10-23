@@ -22,6 +22,30 @@ use kernel::uaccess::{UserPtr, UserSlice};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
 use kernel::{bindings, c_str, device::{Bound, Core}, drm, platform, prelude::*, scatterlist, uapi};
 
+// Downstream UAPI values (asahi_drm.h) are single bits allocated from bit 30
+// downwards; upstream's start at bit 0. Keep the two ranges apart.
+const _: () = {
+    use uapi::*;
+    let upstream = drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64
+        | drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH as u64
+        | drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as u64
+        | drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING as u64
+        | drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT as u64;
+    let downstream = [
+        drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES as u64,
+        drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIER as u64,
+        drm_asahi_render_flags_DRM_ASAHI_RENDER_FEW_PRIMITIVES as u64,
+        drm_asahi_render_flags_DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT as u64,
+    ];
+    assert!(upstream < 1 << 24);
+    let mut i = 0;
+    while i < downstream.len() {
+        let bit = downstream[i];
+        assert!(bit.is_power_of_two() && bit >= 1 << 24 && bit <= 1 << 30);
+        i += 1;
+    }
+};
+
 enum Command {
     Render(uapi::drm_asahi_cmd_render),
     Compute(uapi::drm_asahi_cmd_compute),

@@ -214,21 +214,25 @@ enum drm_asahi_feature {
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
 
+	/*
+	 * Downstream (G16) extensions. They are allocated from bit 30
+	 * downwards, clear of upstream's allocations from bit 0 upwards.
+	 * Upstream userspace must not use these values. Keep this header
+	 * byte-identical with Mesa's include/drm-uapi/asahi_drm.h.
+	 */
+
+	/**
+	 * @DRM_ASAHI_FEATURE_FEW_PRIMITIVES: Render commands accept
+	 * @DRM_ASAHI_RENDER_FEW_PRIMITIVES.
+	 */
+	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 30,
+
 	/**
 	 * @DRM_ASAHI_FEATURE_FRAGMENT_BARRIER: Render commands accept
 	 * @DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT to defer render dependencies
 	 * until the fragment stage.
 	 */
-	DRM_ASAHI_FEATURE_FRAGMENT_BARRIER = (1UL) << 1,
-
-	/**
-	 * @DRM_ASAHI_FEATURE_FEW_PRIMITIVES: Render commands accept
-	 * @DRM_ASAHI_RENDER_FEW_PRIMITIVES.
-	 *
-	 * Downstream (G16) extension. Downstream-only bits are allocated from
-	 * bit 30 downwards to stay clear of upstream allocations.
-	 */
-	DRM_ASAHI_FEATURE_FEW_PRIMITIVES = (1UL) << 30,
+	DRM_ASAHI_FEATURE_FRAGMENT_BARRIER = (1UL) << 29,
 };
 
 /**
@@ -806,17 +810,6 @@ enum drm_asahi_render_flags {
 	DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING = (1U << 2),
 
 	/**
-	 * @DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT: Apply the command header's
-	 * vdm_barrier before fragment execution instead of before tiling.
-	 * The cdm_barrier and submission input fences still precede tiling.
-	 * Tiling commands on the same queue execute in submission order.
-	 * Userspace must ensure that this command's tiling accesses do not
-	 * depend on earlier fragment execution, including write-after-read
-	 * hazards. Requires @DRM_ASAHI_FEATURE_FRAGMENT_BARRIER.
-	 */
-	DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT = (1U << 3),
-
-	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
 	 *
 	 * Graphics specifications contain two alternate formulas for depth
@@ -830,6 +823,13 @@ enum drm_asahi_render_flags {
 	 */
 	DRM_ASAHI_RENDER_DBIAS_IS_INT = (1U << 18),
 
+	/*
+	 * Downstream (G16) extensions. They are allocated from bit 30
+	 * downwards, clear of upstream's allocations from bit 0 upwards.
+	 * Upstream userspace must not use these values. Keep this header
+	 * byte-identical with Mesa's include/drm-uapi/asahi_drm.h.
+	 */
+
 	/**
 	 * @DRM_ASAHI_RENDER_FEW_PRIMITIVES: The render's control streams submit
 	 * at most four primitives in total, counting every draw and instance,
@@ -839,10 +839,19 @@ enum drm_asahi_render_flags {
 	 * This selects a faster fragment-stage tile dispatch mode for such
 	 * passes. Setting it for a larger pass can hang the GPU. Requires
 	 * @DRM_ASAHI_FEATURE_FEW_PRIMITIVES.
-	 *
-	 * Downstream (G16) extension, allocated from the top of the flag space.
 	 */
 	DRM_ASAHI_RENDER_FEW_PRIMITIVES = (1U << 30),
+
+	/**
+	 * @DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT: Apply the command header's
+	 * vdm_barrier before fragment execution instead of before tiling.
+	 * The cdm_barrier and submission input fences still precede tiling.
+	 * Tiling commands on the same queue execute in submission order.
+	 * Userspace must ensure that this command's tiling accesses do not
+	 * depend on earlier fragment execution, including write-after-read
+	 * hazards. Requires @DRM_ASAHI_FEATURE_FRAGMENT_BARRIER.
+	 */
+	DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT = (1U << 29),
 };
 
 /**
