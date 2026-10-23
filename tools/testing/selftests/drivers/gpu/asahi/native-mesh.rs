@@ -21,12 +21,13 @@ fn mode_values_keep_disabled_and_single_parent_behavior_explicit() {
         (0, Mode::Disabled),
         (1, Mode::SingleParent),
         (2, Mode::MultipleParents),
+        (3, Mode::Research),
     ] {
         let mode = Mode::from_parameter(value).unwrap();
         assert_eq!(mode, expected);
         assert_eq!(mode.enabled(), value != 0);
     }
-    for value in [3, 4, 255, u32::MAX] {
+    for value in [4, 5, 255, u32::MAX] {
         assert_eq!(Mode::from_parameter(value), None);
     }
     assert_eq!(
@@ -293,6 +294,165 @@ fn reject_unqualified_resource_classes_and_packets() {
     twice.pop();
     twice.extend_from_slice(&stream()[17..]);
     assert_eq!(decode(&twice, 0x1004000000), Err(DecodeError::Unsupported));
+}
+
+// Research admission (native_mesh=3). `research` builds a stream forward from
+// the study's model; the decoder must accept exactly those streams.
+fn research(planes: u32, primitives: u32, quads: u32, components: u32, draw: u32) -> Vec<u32> {
+    let mut words = stream();
+    words[1] = planes | ((planes + 1) << 8);
+    words[2] = if components > 0 { 0xd0 } else { 0x10 };
+    words[10] = (primitives - 1) | ((primitives.div_ceil(16) - 1) << 16);
+    words[12] = primitives * components;
+    words[13] = 1 + quads * planes;
+    words[17] = draw;
+    words
+}
+fn decode_mode(words: &[u32], mode: Mode) -> std::result::Result<Option<Profile>, DecodeError> {
+    let base = 0x1004003ffc;
+    g16_mesh::decode(base, mode, |va| words.get(((va - base) / 4) as usize).copied())
+}
+fn model_output(planes: u32, primitives: u32, quads: u32, components: u32) -> u32 {
+    quads * 16 * (planes - u32::from(components > 0)) + 4 * primitives * components
+}
+const DRAWS: [u32; 3] = [0x70000000, 0x70000100, 0x70000600];
+const ACCEPT: std::result::Result<Option<Profile>, DecodeError> = Ok(Some(Profile { payload: 0 }));
+const REJECT: std::result::Result<Option<Profile>, DecodeError> = Err(DecodeError::Unsupported);
+
+#[test]
+fn research_mode_admits_the_capability_study_fixtures() {
+    // check_admission.py's nine fixtures: (V, P, n, C, draw).
+    for (v, p, n, c, draw) in [
+        (3, 1, 4, 0, 0x70000600),
+        (4, 2, 4, 0, 0x70000600),
+        (16, 16, 4, 0, 0x70000600),
+        (64, 128, 4, 0, 0x70000600),
+        (128, 256, 4, 0, 0x70000600),
+        (256, 512, 4, 0, 0x70000600),
+        (4, 4, 5, 0, 0x70000000),
+        (16, 16, 4, 0, 0x70000100),
+        (4, 2, 5, 4, 0x70000600),
+    ] {
+        let words = research(n, p, u32::div_ceil(v, 4), c, draw);
+        assert_eq!(decode_mode(&words, Mode::Research), ACCEPT, "V{v} P{p}");
+        let narrow = (v, p, c, draw) == (3, 1, 0, 0x70000600);
+        for mode in [Mode::SingleParent, Mode::MultipleParents] {
+            assert_eq!(decode_mode(&words, mode), if narrow { ACCEPT } else { REJECT });
+        }
+    }
+}
+
+#[test]
+fn research_mode_accepts_the_model_range_and_nothing_beyond_it() {
+    for planes in [3, 4, 5, 6, 32, 127, 128, 129] {
+        for primitives in (1..=513).filter(|p| *p <= 17 || p % 31 == 0 || *p >= 511) {
+            for quads in [0, 1, 2, 16, 63, 64, 65] {
+                for components in [0, 1, 4, 15, 64, 128, 129] {
+                    let words = research(planes, primitives, quads, components, 0x70000600);
+                    let valid = (4..=128).contains(&planes)
+                        && primitives <= 512
+                        && (1..=64).contains(&quads)
+                        && components <= 128
+                        && (components == 0 || planes >= 5)
+                        && model_output(planes, primitives, quads, components) <= 0x8000;
+                    let result = decode_mode(&words, Mode::Research);
+                    assert_eq!(result, if valid { ACCEPT } else { REJECT },
+                               "n{planes} P{primitives} q{quads} C{components}");
+                }
+            }
+        }
+    }
+    // The compiler's largest accepted case: V256 with seven float4 varyings.
+    assert_eq!(decode_mode(&research(32, 1, 64, 0, 0x70000600), Mode::Research), ACCEPT);
+    assert_eq!(decode_mode(&research(33, 1, 64, 0, 0x70000600), Mode::Research), REJECT);
+}
+
+#[test]
+fn research_mutations_are_rejected_or_reproduce_the_model() {
+    for (n, p, q, c) in [(4, 1, 1, 0), (4, 512, 64, 0), (5, 2, 1, 4), (17, 33, 9, 3), (128, 1, 1, 0)] {
+        for draw in DRAWS {
+            let words = research(n, p, q, c, draw);
+            assert_eq!(decode_mode(&words, Mode::Research), ACCEPT);
+            for index in [1, 2, 3, 4, 9, 10, 11, 12, 13, 17] {
+                for bit in 0..32 {
+                    let mut bad = words.clone();
+                    bad[index] ^= 1 << bit;
+                    if decode_mode(&bad, Mode::Research) != ACCEPT {
+                        continue;
+                    }
+                    // An accepted mutation must itself be a model stream.
+                    let n = bad[1] & 0xff;
+                    let p = (bad[10] & 0xffff) + 1;
+                    let c = bad[12] / p;
+                    let q = (bad[13] - 1) / n;
+                    let draw = bad[17];
+                    let mut expected = research(n, p, q, c, draw);
+                    expected[11] = bad[11];
+                    assert_eq!(bad, expected, "word {index} bit {bit}");
+                    assert!(DRAWS.contains(&draw));
+                    assert!(model_output(n, p, q, c) <= 0x8000);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn research_mode_keeps_stream_structure_and_read_bounds() {
+    for draw in DRAWS {
+        let words = research(4, 512, 64, 0, draw);
+        let mut culled = words.clone();
+        culled[10] |= 1 << 30;
+        assert_eq!(decode_mode(&culled, Mode::Research), REJECT);
+        for header in [0x70000200, 0x70000700, 0x74000600, draw | 1] {
+            let mut bad = words.clone();
+            bad[17] = header;
+            assert_eq!(decode_mode(&bad, Mode::Research), REJECT);
+        }
+        let mut twice = words.clone();
+        twice.pop();
+        twice.extend_from_slice(&words[17..]);
+        assert_eq!(decode_mode(&twice, Mode::Research), REJECT);
+        for len in 0..words.len() {
+            assert!(decode_mode(&words[..len], Mode::Research).is_err());
+        }
+        // Multiple parents, as in mode 2.
+        let mut parents = words.clone();
+        parents[18] = 4;
+        assert_eq!(decode_mode(&parents, Mode::Research), ACCEPT);
+        assert_eq!(decode_mode(&parents, Mode::SingleParent), REJECT);
+        // Exactly one sequential read per packet word, as in modes 1 and 2.
+        let base = 0x1004003ffc;
+        let mut reads = Vec::new();
+        let result = g16_mesh::decode(base, Mode::Research, |va| {
+            reads.push(va);
+            words.get(((va - base) / 4) as usize).copied()
+        });
+        assert_eq!(result, ACCEPT);
+        assert_eq!(reads, (0..words.len()).map(|i| base + 4 * i as u64).collect::<Vec<_>>());
+    }
+    let mut words = stream()[..14].to_vec();
+    words.extend(std::iter::repeat_n(0x20000013, 1100));
+    assert_eq!(decode_mode(&words, Mode::Research), REJECT);
+}
+
+#[test]
+fn modes_one_and_two_are_unchanged_by_research_admission() {
+    // Every wider model stream stays rejected outside mode 3.
+    for draw in DRAWS {
+        for (n, p, q, c) in [(4, 2, 1, 0), (4, 1, 2, 0), (5, 1, 1, 1), (4, 512, 64, 0)] {
+            let words = research(n, p, q, c, draw);
+            assert_eq!(decode_mode(&words, Mode::Research), ACCEPT);
+            for mode in [Mode::SingleParent, Mode::MultipleParents] {
+                assert_eq!(decode_mode(&words, mode), REJECT);
+            }
+        }
+    }
+    for draw in [0x70000000, 0x70000100] {
+        for mode in [Mode::SingleParent, Mode::MultipleParents] {
+            assert_eq!(decode_mode(&research(4, 1, 1, 0, draw), mode), REJECT);
+        }
+    }
 }
 
 fn read32(buf: &[u8], off: usize) -> u32 {

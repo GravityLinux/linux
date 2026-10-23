@@ -45,7 +45,7 @@ assert re.search(r'let mesh_mode =\s*' + runtime_expr + r';\s*let params = if me
 assert re.search(r'params\.mesh\.is_some\(\) && !support\.native', runtime)
 assert 'native_mesh.value()' not in runtime
 mesh = (driver / 'g16_mesh.rs').read_text()
-assert 'pub(crate) const MAX_MODE: u32 = 2;' in mesh
+assert 'pub(crate) const MAX_MODE: u32 = 3;' in mesh
 assert 'g16_mesh::decode(params.encoder, mesh_mode,' in runtime
 assert 'native_mesh.value() == 1' not in runtime
 params = (driver / 'asahi_m4.rs').read_text()

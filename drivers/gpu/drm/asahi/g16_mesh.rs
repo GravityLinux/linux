@@ -4,7 +4,7 @@
 //! Native object/mesh launch for the paired experiment.
 //!
 //! The render UAPI does not distinguish a user object shader from a stub that
-//! writes outputs. `native_mesh=1/2` selects the user-object convention. A paired
+//! writes outputs. `native_mesh=1/2/3` selects the user-object convention. A paired
 //! stream starts with a complete mesh state; there is no search for magic words
 //! inside shader data, PPP records, or ordinary vertex streams.
 
@@ -16,7 +16,7 @@ pub(crate) static NATIVE_MESH: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
 /// The highest accepted `native_mesh` value.
-pub(crate) const MAX_MODE: u32 = 2;
+pub(crate) const MAX_MODE: u32 = 3;
 
 pub(crate) fn mode() -> u32 {
     NATIVE_MESH.load(core::sync::atomic::Ordering::Relaxed)
@@ -27,6 +27,9 @@ pub(crate) enum Mode {
     Disabled,
     SingleParent,
     MultipleParents,
+    /// Research admission for the capability study: the wider state model in
+    /// `research_state`, with mode 2's object dispatch rules. Not qualified.
+    Research,
 }
 
 impl Mode {
@@ -35,6 +38,7 @@ impl Mode {
             0 => Some(Self::Disabled),
             1 => Some(Self::SingleParent),
             2 => Some(Self::MultipleParents),
+            3 => Some(Self::Research),
             _ => None,
         }
     }
@@ -76,6 +80,8 @@ pub(crate) enum DecodeError {
 /// complete physical object workgroups, pending device qualification.
 /// This does not bound the child grid computed by the object shader, nor prove
 /// that a particular aggregate workload fits the available GPU resources.
+/// Mode 3 replaces the state check with `research_state` and also admits point
+/// and line draws; the stream structure and object dispatch rules are mode 2's.
 /// The packet budget bounds malformed streams, including a missing terminator.
 pub(crate) fn decode(
     start: u64,
@@ -119,7 +125,11 @@ pub(crate) fn decode(
     // up to a power of two. This packet parser does not validate shader code or
     // its local-allocation instructions.
     let components = state[0] & 0xff;
-    if !(4..=128).contains(&components)
+    if mode == Mode::Research {
+        if !research_state(&state) {
+            return Err(DecodeError::Unsupported);
+        }
+    } else if !(4..=128).contains(&components)
         || state[0] != components | ((components + 1) << 8)
         || state[1] != 0x10
         || state[2] != 0
@@ -143,7 +153,10 @@ pub(crate) fn decode(
                 next()?;
             }
             1 if word & !0x2000_0013 == 0 => {} // G16 coherency barrier
-            3 if word == 0x7000_0600 && !drew => {
+            3 if !drew
+                && (word == 0x7000_0600
+                    || (mode == Mode::Research && matches!(word, 0x7000_0000 | 0x7000_0100))) =>
+            {
                 // Total threads describe a nonempty grid of complete object
                 // workgroups. Keep the scalar carrier and physical T16/T32,
                 // independently of the mesh width in the state packet.
@@ -166,4 +179,56 @@ pub(crate) fn decode(
             _ => return Err(DecodeError::Unsupported),
         }
     }
+}
+
+/// Research state model (`native_mesh=3`), from the 2026-10-22 capability
+/// study's own-MSL captures: n vertex planes, P primitives, ceil(V / 4) vertex
+/// quads and C 32-bit primitive components.
+///
+/// - word 1: n | (n + 1) << 8, 4 <= n <= 128
+/// - word 2: 0xd0 with primitive data (C > 0), otherwise 0x10
+/// - word 10: (P - 1) | (ceil(P / 16) - 1) << 16, 1 <= P <= 512, no culling
+/// - word 11: T16 or T32 mesh state, as in modes 1 and 2
+/// - word 12: P * C, 0 <= C <= 128
+/// - word 13: 1 + ceil(V / 4) * n, 1 <= V <= 256
+///
+/// Primitive data adds one link plane to n. The application output, vertex
+/// planes without that link plus 4 * P * C bytes of primitive data, must fit
+/// the compiler's 32 KiB mesh-output limit. Words 3, 4 and 9 keep their mode
+/// 1/2 values; words 5..8 are launch handles, as in the other modes. The object
+/// payload is not a packet field. Its exclusive storage is fixed at 16 KiB,
+/// the largest payload in the study. Everything is computed from the 13 words
+/// already read, so this adds no command-memory reads.
+fn research_state(state: &[u32; 13]) -> bool {
+    let planes = state[0] & 0xff;
+    let primitives = (state[9] & 0xffff) + 1;
+    let data = state[1] == 0xd0;
+    if !(4..=128).contains(&planes)
+        || state[0] != planes | ((planes + 1) << 8)
+        || !matches!(state[1], 0x10 | 0xd0)
+        || state[2] != 0
+        || state[3] != 0
+        || state[8] != 1
+        || primitives > 512
+        || state[9] != (primitives - 1) | ((primitives.div_ceil(16) - 1) << 16)
+        || !matches!(state[10], 0x400810 | 0x400820)
+    {
+        return false;
+    }
+    let components = state[11] / primitives;
+    if state[11] % primitives != 0
+        || data != (components != 0)
+        || components > 128
+        || (data && planes < 5)
+    {
+        return false;
+    }
+    // The row count includes the header row. At most 64 vertex quads (V <= 256).
+    let rows = state[12].wrapping_sub(1);
+    let quads = rows / planes;
+    if rows % planes != 0 || !(1..=64).contains(&quads) {
+        return false;
+    }
+    // Bounded above: at most 64 * 16 * 128 + 4 * 512 * 128 bytes.
+    quads * 16 * (planes - u32::from(data)) + 4 * primitives * components <= 0x8000
 }

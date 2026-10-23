@@ -162,7 +162,7 @@ kernel::module_platform_driver! {
         },
         native_mesh: u32 {
             default: 0,
-            description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16/T32 one-parent profile, 2=unqualified multiple-parent profile; no capability advertisement. Runtime: debugfs asahi_m4/native_mesh (a VM keeps the support mode of its first render)",
+            description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16/T32 one-parent profile, 2=unqualified multiple-parent profile, 3=research admission of wider mesh state (not qualified); no capability advertisement. Runtime: debugfs asahi_m4/native_mesh (a VM keeps the support mode of its first render)",
         },
         dependency_kind: u32 {
             default: 0,

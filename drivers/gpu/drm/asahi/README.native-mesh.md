@@ -78,6 +78,29 @@ Multi-parent device use requires a guarded measurement of the 16 KiB native
 firmware payload's touched range versus parent count first. Host parser tests
 are not device qualification.
 
+`=3` is research admission for the native capability study
+(`native-capability-20261022`). It is not qualified and is not for normal use.
+It keeps mode 2's stream structure and object dispatch rules, and replaces
+the fixed one-triangle state check with that study's state model. With n
+vertex planes, P primitives, V vertices and C primitive components:
+
+- n: 4–128, with word 1 = n | (n + 1) << 8.
+- P: 1–512, with word 10 = (P - 1) | (ceil(P / 16) - 1) << 16. The culling bit
+  stays rejected.
+- V: 1–256, with word 13 = 1 + ceil(V / 4) × n.
+- C: 0–128, with word 12 = P × C. Word 2 is 0xd0 exactly when C > 0. Primitive
+  data adds one link plane, so n ≥ 5 then.
+- Application output (vertex planes without the link plane, plus 4 × P × C
+  bytes) is at most 32 KiB, the compiler's stated mesh-output limit.
+- Draw headers: 0x70000000 points, 0x70000100 lines, 0x70000600 triangles.
+
+Words 3, 4, 9 and 11 keep their mode 1/2 values. The checks use only the
+13 state words already read, so command-memory reads are unchanged. The
+object payload size is not a packet field. Its exclusive storage stays 16 KiB,
+which is the study's largest payload. The firmware TA size and gate are the
+fixed mesh values from modes 1 and 2. Whether they hold for wider shapes is a
+device question, so admission here is not GPU qualification.
+
 ## Switching at runtime
 
 The boot value only sets the initial state. As root, with debugfs mounted:
