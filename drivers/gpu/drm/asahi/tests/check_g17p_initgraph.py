@@ -5,6 +5,7 @@
 Only the two builder function definitions are compiled from the experiment's AST.
 Its module setup, hardware imports and experiment entrypoint are never executed.
 """
+import host_versions
 import argparse
 import ast
 import contextlib
@@ -89,7 +90,7 @@ class Arena:
 with tempfile.TemporaryDirectory(prefix="g17p-graph-") as tmp:
     tmp = Path(tmp)
     executable = tmp / "oracle"
-    subprocess.run([args.rustc, "--edition=2021", str(Path(__file__).with_name("g17p_initgraph.rs")), "-o", str(executable)], check=True)
+    subprocess.run([args.rustc, *host_versions.build(tmp, args.rustc), "--edition=2021", str(Path(__file__).with_name("g17p_initgraph.rs")), "-o", str(executable)], check=True)
     subprocess.run([str(executable), str(tmp / "bytes")], check=True)
     original_performance = copy.deepcopy(g17p.PERF_TABLES)
     checked = 0

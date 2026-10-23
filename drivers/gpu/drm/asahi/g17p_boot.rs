@@ -32,6 +32,7 @@ use kernel::{
 
 struct Data {
     dev: ARef<platform::Device>,
+    role: super::g17p_abi::FirmwareRole,
     name: &'static CStr,
     firmware_region: &'static CStr,
     crashed: AtomicBool,
@@ -141,6 +142,12 @@ struct Peer {
 #[path = "g17p_bootstrap.rs"]
 mod bootstrap;
 
+#[path = "scheduled_boot_g16c.rs"]
+#[allow(dead_code)]
+mod g16c;
+#[path = "scheduled_compute_runtime.rs"]
+mod g16c_compute;
+
 #[path = "g17p_cleanup_session.rs"]
 #[allow(dead_code)]
 mod cleanup;
@@ -206,6 +213,9 @@ pub(crate) struct Session {
     pending: Option<PendingWork>,
     compute_pending: Option<ComputePending>,
     render_control: Option<KBox<RenderControl>>,
+    g16c_transport: Option<KBox<super::scheduled_transport::StateG16C>>,
+    g16c_compute: Option<KBox<g16c_compute::State>>,
+    g16c_sgx: Option<Pin<KBox<Devres<IoMem<0x3758000>>>>>,
     events: Arc<super::g17p_drm::asynchronous::Events>,
 }
 
@@ -326,7 +336,9 @@ impl Completion {
             pr_info!("G17P: CPU_CACHE_PAUSE_END grid {} owner {:?} outside_runtime_lock\n", self.grid, self.client.owner);
         }
         let result = self.client.cache(true).and_then(|()| self.stamps.run(true));
-        self.error = result.err();
+        // A retired command error must survive successful CPU visibility.
+        // Cache failures still fail the device through the caller.
+        if let Err(error)=result {self.error=Some(error);}
         result
     }
     /// Finish under the brief device state lock, which also serializes fatal
@@ -400,6 +412,10 @@ impl Session {
     /// execution context has released all cached references to the allocation.
     /// Session shutdown stops both peers before releasing these owners.
     pub(crate) fn retain_source_backing(&mut self, bo: &ARef<super::g17p_drm::Object>) -> Result {
+        // Max's context owner and exact publication/CPU leases retain these
+        // BOs until its qualified context-close/root-invalidation receipt.
+        // Do not add a second permanent reference after that receipt.
+        if self.g16c_transport.is_some() {return Ok(());}
         let identity = &**bo as *const super::g17p_drm::Object as usize;
         if self.retained_buffer_ids.get(&identity).is_some() {
             return Ok(());
@@ -416,21 +432,11 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn prepare(
-        pdev: &platform::Device<Core>,
-        platform: &Platform,
-        sgx: &Devres<IoMem<0x4000000>>,
-        image: &Image,
-    ) -> Result<KBox<Self>> {
-        let dev = pdev.as_ref();
-        let events = super::g17p_drm::asynchronous::Events::new()?;
-        // The combined source owners exceed the probe's stack budget when
-        // moved through Runtime/Mutex by value. Keep their lifetime unchanged
-        // while placing the session on the kernel heap.
-        let mut session = KBox::new(
-            Self {
+    fn unstarted(memory: Memory, ttbs: u64, events: Arc<super::g17p_drm::asynchronous::Events>) -> Result<KBox<Self>> {
+        Ok(KBox::init(
+            try_init!(Self {
                 phase: Phase::Prepared,
-                ttbs: platform.regions[0].base,
+                ttbs,
                 independent_compute: super::g17p_compute_queues::Queues::new(),
                 independent_pending: KVec::new(),
                 independent_count: 0,
@@ -458,19 +464,37 @@ impl Session {
                 retained_buffer_ids: RBTree::new(),
                 timestamps: Some(super::g17p_timestamp::Registry::new()),
                 peers: KVec::new(),
-                memory: Some(Memory::new(dev, platform)?),
+                memory: Some(memory),
                 vm: None,
                 pending: None,
                 compute_pending: None,
                 render_control: None,
-                events: events.clone(),
-            },
+                g16c_transport: None,
+                g16c_compute: None,
+                g16c_sgx: None,
+                events,
+            }),
             GFP_KERNEL,
-        )?;
-        session.peers.reserve(2, GFP_KERNEL)?;
-        for (name, registers, firmware_region) in [
-            (c_str!("primary"), c_str!("asc"), c_str!("firmware")),
+        )?)
+    }
+
+    pub(crate) fn prepare(
+        pdev: &platform::Device<Core>,
+        platform: &Platform,
+        sgx: &Devres<IoMem<0x4000000>>,
+        image: &Image,
+    ) -> Result<KBox<Self>> {
+        let dev = pdev.as_ref();
+        let events = super::g17p_drm::asynchronous::Events::new()?;
+        // The combined source owners exceed the probe's stack budget when
+        // moved through Runtime/Mutex by value. Keep their lifetime unchanged
+        // while placing the session on the kernel heap.
+        let mut session = Self::unstarted(Memory::new(dev,platform)?,platform.regions[0].base,events.clone())?;
+        session.peers.reserve(super::g17p_abi::G17P_ROLES.len(), GFP_KERNEL)?;
+        for (role, name, registers, firmware_region) in [
+            (super::g17p_abi::FirmwareRole::Primary, c_str!("primary"), c_str!("asc"), c_str!("firmware")),
             (
+                super::g17p_abi::FirmwareRole::Secondary,
                 c_str!("secondary"),
                 c_str!("asc-secondary"),
                 c_str!("firmware-secondary"),
@@ -499,6 +523,7 @@ impl Session {
             let data = Arc::new(
                 Data {
                     dev: pdev.into(),
+                    role,
                     name,
                     firmware_region,
                     crashed: AtomicBool::new(false),
@@ -2947,6 +2972,7 @@ impl Session {
     }
 
     fn fail_owned_receipts(&self, error: Error) {
+        if let Some(state)=self.g16c_compute.as_ref() {state.fail_receipts(error);}
         self.independent_compute.fail(error);
         for pending in &self.independent_pending { pending.receipt.fail(error); }
         if let Some(control) = &self.render_control { control.receipt.fail(error); }
@@ -3161,7 +3187,8 @@ impl Session {
 
     fn start_inner(&mut self, dev: &kernel::device::Device, image: &Image) -> Result {
         g17p_memory::sync();
-        for (peer, root) in self.peers.iter_mut().zip(image.graph.roots()) {
+        for peer in &mut self.peers {
+            let root = image.graph.root(peer.data.role);
             let rtkit = peer.rtkit.as_mut().ok_or(EINVAL)?;
             rtkit.as_mut().start_endpoint(0x20)?;
             rtkit.as_mut().start_endpoint(0x21)?;
@@ -3284,9 +3311,25 @@ impl Drop for Session {
                 }
             }
         }
+        if stopped {
+            if let (Some(vm), Some(memory)) = (self.vm.as_mut(), self.memory.as_mut()) {
+                let restored = vm.invalidate_g16c_boot_contexts(memory,self.ttbs).and_then(|invalidated| {
+                    if invalidated { Vm::invalidate_gpu(); }
+                    vm.restore_boot_tables(memory)
+                });
+                if let Err(error) = restored {
+                    stopped = false;
+                    if let Some(peer) = self.peers.first() {
+                        dev_err!(peer.data.dev.as_ref(), "AGX: boot table restore failed {:?}; retaining GPU memory\n", error);
+                    }
+                }
+            }
+        }
         if !stopped {
             // Firmware may still reference these pages. The reservation is
             // permanent; keep the runtime owner too as it gains owned tables.
+            core::mem::forget(self.g16c_transport.take());
+            core::mem::forget(self.g16c_compute.take());
             core::mem::forget(self.memory.take());
             core::mem::forget(self.compute.take());
             core::mem::forget(core::mem::replace(&mut self.independent_compute, super::g17p_compute_queues::Queues::new()));

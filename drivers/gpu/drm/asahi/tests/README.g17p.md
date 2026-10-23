@@ -1,12 +1,545 @@
-# G17P UAPI integration and source checks
+# Scheduled G16C/G17P UAPI integration and source checks
+
+Max compute sampler admission now accepts nonzero logical heaps through the
+shared parser and existing generated descriptor. G16C permits representable
+count+1 values (through0xfffffffe), with full checked count*8 readable VM
+coverage, alignment and pointer/count agreement. G17P keeps its existing1024
+limit and the source gate compares the entire parameter parser at that limit.
+This change does not add kernel shader parsing or client-root rewriting.
+
+`g16c_drm_sampler.c` consumes wholly source-owned shader/texture/GEM inputs
+and builds native32 descriptor table DATA in the caller. Default runs are
+short; reserve the wide count/pointer sequence for final qualification:
+
+```sh
+/g16c_drm_sampler /sampler-fixture
+/g16c_drm_sampler /sampler-fixture --raw=17
+/g16c_drm_sampler /sampler-fixture --wide
+```
+
+The short cases use counts1/17/513. The wide sequence includes65535/65537,
+500000 at heapA/B/A, then shrink to1. Every positive case checks two RGBA
+samples, the complete output/guards and every non-output BO byte, including
+shader, root, logical heaps and native table. Five malformed input/range cases
+precede each run. The raw diagnostic leaves the original caller table/root
+unchanged and records output, rather than claiming heap conversion: at count17
+that table's slot44 is nearest while logical heap entry16 is linear. Raw gives
+white; constructing the native table gives gray. Firmware sampler fields alone
+do not replace this shader's table. The shim's Mesa-preamble-specific root
+adapter is not part of the native kernel interface. Integrating equivalent
+bindless table upload into the real Mesa client remains separate work; do not
+claim that integration or all sampler semantics from these direct C controls.
+
+Reproduce the fixture with `prepare_g16c_sampler_fixture.py SOURCE OUTPUT`,
+where SOURCE is the qualified sampler-wide-nonzero-compute-v248-20261021-inputs
+directory. The exporter checks source provenance and every source BO hash,
+copies shader bytes unchanged and adds only an empty caller-owned table BO.
+It imports no Apple client pages or firmware objects.
+
+Native Max checkpoint (2026-10-22): the shared Rust DRM driver now executes
+compute through the existing CPU scheduler, immutable snapshots, ClientLease,
+GEM/fence and CPU completion owners. Max supplies its actual context/operand
+pool, queue, Work15/SKSM construction and single-ASC publication/retirement.
+No second CPU scheduler or fabricated Neo boot image is used. Both ABI profiles
+retain their own real initdata types in RuntimeImage.
+
+The focused native tests are:
+
+```sh
+/g17p_drm_memory /dev/dri/renderD128 --g16c
+/g16c_drm_compute /g16c-fixture
+/g16c_drm_compute /g16c-fixture --timestamps
+/g16c_drm_compute /g16c-fixture --timestamps --file-close
+/g16c_drm_compute /g16c-fixture --queues=2 --kernel-base=0x7100000000
+/g16c_drm_compute /g16c-fixture --replace=3 --queues=2 --destroy-accepted
+```
+
+Build the first two executable names from g17p_drm_memory.c and
+g16c_drm_compute.c using the cross compiler, installed UAPI headers and
+`-Wno-unused-function` for shared C helpers. The default Neo memory invocation
+and expected parameters are preserved. The compute fixture consists entirely
+of our Mesa-generated constant32 GEM resources and one command; it supplies no
+firmware object or Apple binary page. Its source manifest and checksums are
+preserved in the Max checkpoint fixture-v2/provenance.json.
+
+On the final native Image, the memory test passes6303 assertions. Each compute
+mode submits twice, resets the poisoned output, checks all16384 deadbeef words
+and every other byte in the81920-byte output GEM. The timestamp mode also
+checks two ordered caller-owned start/end pairs, invalid object IDs/offsets
+and the complete timestamp BO guards. Two iterations do not exercise the
+shared helper's iteration16 timestamp-object rebind. All16 CPUs remain online;
+firmware stays healthy, and subsequent platform unbind completes.
+
+Max admits compute and nonzero sampler fields through this path. Render
+is still rejected. Hardware admission serializes
+Max's shared operand view/engine rebind; native concurrency, queued firmware
+dependencies, FList growth and render/private-pressure recycling remain separate ports.
+Published Max contexts now close through seven maintenance/tick records and
+one close record per used queue, using the live firmware-assigned prefix
+indices. Every record must retire before exact owned TTBR invalidation and
+dropping Client/root/BO references. Deferred closes are reaped by the common
+scheduler after CPU completion. Uncertain controls poison the session and
+retain backing. Neo's existing permanent BO retention remains unchanged.
+
+The final short native lifetime gate passes six submissions across three
+successive application lifetimes: two explicit VM destroys and one DRM file
+close. All three have kernel release receipts and reuse firmware context1.
+The serialized compute engine also reuses one five-page work slot, checking
+all exact mappings before clearing it after GPU and CPU retirement. This
+removes the work-generation arena and total-context-lifetimes limits. There
+are still at most63 concurrent firmware context namespaces.
+
+Retired Max private pool chunks, support/high-root pages, queue records/rings,
+save/robustness pages and context/queue slots now reuse retained backing. All
+old TTBR words and support mappings are checked before pool reuse. Fresh
+application root paths are prepared before clearing and remapping the private
+chunks; directories and counters are rebuilt for the requested VA base. Queue
+reset checks every exact high mapping and ctx0 alias before clearing even one
+byte. Engine SKSM arrays have independent Session-wide backing and aliases;
+reset never clears them. Physical backing stays in common Memory until stopped
+teardown. Cached slots track the high-water mark of firmware-retained contexts
+and queues. Standalone compute queue destruction now registers an accepted-job
+activity owner, including jobs blocked before any firmware queue construction.
+The existing async Job increments it at acceptance and decrements it only at
+unique retirement. A close request survives until all those jobs and GPU/CPU
+leases finish. Max reaps it before the public completion signal, using eight
+retired maintenance/tick/close controls and checking every installed VM's exact
+roots remain unchanged. Neo allocates no activity owner and keeps its original
+async behavior. No second scheduler or cleanup worker is introduced.
+
+Within the same live root, a retired queue's save mappings are checked exactly
+and reused without advancing the VA cursor. A queue retained by another live
+owner cannot be reused; VM release detaches its save slot after root invalidation.
+Once every queue closes independently, detached VM release invalidates owned
+roots and performs six post-root maintenance controls if no survivor remains,
+matching the qualified source sequence.
+
+The final compute-only native recycling gate passes138 checked submissions
+across69 application lifetimes:68 use two queues and the last returns to one.
+Thirty-four explicit VM destroys and35 file closes produce69 kernel receipts,
+620 retired controls and reuse of context1. The extra66-lifetime loop exceeds
+the old63-total-lifetimes cap and crosses the256-entry control ring twice.
+Retained driver backing is flat after the first two-queue VM:181 allocations,
+196820992 bytes, one pool slot and two queue slots. Private VA bases alternate
+between0x7000000000 and0x7100000000; the final single-queue case uses0x7200000000.
+There are68 guarded ordered caller timestamp pairs. All16 CPUs remain online;
+subsequent unbind removes DRM nodes without reported errors. This qualifies
+serialized compute close/recreate recycling, not simultaneous application VMs,
+render, private-pressure/growth or fault-path reuse.
+
+The subsequent live-VM queue gate passes528 checked submissions in five VM
+lifetimes. Its final run keeps one VM and a survivor queue open for512 jobs,
+destroying256 other queues while their first accepted job waits on an imported
+software fence. Each blocked output remains poisoned until the input signals;
+old queue IDs reject new submissions. Then both the accepted job and survivor
+produce correct complete output. All266 actual queue retirements preserve
+roots and retire eight controls;259 occur after imported-fence-blocked queue
+destruction. Five VM release receipts include the detached and file-close
+paths, for2161 total retired controls. After warm-up backing stays181
+allocations/196820992 bytes, one pool/two queue slots. The post-run6303 memory
+assertions and platform unbind pass with all16 CPUs online.
+
+Keep normal development runs short (`--replace=3`). `--replace=256 --queues=2
+--destroy-accepted` is the final boundary run, not a routine smoke test.
+This still does not qualify concurrent application VMs, render/private-pressure
+or fault-path recycling. Retiring obsolete binding-generation roots/BOs after
+BO rebind within one still-live VM also remains a separate port; unchanged
+binding snapshots are what this queue-replacement gate reuses.
+`--destroy-accepted` uses CONFIG_SW_SYNC only to hold
+an imported input fence; GPU execution remains the native driver.
+
+The `--file-close` banner alone does not prove context retirement: require
+the corresponding kernel close receipt before unbind. The timestamp helper's
+generic banner mentions object rebind, but two iterations never reach that
+case. Post-compute platform unbind passes with all16 CPUs still online.
+No optional Max feature bits are advertised yet. Normal board DTS still keeps
+the GPU disabled pending permanent PMGR ownership; hardware tests use the
+explicit passthrough monitor and loader-populated typed FDT.
+
+`scheduled_operands.rs` defines Max's compute FList Default template, including
+the compute owner's explicit kind/phase overrides. The short gate compares32
+whole pages with the qualified source constructor and asserts size, alignment
+and every field offset:
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_operands.py /path/to/max-m1n1 \
+    --evidence /path/to/fresh-evidence-directory
+```
+
+`check_scheduled_session_shape.py` compares35 original Neo Session defaults,
+probe, complete CPU scheduler/async worker, queue create/destroy,
+identity/GET_PARAMS and ioctl admission with
+the preserved tag. Only immutable G16C-only branches and typed image access
+are excluded. This is source-preservation evidence; live Neo GPU regression
+is still required. Passing layout, compile or memory tests alone does not
+qualify GPU output or retirement.
+
+`check_scheduled_queues.py` compares all48 fresh backing images and four complete
+ctx0 alias images against qualified source QueueSet.create. It also poisons
+each queue and verifies a reset returns every byte to its template with zero
+new allocations, preserves independent canonical engine arrays, and rejects
+a changed final alias before any zero. Run with the typed-memory FDT fixture:
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_queues.py /path/to/max-m1n1 \
+    --inputs /path/to/python-platform-inputs/input.json \
+    --fdt-template /path/to/typed-memory-fdt-fixture.dtb \
+    --evidence /path/to/fresh-evidence-directory
+```
+
+`scheduled_lifetime.rs` uses source Default templates with every field offset,
+size and alignment asserted. Its short differential gate compares71 complete
+64-byte maintenance/tick/close records with the qualified source encoders,
+including varying firmware-assigned indices and seven malformed inputs:
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_lifetime.py /path/to/max-m1n1 \
+    --evidence /path/to/fresh-evidence-directory
+```
+
+The G16C/G17P integration starts at the `neo-known-good-2026-10-21` tag.
+`AGX_SCHEDULED` is a separate versions-macro group with one axis, `G`, and
+the concrete profiles `G16C` and `G17P`. Firmware is fixed to macOS 26.6.2.
+The older `AGX` group retains its existing generation/firmware combinations.
+The operator-approved boundary keeps scheduled-family initdata definitions and
+construction separate from the older Asahi initdata. Within this newer family,
+use versioned layouts for stable meanings with changed placement/presence and
+explicit construction for different roles or handshakes. Share a leaf record
+across families only when both its layout and meaning are established.
+
+For each converted wire structure, first check every field offset, total size
+and alignment against the RE layout, then compare the complete encoded image
+with the established encoders and available captured protocol DATA. Constant
+blocks use source-defined `Default` templates; constructors override variable
+fields. Owned staging values must never become mutable references to live
+firmware storage. Do not claim GPU qualification from layout or compile checks.
+
+The first converted objects are `scheduled_wire::QueueRecordG16C/G17P` and
+`QueuePointersG16C/G17P`; the ordinary Neo queue builder uses both generated
+G17P structures. Neo's 0xac queue wire record stays separate from its 0xc0
+allocation stride. With Python 3.10+
+and `rustc`, the paired layout/reference check is:
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_wire.py /path/to/max-m1n1 \
+    --g17p-layout /path/to/neo-m1n1/proxyclient/m1n1/agx/g17p.py \
+    --native-queue /path/to/captured/stage-0-queue.bin \
+    --native-queue /path/to/captured/stage-1-queue.bin \
+    --native-queue /path/to/captured/stage-2-queue.bin
+```
+
+Native queue inputs are optional DATA-only comparisons; source/layout checks
+always run. The Neo oracle is loaded from the exact preserved commit via Git,
+so this check does not compare the new implementation against itself.
+`host_versions.py` builds the production macro for the standalone host tools.
+
+`scheduled_initdata.rs` separately defines the scheduled-family initialization
+roots, UAT levels, channels, main configuration, MMIO and hardware-region records.
+`FirmwareRole::{Primary, Secondary}` identifies the boot owner in host metadata;
+it is not another macro axis or an added wire discriminator. G16C constructs one
+primary instance, while G17P constructs both roles. Main defaults/channel subsets
+and root form follow the role. Each ASC peer publishes the root selected by its
+role, independently of its position in a list. Kind words remain ABI-specific:
+G16C's primary main object and G17P's secondary main both contain kind four.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_initdata.py /path/to/max-m1n1 \
+    --g17p-initdata /path/to/neo-m1n1/proxyclient/m1n1/agx/g17p_initdata.py \
+    --native-root /path/to/captured/root-data.bin \
+    --native-main /path/to/captured/main-data.bin
+```
+
+This checks RE offsets before source bytes, complete Max template output, the
+tagged Neo encoders and whole initialization graph, role defaults and rejection
+before mutation. Native inputs are bounded DATA objects only. The historical
+graph test's stale mailbox expectation is corrected in its baseline test adapter;
+the baseline production builders remain untouched. Layout/source agreement and
+an ARM64 object compile do not qualify native Max firmware startup or GPU work.
+
+`scheduled_hwdata.rs` describes both complete 0x3db4-byte hardware-data
+layouts and the shared clock/voltage table. Max's 0x2596 word stays explicitly
+unknown (value 46); it is not assumed to mean Neo's twelve work channels.
+Constant-heavy objects have source `Default` templates. Production construction
+copies these from static storage, then assigns fields in exclusive initialized
+host staging memory, avoiding a whole-object kernel-stack temporary. Neo uses
+the shared transport defaults and voltage-table constructor; its final policy
+overlay and explicit opaque-field API keep their existing ordering/behavior.
+Max supplies four cluster voltage columns and sixteen CS-state slots through
+explicit board inputs. This does not yet connect Max to native startup.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_hwdata.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-adt-platform-inputs.json \
+    --g17p-initdata /path/to/neo-m1n1/proxyclient/m1n1/agx/g17p_initdata.py \
+    --native-hwdata /path/to/captured/hardware-data.bin
+```
+
+This checks independently parsed RE offsets and complete Max images, varying
+all cluster columns, MMIO pointers and CS counts 1 through 16. Negative geometry
+checks require an untouched output buffer. The optional native comparison
+decodes understood variable pointers/region fields only; board fields, policy,
+reserved bytes and every other byte must be rebuilt from source. Run the
+initdata gate above as well to compare all Neo graph images against the tag.
+
+`scheduled_board.rs` consumes typed FDT properties and operating-point
+nodes, following the existing Asahi boundary. m1n1 selects the original ADT
+rows, calibrates the board, and fills `t6041-gpu-config.dtsi`: eleven GPU OPPs
+and the eight CS OPPs present on J616c. Linux does not parse or group raw ADT.
+Each GPU OPP carries standard `opp-hz` and four `opp-microvolt` cells, plus
+`apple,alternate-opp-hz`, four `apple,sram-microvolt` cells, two
+`apple,perf-index` cells and two `apple,relative-power` cells. The CS table
+uses the same `apple,cs-opp` phandle as Asahi. Scalar configuration uses normal
+big-endian `apple,*` cells, including IEEE-754 bit patterns for power gains.
+
+`scheduled_power.rs` holds the separate G16C controller wire layout and static
+Default template. Typed `SettingsG16C::from_fdt` reads Asahi-style power names;
+derivation validates properties and computes software-float values in compact
+host storage before encoding changes the destination. The 0x63d4-byte wire
+object is copied from static storage, then assigned through named fields in
+exclusive host staging. Its graph pointers remain explicit constructor inputs.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_fdt.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-adt-inputs.json \
+    --fdt-template /path/to/compiled-g16c-config-fixture.dtb \
+    --native-hwdata /path/to/captured/hardware-data.bin
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_power.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-adt-inputs.json \
+    --fdt-template /path/to/compiled-g16c-config-fixture.dtb \
+    --native-controller /path/to/captured/controller-data.bin
+```
+
+These execute the actual m1n1 C population function with libfdt against a
+compiled copy of the shipped DTS fragment, then compile the production Rust
+OF readers and serializers. Expected firmware images come from the independent
+qualified Python builders. The host OF adapter decodes normal big-endian FDT
+cells, not ADT. The hardware gate varies frequencies, all cluster columns, CS
+counts and GPC/sampling configuration and rejects malformed FDT cells/topology.
+The power gate traces the independent encoder's field offsets/widths, covers
+controller properties and rejects exceptional gains/overflow. Native DATA
+comparisons cover each complete object. This configuration path is not yet
+connected to native Max probe/startup; it does not qualify GPU execution.
+
+`scheduled_boot_records.rs` shares the versioned Region C and primary-status
+layouts, using separate source Default policies for G16C/G17P. Neo's normal
+graph now uses these templates; complete graph output remains identical to
+the preserved tag. The old duplicate constant runs have been removed.
+
+`scheduled_initgraph.rs` composes Max's hardware/controller/main bundle and
+all 36 boot RAM spans. Its eight context-zero views must alias the same physical
+backing as their firmware views. The opening control slot overlaps main+0x4c0;
+it belongs to the bundle allocation. `ImageG16C` owns unpublished CPU staging.
+The bundle names the additional observed scalar locations after entropy, but
+keeps the qualified source default of zero: their meaning/producer has not been
+established, so observed calibration words are not universal constants.
+
+`scheduled_mmio.rs` builds Max's 25 sparse register records and device mappings
+from SoC aperture constants plus two typed FDT inputs populated by m1n1:
+`apple,firmware-sw-interrupt` (u64 physical address) and `apple,active-mcc-mask`
+(u32). MCC windows and the four cluster windows have separate physical strides.
+The hardware-status alias uses its observed shared-NC attributes; none of these
+device mappings are RAM allocations or objects to clear.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_initgraph.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-adt-inputs.json \
+    --fdt-template /path/to/compiled-g16c-config-fixture.dtb
+```
+
+This executes the actual qualified Python `Bootstrap.build_graph` in bounded
+host RAM, the m1n1 C FDT population function and the production Rust constructors.
+It compares every byte of four whole graphs, every RAM permission and alias,
+all channels and MMIO maps. Extra cases compare each possible MCC bit and the
+full 32-window mask with the source builder. Bad storage/configuration must fail
+before graph storage changes. No target is accessed. Reservations, UAT and
+single-ASC startup are now wired below; native work submission remains pending.
+Source-image agreement and compile success do not establish execution.
+
+`t6041-gpu-memory.dtsi` supplies the five standard reserved-memory nodes and
+phandles for TTBS, firmware page tables, shared L2, handoff and firmware image.
+m1n1 validates the complete geometry/target shape before publishing normal
+big-endian `reg` cells, enabling those reservations and setting the private VM
+range. The GPU node stays disabled pending native hardware qualification.
+`scheduled_resources.rs` validates the resulting Linux resources; the new Max
+Memory constructor maps only the four RAM regions needed for host access.
+
+`scheduled_vm_g16c.rs` constructs Max mappings with the existing common `Vm`
+walker. G16C allocates its own backing instead of using Neo's fixed physical
+placement tables. Contexts zero/one have independent low/high roots; firmware
+keeps its existing high root and boot-code mappings. The constructor reads
+bounded page-table DATA, not firmware executable pages, and never accesses
+MMIO through CPU RAM operations. It retains original boot-table DATA until
+stopped cleanup can detach all links to owned pages.
+
+The qualified ordering is cold validation/VM preparation/context clearing,
+RTKit management boot, then graph population. Retain `Vm::prepare_g16c` in the
+session before RTKit starts, and use that same VM for any management buffer
+mappings before calling `populate_g16c`. Failure must preserve its backing until RTKit stops.
+The common session destructor then invalidates Max's contexts, performs the
+global UAT invalidation, restores inherited tables and releases ownership.
+Any shutdown/restore failure retains backing. `build_g16c` is a convenience
+transaction for a stopped ASC, including the host tests; it is not a replacement
+for that management-running ownership sequence.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_resources.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-adt-inputs.json \
+    --fdt-template /path/to/compiled-config-and-memory-fixture.dtb
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_vm.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-adt-inputs.json \
+    --fdt-template /path/to/compiled-config-and-memory-fixture.dtb
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_vm_neo.py
+```
+
+The memory fixture includes both shipped Max DTS fragments. Resource tests run
+actual C/libfdt publication and Rust OF parsing. VM tests run production image
+construction and the common walker against bounded owned RAM, comparing every
+boot object with actual Python startup output and checking all RAM permissions,
+aliases, MMIO PTEs, isolated roots, inherited code mappings, failures and stopped
+cleanup. The Neo differential check runs the original tagged walker and current
+walker with the unchanged Neo graph, comparing the complete RAM/physical-address
+image and allocation count. These are source/host checks, not native GPU tests.
+The full Max SoC/board DTS and native work remain pending; single-ASC startup
+is wired below but still needs hardware qualification.
+
+`scheduled_boot_g16c.rs` now wires single-ASC startup into the common `Session`
+owner and platform driver (`apple,agx-g16c` / `apple,agx-t6041`). It checks the
+cold ASC/GPU identity, prepares UAT, applies AXI/gate/handoff/context state,
+releases ASC RUN and the gate with adjacent stores, waits for RTKit, installs
+the graph and publishes context zero/initdata. Max accepts through status-A+0x14;
+it then retires the 0x16 opening and six 0x1b maintenance messages. The application
+context stays unpublished until work admission. This path does not fabricate a
+Neo graph or register unsupported DRM capabilities: native Max command lowering
+and full SoC/board DTS are still pending, and the loader keeps the GPU disabled.
+
+`scheduled_bootstrap.rs` implements the source DATA transactions and bounded
+boot receive-ring servicing. Unknown/unowned events stop bring-up; independent
+consumer/retired/producer positions must all match before retirement is accepted.
+The shared Session defaults and Neo probe body remain identical to the tag.
+Probe construction is split into per-profile helpers to bound stack usage;
+large MMIO staging and Session defaults initialize directly in heap storage.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_bootstrap.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-adt-inputs.json \
+    --fdt-template /path/to/compiled-config-and-memory-fixture.dtb
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_session_shape.py
+```
+
+The bootstrap gate compares complete RAM images after running the actual Python
+publication/opening methods and EventService. Firmware responses and the host
+ASID primitive are simulated; this does not qualify native startup or barriers.
+`inspect_scheduled_native_code.py` checks only our compiled ARM64 Linux object
+for the adjacent RUN/gate stores and major stack frames, without inspecting
+Apple executable content. Major-frame totals exclude nested callees and are
+not a substitute for hardware execution or a complete stack-depth analysis.
+
+`scheduled_compute.rs` generates `ComputeDescriptorG16C/G17P` and
+`ComputeProgramG16C/G17P` from the same hardware ABI axis. Neo's active compute
+builder now delegates to them; its descriptor interface and forty-write program
+remain unchanged. Max has its distinct scratch offsets and optional 36-write
+Metal / 40-write queue-state forms. USC execution base remains fixed.
+
+Both descriptor profiles copy source-defined Default templates from static
+storage into exclusive CPU staging. The Max native packed object is 4 KiB;
+a standalone allocation may be 16 KiB with a zero tail. The unaligned zero-page
+pointer overwrites the high byte of the preceding ordinal word, represented by
+nonoverlapping byte fields. Neo's fixed header counts and first-match scalar
+lookup are preserved. Max computes header counts, takes scalar fields from
+explicit inputs, and selects last matches for its secondary register array.
+These source policies differ even though the final wire shape matches.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_compute.py /path/to/max-m1n1 \
+    --evidence /path/to/new-evidence-directory
+```
+
+This compiles the actual production macro/layouts and the independently tagged
+Neo encoder. It checks 256 complete Neo pages/programs, 195 complete Max pages/
+programs against current source, two native ready descriptor DATA images,
+packed and full-page output, malformed inputs before mutation and every declared
+field's offset/size/alignment. No executable capture content is used. Max's
+queue/scheduler records, work publication and native UAPI wiring remain pending;
+these byte comparisons and native object compilation do not qualify GPU work.
+
+`scheduled_work.rs` now generates the compute Work15 wrapper (0xc0),
+SKSM/context record (0x200), and scheduler record (0x100) for G16C/G17P. All
+fields, reserved spans, sizes and alignment have compile-time assertions.
+Constructors populate source Default templates. Neo's active Optional, Context
+and Scheduler encoders delegate to them; dependency-list writing and reuse of
+firmware-owned bytes keep their existing behavior. Max computes its compact
+register locators from the descriptor heap and preserves independent mixed-work
+header/control and wrapper flag inputs. Only the source-qualified Max scheduler
+construction is exposed; Neo's node/phase policy is not inferred for Max.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_work.py /path/to/max-m1n1 \
+    --evidence /path/to/new-evidence-directory
+```
+
+The gate compares 388 complete Max records, including four independent native
+protocol DATA objects and 64 actual ComputeWork.prepare cases, with 1024 complete
+Neo wrapper/context/scheduler/reuse images against the original tag. It exercises
+packed locator/count boundaries and near-limit item generations without adding
+temporary runtime caps. The earlier descriptor/program gate must also pass after
+these shared encoder changes. This does not qualify native queue allocation,
+producer publication, event ownership or GPU execution.
+
+`scheduled_queues.rs` prepares a G16C three-lane queue reservation through the
+existing common `Memory` and `Vm`. Each lane has a private header, shared cursor
+page, private work-ring page and shared scratch allocation with read-only
+context-zero aliases. The source 0x500 cursor geometry remains separate from
+the allocated ring page. `QueueContextG16C/G17P` now has a versioned Default
+layout for the 0x40 control object. Session requires Running phase and a Max
+VM graph, then invalidates UAT before returning the prepared queue storage.
+No producer or application root is published by allocation.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_queues.py /path/to/max-m1n1 \
+    --inputs /path/to/saved-loader-inputs.json \
+    --fdt-template /path/to/compiled-config-and-memory-fixture.dtb \
+    --evidence /path/to/new-evidence-directory
+```
+
+The gate executes actual Python QueueSet.create with private rings, compares
+48 complete RAM owners and four complete alias images, and checks all PTE
+permissions/physical identity, independent roots and unchanged TTBS. It covers
+all four queue priorities, custom aliases, invalid geometry, collisions and
+partial allocation refusal without replacing/freeing earlier backing. These
+pages remain Session/Memory-owned until stopped cleanup. Per-queue retirement,
+reclamation and public UAPI allocation still require integration; the prepared
+storage is not a claim of a usable native DRM queue. Privileged invalidation
+and GPU execution are not exercised by this host gate.
+
+`scheduled_transport.rs` adds Max's publication transaction to the common
+Session. It retains common ClientLease owners before the first store, enforces
+both-consumer half-ring bounds, emits fragment/tiling/compute in source order,
+publishes outer producers after a barrier, and sends the per-stage plus final
+doorbells. Retirement requires owned stamp/counter progress, both consumers of
+each ring, notifiers and control drains. Uncertain stores/sends poison the Max
+session and retain leases. The common shutdown failure path retains this state.
+Neo leaves the new transport field None and retains its existing publication.
+
+```sh
+python3 drivers/gpu/drm/asahi/tests/check_scheduled_transport.py /path/to/max-m1n1 \
+    --evidence /path/to/new-evidence-directory
+```
+
+This executes the production Rust transaction and actual Python Publisher with
+bounded DATA/translation stand-ins and counted lease stand-ins. Traces include
+22 successful publication calls, 19 failures after each write/send, nine
+pre-write/live-flight rejects, independent flight release and 360 ring-boundary
+checks. It does not execute native translations, cache instructions, actual GEM
+owners or GPU work. Public Max DRM submission and native event/fence wiring
+remain incomplete; the next milestone is a native boot/probe test.
 
 The frontend accepts copied commands and publishes pending output fences before
 returning. Firmware events and DMA-fence callbacks advance the backend; pending
 external inputs have no GPU execution timeout. Jobs retain their file, VM and
 GEM references until completion. Published backing pages remain retained.
 
-The completion bar is hardware integration through the Asahi UAPI; unit or
-source serialization checks are not required. Run consecutively in one driver
+Layout and source serialization checks are required during integration.
+Completion also requires hardware execution through the Asahi UAPI. Run consecutively in one driver
 session, using the same complete output/guard/timestamp/fence oracles:
 
 ```sh
@@ -819,3 +1352,144 @@ This fixes the normal mixed failure; the cancellation oracle remains open.
 `g17p-drm-gpu-dependencies-control` is an output-only diagnostic variant. It
 records missing overlap without aborting, while preserving every data/fence/
 timestamp assertion. Its passes do not qualify strict asynchronous scheduling.
+
+
+G16C native hardware probing (2026-10-22): the real shared Rust driver has
+booted firmware on J616c, accepted the complete source-built initdata graph,
+and retired opening control producers 1 and 7. Linux reports all 16 CPUs
+online. This qualifies firmware startup, not native compute/render output or
+DRM registration. Those remain the next hardware milestones.
+
+The new t6041-j616c.dts describes the minimal CPU/AIC/UART/GPU resources.
+The GPU is disabled by default until permanent PMGR ownership is installed;
+the probe tool explicitly powers SGX/ASC and enables the test node. The
+M1N1_MONITOR build option selects PSCI for the test monitor; the normal board
+uses spin-table startup. Apply tests/g16c-probe.config to the known-good Neo
+kernel configuration. Native Max must not inherit its old NR_CPUS=10 limit.
+Use idle=yield during this bring-up to avoid the observed M4 WFI state loss.
+
+The clean-room bootloader checkout's experiments/g16c_linux_probe.py loads
+the actual ARM64 Image and loader-populated FDT. m1n1 supplies PSCI CPU_ON and
+its existing VUART; GPU MMIO, mailbox interrupts, firmware and RAM pass through
+to hardware. VUART JPWWJRX2N03 is bridged to the terminal, with all proxy and
+chainload control explicitly on JPWWJRX2N01. The launcher records dmesg,
+populated.dtb, input hashes and the exact command. It reads symbols only from
+our own matching m1n1-raw.elf and disables automatic crash disassembly.
+
+The first hardware probe exposed a real startup-order bug absent from the
+original host fixture: firmware links its reserved shared L2 after the cold
+inventory. Refresh that inventory after RTKit boot, before graph mapping.
+Walk only declared page-table DATA reservations and preserve pre-management
+snapshots for cleanup. The short VM gate now reproduces that late link,
+checks repeated refresh and rollback, and rejects newly linked out-of-range
+or cyclic tables. Host equality remains supporting evidence; each subsequent
+feature must also be tested through this native driver on the Max.
+
+Native G16C active parameter-buffer growth
+----------------------------------------
+
+`check_scheduled_parameter_growth.py BOOTLOADER --evidence NEW_DIRECTORY`
+compares 128 complete replies with the source-qualified shim, compiles every
+wire size/alignment/field-offset assertion, and rejects malformed requests and
+foreign PB metadata. Active free-list reordering and holes remain permitted.
+This is a CPU/layout check, not evidence of GPU execution.
+
+`prepare_g16c_parameter_growth.py BOOTLOADER SOURCE OUTPUT` exports the qualified
+`shared-indirect-partial-load-mixed-count{2,200000}-source-v1-20261018` workload.
+The commands and all shader/launch bytes remain exact; only a verified zero
+shader-aperture tail is omitted and page-equivalent bindings are coalesced.
+Complete argument, color and counting-query expectations come from CPU source
+inputs, independently checked against the previous source fixture. Known draw
+argument results are never uploaded.
+
+Build `g16c_drm_parameter_growth.c` with the same strict flags/UAPI headers as
+`g16c_drm_mixed.c`. Run the two-instance control before the 200000-instance
+pressure case. Each invocation uses two batches in one VM, compares all three
+complete output BOs (294884 guard bytes), six ordered timestamps per batch and
+prior timestamp-bank poison. Actual outputs/timestamps are saved under
+`/pressure-INSTANCES-epochN-*` for independent readback. `--file-close` tests
+implicit queue/VM teardown; `--origin=0x7100004000` relocates driver-private
+storage. Verify grown-pool reuse across fresh VMs using these options, and
+require actual owned-growth receipts in dmesg on the first pressure draw.
+
+The native transaction validates pending render/context/slot/token/TTBR and PB
+metadata before ACK. It then retires the source's six maintenance controls,
+adds fresh guarded backing, preserves manager/counter/free-list/RegionC bytes,
+and publishes only appended block entries and two counts before a typed reply.
+Control retirement and applied manager counts are separate conditions: require
+both with bounded waits. A following growth request remains unacknowledged
+until the current transaction finishes. The original render deadline is not
+reset. Grown IDs/backing survive dormant-pool transfer; retired roots do not.
+
+This case qualifies reactive growth and the one-pixel indirect partial-render
+path, not all partial-render formats, maximum-capacity/physical-OOM recovery,
+overlapping firmware flights, or Neo hardware behavior. Faults quarantine
+published backing. Capture new unknown behavior using the single-user Metal /
+full-UAT / cold-replay / source-bisection procedure. Before executing any guest
+client, verify the shell, all 16 CPUs, actual executable and fixture hashes;
+a failed verifier must stop dependent actions.
+
+Native G16C parameter-memory-limit retirement
+-------------------------------------------
+
+`check_scheduled_parameter_error.py BOOTLOADER --evidence NEW_DIRECTORY`
+compares128 complete type9 replies with the qualified source shim, compiles
+all wire size/alignment/field-offset assertions, and rejects5632 foreign
+report bytes,4096 foreign descriptor bytes,256 incorrect descriptor sizes and
+five invalid reply identities. The runtime also ties every checked descriptor
+identity offset to the actual macro-generated FragmentDescriptorG16C. Unknown
+report words remain opaque; no report callback/cookie pointer is dereferenced.
+
+Build `g16c_drm_parameter_oom.c` with the usual strict flags and UAPI headers.
+Before GPU execution, run its REAL reader in `--preflight` mode against the
+pressure/control fixtures; this supports a native host build without a DRM
+node. Hardware-only barrier checks must not apply to synthetic attachment
+commands, which require NONE. Query a fresh BINARY output fence for each
+submission's exact errno; a timeline wrapper is not an individual error fence.
+
+Cold-boot the test kernel with the explicit module parameter
+`asahi_neo.g16c_parameter_oom_test=0` (the loader accepts
+`--bootarg asahi_neo.g16c_parameter_oom_test=0`). Default0xffffffff disables
+this diagnostic. Run this client before any other render so ordinal0 uses
+the source-qualified one-shot TA892=0/FG2100=1 policy. All ordinary render
+parameters retain their defaults. This causes a REAL firmware OOM7; it does
+not synthesize an event or write completion stamps from the CPU.
+
+```
+/g16c_drm_parameter_oom /fixture-pressure200000 /fixture-pressure2 --preflight
+/g16c_drm_parameter_oom /fixture-pressure200000 /fixture-pressure2
+```
+
+Three phases share one live VM/queue. First: the compute producer completes,
+the pressure render retires via owned OOM7/error9, and the output fence reports
+-ENOMEM. Second: barriers0 intentionally inherit that failure; both commands
+reject before GPU publication and every output/timestamp seed stays unchanged.
+Third: VDM barriers NONE explicitly disconnect the old failed render; changing
+only the known uniform input to2 instances gives complete CPU argument/color/
+query matches and six timestamps on the SAME queue. The compute dependency
+within the batch remains intact. Do not claim transparent recovery with the
+old failed dependencies still requested.
+
+Every phase checks294884 output guard bytes, timestamp-bank guards and prior
+bank poison. Failed-render color/query mutable prefixes and failed-render
+user timestamp words are unspecified; the compute result is checked fully.
+The successful retry checks complete output BOs. All twelve actual output/
+timestamp banks are saved as /oom-epochN-* for independent readback. Optional
+--file-close skips explicit queue/VM destruction; the qualified initial case
+uses explicit close, with later regular pressure runs covering file close.
+
+Native ownership is validated BEFORE RX ACK against the pending render,
+context/slot/event/stamp/queue/manager/descriptor, installed roots and live
+source descriptor fields. Only a type9 reply is published; no GPU backing or
+parameter metadata is changed by this handler. Reply retirement is not render
+completion: the normal stamps, event counter and queue/channel cursors must
+also retire. CPU cache completion preserves the command's ENOMEM while making
+its bounded writes visible; a cache failure remains a fatal device error.
+Unowned/duplicate reports and uncertain replies retain the fail-closed path.
+
+After this test, require ordinary pressure growth/reuse and memory/unbind
+checks. Also cold-boot WITHOUT the diagnostic parameter and run short native
+regressions. This qualifies owned OOM7 retirement, explicit dependency
+attribution and independent retry; host allocation failure during growth,
+maximum capacity/refusal handling, other faults, uncertain publication and
+actual overlapping firmware work still require separate evidence.

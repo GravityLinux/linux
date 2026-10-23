@@ -104,6 +104,14 @@ static AGX_VERSIONS: VersionConfig = VersionConfig {
     ],
 };
 
+// Scheduled-work firmware family, fixed to the macOS 26.6.2 ABI. Hardware
+// profiles remain independent of the older driver's firmware-version axis.
+static AGX_SCHEDULED_VERSIONS: VersionConfig = VersionConfig {
+    fields: &["G"],
+    enums: &[&["G16C", "G17P"]],
+    versions: &[&["G16C"], &["G17P"]],
+};
+
 fn check_version(
     config: &VersionConfig,
     ver: &[usize],
@@ -192,7 +200,19 @@ fn filter_versions(
                         } else if is_struct {
                             drop_until_punct(&mut it, ",", true);
                         } else {
-                            let first = it.next().unwrap();
+                            let mut first = it.next().unwrap();
+                            // A conditional method may start with `pub` or
+                            // `pub(crate)`. Identify the item after visibility
+                            // before deciding whether to skip a body or a
+                            // semicolon-terminated expression.
+                            if matches!(&first, TokenTree::Ident(id) if id.to_string() == "pub") {
+                                first = it.next().unwrap();
+                                if matches!(&first, TokenTree::Group(group)
+                                    if group.delimiter() == Delimiter::Parenthesis)
+                                {
+                                    first = it.next().unwrap();
+                                }
+                            }
                             match &first {
                                 TokenTree::Ident(ident)
                                     if ["while", "for", "loop", "if", "match", "unsafe", "fn"]
@@ -278,6 +298,7 @@ fn filter_versions(
 pub(crate) fn versions(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config = match attr.to_string().as_str() {
         "AGX" => &AGX_VERSIONS,
+        "AGX_SCHEDULED" => &AGX_SCHEDULED_VERSIONS,
         _ => panic!("Unknown version group {}", attr),
     };
 

@@ -5,6 +5,7 @@
 No target, firmware binary or captured RAM. The bounded interpreter executes
 only the host's two publication primitives over explicit synthetic owned RAM.
 """
+import host_versions
 import argparse
 import ast
 from contextlib import redirect_stdout
@@ -173,7 +174,7 @@ def oracle(case,bad_state=False):
 
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'release'
-    subprocess.run([args.rustc,'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_dependency_release.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc, *host_versions.build(tmp, args.rustc),'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_dependency_release.rs')),'-o',str(binary)],check=True)
     def rust(case,fail=999999,bad=0):
         lines=subprocess.check_output([str(binary)],input=f'{case} {fail} {bad}\n'.encode()).decode().splitlines()
         result=lines.pop().split()

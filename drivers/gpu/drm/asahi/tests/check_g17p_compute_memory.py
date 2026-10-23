@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Compare generated allocator/control memory against current Python builders."""
+import host_versions
 import argparse,importlib.util,struct,subprocess,tempfile
 from pathlib import Path
 parser=argparse.ArgumentParser(description=__doc__)
@@ -33,7 +34,7 @@ for case in range(32):
     emit(f'{case}:minimal-slots',ref.build_compute_minimal_class2_predecessor_slots())
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'compute-memory'
-    subprocess.run([args.rustc,'--edition=2021',str(Path(__file__).with_name('g17p_compute_memory.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc,*host_versions.build(tmp, args.rustc),'--edition=2021',str(Path(__file__).with_name('g17p_compute_memory.rs')),'-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)])
 offset=0
 for name,body in expected:

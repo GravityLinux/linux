@@ -2,6 +2,13 @@
 // Host-side byte oracle adapter: compile the actual kernel serializers.
 #![allow(dead_code)]
 
+#[path = "../scheduled_initdata.rs"]
+mod scheduled_initdata;
+#[path = "../scheduled_boot_records.rs"]
+mod scheduled_boot_records;
+#[path = "../scheduled_hwdata.rs"]
+mod scheduled_hwdata;
+
 #[path = "../g17p_abi.rs"]
 mod abi;
 
@@ -15,6 +22,36 @@ fn main() {
     let directory = env::args().nth(1).expect("output directory");
     let directory = Path::new(&directory);
     fs::create_dir_all(directory).unwrap();
+    // Topology selects the actual root form. A null staging pointer must not
+    // turn a secondary instance into a primary-size descriptor.
+    let mut role_root = abi::Root {
+        version: [0x04c0, 0x0396, 0xa322, 0x0c8a],
+        region_a: 0,
+        main: 0,
+        region_c: 0,
+        kind: 1,
+        status: [0; 2],
+        secondary_extra: [0; 2],
+    };
+    let mut secondary = [0xa5; abi::ROOT_SECONDARY_SIZE];
+    role_root
+        .build_for_role(abi::FirmwareRole::Secondary, &mut secondary)
+        .unwrap();
+    assert_eq!(&secondary[0x28..0x2c], &1u32.to_le_bytes());
+    assert_eq!(&secondary[0xb8..], &[0; 16]);
+    let mut refused = [0xa5; abi::ROOT_SIZE];
+    assert_eq!(
+        role_root.build_for_role(abi::FirmwareRole::Primary, &mut refused),
+        Err(abi::InvalidSize)
+    );
+    assert_eq!(refused, [0xa5; abi::ROOT_SIZE]);
+    role_root.kind = 0;
+    role_root.secondary_extra = [1, 0];
+    assert_eq!(
+        role_root.build_for_role(abi::FirmwareRole::Primary, &mut refused),
+        Err(abi::InvalidSize)
+    );
+    assert_eq!(refused, [0xa5; abi::ROOT_SIZE]);
     for case in 0..64u32 {
         let address = |index: u64| 0xffff_fc20_0000_0000 + (u64::from(case) << 24) + index * 0x4143;
         let root = abi::Root {
@@ -61,7 +98,11 @@ fn main() {
                 (address(77), Some(0x01840000)),
                 (address(78), None),
             ],
-            secondary: case & 1 != 0,
+            role: if case & 1 != 0 {
+                abi::FirmwareRole::Secondary
+            } else {
+                abi::FirmwareRole::Primary
+            },
             secondary_extra: if case & 2 != 0 { address(79) } else { 0 },
         };
         let mut out = vec![0xa5; abi::MAIN_SIZE];

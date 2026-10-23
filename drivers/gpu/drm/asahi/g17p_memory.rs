@@ -156,6 +156,12 @@ impl Word64<'_> {
 unsafe impl Send for Memory {}
 
 impl Memory {
+    /// Retained physical high-water mark, including allocator order padding.
+    /// Used by native lifetime receipts to establish bounded backing reuse.
+    pub(crate) fn allocation_stats(&self) -> (usize, u64) {
+        (self.allocations.len(), self.allocations.iter().map(|a| a.size as u64).sum())
+    }
+
     fn owns_allocation(&self, address: u64, end: u64) -> bool {
         // The first allocation ending at or beyond this span is the only
         // possible owner: the allocator's retained physical ranges disjoint.
@@ -265,6 +271,31 @@ impl Memory {
             "G17P: mapped {} reserved RAM ranges for bounded CPU access\n",
             memory.mappings.len()
         );
+        Ok(memory)
+    }
+
+    pub(crate) fn new_g16c(
+        dev: &device::Device,
+        resources: &super::scheduled_resources::ResourcesG16C,
+    ) -> Result<Self> {
+        let node = dev.of_node().ok_or(ENODEV)?;
+        let mut memory = Self::detached();
+        for (index, name) in [
+            c_str!("ttbs"),
+            c_str!("pagetables"),
+            c_str!("l2"),
+            c_str!("handoff"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let range = resources.regions[index];
+            memory.map(
+                node.reserved_mem_region_to_resource_byname(name)?,
+                range.base,
+                range.size,
+            )?;
+        }
         Ok(memory)
     }
 
@@ -533,7 +564,21 @@ impl Memory {
     }
 
     pub(crate) fn write_handoff(&mut self, platform: &Platform) -> Result {
-        let handoff = platform.regions[3].base;
+        self.write_handoff_at(platform.regions[3].base)
+    }
+
+    /// Max's qualified context-table clearing occurs before RTKit startup.
+    /// Call only after verifying that the single ASC is stopped.
+    pub(crate) fn prepare_cold_g16c(
+        &mut self,
+        resources: &super::scheduled_resources::ResourcesG16C,
+    ) -> Result {
+        self.write_handoff_at(resources.regions[3].base)?;
+        self.zero(resources.regions[0].base, 64 * 16)?;
+        self.clean(resources.regions[0].base, 64 * 16)
+    }
+
+    fn write_handoff_at(&mut self, handoff: u64) -> Result {
         // Use the existing gravity-m4 host handoff initialization.
         self.write64(handoff, 0x4b1d000000000002)?;
         self.write32(handoff + 0x18, u32::MAX)?;

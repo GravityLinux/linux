@@ -10,6 +10,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import tempfile
+import host_versions
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("m1n1", type=Path)
@@ -23,7 +24,7 @@ spec.loader.exec_module(reference)
 with tempfile.TemporaryDirectory(prefix="g17p-abi-") as tmp:
     tmp = Path(tmp)
     executable = tmp / "oracle"
-    subprocess.run([args.rustc, "--edition=2021", str(Path(__file__).with_name("g17p_abi.rs")), "-o", str(executable)], check=True)
+    subprocess.run([args.rustc, *host_versions.build(tmp, args.rustc), "--edition=2021", str(Path(__file__).with_name("g17p_abi.rs")), "-o", str(executable)], check=True)
     subprocess.run([str(executable), str(tmp / "bytes")], check=True)
     checked = 0
 

@@ -7,6 +7,7 @@
 use super::{
     g17p_drm::Object,
     g17p_memory::Memory,
+    g17p_timestamp_span::{Mapping, PAGE},
     g17p_vm::{Vm, TIMESTAMP_BASE as BASE, TIMESTAMP_SIZE as SIZE},
 };
 use kernel::{
@@ -17,13 +18,13 @@ use kernel::{
     sync::aref::ARef,
 };
 
-const PAGE: u64 = 0x4000;
-
 struct Alias {
     bo: ARef<Object>,
     offset: u64,
     size: u64,
     address: u64,
+    mapping_address: u64,
+    mapping_size: u64,
     pages: KVec<u64>,
     fences: KVec<Fence>,
     unbound: bool,
@@ -75,12 +76,7 @@ impl Registry {
         offset: u64,
         size: u64,
     ) -> Result<u64> {
-        if size == 0
-            || (offset | size) & (PAGE - 1) != 0
-            || offset.checked_add(size).ok_or(EINVAL)? > bo.size() as u64
-        {
-            return Err(EINVAL);
-        }
+        let mapping = Mapping::new(offset, size, bo.size() as u64).ok_or(EINVAL)?;
         self.reap(memory, vm)?;
         // Source _timestamp_address: first fit over all retained allocations,
         // including unbound tokens with pending or failed work.
@@ -89,20 +85,20 @@ impl Registry {
             let next = self
                 .aliases
                 .iter()
-                .filter(|a| a.address >= address)
-                .min_by_key(|a| a.address);
+                .filter(|a| a.mapping_address >= address)
+                .min_by_key(|a| a.mapping_address);
             match next {
-                Some(alias) if address.checked_add(size).ok_or(EOVERFLOW)? > alias.address => {
-                    address = alias.address.checked_add(alias.size).ok_or(EOVERFLOW)?;
+                Some(alias) if address.checked_add(mapping.size).ok_or(EOVERFLOW)? > alias.mapping_address => {
+                    address = alias.mapping_address.checked_add(alias.mapping_size).ok_or(EOVERFLOW)?;
                 }
                 _ => break,
             }
         }
-        let end = address.checked_add(size).ok_or(EOVERFLOW)?;
+        let end = address.checked_add(mapping.size).ok_or(EOVERFLOW)?;
         if end > BASE + SIZE {
             return Err(ENOSPC);
         }
-        let mut pages = KVec::with_capacity((size / PAGE) as usize, GFP_KERNEL)?;
+        let mut pages = KVec::with_capacity((mapping.size / PAGE) as usize, GFP_KERNEL)?;
         let mut cursor = 0;
         for entry in bo.sg_table()?.iter() {
             let pa = entry.dma_address();
@@ -111,13 +107,13 @@ impl Registry {
                 return Err(EINVAL);
             }
             for index in (0..length).step_by(PAGE as usize) {
-                if cursor >= offset && cursor < offset + size {
+                if cursor >= mapping.bo_offset && cursor < mapping.bo_offset + mapping.size {
                     pages.push(pa + index, GFP_KERNEL)?;
                 }
                 cursor += PAGE;
             }
         }
-        if pages.len() as u64 != size / PAGE {
+        if pages.len() as u64 != mapping.size / PAGE {
             return Err(EIO);
         }
         // Retain ownership before the first page-table store, including a
@@ -127,7 +123,9 @@ impl Registry {
                 bo,
                 offset,
                 size,
-                address,
+                address: address + mapping.bias,
+                mapping_address: address,
+                mapping_size: mapping.size,
                 pages,
                 fences: KVec::new(),
                 unbound: false,
@@ -148,7 +146,7 @@ impl Registry {
                 options(nostack, preserves_flags)
             );
         }
-        Ok(address)
+        Ok(address + mapping.bias)
     }
 
     fn reap(&mut self, memory: &Memory, vm: &Vm) -> Result {
@@ -161,7 +159,7 @@ impl Registry {
                 .fences
                 .retain(|f| unsafe { bindings::dma_fence_get_status(f.raw()) } <= 0);
             if alias.unbound && alias.fences.is_empty() {
-                vm.unmap_timestamp(memory, alias.address, &alias.pages)?;
+                vm.unmap_timestamp(memory, alias.mapping_address, &alias.pages)?;
                 self.aliases.swap_remove(index);
             } else {
                 index += 1;

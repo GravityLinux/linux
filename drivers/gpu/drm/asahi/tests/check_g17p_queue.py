@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Compare ordered Rust publication writes with actual G17PSubmitter.stage."""
+import host_versions
 import argparse,ast,importlib.util,struct,subprocess,tempfile,sys
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -70,7 +71,7 @@ for producer in (0,1,127,128,254,255):
 expected.append(f'digest {digest:x}')
 with tempfile.TemporaryDirectory() as temp:
     binary=Path(temp)/'queue'
-    subprocess.run([args.rustc,'--edition=2021',str(Path(__file__).with_name('g17p_queue.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc, *host_versions.build(temp, args.rustc),'--edition=2021',str(Path(__file__).with_name('g17p_queue.rs')),'-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)],text=True).splitlines()
 assert len(actual)==len(expected),(len(actual),len(expected))
 for index,(a,b) in enumerate(zip(actual,expected)):

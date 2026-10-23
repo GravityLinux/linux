@@ -173,6 +173,7 @@ impl Session {
             }
             let parameters = compute::Parameters {
                 preempt,
+                kernel_end: preempt + 0x20000000,
                 cdm: CDM,
                 end: CDM + 0x30,
                 sampler: 0,

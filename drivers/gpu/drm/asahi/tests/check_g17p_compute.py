@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Compare the Rust compute builders with current source Python constructors."""
+import host_versions
 import argparse,importlib,struct,subprocess,sys,tempfile,types
 from pathlib import Path
 parser=argparse.ArgumentParser(description=__doc__)
@@ -46,7 +47,7 @@ for case in range(96):
     emit(f'{case}:scheduler-slot',ref.build_compute_scheduler_slot(case*17,case%9))
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'compute'
-    subprocess.run([args.rustc,'--edition=2021',str(Path(__file__).with_name('g17p_compute.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc,*host_versions.build(tmp, args.rustc),'--edition=2021',str(Path(__file__).with_name('g17p_compute.rs')),'-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)])
 offset=0
 for name,body in expected:

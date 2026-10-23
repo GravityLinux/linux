@@ -5,6 +5,7 @@
 No hardware imports, captures, or firmware binaries. A bounded in-memory allocator
 executes the actual G17PWorkBuilder.item method, including its structural tails.
 """
+import host_versions
 import argparse
 from dataclasses import MISSING, fields
 import importlib
@@ -128,7 +129,7 @@ for dimension in range(1,16385):
 emit('aux-fb',ref.build_aux_fb())
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'render'
-    subprocess.run([args.rustc,'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_render.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc,*host_versions.build(tmp, args.rustc),'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_render.rs')),'-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)],input=inputs)
 offset=0
 for name, body in expected:

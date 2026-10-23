@@ -7,6 +7,7 @@ over synthetic owned RAM; the actual shim register method runs over explicit
 caller state. Dependency constructor checks vary timestamps, CDM, samplers,
 completion values and receipt sequences, preserving register store order.
 """
+import host_versions
 import argparse
 import ast
 from dataclasses import MISSING, fields
@@ -295,7 +296,7 @@ for kind in ('tiling','fragment'):
     emit(kind+':override-registers',regs([(n,overrides[kind].get(n,v)) for n,v in original]))
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'dependency'
-    subprocess.run([args.rustc,'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_dependency.rs')),
+    subprocess.run([args.rustc, *host_versions.build(tmp, args.rustc),'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_dependency.rs')),
         '-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)],input=regs(inputs))
 offset=0

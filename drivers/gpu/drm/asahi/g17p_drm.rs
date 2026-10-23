@@ -37,13 +37,41 @@ const SINGLE: u32 = uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE;
 type Device = drm::Device<Driver>;
 type DrmFile = drm::File<File>;
 pub(crate) type Object = shmem::Object<Bo>;
+/// Boot graphs have different semantics; keep their actual types while the
+/// file, GEM, fence and CPU scheduling owners remain shared.
+pub(crate) enum RuntimeImage {
+    G16C(KBox<super::scheduled_image::ImageG16C>),
+    G17P(Image),
+}
+impl RuntimeImage {
+    fn abi(&self) -> super::GpuAbi {
+        match self {
+            Self::G16C(_) => super::GpuAbi::G16C,
+            Self::G17P(_) => super::GpuAbi::G17P,
+        }
+    }
+    fn g17p(&self) -> Result<&Image> {
+        match self {
+            Self::G17P(image) => Ok(image),
+            Self::G16C(_) => Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32))),
+        }
+    }
+}
 pub(crate) struct Runtime {
     pub(crate) session: KBox<Session>,
-    pub(crate) image: Image,
+    pub(crate) image: RuntimeImage,
     pub(crate) active: usize,
     pub(crate) exclusive: bool,
     pub(crate) admission_handoff: Option<kernel::dma_fence::Fence>,
     pub(crate) engine_handoff: [Option<kernel::dma_fence::Fence>;2],
+}
+impl Runtime {
+    fn destroy_vm(&mut self, owner: (u64, u32)) -> Result {
+        match &self.image {
+            RuntimeImage::G17P(image) => self.session.destroy_vm(owner, image),
+            RuntimeImage::G16C(_) => self.session.destroy_g16c_vm(owner),
+        }
+    }
 }
 pub(crate) type RuntimeRef = Arc<Mutex<Option<Runtime>>>;
 
@@ -51,6 +79,7 @@ pub(crate) struct Driver;
 #[pin_data]
 pub(crate) struct Data {
     params: uapi::drm_asahi_params_global,
+    abi: super::GpuAbi,
     runtime: RuntimeRef,
     events: Arc<asynchronous::Events>,
 }
@@ -131,11 +160,59 @@ pub(crate) fn register(
         max_attachments: 16,
         command_timestamp_frequency_hz: 1_000_000_000,
     };
-    let events = runtime.lock().as_ref().ok_or(ENODEV)?.session.events();
+    register_params(dev, params, runtime)
+}
+
+pub(crate) fn register_g16c(
+    dev: &device::Device<device::Bound>,
+    version: u32,
+    max_mhz: u32,
+    runtime: RuntimeRef,
+) -> Result<ARef<Device>> {
+    // The qualified Max profile is the 40-core T6041. GPU revision is from
+    // ID_VERSION, independently of the SoC revision used in initdata.
+    if version != 0x0a041100 || max_mhz == 0 {
+        return Err(ENODEV);
+    }
+    let mut masks = [0u64; uapi::DRM_ASAHI_MAX_CLUSTERS as usize];
+    masks[..4].fill(0x3ff);
+    register_params(dev, uapi::drm_asahi_params_global {
+        features: 0,
+        gpu_generation: 16,
+        gpu_variant: b'C' as u32,
+        gpu_revision: (version >> 8) & 255,
+        chip_id: 0x6041,
+        num_dies: 1,
+        num_clusters_total: 4,
+        num_cores_per_cluster: 10,
+        max_frequency_khz: max_mhz.checked_mul(1000).ok_or(EINVAL)?,
+        core_masks: masks,
+        vm_start: VM_START,
+        vm_end: VM_END,
+        vm_kernel_min_size: VM_KERNEL_MIN,
+        max_commands_per_submission: 64,
+        max_attachments: 16,
+        command_timestamp_frequency_hz: 1_000_000_000,
+    }, runtime)
+}
+
+fn register_params(
+    dev: &device::Device<device::Bound>,
+    params: uapi::drm_asahi_params_global,
+    runtime: RuntimeRef,
+) -> Result<ARef<Device>> {
+    let generation = params.gpu_generation;
+    let variant = params.gpu_variant;
+    let (events, abi) = {
+        let held = runtime.lock();
+        let owner = held.as_ref().ok_or(ENODEV)?;
+        (owner.session.events(), owner.image.abi())
+    };
     let drm = Device::new(
         dev,
         try_pin_init!(Data {
             params,
+            abi,
             runtime,
             events
         }),
@@ -143,8 +220,8 @@ pub(crate) fn register(
     drm::driver::Registration::new_foreign_owned(&drm, dev, 0)?;
     dev_info!(
         dev,
-        "G17P: Asahi DRM/GEM registered: core mask {:#x}; first-work initialization deferred\n",
-        core_mask
+        "G{}{}: Asahi DRM/GEM registered\n",
+        generation, variant as u8 as char
     );
     Ok(drm)
 }
@@ -440,10 +517,13 @@ struct EngineHistory {
 struct QueueHistory {
     #[pin]
     state: Mutex<EngineHistory>,
+    // Only Max currently retires individual firmware queues. Accepted jobs
+    // include CPU/input-blocked work, which a last-submit fence cannot cover.
+    active_jobs: Option<Arc<AtomicU64>>,
 }
 impl QueueHistory {
-    fn new() -> Result<Arc<Self>> {
-        Arc::pin_init(try_pin_init!(Self { state <- new_mutex!(EngineHistory::default()) }), GFP_KERNEL)
+    fn new(active_jobs: Option<Arc<AtomicU64>>) -> Result<Arc<Self>> {
+        Arc::pin_init(try_pin_init!(Self { state <- new_mutex!(EngineHistory::default()), active_jobs }), GFP_KERNEL)
     }
 }
 struct Queue {
@@ -500,6 +580,8 @@ pub(crate) mod asynchronous;
 struct Prepared {
     queue_key: super::g17p_compute_queues::Key,
     queue_priority: u32,
+    g16c_kernel_start: u64,
+    g16c_kernel_end: u64,
     owner: (u64, u32),
     history: Arc<QueueHistory>,
     // Frozen only after the preceding accepted queue job has published.
@@ -592,10 +674,7 @@ impl PinnedDrop for FileState {
                 }
             }
             for vm in &state.vms {
-                if runtime
-                    .session
-                    .destroy_vm((self.id, vm.id), &runtime.image)
-                    .is_err()
+                if runtime.destroy_vm((self.id, vm.id)).is_err()
                 {
                     pr_err!("G17P: retaining native VM after file close without cleanup receipt\n");
                 }
@@ -723,9 +802,7 @@ impl File {
         }
         let mut runtime = dev.runtime.lock();
         let runtime = Option::as_mut(&mut *runtime).ok_or(ENODEV)?;
-        runtime
-            .session
-            .destroy_vm((inner.id, data.vm_id), &runtime.image)?;
+        runtime.destroy_vm((inner.id, data.vm_id))?;
         state.vms.swap_remove(index);
         Ok(0)
     }
@@ -952,8 +1029,11 @@ impl File {
             return Err(EINVAL);
         }
         let bo = Object::lookup_handle(file, data.handle)?;
+        // Max's source-qualified timestamp objects are logical 8-byte ranges.
+        // Keep Neo's existing admission policy; both reserve complete UAT pages.
+        let alignment = if matches!(dev.abi, super::GpuAbi::G16C) { 8 } else { PAGE };
         if data.range == 0
-            || (data.offset | data.range) & (PAGE - 1) != 0
+            || (data.offset | data.range) & (alignment - 1) != 0
             || data.offset.checked_add(data.range).ok_or(EINVAL)? > bo.size() as u64
         {
             return Err(EINVAL);
@@ -981,7 +1061,7 @@ impl File {
         Ok(0)
     }
     fn queue_create(
-        _dev: &Device,
+        dev: &Device,
         data: &mut uapi::drm_asahi_queue_create,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -999,13 +1079,17 @@ impl File {
         vm.range(USC_EXEC_BASE, 1 << 32)?;
         let id = state.next_queue;
         let next = id.checked_add(1).ok_or(EOVERFLOW)?;
+        let mut active_jobs = None;
+        if matches!(dev.abi, super::GpuAbi::G16C) {
+            active_jobs = Some(Arc::new(AtomicU64::new(0), GFP_KERNEL)?);
+        }
         state.queues.push(
             Queue {
                 accepted: [None,None],
                 tail: None,
                 publication: None,
                 render_pipeline: false,
-                history: QueueHistory::new()?,
+                history: QueueHistory::new(active_jobs)?,
                 id,
                 vm: data.vm_id,
                 // Match Asahi's UAPI-to-firmware ordering: LOW/MEDIUM
@@ -1019,7 +1103,7 @@ impl File {
         Ok(0)
     }
     fn queue_destroy(
-        _dev: &Device,
+        dev: &Device,
         data: &uapi::drm_asahi_queue_destroy,
         file: &DrmFile,
     ) -> Result<u32> {
@@ -1033,6 +1117,12 @@ impl File {
             .iter()
             .position(|q| q.id == data.queue_id)
             .ok_or(ENOENT)?;
+        if matches!(dev.abi, super::GpuAbi::G16C) {
+            let jobs = state.queues[index].history.active_jobs.as_ref().ok_or(EIO)?.clone();
+            let mut runtime = dev.runtime.lock();
+            Option::as_mut(&mut *runtime).ok_or(ENODEV)?.session
+                .close_g16c_queue((inner.id, data.queue_id), jobs)?;
+        }
         state.queues.swap_remove(index);
         Ok(0)
     }
@@ -1041,6 +1131,8 @@ impl File {
         objects: &[Timestamp],
         payload: &[u8],
         fragment_count: usize,
+        sampler_limit: u32,
+        render_flags: u32,
     ) -> Result<super::g17p_render::Parameters> {
         if payload
             .get(240..)
@@ -1060,7 +1152,7 @@ impl File {
         let cmd = unsafe {
             core::ptr::read_unaligned(body.as_ptr().cast::<uapi::drm_asahi_cmd_render>())
         };
-        if cmd.flags & !(2 | (1 << 3) | (1 << 18)) != 0
+        if cmd.flags & !render_flags != 0
             || cmd.vertex_helper.binary != 0
             || cmd.vertex_helper.cfg != 0
             || cmd.vertex_helper.data != 0
@@ -1132,7 +1224,7 @@ impl File {
                 )?;
             }
         }
-        if cmd.sampler_count > 1024
+        if u32::from(cmd.sampler_count) > sampler_limit
             || (cmd.sampler_heap == 0) != (cmd.sampler_count == 0)
             || cmd.sampler_heap & 7 != 0
         {
@@ -1221,6 +1313,16 @@ impl File {
         objects: &[Timestamp],
         bytes: &[u8],
     ) -> Result<(KVec<Command>, KVec<[u16; 2]>)> {
+        Self::parameters_with_limits(vm, objects, bytes, 1024, 2 | (1 << 3) | (1 << 18))
+    }
+
+    fn parameters_with_limits(
+        vm: &Vm,
+        objects: &[Timestamp],
+        bytes: &[u8],
+        sampler_limit: u32,
+        render_flags: u32,
+    ) -> Result<(KVec<Command>, KVec<[u16; 2]>)> {
         use super::g17p_compute_runtime as compute;
         let mut offset = 0;
         let mut commands = KVec::new();
@@ -1271,7 +1373,7 @@ impl File {
             }
             counts[kind as usize] += 1;
             if kind == 0 {
-                let mut p = Self::render_parameters(vm, objects, payload, fragment_count)?;
+                let mut p = Self::render_parameters(vm, objects, payload, fragment_count, sampler_limit, render_flags)?;
                 p.fragment_attachments = fragment_attachments;
                 p.fragment_attachment_count = fragment_count;
                 commands.push(Command::Render(p), GFP_KERNEL)?;
@@ -1320,7 +1422,7 @@ impl File {
             let end = cmd.cdm_ctrl_stream_end;
             if (base | end) & 3 != 0
                 || end <= base
-                || cmd.sampler_count > 1024
+                || cmd.sampler_count > sampler_limit
                 || (cmd.sampler_heap == 0) != (cmd.sampler_count == 0)
                 || cmd.sampler_heap & 7 != 0
             {
@@ -1333,6 +1435,7 @@ impl File {
             commands.push(
                 Command::Compute(compute::Parameters {
                     preempt: vm.kernel_start,
+                    kernel_end: vm.kernel_end,
                     cdm: base,
                     end,
                     sampler: cmd.sampler_heap,
@@ -1383,7 +1486,27 @@ impl File {
         let history = queue.history.clone();
         let accepted = queue.accepted.clone();
         let vm = state.vms.iter().find(|v| v.id == queue_vm).ok_or(ENOENT)?;
-        let (mut parameters, barriers) = Self::parameters(vm, &state.objects, &bytes)?;
+        let mut parsed = None;
+        let mut g16c_kernel_start = 0;
+        let mut g16c_kernel_end = 0;
+        if matches!(dev.abi, super::GpuAbi::G16C) {
+            g16c_kernel_start = vm.kernel_start;
+            g16c_kernel_end = vm.kernel_end;
+            // Count+1 is a firmware field. Keep all representable G16C counts;
+            // checked VM coverage validates the complete logical eight-byte array.
+            // Max already serializes shared operand users, retains its owned
+            // VM-origin pool, and emits nonclustered TA control bit 0. Scratch
+            // and NO_VERTEX_CLUSTERING therefore need no classic ABI word.
+            parsed = Some(Self::parameters_with_limits(vm, &state.objects, &bytes,
+                u32::MAX - 1, 0xf | (1 << 18))?);
+        }
+        let (mut parameters, barriers) = match parsed {
+            Some(parameters) => parameters,
+            None => Self::parameters(vm, &state.objects, &bytes)?,
+        };
+        if matches!(dev.abi, super::GpuAbi::G16C) && !scheduling::Schedule::enabled() {
+            return Err(Error::from_errno(-(bindings::EOPNOTSUPP as i32)));
+        }
         for command in &mut parameters {
             if let Command::Render(p) = command {
                 p.firmware_priority = Some(queue_priority);
@@ -1412,6 +1535,10 @@ impl File {
         if let Some(client) = &render_client {
             for command in &parameters {
                 if let Command::Render(p) = command {
+                    if matches!(dev.abi, super::GpuAbi::G16C) {
+                        p.validate().map_err(|_| EINVAL)?;
+                        continue;
+                    }
                     super::g17p_render_runtime::validate_client(client, p)?;
                 }
             }
@@ -1435,6 +1562,8 @@ impl File {
         let prepared = Prepared {
             queue_key: (inner.id, data.queue_id),
             queue_priority,
+            g16c_kernel_start,
+            g16c_kernel_end,
             owner,
             history,
             history_seed: None,
@@ -1489,6 +1618,8 @@ impl File {
         let Prepared {
             queue_key: _,
             queue_priority: _,
+            g16c_kernel_start: _,
+            g16c_kernel_end: _,
             owner,
             history: _,
             history_seed: _,
@@ -1709,7 +1840,7 @@ impl File {
                 && unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) } == 0) {
                 let mut held = dev.runtime.lock();
                 let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
-                runtime.session.poll_work(dev.as_ref(), &runtime.image)?;
+                runtime.session.poll_work(dev.as_ref(), runtime.image.g17p()?)?;
                 if render_receipts.iter().any(|receipt| !receipt.is_published()
                     && unsafe { bindings::dma_fence_get_status(receipt.fence.raw()) } == 0) {
                     return Ok(false);
@@ -1817,7 +1948,7 @@ impl File {
             *initialized = true;
         }
         let result = (|| -> Result<bool> {
-            let drained = runtime.session.poll_work(dev.as_ref(), &runtime.image)?;
+            let drained = runtime.session.poll_work(dev.as_ref(), runtime.image.g17p()?)?;
             if prepared.pipeline_render()
                 && *cursor == prepared.parameters.len()
                 && !render_receipts.is_empty()
@@ -1879,7 +2010,7 @@ impl File {
                 {
                     runtime.session.submit_native_dependency(
                         dev.as_ref(),
-                        &runtime.image,
+                        runtime.image.g17p()?,
                         prepared.compute_client.take(),
                         prepared.render_client.take().ok_or(EIO)?,
                         [opening, closing],
@@ -1909,7 +2040,7 @@ impl File {
                         };
                         runtime.session.submit_prepared_render_ticket(
                             dev.as_ref(),
-                            &runtime.image,
+                            runtime.image.g17p()?,
                             prepared.render_client.take(),
                             compute_replacement,
                             p,
@@ -1918,7 +2049,7 @@ impl File {
                     } else {
                         runtime.session.submit_render_ticket(
                             dev.as_ref(),
-                            &runtime.image,
+                            runtime.image.g17p()?,
                             prepared.render_client.take().ok_or(EIO)?,
                             p,
                         )?
@@ -1953,7 +2084,7 @@ impl File {
                     }
                     let (published, gate) = runtime.session.submit_computes(
                         dev.as_ref(),
-                        &runtime.image,
+                        runtime.image.g17p()?,
                         &mut prepared.compute_client,
                         &run,
                     )?;

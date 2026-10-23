@@ -6,6 +6,7 @@ Exercises full descriptors (including embedded partial programs), optionals,
 queue dependency records and the source tilemap advancement method. No proxy,
 firmware binaries, captures or GPU hardware imports.
 """
+import host_versions
 import argparse, ast, dataclasses, importlib, os, struct, subprocess, sys, tempfile, types
 from pathlib import Path
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('m1n1',type=Path);p.add_argument('--rustc',default='rustc');args=p.parse_args()
@@ -149,7 +150,7 @@ for current in (0,1,2,4,6,14,0xfffffffd,0xfffffffe,0xffffffff):
    result=bytes(13)
   expected.append((f'scheduler-phases:{current}:{reused}',result))
 with tempfile.TemporaryDirectory() as tmp:
- binary=Path(tmp)/'repeat';subprocess.run([args.rustc,'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_render_lifecycle.rs')),'-o',str(binary)],check=True)
+ binary=Path(tmp)/'repeat';subprocess.run([args.rustc, *host_versions.build(tmp, args.rustc),'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_render_lifecycle.rs')),'-o',str(binary)],check=True)
  actual=subprocess.check_output([str(binary)])
 offset=0
 for name,body in expected:

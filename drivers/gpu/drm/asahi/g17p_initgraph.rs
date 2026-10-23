@@ -122,6 +122,14 @@ pub(crate) struct Graph {
 }
 
 impl Graph {
+    pub(crate) fn root(&self, role: abi::FirmwareRole) -> u64 {
+        self.addresses[ROOTS
+            + match role {
+                abi::FirmwareRole::Primary => 0,
+                abi::FirmwareRole::Secondary => 1,
+            }]
+    }
+
     pub(crate) fn roots(&self) -> [u64; 2] {
         [self.addresses[ROOTS], self.addresses[ROOTS + 1]]
     }
@@ -196,26 +204,26 @@ pub(crate) fn build(
     }
     abi::region_c(&mut storage.object(REGION_C)?[..abi::REGION_C_SIZE])?;
 
-    for slot in 0..2 {
-        let main_offset = if slot == 0 {
+    for (slot, role) in abi::G17P_ROLES.iter().copied().enumerate() {
+        let main_offset = if role == abi::FirmwareRole::Primary {
             NATIVE_PRIMARY_MAIN_OFFSET
         } else {
             NATIVE_SECONDARY_MAIN_OFFSET
         };
         let main_address = bundle_address + main_offset as u64;
-        let state_offset = if slot == 0 {
+        let state_offset = if role == abi::FirmwareRole::Primary {
             NATIVE_PRIMARY_WORK_STATE_OFFSET
         } else {
             NATIVE_SECONDARY_WORK_STATE_OFFSET
         };
-        let status_a_offset = if slot == 0 {
+        let status_a_offset = if role == abi::FirmwareRole::Primary {
             NATIVE_PRIMARY_STATUS_A_OFFSET
         } else {
             NATIVE_SECONDARY_STATUS_A_OFFSET
         };
         let state_address = base + state_offset as u64;
         let status_a = base + status_a_offset as u64;
-        let status_b = if slot == 0 {
+        let status_b = if role == abi::FirmwareRole::Primary {
             state_address + NATIVE_STATUS_B_OFFSET as u64
         } else {
             0
@@ -246,13 +254,13 @@ pub(crate) fn build(
             repeated: bundle_address + MAIN_REPEATED_ADDR_OFFSET as u64,
             channels: *channels,
             addresses,
-            region_views: if slot == 0 {
+            region_views: if role == abi::FirmwareRole::Primary {
                 PRIMARY_VIEWS.map(|(offset, value)| (base + offset as u64, value))
             } else {
                 SECONDARY_VIEWS
             },
-            secondary: slot == 1,
-            secondary_extra: if slot == 1 {
+            role,
+            secondary_extra: if role == abi::FirmwareRole::Secondary {
                 addresses[SECONDARY_EXTRA_ADDR_OBJECT] + SECONDARY_EXTRA_ADDR_OFFSET as u64
             } else {
                 0
@@ -263,19 +271,17 @@ pub(crate) fn build(
         let private = storage.object(PRIVATE)?;
         let status_offset = status_a_offset - NATIVE_PRIVATE_CLUSTER_OFFSET;
         abi::status(&mut private[status_offset..status_offset + 0x80], false)?;
-        if slot == 0 {
+        if role == abi::FirmwareRole::Primary {
             let offset = state_offset + NATIVE_STATUS_B_OFFSET - NATIVE_PRIVATE_CLUSTER_OFFSET;
             let fwctl = graph.addresses[FWCTL];
-            abi::primary_status(
+            super::scheduled_boot_records::PrimaryStatusG17P::encode(
                 &mut private[offset..offset + NATIVE_PRIMARY_STATUS_B_SIZE],
                 fwctl,
                 fwctl + 0x40,
-                NATIVE_PRIMARY_STATUS_B_CONFIG_HEADER,
-                NATIVE_PRIMARY_STATUS_B_CONFIG_OFFSET,
-                NATIVE_PRIMARY_STATUS_B_CONFIG_RUNS,
-            )?;
+            )
+            .map_err(|_| InvalidSize)?;
         }
-        let secondary_extra = if slot == 1 {
+        let secondary_extra = if role == abi::FirmwareRole::Secondary {
             let offset = NATIVE_SECONDARY_ROOT_EXTRA_OFFSETS[1] - NATIVE_PRIVATE_CLUSTER_OFFSET;
             private[offset..offset + 0x80].fill(0);
             overlay(
@@ -291,11 +297,17 @@ pub(crate) fn build(
             region_a: graph.addresses[REGION_A],
             main: main_address,
             region_c: graph.addresses[REGION_C],
-            kind: slot as u32,
+            kind: match role {
+                abi::FirmwareRole::Primary => 0,
+                abi::FirmwareRole::Secondary => 1,
+            },
             status: [status_a, status_b],
             secondary_extra,
         };
-        root.build(&mut storage.object(ROOTS + slot)?[..root.size()])?;
+        root.build_for_role(
+            role,
+            &mut storage.object(ROOTS + slot)?[..abi::Root::size_for_role(role)],
+        )?;
     }
     let placed = graph.channels[1][12].states[0] + HWDATA_STATE_AFTER_CONTROL_STATE as u64;
     storage.object(BUNDLE)?[HWDATA_BUNDLE_STATE_PTR..HWDATA_BUNDLE_STATE_PTR + 8]

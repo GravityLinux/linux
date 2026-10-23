@@ -232,6 +232,10 @@ impl Job {
                 .vm_pending
                 .fetch_add(1, Ordering::Release);
             execution.file.pending.fetch_add(1, Ordering::Release);
+            if matches!(execution.dev.abi, super::super::GpuAbi::G16C) {
+                execution.prepared.history.active_jobs.as_ref().expect("Max queue activity")
+                    .fetch_add(1, Ordering::Release);
+            }
             execution.sync.publish_outputs();
             job.committed.store(true, Ordering::Release);
         }
@@ -298,7 +302,7 @@ impl Job {
             }
             result => {
                 let execution = held.take().unwrap();
-                let error = match result {
+                let mut error = match result {
                     Ok(Some(error)) => error,
                     Err(error) => Some(error),
                     _ => unreachable!(),
@@ -326,6 +330,17 @@ impl Job {
                 execution.file.pending.fetch_sub(1, Ordering::Release);
                 // A rejected/unpublished job still releases queue ordering.
                 // Its public fence retains the actual completion/error.
+                if matches!(execution.dev.abi, super::super::GpuAbi::G16C) {
+                    execution.prepared.history.active_jobs.as_ref().expect("Max queue activity")
+                        .fetch_sub(1, Ordering::Release);
+                    let mut runtime = execution.dev.runtime.lock();
+                    if let Some(runtime) = Option::as_mut(&mut *runtime) {
+                        if let Err(cleanup_error) = runtime.session.reap_g16c_contexts() {
+                            runtime.session.fail_cpu_completion(cleanup_error);
+                            error.get_or_insert(cleanup_error);
+                        }
+                    }
+                }
                 execution.publication.signal();
                 execution.sync.complete(error);
                 drop(held);

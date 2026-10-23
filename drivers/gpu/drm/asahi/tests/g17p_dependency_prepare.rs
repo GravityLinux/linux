@@ -4,6 +4,15 @@
 //! builders. This does not qualify cache instructions or execution on a GPU.
 #![allow(dead_code)]
 extern crate self as kernel;
+pub mod macros {
+    pub use host_versions::versions;
+}
+#[path = "../scheduled_initdata.rs"]
+mod scheduled_initdata;
+#[path = "../scheduled_boot_records.rs"]
+mod scheduled_boot_records;
+#[path = "../scheduled_hwdata.rs"]
+mod scheduled_hwdata;
 use std::{
     cell::RefCell,
     collections::BTreeMap,

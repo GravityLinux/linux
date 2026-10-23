@@ -97,6 +97,7 @@ int main(int argc, char **argv)
 {
 	setbuf(stdout, NULL);
 	const char *path = argc > 1 ? argv[1] : "/dev/dri/renderD128";
+	int g16c = argc > 2 && !strcmp(argv[2], "--g16c");
 	int fd = open(path, O_RDWR | O_CLOEXEC), other = open(path, O_RDWR | O_CLOEXEC);
 	CHECK(fd >= 0 && other >= 0);
 	char name[32] = {0};
@@ -106,9 +107,18 @@ int main(int argc, char **argv)
 	struct drm_asahi_params_global p = {0};
 	struct drm_asahi_get_params gp = { .size = sizeof(p), .pointer = (uintptr_t)&p };
 	OK(fd, DRM_IOCTL_ASAHI_GET_PARAMS, &gp);
-	CHECK(p.chip_id == 0x8140 && p.gpu_generation == 17 && p.gpu_variant == 'P');
-	CHECK(p.num_dies == 1 && p.num_clusters_total == 1 && p.num_cores_per_cluster == 6);
-	CHECK(p.core_masks[0] == 0x3d && p.max_frequency_khz == 1470000);
+	if (g16c) {
+		CHECK(p.chip_id == 0x6041 && p.gpu_generation == 16 && p.gpu_variant == 'C');
+		CHECK(p.gpu_revision == 0x11 && p.num_dies == 1);
+		CHECK(p.num_clusters_total == 4 && p.num_cores_per_cluster == 10);
+		for (unsigned i = 0; i < 4; i++) CHECK(p.core_masks[i] == 0x3ff);
+		for (unsigned i = 4; i < DRM_ASAHI_MAX_CLUSTERS; i++) CHECK(p.core_masks[i] == 0);
+		CHECK(p.max_frequency_khz != 0 && p.features == 0);
+	} else {
+		CHECK(p.chip_id == 0x8140 && p.gpu_generation == 17 && p.gpu_variant == 'P');
+		CHECK(p.num_dies == 1 && p.num_clusters_total == 1 && p.num_cores_per_cluster == 6);
+		CHECK(p.core_masks[0] == 0x3d && p.max_frequency_khz == 1470000);
+	}
 	CHECK(p.vm_start == PAGE && p.vm_end == (1ULL << 42) - 2 * PAGE);
 	printf("PARAMS G%u%c rev=%x chip=%x mask=%" PRIx64 " max_khz=%u\n",
 		p.gpu_generation, p.gpu_variant, p.gpu_revision, p.chip_id,
@@ -198,7 +208,24 @@ int main(int argc, char **argv)
 	/* An empty submission must never fabricate a completion. */
 	struct drm_asahi_submit submit = {0};
 	BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, EINVAL);
-	if (argc > 2) {
+	if (g16c) {
+		/* A malformed Max queue must fail without mutating an existing
+		 * output fence, even though compute admission is now connected. */
+		struct drm_syncobj_create pending = { .flags = DRM_SYNCOBJ_CREATE_SIGNALED };
+		OK(fd, DRM_IOCTL_SYNCOBJ_CREATE, &pending);
+		struct drm_asahi_sync output = { .handle = pending.handle };
+		uint64_t payload = 0;
+		submit = (struct drm_asahi_submit) { .cmdbuf = (uintptr_t)&payload,
+			.cmdbuf_size = sizeof(payload), .out_sync_count = 1,
+			.syncs = (uintptr_t)&output };
+		BAD(fd, DRM_IOCTL_ASAHI_SUBMIT, &submit, ENOENT);
+		struct drm_syncobj_wait ready = { .handles = (uintptr_t)&pending.handle,
+			.count_handles = 1 };
+		OK(fd, DRM_IOCTL_SYNCOBJ_WAIT, &ready);
+		struct drm_syncobj_destroy done = { .handle = pending.handle };
+		OK(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &done);
+	}
+	if (argc > 2 && !g16c) {
 		printf("G17P_UAT_AUDIT_READY vm=%u vm2=%u; press Enter to finish\n", vm, vm2);
 		CHECK(getchar() != EOF);
 	}
@@ -222,6 +249,7 @@ int main(int argc, char **argv)
 	CHECK(a[0] == 0xa18 && a[PAGE / 8] == 0x8140);
 	CHECK(munmap(a, 2 * PAGE) == 0);
 	CHECK(close(fd) == 0);
-	printf("G17P_DRM_MEMORY_PASS checks=%u; native memory UAPI; empty submit rejected\n", checks);
+	printf("G%u%c_DRM_MEMORY_PASS checks=%u; native memory UAPI; empty submit rejected\n",
+		p.gpu_generation, p.gpu_variant, checks);
 	return 0;
 }

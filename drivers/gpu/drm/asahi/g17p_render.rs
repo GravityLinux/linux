@@ -6,6 +6,19 @@
 
 use super::g17p_compute::{add, clear, u32_at, u64_at, Error, Register, Result, USC_EXEC_BASE};
 
+#[path = "scheduled_render.rs"]
+pub(crate) mod wire;
+#[path = "scheduled_render_program.rs"]
+pub(crate) mod program;
+#[path = "scheduled_render_admission.rs"]
+pub(crate) mod admission;
+#[path = "scheduled_render_resources.rs"]
+pub(crate) mod resources;
+#[path = "scheduled_parameter_growth.rs"]
+pub(crate) mod growth;
+#[path="scheduled_parameter_error.rs"]
+pub(crate) mod parameter_error;
+
 pub(crate) const TA_SIZE: usize = 0x9c0;
 pub(crate) const FRAGMENT_SIZE: usize = 0x2240;
 pub(crate) const SUPPORT_SIZE: usize = 0x70;
@@ -1083,6 +1096,12 @@ impl Descriptor<'_> {
         p: &Parameters,
         deflake: u64,
     ) {
+        // Preserve Neo's late overlay order, including its exact byte widths.
+        // Max uses a complete initial template and writes primary programs last.
+        match self.kind {
+            Kind::Tiling => wire::TilingDescriptorG17P::apply_constants(out),
+            Kind::Fragment => wire::FragmentDescriptorG17P::apply_constants(out),
+        }
         let sampler_max = if p.sampler_count == 0 {
             0
         } else {
@@ -1092,7 +1111,6 @@ impl Descriptor<'_> {
             for (at, v) in [
                 (0x768, 0x036c0049),
                 (0x7d6, deflake as u32),
-                (0x876, u32::MAX),
                 (0x882, p.sampler_count as u32),
                 (0x886, sampler_max),
             ] {
@@ -1112,9 +1130,6 @@ impl Descriptor<'_> {
             for (at, v) in [
                 (0x892, p.reactive_tvb_growth as u8),
                 (0x89a, p.vertex_store_flag as u8),
-                (0x932, 0x44),
-                (0x93c, 1),
-                (0x94d, 1),
             ] {
                 out[at] = v;
             }
@@ -1168,7 +1183,6 @@ impl Descriptor<'_> {
             u64_at(out, at, v);
         }
         for (at, v) in [
-            (0x1ec0, 0x04040404),
             (0x1f48, p.width as u32),
             (0x1f4c, p.height as u32),
             (0x1f78, p.store_pipeline_bind as u32),
@@ -1177,7 +1191,6 @@ impl Descriptor<'_> {
             (0x1fac, p.stencil_clear_value as u32 | 0x300),
             (0x1fb0, p.sample_size_field().unwrap()),
             (0x212c, u32::from(p.samples > 1)),
-            (0x2110, u32::MAX),
             (0x211c, p.sampler_count as u32),
             (0x2120, sampler_max),
         ] {
@@ -1190,13 +1203,6 @@ impl Descriptor<'_> {
             ),
             (0x20fc, p.fragment_store_flag as u8),
             (0x2124, p.process_empty_tiles as u8),
-            (0x2128, 1),
-            (0x21cc, 0x53),
-            (0x21d6, 1),
-            (0x21e7, 1),
-            (0x2208, 1),
-            (0x220c, 1),
-            (0x222d, 1),
         ] {
             out[at] = v;
         }

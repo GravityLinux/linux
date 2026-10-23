@@ -4,6 +4,9 @@
 //! G17PSubmitter.stage. Caller owns storage, cache maintenance and notification.
 //! Deferred outer producers stay invisible until the startup/runtime boundary.
 
+#[path = "scheduled_wire.rs"]
+pub(crate) mod wire;
+
 // CL_2 is entry 8 in the TA/3D/CL channel table. Its mailbox selector is
 // separately encoded as 0x0a; it is not an index into that table.
 pub(crate) const COMPUTE_CHANNEL: usize = 8;
@@ -71,39 +74,36 @@ impl Record {
         if self.sentinel_size > 6 {
             return Err(Error::Invalid);
         }
-        let mut out = [0; 0xc0];
-        for (offset, value) in [
-            (0, self.pointers),
-            (8, self.ring),
-            (0x10, self.job_list),
-            (0x9c, self.context),
-        ] {
-            put64(&mut out, offset, value);
-        }
-        if let Some(value) = self.unk_30 {
-            put64(&mut out, 0x30, value);
+        let mask = if let Some(value) = self.unk_30 {
+            value
+        } else if self.sentinel_size == 0 {
+            0
         } else {
-            out[0x38 - self.sentinel_size..0x38].fill(0xff);
-        }
-        for (offset, value) in [
-            (0x24, u32::MAX),
-            (0x28, self.priority),
-            (0x2c, self.unk_2c),
-            (0x38, self.unk_38),
-            (0x40, self.prio5),
-            (0x44, u32::MAX),
-            (0x48, self.uuid),
-            (0x94, self.unk_94),
-        ] {
-            put32(&mut out, offset, value);
-        }
+            u64::MAX << (8 * (8 - self.sentinel_size))
+        };
+        let record = wire::QueueRecordG17P::new(wire::QueueParameters {
+            pointers: self.pointers,
+            ring: self.ring,
+            jobs: self.job_list,
+            context: self.context,
+            uuid: self.uuid,
+            priority: self.priority,
+            unk_2c: self.unk_2c,
+            unk_30: mask,
+            unk_38: self.unk_38,
+            prio5: self.prio5,
+            unk_94: self.unk_94,
+        });
+        let mut out = [0; 0xc0];
+        out[..wire::QueueRecordG17P::SIZE].copy_from_slice(record.as_bytes());
         Ok(out)
     }
 }
 
 pub(crate) fn pointers(ring_size: u32) -> [u8; 0x60] {
+    let pointers = wire::QueuePointersG17P::with_capacity(ring_size);
     let mut out = [0; 0x60];
-    put32(&mut out, 0x50, ring_size);
+    out.copy_from_slice(pointers.as_bytes());
     out
 }
 pub(crate) fn job_list(address: u64) -> [u8; 0x18] {
@@ -112,7 +112,11 @@ pub(crate) fn job_list(address: u64) -> [u8; 0x18] {
     out
 }
 pub(crate) fn ring_slot(queue: u64, head: u32, grid: u32, first: bool, kind: Kind) -> [u8; 0x18] {
+    ring_slot_tag(0, queue, head, grid, first, kind)
+}
+pub(crate) fn ring_slot_tag(tag: u64, queue: u64, head: u32, grid: u32, first: bool, kind: Kind) -> [u8; 0x18] {
     let mut out = [0; 0x18];
+    put64(&mut out, 0, tag);
     put64(&mut out, 8, queue);
     put32(&mut out, 0x10, kind as u32);
     put32(

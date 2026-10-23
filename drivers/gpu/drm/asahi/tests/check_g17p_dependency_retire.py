@@ -4,6 +4,7 @@
 
 Synthetic owned observations only; no firmware, hardware or captured objects.
 """
+import host_versions
 import argparse
 import ast
 from pathlib import Path
@@ -75,7 +76,7 @@ cases += [(mask, start, growth) for start in (254, 255) for mask in range(0xf000
 expected = [oracle(*case) for case in cases]
 with tempfile.TemporaryDirectory() as tmp:
     binary = Path(tmp) / "retire"
-    subprocess.run([args.rustc, "--edition=2021", "-Dwarnings",
+    subprocess.run([args.rustc, *host_versions.build(tmp, args.rustc), "--edition=2021", "-Dwarnings",
                     str(Path(__file__).with_name("g17p_dependency_retire.rs")), "-o", str(binary)], check=True)
     actual = subprocess.check_output([str(binary)], input="".join(
         f"{mask} {start} {growth}\n" for mask, start, growth in cases).encode()).decode().splitlines()

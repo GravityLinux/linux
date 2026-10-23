@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Differential check of retained queue metadata against source-only Python."""
+import host_versions
 import argparse, ast, importlib.util, struct, subprocess, tempfile
 from pathlib import Path
 p=argparse.ArgumentParser(description=__doc__)
@@ -104,7 +105,7 @@ for case in range(40):
     emit(f'transport-{case}:pointers',ram[replacement.pointers_addr])
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'lifecycle'
-    subprocess.run([args.rustc,'--edition=2021',str(Path(__file__).with_name('g17p_compute_lifecycle.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc,*host_versions.build(tmp, args.rustc),'--edition=2021',str(Path(__file__).with_name('g17p_compute_lifecycle.rs')),'-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)])
 offset=0
 for name,body in expected:

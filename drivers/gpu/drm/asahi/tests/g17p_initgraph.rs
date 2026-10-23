@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #![allow(dead_code)]
 
+#[path = "../scheduled_initdata.rs"]
+mod scheduled_initdata;
+#[path = "../scheduled_boot_records.rs"]
+mod scheduled_boot_records;
+#[path = "../scheduled_hwdata.rs"]
+mod scheduled_hwdata;
+
 #[path = "../g17p_abi.rs"]
 mod g17p_abi;
 #[path = "../g17p_initgraph.rs"]
@@ -46,7 +53,19 @@ fn main() {
             compute.states,
             [base + 0x20240, base + 0x20250, base + 0x20260]
         );
-        assert_eq!(g17p_queue::COMPUTE_DOORBELL, 0x0083000a00000000);
+        assert_eq!(g17p_queue::COMPUTE_DOORBELL, 0x008300000000000a);
+        assert_eq!(
+            graph.root(g17p_abi::FirmwareRole::Primary),
+            graph.roots()[0]
+        );
+        assert_eq!(
+            graph.root(g17p_abi::FirmwareRole::Secondary),
+            graph.roots()[1]
+        );
+        assert_ne!(
+            graph.root(g17p_abi::FirmwareRole::Primary),
+            graph.root(g17p_abi::FirmwareRole::Secondary)
+        );
         let mut manifest = String::new();
         for (index, object) in OBJECT_LAYOUT.iter().enumerate() {
             let address = graph.addresses[index];

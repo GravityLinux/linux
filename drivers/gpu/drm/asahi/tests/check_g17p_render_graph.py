@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Source-only differential checks for G17P render allocator and context objects."""
+import host_versions
 import argparse
 import importlib.util
 from pathlib import Path
@@ -79,7 +80,7 @@ for case in range(256):
                 b''.join(struct.pack('<BI',queue,value) for queue,value in points))
 with tempfile.TemporaryDirectory() as tmp:
     binary=Path(tmp)/'render-graph'
-    subprocess.run([args.rustc,'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_render_graph.rs')),'-o',str(binary)],check=True)
+    subprocess.run([args.rustc,*host_versions.build(tmp, args.rustc),'--edition=2021','-Dwarnings',str(Path(__file__).with_name('g17p_render_graph.rs')),'-o',str(binary)],check=True)
     actual=subprocess.check_output([str(binary)])
 offset=0
 for name,body in expected:

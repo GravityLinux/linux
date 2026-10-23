@@ -6,12 +6,16 @@
 //! unpublished storage; they never update firmware-owned state or publish a
 //! producer. In particular, unaligned qwords are serialized as bytes.
 
-pub(crate) const ROOT_SIZE: usize = 0xb8;
-pub(crate) const ROOT_SECONDARY_SIZE: usize = 0xc8;
-pub(crate) const MAIN_SIZE: usize = 0x600;
+use super::scheduled_initdata as wire;
+pub(crate) use wire::FirmwareRole;
+pub(crate) const G17P_ROLES: &[FirmwareRole] = wire::G17P_ROLES;
+
+pub(crate) const ROOT_SIZE: usize = wire::InitRootG17P::SIZE;
+pub(crate) const ROOT_SECONDARY_SIZE: usize = wire::SecondaryInitRootG17P::SIZE;
+pub(crate) const MAIN_SIZE: usize = wire::MainConfigG17P::SIZE;
 pub(crate) const CHANNELS: usize = 17;
 pub(crate) const HWDATA_SIZE: usize = 0x3db4;
-pub(crate) const REGION_C_SIZE: usize = 0x1000;
+pub(crate) const REGION_C_SIZE: usize = super::scheduled_boot_records::RegionCG17P::SIZE;
 
 #[path = "g17p_constants.rs"]
 mod constants;
@@ -25,10 +29,6 @@ fn clear(out: &mut [u8], size: usize) -> Result<(), InvalidSize> {
     }
     out.fill(0);
     Ok(())
-}
-
-fn put16(out: &mut [u8], offset: usize, value: u16) {
-    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
 fn put32(out: &mut [u8], offset: usize, value: u32) {
@@ -50,6 +50,13 @@ pub(crate) struct Root {
 }
 
 impl Root {
+    pub(crate) fn size_for_role(role: FirmwareRole) -> usize {
+        match role {
+            FirmwareRole::Primary => ROOT_SIZE,
+            FirmwareRole::Secondary => ROOT_SECONDARY_SIZE,
+        }
+    }
+
     pub(crate) fn size(&self) -> usize {
         if self.secondary_extra == [0; 2] {
             ROOT_SIZE
@@ -59,32 +66,47 @@ impl Root {
     }
 
     pub(crate) fn build(&self, out: &mut [u8]) -> Result<(), InvalidSize> {
-        clear(out, self.size())?;
-        for (index, value) in self.version.iter().enumerate() {
-            put16(out, index * 2, *value);
+        self.build_image(out, self.size())
+    }
+
+    /// Real instance construction selects the wire form by role, independently
+    /// of whether a pointer happens to be zero while staging is populated.
+    pub(crate) fn build_for_role(
+        &self,
+        role: FirmwareRole,
+        out: &mut [u8],
+    ) -> Result<(), InvalidSize> {
+        let kind = match role {
+            FirmwareRole::Primary => 0,
+            FirmwareRole::Secondary => 1,
+        };
+        if self.kind != kind || (role == FirmwareRole::Primary && self.secondary_extra != [0; 2]) {
+            return Err(InvalidSize);
         }
-        put64(out, 0x08, self.region_a);
-        put64(out, 0x18, self.main);
-        put64(out, 0x20, self.region_c);
-        put32(out, 0x28, self.kind);
-        put32(out, 0x2c, 1);
-        put16(out, 0x30, 0x4000);
-        out[0x32] = 14;
-        out[0x33] = 3;
-        for (index, (shift, count)) in [(36, 64), (25, 2048), (14, 2048)].iter().enumerate() {
-            let offset = 0x34 + index * 0x20;
-            out[offset..offset + 4].copy_from_slice(&[8, 14, 14, *shift]);
-            put16(out, offset + 4, *count);
-            put16(out, offset + 6, 0x4000);
-            put64(out, offset + 8, 1);
-            put64(out, offset + 0x10, 0x0000_03ff_ffff_c000);
-            put64(out, offset + 0x18, (u64::from(*count) - 1) << shift);
-        }
-        put64(out, 0xa8, self.status[0]);
-        put64(out, 0xb0, self.status[1]);
-        if self.size() == ROOT_SECONDARY_SIZE {
-            put64(out, 0xb8, self.secondary_extra[0]);
-            put64(out, 0xc0, self.secondary_extra[1]);
+        self.build_image(out, Self::size_for_role(role))
+    }
+
+    fn build_image(&self, out: &mut [u8], size: usize) -> Result<(), InvalidSize> {
+        clear(out, size)?;
+        let root = wire::InitRootG17P {
+            version: wire::version_words(self.version),
+            region_a: self.region_a.to_le_bytes(),
+            main: self.main.to_le_bytes(),
+            region_c: self.region_c.to_le_bytes(),
+            kind: self.kind.to_le_bytes(),
+            status_a: self.status[0].to_le_bytes(),
+            status_b: self.status[1].to_le_bytes(),
+            ..Default::default()
+        };
+        if size == ROOT_SECONDARY_SIZE {
+            let extended = wire::SecondaryInitRootG17P {
+                root,
+                extra_0: self.secondary_extra[0].to_le_bytes(),
+                extra_1: self.secondary_extra[1].to_le_bytes(),
+            };
+            out.copy_from_slice(extended.as_bytes());
+        } else {
+            out.copy_from_slice(root.as_bytes());
         }
         Ok(())
     }
@@ -98,11 +120,12 @@ pub(crate) struct Channel {
 
 impl Channel {
     pub(crate) fn build(&self, out: &mut [u8]) -> Result<(), InvalidSize> {
-        clear(out, 0x20)?;
-        for (index, address) in self.states.iter().enumerate() {
-            put64(out, index * 8, *address);
-        }
-        put64(out, 0x18, self.ring);
+        clear(out, wire::Channel::SIZE)?;
+        let channel = wire::Channel {
+            states: self.states.map(u64::to_le_bytes),
+            ring: self.ring.to_le_bytes(),
+        };
+        out.copy_from_slice(channel.as_bytes());
         Ok(())
     }
 }
@@ -115,42 +138,45 @@ pub(crate) struct MainConfig {
     // Three pairs represent six qwords: high sentinel, two low/high aliases,
     // then a null terminator. None leaves the second qword zero.
     pub(crate) region_views: [(u64, Option<u32>); 3],
-    pub(crate) secondary: bool,
+    pub(crate) role: FirmwareRole,
     pub(crate) secondary_extra: u64,
 }
 
 impl MainConfig {
     pub(crate) fn build(&self, out: &mut [u8]) -> Result<(), InvalidSize> {
         clear(out, MAIN_SIZE)?;
-        put64(out, 0, self.hardware);
-        put64(out, 8, self.repeated);
-        put64(out, 0x10, self.repeated);
-        let first = if self.secondary { 12 } else { 0 };
+        let mut main = wire::MainConfigG17P::for_role(self.role);
+        main.hardware = self.hardware.to_le_bytes();
+        main.repeated = self.repeated.to_le_bytes();
+        main.repeated_2 = self.repeated.to_le_bytes();
+        let first = match self.role {
+            FirmwareRole::Primary => 0,
+            FirmwareRole::Secondary => 12,
+        };
         for (index, channel) in self.channels.iter().enumerate().skip(first) {
-            let offset = 0x20 + index * 0x20;
-            channel.build(&mut out[offset..offset + 0x20])?;
+            main.channels[index] = wire::Channel {
+                states: channel.states.map(u64::to_le_bytes),
+                ring: channel.ring.to_le_bytes(),
+            };
         }
-        if !self.secondary {
-            for (index, address) in self.addresses.iter().enumerate() {
-                put64(out, 0x254 + index * 8, *address);
-            }
+        if self.role == FirmwareRole::Primary {
+            main.auxiliary = self.addresses.map(u64::to_le_bytes);
         }
-        for (index, (address, value)) in self.region_views.iter().enumerate() {
-            let offset = 0x2d0 + index * 0x10;
-            put64(out, offset, *address);
-            if let Some(value) = value {
-                put32(out, offset + 8, *value);
-                put32(out, offset + 12, 0x70);
-            }
+        main.regions = self
+            .region_views
+            .map(|(address, value)| wire::RegionTriple {
+                address: address.to_le_bytes(),
+                value: value.unwrap_or(0).to_le_bytes(),
+                kind: if value.is_some() {
+                    0x70u32.to_le_bytes()
+                } else {
+                    [0; 4]
+                },
+            });
+        if self.role == FirmwareRole::Secondary {
+            main.unaligned = self.secondary_extra.to_le_bytes();
         }
-        if self.secondary {
-            put32(out, 0x300, 4);
-            put32(out, 0x4c0, 0x2a);
-            put64(out, 0x471, self.secondary_extra);
-        } else {
-            put32(out, 0x3e0, 0xff);
-            put32(out, 0x4c0, 0x16);
-        }
+        out.copy_from_slice(main.as_bytes());
         Ok(())
     }
 }
@@ -166,12 +192,16 @@ pub(crate) struct Register {
 impl Register {
     pub(crate) fn build(&self, out: &mut [u8]) -> Result<(), InvalidSize> {
         clear(out, 0x28)?;
-        put64(out, 0, self.physical);
-        put64(out, 8, self.address);
-        put32(out, 0x10, self.size);
-        put32(out, 0x14, self.size);
-        put64(out, 0x18, self.relative);
-        put32(out, 0x20, self.flags);
+        let region = wire::MmioRegion {
+            physical: self.physical.to_le_bytes(),
+            address: self.address.to_le_bytes(),
+            size: self.size.to_le_bytes(),
+            stride: self.size.to_le_bytes(),
+            relative: self.relative.to_le_bytes(),
+            flags: self.flags.to_le_bytes(),
+            ..Default::default()
+        };
+        out.copy_from_slice(region.as_bytes());
         Ok(())
     }
 }
@@ -188,13 +218,16 @@ pub(crate) struct RegionRecord {
 impl RegionRecord {
     pub(crate) fn build(&self, out: &mut [u8]) -> Result<(), InvalidSize> {
         clear(out, 0x40)?;
-        put32(out, 0, self.lead);
-        put32(out, 4, self.value);
-        put32(out, 8, 0x70);
-        put64(out, 0xc, self.address);
-        put32(out, 0x14, self.size_a);
-        put32(out, 0x18, self.size_b);
-        put32(out, 0x1c, self.trail);
+        let region = wire::HardwareRegion {
+            lead: self.lead.to_le_bytes(),
+            low: self.value.to_le_bytes(),
+            high: self.address.to_le_bytes(),
+            count: self.size_a.to_le_bytes(),
+            stride: self.size_b.to_le_bytes(),
+            trail: self.trail.to_le_bytes(),
+            ..Default::default()
+        };
+        out.copy_from_slice(region.as_bytes());
         Ok(())
     }
 }
@@ -259,7 +292,11 @@ impl HardwareData<'_> {
         {
             return Err(InvalidSize);
         }
-        clear(out, HWDATA_SIZE)?;
+        if out.len() < HWDATA_SIZE {
+            return Err(InvalidSize);
+        }
+        out[..HWDATA_SIZE]
+            .copy_from_slice(super::scheduled_hwdata::template_g17p_transport_bytes());
         for (slot, register) in self.registers {
             let offset = 0x640 + slot * 0x28;
             register.build(&mut out[offset..offset + 0x28])?;
@@ -268,23 +305,13 @@ impl HardwareData<'_> {
             put32(out, 0x640 + slot * 0x28 + 0x20, *flags);
         }
         let perf = self.performance;
-        for (base, repeat, frequency) in [(0xfc8, 16, &perf.freq_a), (0x1cdc, 1, &perf.freq_b)] {
-            for state in 0..11 {
-                put32(out, base + state * 4, frequency[state]);
-                for word in 0..repeat {
-                    put32(
-                        out,
-                        base + 0x40 + state * 0x40 + word * 4,
-                        perf.core_voltage[state],
-                    );
-                    put32(
-                        out,
-                        base + 0x440 + state * 0x40 + word * 4,
-                        perf.memory_voltage[state],
-                    );
-                }
-            }
-        }
+        super::scheduled_hwdata::tables_g17p(
+            out,
+            &perf.freq_a,
+            &perf.freq_b,
+            &perf.core_voltage,
+            &perf.memory_voltage,
+        );
         for (base, ladder) in [
             (0x1808, &perf.freq_b),
             (0x1848, &perf.scale_b),
@@ -300,18 +327,6 @@ impl HardwareData<'_> {
         if let Some(chip) = self.chip {
             put32(out, 0xe90, chip);
         }
-        put16(out, 0x258e, 12);
-        for group in 0..2 {
-            for (index, value) in [0, 1, 1, 1].iter().enumerate() {
-                put32(out, 0x2590 + group * 16 + index * 4, *value);
-            }
-        }
-        for channel in 0..12 {
-            put32(out, 0x25b4 + channel * 4, u32::MAX);
-        }
-        for offset in [0x25f4, 0x2600, 0x2608] {
-            put32(out, offset, 1);
-        }
         for (index, region) in self.regions.iter().enumerate() {
             let offset = 0x2610 + index * 0x40;
             region.build(&mut out[offset..offset + 0x40])?;
@@ -321,10 +336,16 @@ impl HardwareData<'_> {
 }
 
 pub(crate) fn region_c(out: &mut [u8]) -> Result<(), InvalidSize> {
-    clear(out, REGION_C_SIZE)?;
-    runs(out, constants::REGION_C_CONSTANTS)
+    if out.len() != REGION_C_SIZE {
+        return Err(InvalidSize);
+    }
+    out.copy_from_slice(super::scheduled_boot_records::RegionCG17P::template_bytes());
+    Ok(())
 }
 
+// Retained for explicit overlays in ABI regression fixtures. Runtime boot
+// construction uses the versioned source template.
+#[allow(dead_code)]
 pub(crate) fn primary_status(
     out: &mut [u8],
     fwctl_state: u64,

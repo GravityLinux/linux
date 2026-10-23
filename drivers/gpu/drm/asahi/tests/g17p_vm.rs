@@ -2,6 +2,15 @@
 //! Execute the kernel VM constructor against bounded RAM, with no hardware.
 #![allow(dead_code)]
 extern crate self as kernel;
+pub mod macros {
+    pub use host_versions::versions;
+}
+#[path = "../scheduled_initdata.rs"]
+mod scheduled_initdata;
+#[path = "../scheduled_boot_records.rs"]
+mod scheduled_boot_records;
+#[path = "../scheduled_hwdata.rs"]
+mod scheduled_hwdata;
 
 #[macro_export]
 macro_rules! dev_info { ($dev:expr, $($arg:tt)*) => {{ let _ = $dev; let _ = format_args!($($arg)*); }}; }
@@ -16,6 +25,7 @@ pub mod prelude {
     pub const EIO: i32 = 5;
     pub const GFP_KERNEL: u32 = 0;
     pub struct KVec<T>(Vec<T>);
+    pub type KVVec<T> = Vec<T>;
     impl<T> KVec<T> {
         pub fn new() -> Self {
             Self(Vec::new())

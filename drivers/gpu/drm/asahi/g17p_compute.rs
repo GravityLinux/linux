@@ -4,6 +4,13 @@
 //! The caller supplies CDM and resource addresses; no shader or workload data
 //! is embedded. Large output buffers belong to the caller, not the CPU stack.
 
+#[path = "scheduled_compute.rs"]
+#[allow(dead_code)]
+pub(crate) mod wire;
+#[path = "scheduled_work.rs"]
+#[allow(dead_code)]
+pub(crate) mod work;
+
 pub(crate) const PAGE: usize = 0x4000;
 pub(crate) const USC_EXEC_BASE: u64 = 0x10000000000;
 pub(crate) type Register = (u32, u64);
@@ -53,16 +60,14 @@ pub(crate) fn register_value(
         .map(|(_, v)| *v)
         .ok_or(Error::MissingRegister)
 }
-fn register_array(out: &mut [u8], registers: &[Register]) -> Result {
-    if registers.len() > 128 {
-        return Err(Error::Invalid);
+
+fn wire_error(e: wire::Error) -> Error {
+    match e {
+        wire::Error::Invalid => Error::Invalid,
+        wire::Error::Overflow => Error::Overflow,
+        wire::Error::MissingRegister => Error::MissingRegister,
+        wire::Error::UnsupportedExecBase => Error::UnsupportedExecBase,
     }
-    clear(out, 128 * 12)?;
-    for (index, (number, value)) in registers.iter().enumerate() {
-        u32_at(out, index * 12, *number);
-        u64_at(out, index * 12 + 4, *value);
-    }
-    Ok(())
 }
 
 pub(crate) struct Program {
@@ -81,54 +86,14 @@ pub(crate) struct Program {
 }
 impl Program {
     pub(crate) fn build(&self) -> Result<[Register; 40]> {
-        if self.usc_exec_base != USC_EXEC_BASE {
-            return Err(Error::UnsupportedExecBase);
-        }
-        // The low eight bits are a reusable hardware work tag. Preserve the
-        // context above it; full ordinals live in the descriptor/scheduler.
-        let context = (self.context as u64) << 8 | (self.ordinal as u64 & 0xff);
-        Ok([
-            (0x1a510, self.preempt),
-            (0x1a420, self.cdm),
-            (0x1a4d0, add(self.preempt, 0x1480)?),
-            (0x1a4d8, add(self.preempt, 0x1488)?),
-            (0x1a4e0, add(self.preempt, 0x1490)?),
-            (0x1a4e8, add(self.preempt, 0x1498)?),
-            (0x10071, self.usc_exec_base),
-            (0x11841, self.helper_binary),
-            (0x11849, self.helper_data),
-            (0x11f81, self.helper_cfg),
-            (0x1a440, 0x154024201),
-            (0x1a458, 0x10c08860),
-            (0x101d9, 0x1c),
-            (0x1a089, 0),
-            (0x1a091, 0),
-            (0x1a059, 0),
-            (0x1a061, 0),
-            (0x1a0b9, 0),
-            (0x1a0c1, 0),
-            (0x101d1, 0),
-            (0x0d479, 0),
-            (0x1a0e9, 8),
-            (0x107a1, 0xff0000),
-            (0x0a599, 0x13200400020),
-            (0x0d411, 0x200000001),
-            (0x1a540, self.identity),
-            (0x014a9, self.identity),
-            (0x0a351, self.identity),
-            (0x10201, context),
-            (0x10428, context),
-            (0x14028, self.execution_gate),
-            (0x14070, self.robustness | 1),
-            (0x10229, add(self.operand_state, 0x12800)?),
-            (0x140a8, add(self.operand_state, 0x13000)?),
-            (0x10099, add(self.operand_state, 0x9405)?),
-            (0x10091, add(self.operand_state, 0x12400)?),
-            (0x0a5c1, add(self.operand_state, 5)?),
-            (0x0a5c9, add(self.operand_state, 0x9000)?),
-            (0x1a440, 0x154024209),
-            (0x0a599, 0x6000400020),
-        ])
+        wire::ComputeProgramG17P::new(&wire::ProgramParameters {
+            save_area: self.preempt, cdm: self.cdm, identity: self.identity,
+            context: self.context, ordinal: self.ordinal, robustness: self.robustness,
+            operand_state: self.operand_state, usc_exec_base: Some(self.usc_exec_base),
+            helper_binary: self.helper_binary, helper_data: self.helper_data,
+            helper_config: self.helper_cfg, execution_gate: self.execution_gate,
+            register_a599: 0x13200400020,
+        }).map(wire::ComputeProgramG17P::into_array).map_err(wire_error)
     }
 }
 
@@ -155,96 +120,31 @@ pub(crate) struct Descriptor {
 }
 impl Descriptor {
     pub(crate) fn build(&self, out: &mut [u8], registers: &[Register]) -> Result {
-        if out.len() != PAGE
-            || registers.len() > 128
-            || self.submission_index == 0
-            || self.queue_submission == 0
-            || self.queue_submission > 0xffffff
-            || self.sampler_count == u32::MAX
-            || (self.sampler_array == 0) != (self.sampler_count == 0)
-            || self.sampler_array & 7 != 0
-        {
-            return Err(Error::Invalid);
-        }
-        let one = |number| register_value(registers, number, 0);
-        let secondary = [
-            (0x10099, one(0x0a5c1)?),
-            (0x10091, one(0x0a5c9)?),
-            (0x0a5c1, one(0x10099)?),
-            (0x0a5c9, one(0x10091)?),
-        ];
-        let resource = one(0x1a510)?;
-        let cdm = one(0x1a420)?;
-        let identity = one(0x1a540)?;
-        let control = one(0x1a440)?;
-        if self.cdm_terminator < cdm {
-            return Err(Error::Invalid);
-        }
-        let primary_address = add(self.low_alias, 0x40)?;
-        let secondary_address = add(self.low_alias, 0x760)?;
-        clear(out, PAGE)?;
-        u32_at(out, 0, 3);
-        u64_at(out, 4, self.sequence);
-        u32_at(out, 0xc, self.context);
-        u64_at(out, 0x10, self.scheduler);
-        for (index, value) in [0x22, 0x23, 0x23, 0x24].into_iter().enumerate() {
-            u16_at(out, 0x18 + index * 2, value);
-        }
-        register_array(&mut out[0x40..0x640], registers)?;
-        register_array(&mut out[0x760..0xd60], &secondary)?;
-        for (at, value) in [
-            (0x740, primary_address),
-            (0xe60, secondary_address),
-            (0xed8, resource),
-            (0xee0, self.cdm_terminator),
-            (0xf08, control),
-            (0xf2c, self.sampler_array),
-            (0xf40, self.dispatch[0]),
-            (0xf48, self.dispatch[1]),
-            (0xf68, identity & 0xffffffff),
-            (0xf7c, self.status[0]),
-            (0xf84, self.status[1]),
-            (0xf8c, self.timestamps[0]),
-            (0xf94, self.timestamps[1]),
-            (0xfb2, self.shared_control),
-        ] {
-            u64_at(out, at, value);
-        }
-        for (at, value) in [
-            (
-                0x748,
-                ((registers.len() * 12) as u32) << 16 | registers.len() as u32,
-            ),
-            (0xe68, 0x300004),
-            (0xf20, (identity >> 32) as u32),
-            (0xf28, u32::MAX),
-            (0xf34, self.sampler_count),
-            (
-                0xf38,
-                if self.sampler_count == 0 {
-                    0
-                } else {
-                    self.sampler_count + 1
-                },
-            ),
-            (0xf50, self.queue_submission << 8),
-            (0xf54, self.grid),
-            (0xf58, self.queue_ordinal),
-            (0xf60, self.submission_index),
-            (0xf70, self.ordinal),
-            (0xfba, self.support_control),
-            (0xfbe, self.support_flags),
-            (0xfc8, (self.ordinal & 3) << 30),
-        ] {
-            u32_at(out, at, value);
-        }
-        u16_at(out, 0xfb0, 0x1a);
-        out[0xfc5] = 0x9f;
-        // The unaligned pointer overwrites byte 0xfcb of the preceding word,
-        // so preserve the Python builder's store order at this packed overlap.
-        u64_at(out, 0xfcb, self.zero_page);
-        out[0xfd3] = 1;
-        Ok(())
+        if out.len() != PAGE { return Err(Error::Invalid); }
+        wire::ComputeDescriptorG17P::write(out, &wire::Parameters {
+            save_area: 0, cdm: 0, identity: 0, // Neo scalars come from the register program.
+            sequence: self.sequence,
+            context: self.context,
+            scheduler: self.scheduler,
+            alias: self.low_alias,
+            terminator: self.cdm_terminator,
+            sampler_array: self.sampler_array,
+            sampler_count: self.sampler_count,
+            dispatch: self.dispatch,
+            grid: self.grid,
+            queue_submission: self.queue_submission,
+            queue_ordinal: self.queue_ordinal,
+            submission_index: self.submission_index,
+            ordinal: self.ordinal,
+            status: self.status,
+            timestamps: self.timestamps,
+            support: self.shared_control,
+            support_control: self.support_control,
+            support_flags: self.support_flags,
+            support_kind: 0x9f,
+            support_phase: 1,
+            zero_page: self.zero_page,
+        }, registers).map_err(wire_error)
     }
 }
 
@@ -266,36 +166,18 @@ pub(crate) struct Optional {
 }
 impl Optional {
     pub(crate) fn build(&self) -> [u8; 0xc0] {
+        let raw = work::ComputeWrapperG17P::new(&work::WrapperParameters {
+            scratch_low: self.context_low, scratch_high: self.context_high,
+            support: self.shared_control, queue_control: self.channel_control,
+            grid: self.grid as u16, item: self.item_index as u16,
+            ordinal: self.ordinal as u16, context: self.field_32 as u16,
+            support_id: self.field_56 as u16, uuid: self.uuid as u16,
+            scheduler: self.field_1e as u16, scheduler_hint: self.field_46 as u16,
+            first: self.first, field_52: self.first as u16,
+            field_5e: self.field_5e as u16, field_62: self.first as u16,
+        });
         let mut out = [0; 0xc0];
-        u32_at(&mut out, 0, 0xf);
-        for (at, value) in [
-            (8, self.context_low),
-            (0x10, self.context_high),
-            (0x36, self.shared_control),
-            (0x4a, self.channel_control),
-        ] {
-            u64_at(&mut out, at, value);
-        }
-        for (at, value) in [
-            (0x18, self.grid),
-            (0x1a, self.first as u32),
-            (0x1e, self.field_1e),
-            (0x22, 2),
-            (0x32, self.field_32),
-            (0x3e, self.ordinal),
-            (0x46, self.field_46),
-            (0x52, self.first as u32),
-            (0x56, self.field_56),
-            (0x5a, self.uuid),
-            (0x5e, self.field_5e),
-            (0x62, self.first as u32),
-            (0x66, 1),
-            (0x2a, self.item_index),
-            (0x2e, self.item_index << 8),
-        ] {
-            u16_at(&mut out, at, value as u16);
-        }
-        out[0x76..0x86].fill(0xff);
+        out.copy_from_slice(raw.as_bytes());
         out
     }
 }
@@ -402,20 +284,15 @@ impl Context<'_> {
             header = completion_header(header, value)?;
         }
         clear(out, 0x200)?;
-        for (at, value) in [
-            (0, header),
-            (0x10, self.descriptor),
-            (0x18, self.queue),
-            (0x20, self.word_220),
-            (0x28, ((self.grid as u64) << 40) | self.item_index as u64),
-            (0x130, self.word_330),
-            (0x138, self.word_338),
-            (0x150, self.word_350),
-            (0x158, self.word_358),
-            (0x178, self.word_378),
-        ] {
-            u64_at(out, at, value);
-        }
+        let raw = work::ComputeRecordG17P::from_fields(work::RecordFields {
+            header, descriptor: self.descriptor, queue: self.queue,
+            dependency_header: self.word_220,
+            previous: ((self.grid as u64) << 40) | self.item_index as u64,
+            field_30: 0, control_130: self.word_330,
+            retire_control: self.word_338, ready: 0,
+            arrays: [self.word_350, self.word_358], mask: self.word_378,
+        });
+        out.copy_from_slice(raw.as_bytes());
         if let Some(values) = self.points {
             points(
                 &mut out[0x20..0x130],
@@ -454,23 +331,13 @@ pub(crate) struct Scheduler {
 }
 impl Scheduler {
     pub(crate) fn build(&self) -> [u8; 0x100] {
+        let raw = work::ComputeSchedulerG17P::new(work::SchedulerParameters {
+            slot: self.slot, work_id: self.work_id, phase: self.phase,
+            job_list: self.job_list, node_id: self.node_id,
+            completion_kind: self.completion_kind,
+        });
         let mut out = [0; 0x100];
-        u64_at(&mut out, 0, self.slot);
-        for (at, value) in [(8, self.work_id), (0xc, self.phase), (0x10, 0x50)] {
-            u32_at(&mut out, at, value);
-        }
-        if self.phase != 0 {
-            u32_at(&mut out, 0x24, 1);
-        }
-        u64_at(&mut out, 0xa0, self.job_list);
-        if self.node_id != 0 {
-            u64_at(&mut out, 0xa8, 0x2000000 | self.node_id);
-            u64_at(&mut out, 0xb0, 0x2000000 | (self.node_id - 1));
-            u64_at(&mut out, 0xc0, 1);
-        }
-        if self.completion_kind != 0 {
-            u64_at(&mut out, 0xc0, self.completion_kind);
-        }
+        out.copy_from_slice(raw.as_bytes());
         out
     }
 }

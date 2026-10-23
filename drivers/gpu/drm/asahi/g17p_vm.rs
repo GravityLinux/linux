@@ -16,7 +16,19 @@ const SECONDARY: u64 = 0x40000;
 pub(crate) const TIMESTAMP_BASE: u64 = 0xfffffc2181400000;
 pub(crate) const TIMESTAMP_SIZE: u64 = 0x4000000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    G16C,
+    G17P,
+}
+
+pub(super) type BootTables = KVec<(u64, usize, KVVec<u8>)>;
+
 pub(crate) struct Vm {
+    placement: Placement,
+    context_high: Option<[u64; 2]>,
+    boot_restore: Option<BootTables>,
+    g16c_graph_started: bool,
     roots: [u64; 3],
     tables: KVec<u64>,
     claims: KVec<(u64, usize)>,
@@ -40,6 +52,117 @@ fn native(va: u64) -> Option<u64> {
 }
 
 impl Vm {
+    /// New Max queue storage is admitted only through its prepared graph.
+    /// Session additionally requires Phase::Running before calling the builder.
+    pub(super) fn require_g16c_graph(&self) -> Result {
+        if self.placement != Placement::G16C || !self.g16c_graph_started {
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+
+    /// G16C owns separate low/high roots for each initial GPU context;
+    /// firmware retains its bootloader-provided high root. No TTBS publication.
+    pub(super) fn g16c(firmware: u64, low: [u64; 2], high: [u64; 2]) -> Result<Self> {
+        let roots = [low[0], low[1], firmware];
+        let all = [low[0], low[1], firmware, high[0], high[1]];
+        for (i, &page) in all.iter().enumerate() {
+            if page == 0 || page >= 1 << 42 || page & !ADDRESS != 0 || all[..i].contains(&page) {
+                return Err(EINVAL);
+            }
+        }
+        let mut vm = Self {
+            placement: Placement::G16C,
+            context_high: Some(high),
+            boot_restore: None,
+            g16c_graph_started: false,
+            roots,
+            tables: KVec::new(),
+            claims: KVec::new(),
+            leaves: 0,
+        };
+        for page in all {
+            vm.track_boot_table(page)?;
+        }
+        Ok(vm)
+    }
+
+    pub(super) fn track_boot_table(&mut self, page: u64) -> Result {
+        if page == 0 || page & !ADDRESS != 0 {
+            return Err(EINVAL);
+        }
+        if !self.tables.contains(&page) {
+            self.tables.push(page, GFP_KERNEL)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn boot_context_roots(&self, slot: usize) -> Result<[u64; 2]> {
+        if slot >= 2 || self.roots[slot] == 0 || self.roots[2] == 0 {
+            return Err(EINVAL);
+        }
+        Ok([
+            self.roots[slot],
+            self.context_high.map_or(self.roots[2], |roots| roots[slot]),
+        ])
+    }
+
+    pub(super) fn retain_boot_tables(&mut self, tables: BootTables) {
+        self.boot_restore = Some(tables);
+    }
+
+    pub(super) fn take_g16c_boot_tables(&mut self) -> Result<BootTables> {
+        if self.placement != Placement::G16C || self.g16c_graph_started {
+            return Err(EBUSY);
+        }
+        self.boot_restore.take().ok_or(EINVAL)
+    }
+
+    pub(super) fn begin_g16c_graph(&mut self) -> Result {
+        if self.placement != Placement::G16C
+            || self.boot_restore.is_none()
+            || self.g16c_graph_started
+        {
+            return Err(EBUSY);
+        }
+        // RTKit may already have mapped its own buffers through this VM.
+        // Mapping count is not a graphics-publication/construction state.
+        self.g16c_graph_started = true;
+        Ok(())
+    }
+
+    /// After firmware has stopped, invalidate this GPU's context entries
+    /// before their retained roots can be freed. Caller performs the global
+    /// UAT invalidation when true is returned. Neo's existing path is unchanged.
+    pub(crate) fn invalidate_g16c_boot_contexts(
+        &self,
+        memory: &mut Memory,
+        ttbs: u64,
+    ) -> Result<bool> {
+        if self.placement != Placement::G16C || self.boot_restore.is_none() {
+            return Ok(false);
+        }
+        memory.zero(ttbs, 64 * 16)?;
+        memory.clean(ttbs, 64 * 16)?;
+        Ok(true)
+    }
+
+    /// After firmware/GPU access has stopped, detach every borrowed-table link
+    /// to owned RAM before dropping Memory. Also supports aborting a completed
+    /// cold construction. Neo has no borrowed-table transaction in this path.
+    pub(crate) fn restore_boot_tables(&mut self, memory: &mut Memory) -> Result {
+        let Some(tables) = self.boot_restore.as_ref() else {
+            return Ok(());
+        };
+        for (table, _, bytes) in tables.iter().rev() {
+            memory.write(*table, bytes)?;
+            memory.clean(*table, PAGE as usize)?;
+        }
+        self.roots = [0; 3];
+        self.context_high = None;
+        self.boot_restore = None;
+        Ok(())
+    }
     pub(crate) fn firmware_root(&self) -> u64 {
         self.roots[2]
     }
@@ -50,6 +173,10 @@ impl Vm {
         image: &Image,
     ) -> Result<Self> {
         let mut vm = Self {
+            placement: Placement::G17P,
+            context_high: None,
+            boot_restore: None,
+            g16c_graph_started: false,
             roots: [
                 target(0, &[]).ok_or(EINVAL)?,
                 target(1, &[]).ok_or(EINVAL)?,
@@ -293,6 +420,9 @@ impl Vm {
     /// Source leaves. Capture once at boot; no executable leaf is read.
     pub(crate) fn render_fallback_leaves(&self, memory: &Memory) -> Result<KVec<(u64, u64)>> {
         let mut leaves = KVec::new();
+        if self.placement == Placement::G16C {
+            return Ok(leaves);
+        }
         for &(base, count, _) in topology::RENDER_RUNS {
             for index in 0..count {
                 let va = base + index as u64 * PAGE;
@@ -680,6 +810,9 @@ impl Vm {
         if va & (PAGE - 1) != 0 || size == 0 || size % PAGE as usize != 0 {
             return Err(EINVAL);
         }
+        if self.placement == Placement::G16C {
+            return memory.allocate(size);
+        }
         let candidate = native(va).filter(|&pa| {
             (0..size)
                 .step_by(PAGE as usize)
@@ -708,7 +841,12 @@ impl Vm {
     }
 
     fn table(&mut self, memory: &mut Memory, group: usize, path: &[usize]) -> Result<u64> {
-        let pa = if let Some(pa) = target(group, path) {
+        let fixed = if self.placement == Placement::G17P {
+            target(group, path)
+        } else {
+            None
+        };
+        let pa = if let Some(pa) = fixed {
             pa
         } else {
             memory.allocate(PAGE as usize)?
@@ -762,7 +900,42 @@ impl Vm {
         Err(EINVAL)
     }
 
-    fn span(
+    /// Max-only preparation installs at most EMPTY parent tables. No leaf,
+    /// existing binding, producer or context root is replaced. ENOMEM can be
+    /// retried at the same VA; completed parents remain valid and bounded.
+    pub(super) fn prepare_g16c_empty(
+        &mut self, memory: &mut Memory, group: usize, va: u64, size: usize,
+    ) -> Result {
+        self.require_g16c_graph()?;
+        if size == 0 || size % PAGE as usize != 0 { return Err(EINVAL); }
+        va.checked_add(size as u64).ok_or(EINVAL)?;
+        for offset in (0..size).step_by(PAGE as usize) {
+            if self.lookup(memory, group, va + offset as u64)?.is_some() { return Err(EBUSY); }
+        }
+        for offset in (0..size).step_by(PAGE as usize) {
+            let indices = Self::indices(group, va + offset as u64)?;
+            let mut table = self.roots[group];
+            // Reserve ownership metadata before allocating either child.
+            self.tables.reserve(2, GFP_KERNEL)?;
+            for level in 0..2 {
+                if !self.tables.contains(&table) { return Err(EIO); }
+                let at = table + indices[level] as u64 * 8;
+                let mut pte = memory.read64(at)?;
+                if pte & 1 == 0 {
+                    let child = self.table(memory, group, &indices[..level + 1])?;
+                    pte = child | 3;
+                    memory.write64(at, pte)?;
+                    memory.clean(at, 8)?;
+                }
+                if pte & 3 != 3 { return Err(EIO); }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) { return Err(EIO); }
+        }
+        Ok(())
+    }
+
+    pub(super) fn span(
         &mut self,
         memory: &mut Memory,
         group: usize,
