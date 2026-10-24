@@ -4,11 +4,12 @@
 //! immutable snapshots, GEMs, fences and completions use the shared owners.
 
 use super::super::{
-    g17p_compute::{wire, work},
+    g17p_compute::{self as protocol, wire, work},
     g17p_compute_queues::Key,
     g17p_render::parameter_error,
     g17p_user_vm::UserVm,
     scheduled_bootstrap as boot,
+    scheduled_dispatch::DispatchStateG16C,
     scheduled_lifetime::{ContextCloseG16C, LifetimeTickG16C, MaintenanceG16C},
     scheduled_operands as operands,
     scheduled_queues::{self, EngineScratchG16C, QueueSetG16C},
@@ -77,7 +78,7 @@ struct Owner {
     support: u64,
     support_pages: [u64; 2],
     private_next: u64,
-    dispatch: [u8; 32],
+    dispatch_initial: [u8; 32],
     compute_ordinal: u32,
     published: bool,
     close_requested: bool,
@@ -659,11 +660,8 @@ impl State {
         .ok_or(EINVAL)?;
         vm.write(memory, 2, support, record.as_bytes())?;
         vm.write(memory, 2, support + PAGE, &1u32.to_le_bytes())?;
-        let mut dispatch = [0u8; 32];
-        dispatch[..8].copy_from_slice(&(0x4000000000000000u64 | (base >> 7)).to_le_bytes());
         let pages = u32::try_from(operand_buffers.len())? * 2048;
-        dispatch[12..16].copy_from_slice(&(pages << 1).to_le_bytes());
-        dispatch[16..20].copy_from_slice(&pages.to_le_bytes());
+        let dispatch_initial = *DispatchStateG16C::initial(base, pages).ok_or(EINVAL)?.as_bytes();
         let index = reusable.unwrap_or(self.owners.len());
         let render = reusable.and_then(|i| self.owners[i].render.take());
         let value = Owner {
@@ -676,7 +674,7 @@ impl State {
             support,
             support_pages,
             private_next: private_end,
-            dispatch,
+            dispatch_initial,
             compute_ordinal: 0,
             published: false,
             close_requested: false,
@@ -833,16 +831,13 @@ impl State {
         Ok(i)
     }
     fn activate(&mut self, session: &mut Session, index: usize) -> Result {
+        // Different ASIDs own distinct 32-byte entries. Initializing one can
+        // touch a cache line containing its neighbor's GPU-written cursors.
+        // New entries therefore require quiescence; existing entries are
+        // never copied or rewritten when switching between live contexts.
+        if !self.owners[index].published && !self.idle() { return Err(EBUSY); }
         let memory = session.memory.as_mut().ok_or(EIO)?;
         let vm = session.vm.as_ref().ok_or(EIO)?;
-        if self.selected != Some(index) {
-            if let Some(previous) = self.selected {
-                let pa = vm.physical(memory, 2, DISPATCH)?;
-                memory.read_firmware_words(pa, &mut self.owners[previous].dispatch)?;
-            }
-            vm.write(memory, 2, DISPATCH, &self.owners[index].dispatch)?;
-            self.selected = Some(index);
-        }
         let o = &mut self.owners[index];
         if !o.published {
             let at = session.ttbs + o.context as u64 * 16;
@@ -854,6 +849,13 @@ impl State {
             memory.write64(at + 8, 0)?;
             memory.clean(at, 16)?;
             UserVm::invalidate(o.context);
+            let offset=DispatchStateG16C::slot_offset(o.context).ok_or(EINVAL)?;
+            let dispatch=vm.physical(memory,2,DISPATCH+offset as u64)?;
+            // Invalidate before the partial store to preserve a neighboring
+            // live context's most recent cursors in this same cache line.
+            memory.invalidate(dispatch,32)?;
+            memory.write(dispatch,&o.dispatch_initial)?;
+            memory.clean(dispatch,32)?;
             // Retain this client in State before exposing either TTBR.
             o.published = true;
             memory.write64(
@@ -863,6 +865,7 @@ impl State {
             memory.write64(at + 8, o.high_root | ((o.context as u64) << 48) | 1)?;
             memory.clean(at, 16)?;
         }
+        self.selected=Some(index);
         vm.flush_tables(memory)?;
         Vm::invalidate_gpu();
         // Seed diagnostics before this fresh pool can be used by either
@@ -935,21 +938,40 @@ impl State {
         self.reap_work_slots();
         let busy=!self.pending.is_empty() || !self.cpu_leases.is_empty();
         if busy {
-            // The global operand view must stay on the SAME immutable VM
-            // generation. Different VM dispatch switching needs its own proof.
-            let Some(owner)=self.selected.and_then(|i|self.owners[i].client.as_ref()) else {return Ok(None);};
+            // A closed queue with no unfinished accepted jobs is reclaimable.
+            // Stop refilling the engines until its qualified close transaction
+            // can run at global quiescence. Unfinished closing queues must
+            // still be allowed to publish all of their accepted work.
+            if self.queue_closes.iter().any(|q|q.active_jobs.load(Ordering::Acquire)==0) {
+                return Ok(None);
+            }
+            // A live ASID retains its own GPU-written dispatch entry. Admit
+            // another immutable owner only after its root/entry was published
+            // at quiescence; never initialize a neighboring cursor while busy.
             let requested=client.as_ref().or_else(||self.client(key));
-            if !self.compute_mode || requested.is_none_or(|next|!same(owner,next))
+            let resident=requested.and_then(|next|self.owners.iter().find(|o|
+                o.published && o.client.as_ref().is_some_and(|old|same(old,next))));
+            if !self.compute_mode || resident.is_none()
                 || self.pending.iter().any(|p|p.render_owner.is_some()) {return Ok(None);}
         } else {self.release_requested(session)?;}
-        let Some(slot)=self.work_leases[..Self::compute_slots()?].iter().position(Option::is_none) else {return Ok(None);};
+        let slots=Self::compute_slots()?;
+        // A cold binding runs the full engine setup and global start. Do not
+        // perform that transaction while a sibling is executing. Once idle,
+        // initialize an unused slot before reusing an already-bound one, so
+        // the next pair can use both engines with the qualified resume tail.
+        let free=|index: &usize|self.work_leases[*index].is_none();
+        let slot=if busy {
+            (0..slots).find(|index|free(index) && self.compute_bound[*index])
+        } else {
+            (0..slots).find(|index|free(index) && !self.compute_bound[*index])
+                .or_else(||(0..slots).find(free))
+        };
+        let Some(slot)=slot else {return Ok(None);};
         let qi=self.prepare_queue(session,key,client,p.preempt,p.kernel_end,priority,Some(slot))?;
         let oi=self.queues[qi].owner;
-        if !busy && self.selected != Some(oi) {
-            // A resume is valid only in the retained immutable VM generation.
-            self.compute_bound = [false; 2];
-        }
-        if busy && self.selected!=Some(oi) {return Err(EIO.into());}
+        // Engine scratch is device-wide; work packets carry their own ASID.
+        // Retain initialized bindings across live owners. Queue/context close
+        // and render transitions still invalidate them at global quiescence.
         let target=*crate::module_parameters::g16c_operand_buffers.value();
         if !(operands::INITIAL_BUFFERS..=1024).contains(&target) {return Err(EINVAL.into());}
         if !busy && self.queues[qi].ordinal!=0 && target as usize>self.owners[oi].operand_buffers.len() {
@@ -974,6 +996,9 @@ impl State {
         let receipt = ComputeReceipt::new(receipt_ordinal).map_err(StageError::allocation)?;
         let o = &self.owners[oi];
         let q = &self.queues[qi];
+        // One backend submission namespace per owned context. Its numeric
+        // ID is our allocation policy, independent of physical engine IDs.
+        let namespace=o.context.checked_sub(1).ok_or(EIO)?;
         // All these bindings use the owner's one compute support domain.
         // Its submission identity is independent of queue and engine counters.
         let support_ordinal=o.compute_ordinal;
@@ -1016,8 +1041,8 @@ impl State {
         let vm = session.vm.as_mut().ok_or(EIO)?;
         let alias = 0x7000000000 + base - work::DESCRIPTOR_BASE_G16C;
         let identity = ((q.storage.uuid as u64) << 32) | 0xc0 | o.context as u64;
-        let program = wire::ComputeProgramG16C::new(&wire::ProgramParameters {
-            save_area: q.save,
+        let program = protocol::ProgramG16C {
+            preempt: q.save,
             cdm: p.cdm,
             identity,
             context: o.context as u32,
@@ -1027,23 +1052,23 @@ impl State {
             usc_exec_base: Some(1 << 40),
             helper_binary: 0,
             helper_data: 0,
-            helper_config: 0,
-            execution_gate: 0,
+            helper_cfg: 0,
+            // Our live-pool reservation uses context-1. This is a host policy,
+            // not an inherent firmware association between bank and ASID.
+            execution_gate: u64::from(o.context - 1),
             register_a599: 0x13200400020,
-        })
+        }.build()
         .map_err(|_| EINVAL)?;
         let mut descriptor = bytes(PAGE as usize).map_err(StageError::allocation)?;
-        wire::ComputeDescriptorG16C::write(
-            &mut descriptor,
-            &wire::Parameters {
+        protocol::DescriptorG16C {
                 save_area: q.save,
                 cdm: p.cdm,
                 identity,
                 sequence: u64::from(support_ordinal),
                 context: o.context as u32,
                 scheduler: base + 0x8000,
-                alias,
-                terminator: p.end.checked_sub(4).ok_or(EINVAL)?,
+                low_alias: alias,
+                cdm_terminator: p.end.checked_sub(4).ok_or(EINVAL)?,
                 sampler_array: p.sampler,
                 sampler_count: p.sampler_count,
                 // Shared Neo names: dispatch = completion stamps; status = internal timestamps.
@@ -1055,15 +1080,13 @@ impl State {
                 ordinal: support_ordinal,
                 status: [base + 0xc120, base + 0xc128],
                 timestamps: p.timestamps,
-                support: o.support,
+                shared_control: o.support,
                 support_control: 0x6c000001,
                 support_flags: 6,
                 support_kind: 0x45f,
                 support_phase: 1,
                 zero_page: base + 0x10000,
-            },
-            program.registers(),
-        )
+            }.build(&mut descriptor,program.registers())
         .map_err(|_| EINVAL)?;
         vm.write(memory, 2, base, &descriptor)?;
         let wrapper = work::ComputeWrapperG16C::new(&work::WrapperParameters {
@@ -1075,8 +1098,7 @@ impl State {
             item: q.ordinal as u16 & 255,
             ordinal: q.ordinal as u16,
             context: o.context,
-            // One qualified compute support domain is installed per VM.
-            support_id: 0,
+            support_id: namespace,
             uuid: q.storage.uuid,
             scheduler: priority as u16,
             scheduler_hint: 0,
@@ -1120,10 +1142,10 @@ impl State {
             grid: event,
             item: sequence,
             primary_count: (program.registers().len() - 2) as u16,
-            control: 0x0800,
+            control: 0x0800 | namespace,
             retire_control: 2,
             ..Default::default()
-        }, 0x0800, &points[..point_count])
+        }, 0x0800 | namespace, &points[..point_count])
         .map_err(|_| EINVAL)?;
         vm.write(
             memory,

@@ -34,6 +34,8 @@ mod scheduled_resources;
 #[allow(dead_code)]
 mod scheduled_queues;
 mod scheduled_operands;
+#[allow(dead_code)]
+mod scheduled_dispatch;
 mod scheduled_lifetime;
 #[allow(dead_code)]
 mod scheduled_transport;

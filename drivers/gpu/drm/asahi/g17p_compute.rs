@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Field-built compute protocol objects from the current g17p_compute.py.
+//! Field-built compute protocol objects for the scheduled firmware family.
 //! The caller supplies CDM and resource addresses; no shader or workload data
 //! is embedded. Large output buffers belong to the caller, not the CPU stack.
+
+use kernel::macros::versions;
 
 #[path = "scheduled_compute.rs"]
 #[allow(dead_code)]
@@ -70,6 +72,7 @@ fn wire_error(e: wire::Error) -> Error {
     }
 }
 
+#[versions(AGX_SCHEDULED)]
 pub(crate) struct Program {
     pub(crate) preempt: u64,
     pub(crate) cdm: u64,
@@ -78,26 +81,52 @@ pub(crate) struct Program {
     pub(crate) ordinal: u32,
     pub(crate) robustness: u64,
     pub(crate) operand_state: u64,
+    #[ver(G == G17P)]
     pub(crate) usc_exec_base: u64,
+    #[ver(G == G16C)]
+    pub(crate) usc_exec_base: Option<u64>,
     pub(crate) helper_binary: u64,
     pub(crate) helper_data: u64,
     pub(crate) helper_cfg: u64,
     pub(crate) execution_gate: u64,
+    #[ver(G == G16C)]
+    pub(crate) register_a599: u64,
 }
-impl Program {
-    pub(crate) fn build(&self) -> Result<[Register; 40]> {
-        wire::ComputeProgramG17P::new(&wire::ProgramParameters {
+pub(crate) type ProgramOutputG17P = [Register; 40];
+pub(crate) type ProgramOutputG16C = wire::ComputeProgramG16C;
+#[versions(AGX_SCHEDULED)]
+impl Program::ver {
+    pub(crate) fn build(&self) -> Result<ProgramOutput::ver> {
+        let raw=wire::ComputeProgram::ver::new(&wire::ProgramParameters {
             save_area: self.preempt, cdm: self.cdm, identity: self.identity,
             context: self.context, ordinal: self.ordinal, robustness: self.robustness,
-            operand_state: self.operand_state, usc_exec_base: Some(self.usc_exec_base),
+            operand_state: self.operand_state,
+            #[ver(G == G17P)]
+            usc_exec_base: Some(self.usc_exec_base),
+            #[ver(G == G16C)]
+            usc_exec_base: self.usc_exec_base,
             helper_binary: self.helper_binary, helper_data: self.helper_data,
             helper_config: self.helper_cfg, execution_gate: self.execution_gate,
+            #[ver(G == G17P)]
             register_a599: 0x13200400020,
-        }).map(wire::ComputeProgramG17P::into_array).map_err(wire_error)
+            #[ver(G == G16C)]
+            register_a599: self.register_a599,
+        }).map_err(wire_error)?;
+        #[ver(G == G17P)]
+        return Ok(raw.into_array());
+        #[ver(G == G16C)]
+        return Ok(raw);
     }
 }
 
+#[versions(AGX_SCHEDULED)]
 pub(crate) struct Descriptor {
+    #[ver(G == G16C)]
+    pub(crate) save_area: u64,
+    #[ver(G == G16C)]
+    pub(crate) cdm: u64,
+    #[ver(G == G16C)]
+    pub(crate) identity: u64,
     pub(crate) scheduler: u64,
     pub(crate) low_alias: u64,
     pub(crate) cdm_terminator: u64,
@@ -111,6 +140,10 @@ pub(crate) struct Descriptor {
     pub(crate) zero_page: u64,
     pub(crate) support_control: u32,
     pub(crate) support_flags: u32,
+    #[ver(G == G16C)]
+    pub(crate) support_kind: u16,
+    #[ver(G == G16C)]
+    pub(crate) support_phase: u8,
     pub(crate) ordinal: u32,
     pub(crate) queue_submission: u32,
     pub(crate) queue_ordinal: u32,
@@ -118,11 +151,26 @@ pub(crate) struct Descriptor {
     pub(crate) sampler_array: u64,
     pub(crate) sampler_count: u32,
 }
-impl Descriptor {
+#[versions(AGX_SCHEDULED)]
+impl Descriptor::ver {
     pub(crate) fn build(&self, out: &mut [u8], registers: &[Register]) -> Result {
+        #[ver(G == G17P)]
         if out.len() != PAGE { return Err(Error::Invalid); }
-        wire::ComputeDescriptorG17P::write(out, &wire::Parameters {
-            save_area: 0, cdm: 0, identity: 0, // Neo scalars come from the register program.
+        #[ver(G == G16C)]
+        if out.len() != 0x1000 && out.len() != PAGE { return Err(Error::Invalid); }
+        wire::ComputeDescriptor::ver::write(out, &wire::Parameters {
+            #[ver(G == G17P)]
+            save_area: 0, // Neo scalars come from the register program.
+            #[ver(G == G17P)]
+            cdm: 0,
+            #[ver(G == G17P)]
+            identity: 0,
+            #[ver(G == G16C)]
+            save_area: self.save_area,
+            #[ver(G == G16C)]
+            cdm: self.cdm,
+            #[ver(G == G16C)]
+            identity: self.identity,
             sequence: self.sequence,
             context: self.context,
             scheduler: self.scheduler,
@@ -141,12 +189,23 @@ impl Descriptor {
             support: self.shared_control,
             support_control: self.support_control,
             support_flags: self.support_flags,
+            #[ver(G == G17P)]
             support_kind: 0x9f,
+            #[ver(G == G16C)]
+            support_kind: self.support_kind,
+            #[ver(G == G17P)]
             support_phase: 1,
+            #[ver(G == G16C)]
+            support_phase: self.support_phase,
             zero_page: self.zero_page,
         }, registers).map_err(wire_error)
     }
 }
+
+// Keep existing Neo call sites and their constructor inputs unchanged while
+// the queue-generation path gains a concrete Max instantiation.
+pub(crate) type Descriptor = DescriptorG17P;
+pub(crate) type Program = ProgramG17P;
 
 pub(crate) struct Optional {
     pub(crate) context_low: u64,

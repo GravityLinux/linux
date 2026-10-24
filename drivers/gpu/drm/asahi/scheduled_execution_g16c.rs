@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Source-qualified engine bindings. Event IDs name physical engine slots;
-//! logical queue lanes remain TA/fragment/compute independently of this choice.
+//! Firmware submission bindings. Native queues retain distinct scratch and
+//! identities; the two 64-bit start banks cover the seven-bit grid field.
 
 pub(crate) struct BindingG16C {
     event: u8,
@@ -10,7 +10,7 @@ pub(crate) struct BindingG16C {
 }
 impl BindingG16C {
     fn new(event: u8, tag: u64, address: u64) -> Option<Self> {
-        if event > 3 || address < 0x4000 || address >= 1 << 42 || address & 0x3fff != 0 {
+        if event >= 128 || address < 0x4000 || address >= 1 << 42 || address & 0x3fff != 0 {
             return None;
         }
         Some(Self {
@@ -20,8 +20,9 @@ impl BindingG16C {
         })
     }
     pub(crate) fn compute(event: u8, address: u64) -> Option<Self> {
-        // The held four-queue Max replay qualifies all four CS engines.
-        if event > 3 {
+        // Native traces qualify distinct queue IDs through64, including the
+        // second start bank; this is not a physical engine count.
+        if event >= 128 {
             return None;
         }
         Self::new(event, 0x3100000000000000, address)
@@ -43,20 +44,17 @@ impl BindingG16C {
         [initial[8], initial[9], initial[10], initial[11]]
     }
     pub(crate) fn transactions(&self) -> [(usize, u8, u64); 12] {
-        let selector = [
-            0x0020040000021008,
-            0x00200c0000021008,
-            0x0020140000021008,
-            0x00201c0000021008,
-        ][self.event as usize];
+        let selector = 0x0020040000021008 + (u64::from(self.event) << 43);
+        let high = if self.event >= 64 { 1u64 << (self.event - 64) } else { 0 };
+        let low = if self.event < 64 { 1u64 << self.event } else { 0 };
         [
             (0xd06030, 32, 4),
             (0x4090, 64, selector),
             (0x4098, 64, self.tag | self.address),
             (0xd06030, 32, 0),
             (0xd06030, 32, 4),
-            (0x21070, 64, 0),
-            (0x21068, 64, 1 << self.event),
+            (0x21070, 64, high),
+            (0x21068, 64, low),
             (0xd06030, 32, 0),
             (0xd06030, 32, 4),
             (0x4090, 64, selector + 0x10),

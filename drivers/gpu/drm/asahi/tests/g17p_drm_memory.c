@@ -146,16 +146,29 @@ int main(int argc, char **argv)
 	for (size_t i = 0; i < 3 * PAGE / 8; i++) a[i] = 0x4e454f0000000000ULL ^ (i * 0x10001);
 	for (size_t i = 0; i < 3 * PAGE / 8; i++) CHECK(b[i] == (0x4e454f0000000000ULL ^ (i * 0x10001)));
 	bind(fd, vm, bo, VA, 3 * PAGE, 0, RW, 0);
-	bind(fd, vm, bo, VA, PAGE, 0, RW, EINVAL);
+	bind(fd, vm, bo, VA, PAGE, 0, RW, 0);
 	bind(fd, vm, bo, KSTART, PAGE, 0, RW, EINVAL);
 	bind(fd, vm, bo, VA + 1, PAGE, 0, RW, EINVAL);
 	bind(fd, vm, bo, VA + 4 * PAGE, PAGE, 3 * PAGE, RW, EINVAL);
 	vm_destroy(fd, vm, EBUSY);
 	bind(fd, vm, 0, VA + PAGE, PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0);
 	bind(fd, vm, bo, VA + PAGE, PAGE, 2 * PAGE, RW, 0);
-	bind(fd, vm, bo, VA, PAGE, 0, RW, EINVAL);
+	bind(fd, vm, bo, VA, PAGE, 0, RW, 0);
 	bind(fd, vm, bo, VA + 2 * PAGE, PAGE, 0, RW, EINVAL);
 	bind(fd, vm2, bo, VA, 3 * PAGE, 0, DRM_ASAHI_BIND_READ, 0);
+	/* Rebinding the read-only shadow is idempotent, including a matching
+	 * subrange. Different offsets/permissions/backing still conflict. */
+	bind(fd, vm2, bo, VA, 3 * PAGE, 0, DRM_ASAHI_BIND_READ, 0);
+	bind(fd, vm2, bo, VA + PAGE, PAGE, PAGE, DRM_ASAHI_BIND_READ, 0);
+	bind(fd, vm2, bo, VA + PAGE, PAGE, 0, DRM_ASAHI_BIND_READ, EINVAL);
+	bind(fd, vm2, bo, VA, PAGE, 0, RW, EINVAL);
+	uint32_t shadow_other = bo_new(fd, PAGE, 0, 0);
+	bind(fd, vm2, shadow_other, VA, PAGE, 0, DRM_ASAHI_BIND_READ, EINVAL);
+	bo_close(fd, shadow_other);
+	bind(fd, vm, bo, VA + 16 * PAGE, 8 * PAGE, PAGE,
+	     RW | DRM_ASAHI_BIND_SINGLE_PAGE, 0);
+	bind(fd, vm, bo, VA + 17 * PAGE, PAGE, PAGE,
+	     RW | DRM_ASAHI_BIND_SINGLE_PAGE, 0);
 	bind(fd, vm, bo, VA + 16 * PAGE, 8 * PAGE, PAGE, RW | DRM_ASAHI_BIND_SINGLE_PAGE, 0);
 	bind(fd, vm, 0, VA + 18 * PAGE, 3 * PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0);
 	bind(fd, vm, bo, VA + 18 * PAGE, 3 * PAGE, 0, RW, 0);
@@ -175,7 +188,7 @@ int main(int argc, char **argv)
 	bo_close(other, imported.handle);
 	CHECK(close(prime.fd) == 0);
 	/* Closing a handle on another file must preserve this file's mappings. */
-	bind(fd, vm, bo, VA, PAGE, 0, RW, EINVAL);
+	bind(fd, vm, bo, VA, PAGE, PAGE, RW, EINVAL);
 	struct drm_asahi_queue_create q = { .vm_id = vm, .usc_exec_base = EXEC + (1ULL << 32) };
 	BAD(fd, DRM_IOCTL_ASAHI_QUEUE_CREATE, &q, EINVAL);
 	q.usc_exec_base = EXEC; q.priority = 2;

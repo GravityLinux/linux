@@ -184,7 +184,12 @@ fn drain_events(memory: &mut Memory, vm: &Vm,
                         if !handler(memory, vm, &data)? { break; }
                         work_accepted = true;
                     },
-                    4 => return Err(ETIMEDOUT),
+                    4 => {
+                        let mut data = [0u8; 0x48];
+                        read_words(memory, vm, ring + consumer as u64 * 0x48, &mut data)?;
+                        kernel::pr_err!("G16C: firmware timeout event RX={:02x?}\n", data);
+                        return Err(ETIMEDOUT);
+                    },
                     kind => {kernel::pr_err!("G16C: unhandled event kind={} consumer={} producer={}\n",kind,consumer,producer);return Err(EIO);},
                 }
             }

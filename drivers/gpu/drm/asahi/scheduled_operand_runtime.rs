@@ -64,11 +64,14 @@ impl State {
     }
     pub(super) fn retire_operand_probe(&mut self,session:&Session)->Result {
         if *crate::module_parameters::g16c_operand_probe.value()==0 {return Ok(());}
-        let Some(index)=self.selected else {return Ok(());};
-        let o=&self.owners[index];
-        if !o.operand_probe_pending || !o.operand_probe_seeded {return Ok(());}
-        self.sample_operands(session,index,false)?;
-        self.owners[index].operand_probe_pending=false;
+        // Several immutable owners can retire in this idle interval. Sample
+        // every seeded pending pool, not just the last submitted ASID.
+        for index in 0..self.owners.len() {
+            let o=&self.owners[index];
+            if !o.operand_probe_pending || !o.operand_probe_seeded {continue;}
+            self.sample_operands(session,index,false)?;
+            self.owners[index].operand_probe_pending=false;
+        }
         Ok(())
     }
     pub(super) fn grow_operands(&mut self,session:&mut Session,index:usize,total:u32)->StageResult<()> {

@@ -925,10 +925,6 @@ impl File {
             }
             if op.flags & !(READ | WRITE | SINGLE) != 0
                 || op.flags & (READ | WRITE) == 0
-                || vm
-                    .bindings
-                    .iter()
-                    .any(|b| op.addr < b.end() && b.start < end)
             {
                 return Err(EINVAL);
             }
@@ -944,6 +940,24 @@ impl File {
                 op.range
             };
             if op.offset.checked_add(accessed).ok_or(EINVAL)? > object.size() as u64 {
+                return Err(EINVAL);
+            }
+            // GPUVM treats a repeated map of the same backing, offset and
+            // permissions as a no-op. Mesa rebinds its read-only buffer shadow
+            // for multiple VkBuffers sharing one allocation. Do not change the
+            // logical generation, invalidate a snapshot, or touch a live root.
+            if vm.bindings.iter().any(|b| {
+                b.start <= op.addr && end <= b.end()
+                    && b.flags == op.flags
+                    && b.offset + (if b.flags & SINGLE != 0 { 0 } else { op.addr - b.start })
+                        == op.offset
+                    && core::ptr::eq(&*b.bo, &*object)
+            }) {
+                continue;
+            }
+            // Replacing different live mappings is a separate operation;
+            // callers may explicitly unbind before installing new backing.
+            if vm.bindings.iter().any(|b| op.addr < b.end() && b.start < end) {
                 return Err(EINVAL);
             }
             // Pin the real shmem pages, preserving their actual DMA addresses.

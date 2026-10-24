@@ -28,11 +28,11 @@ int main(int argc,char **argv)
     int queued=argc==3 && !strcmp(argv[2],"--queued");
     int same_queue=argc==3 && (!strcmp(argv[2],"--same-queue") || !strcmp(argv[2],"--same-queue-warm") || !strcmp(argv[2],"--same-queue-close"));
     int closing=argc==3 && !strcmp(argv[2],"--same-queue-close");
-    int warm=argc==3 && (!strcmp(argv[2],"--warm") || !strcmp(argv[2],"--same-queue-warm"));
+    int warm=argc==3 && (!strcmp(argv[2],"--warm") || !strcmp(argv[2],"--same-queue-warm") || closing);
     queued |= same_queue;
 	size_t n; unsigned char *input=read_input(argv[1],"inputs.bin",&n);
 	CHECK(n>=32); uint32_t h[8]; memcpy(h,input,32);
-	CHECK(h[0]==0x384f4347 && h[1]==1 && h[2]<128 && h[3]<4096 && h[4]==144);
+	CHECK(h[0]==0x384f4347 && (h[1]==1 || h[1]==2) && h[2]<128 && h[3]<4096 && h[4]==144);
 	CHECK(n==32+h[2]*16+h[3]*sizeof(struct drm_asahi_gem_bind_op)+h[4]);
 	unsigned char *seed[128]={0},*maps[128]={0},*expected[128]={0}; size_t sizes[128]={0}; uint32_t handles[128]={0};
 	for(unsigned i=0;i<h[2];i++) {
@@ -44,14 +44,14 @@ int main(int argc,char **argv)
 		unsigned id=h[5+job];CHECK(id<128 && sizes[id]==PAGE);
 		char name[64];snprintf(name,sizeof(name),"expected-gem-%u.bin",id);expected[id]=read_input(argv[1],name,&n);CHECK(n==PAGE);
 		for(unsigned i=0;i<PAGE;i++) {
-			unsigned char want=seed[id][i];if(i<64)want=oracle(i/4,job?1:h[7])>>(8*(i%4));CHECK(expected[id][i]==want);
+			unsigned char want=seed[id][i];if(i<64)want=oracle(i/4,job && h[1]==1?1:h[7])>>(8*(i%4));CHECK(expected[id][i]==want);
 		}
 	}
 	struct drm_asahi_gem_bind_op *ops=(void *)(input+32+h[2]*16);
 	for(unsigned i=0;i<h[3];i++) CHECK(ops[i].handle<128 && seed[ops[i].handle] && ops[i].offset+ops[i].range<=sizes[ops[i].handle]);
 	unsigned char *commands=input+32+h[2]*16+h[3]*sizeof(*ops);
 	for(unsigned j=0;j<2;j++) {struct drm_asahi_cmd_header *ch=(void *)(commands+j*72);CHECK(ch->cmd_type==DRM_ASAHI_CMD_COMPUTE && ch->size==64 && ch->vdm_barrier==0xffff && ch->cdm_barrier==0xffff);}
-	printf("G16C_COMPUTE_OVERLAP_INPUTS_PASS objects=%u binds=%u iterations=%u,1 CPU_oracle=1 raw_async=1\n",h[2],h[3],h[7]);
+	printf("G16C_COMPUTE_OVERLAP_INPUTS_PASS objects=%u binds=%u iterations=%u,%u CPU_oracle=1 raw_async=1\n",h[2],h[3],h[7],h[1]==1?1:h[7]);
 	if(argc==3 && !serial && !queued && !warm)return 0;
 	int fd=open("/dev/dri/renderD128",O_RDWR|O_CLOEXEC);CHECK(fd>=0);
 	struct drm_asahi_vm_create vm={.kernel_start=0x7000000000ULL,.kernel_end=0x7020000000ULL};OK(fd,DRM_IOCTL_ASAHI_VM_CREATE,&vm);
@@ -78,7 +78,9 @@ int main(int argc,char **argv)
 		cmd->ts.end=(struct drm_asahi_timestamp){.handle=obj.object_handle,.offset=72+j*32};
 		submits[j]=(struct drm_asahi_submit){.queue_id=q[j].queue_id,.cmdbuf=(uintptr_t)(commands+j*72),.cmdbuf_size=72,.syncs=(uintptr_t)&sync[j],.out_sync_count=1};
 	}
-    for(unsigned phase=0;phase<(warm?3U:1U);phase++) {
+    unsigned phases=closing?2U:warm?3U:1U;
+    for(unsigned phase=0;phase<phases;phase++) {
+        int closing_now=closing && phase+1==phases;
         if(phase) {
             for(unsigned id=0;id<128;id++)if(seed[id])memcpy(maps[id],seed[id],sizes[id]);
             memset(ts,0xa5,PAGE*3);
@@ -97,7 +99,7 @@ int main(int argc,char **argv)
         }
     }
     int closed_fences[2]={-1,-1};
-    if(closing) {
+    if(closing_now) {
         for(unsigned j=0;j<2;j++) {
             struct drm_syncobj_handle export={.handle=done[j].handle,.flags=DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE};
             OK(fd,DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,&export);closed_fences[j]=export.fd;
@@ -117,7 +119,7 @@ int main(int argc,char **argv)
     }
     for(unsigned j=0;j<2;j++) {
         int fence_fd;
-        if(closing) {
+        if(closing_now) {
             fence_fd=closed_fences[j];struct pollfd ready={.fd=fence_fd,.events=POLLIN};
             CHECK(poll(&ready,1,15000)==1 && (ready.revents&POLLIN));
         } else {
@@ -135,10 +137,14 @@ int main(int argc,char **argv)
 	}
 	uint64_t times[2][2];for(unsigned j=0;j<2;j++){memcpy(times[j],ts+PAGE+64+j*32,16);CHECK(times[j][0] && times[j][1]>times[j][0]);printf("OVERLAP_TIMESTAMP job=%u start=%"PRIu64" end=%"PRIu64"\n",j,times[j][0],times[j][1]);}
 	for(unsigned i=0;i<PAGE*3;i++)if(!(i>=PAGE+64 && i<PAGE+80) && !(i>=PAGE+96 && i<PAGE+112))CHECK(ts[i]==0xa5);
-	if(serial || queued || (warm && phase==0))CHECK(times[0][1]<times[1][0]);
+	if(serial || queued)CHECK(times[0][1]<times[1][0]);
+    // Independent queues have no API ordering. Cold bindings serialize in
+    // publication order, which may differ from the order of the two ioctls.
+    else if(warm && phase==0)CHECK(times[0][1]<times[1][0] || times[1][1]<times[0][0]);
     else CHECK(times[1][0]<times[0][1] && times[0][0]<times[1][1]);
         printf("OVERLAP_PHASE_PASS phase=%u actual_overlap=%d full_outputs_and_guards=1\n",phase,
             times[1][0]<times[0][1] && times[0][0]<times[1][1]);
+        if(closing && !closing_now)puts("CLOSE_WARMUP_PASS one_queue=1 first_pair_output_verified=1");
     }
 	if(fd>=0)CHECK(!close(fd));
 	printf("G16C_COMPUTE_%s_PASS logical_queues=%u, two commands, exact all BOs, timestamp guards, checks=%u\n",closing?"CLOSED_QUEUE_PIPELINE":same_queue?(warm?"ORDERED_QUEUE_REUSE":"ORDERED_QUEUE_PIPELINE"):serial?"SERIAL_CONTROL":queued?"PENDING_PAIR":warm?"WARM_REUSE":"OVERLAP",same_queue?1U:2U,checks);
