@@ -39,9 +39,15 @@ mode_expr = r'g16_mesh::Mode::from_parameter\(crate::module_parameters::native_m
 # copy (debugfs asahi_m4/native_mesh) through the same mapping.
 runtime_expr = r'g16_mesh::Mode::from_parameter\(g16_mesh::mode\(\)\)\s*\.ok_or\(EINVAL\)\?'
 assert re.search(mode_expr, bootstrap)
-assert re.search(r'let native =\s*' + runtime_expr + r'\s*\.enabled\(\);', runtime)
+# Support and decode use the VM's latched mode, never the current runtime mode.
+assert re.search(r'fn acquire_render_support\(&mut self, pool: &render::OperandPool, mode: g16_mesh::Mode\)', runtime)
+assert re.search(r'let native = mode\.enabled\(\);', runtime)
+drm = (driver / 'g16_drm.rs').read_text()
+assert 'runtime.acquire_render_support(&pool, vm.native_mode)?' in drm
+assert re.search(r'native_mode: crate::g16_mesh::Mode::from_parameter\(crate::g16_mesh::snapshot\(\)\.1\)', drm)
+assert 'g16_mesh::mode()' not in runtime
 assert re.search(r'if lease\.native\s*\{\s*render::initialize_native_support', runtime)
-assert re.search(r'let mesh_mode =\s*' + runtime_expr + r';[\s\S]*?let params = if mesh_mode.enabled\(\)', runtime)
+assert re.search(r'let mesh_mode = support\.mode;[\s\S]*?let params = if mesh_mode.enabled\(\)', runtime)
 # The unwaited peek comes first: only a possibly native (or unreadable) first
 # word reaches the producer-stamp wait and the decode.
 assert re.search(r'let params = if mesh_mode\.enabled\(\)\s*&& owner\.lock\(\)\.command_word\(params\.encoder\)'

@@ -52,11 +52,12 @@ impl Bootstrap {
         self.render_failed
     }
 
-    pub(crate) fn acquire_render_support(&mut self, pool: &render::OperandPool) -> Result<Support> {
+    /// `mode`: the VM's native mesh mode, latched when it was created.
+    pub(crate) fn acquire_render_support(&mut self, pool: &render::OperandPool, mode: g16_mesh::Mode) -> Result<Support> {
         if self.render_failed {
             return Err(EIO);
         }
-        let native = g16_mesh::Mode::from_parameter(g16_mesh::mode()).ok_or(EINVAL)?.enabled();
+        let native = mode.enabled();
         let mut used = self.render_support.load(Ordering::Acquire);
         let index = loop {
             let index = (!used).trailing_zeros();
@@ -80,6 +81,7 @@ impl Bootstrap {
                 crate::module_parameters::fw_counter_start.value().wrapping_mul(2),
             ),
             native,
+            mode,
         };
         let mut a = render::Addresses::bootstrap();
         a.support = lease.address();

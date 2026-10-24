@@ -137,22 +137,19 @@ echo 1 > /sys/kernel/debug/asahi_m4/native_mesh  # one-parent mode (2: multi-par
 echo 0 > /sys/kernel/debug/asahi_m4/native_mesh  # back to the default
 ```
 
-Values above the highest supported mode return EINVAL, and each change is
-logged as `G16: native_mesh=N`. Flipping is safe at any time, not only when
-idle:
+Values above the highest supported mode return EINVAL. Each write starts a new
+generation, even when it writes the current value, and is logged as
+`G16: native_mesh=N (generation G)`. Flipping is safe at any time, not only
+when idle:
 
-- Each submission reads the mode once. Work already queued keeps the decode
-  it was admitted with.
-- A VM's support header is set at its first render from the mode at that
-  moment and is never rewritten afterwards. A VM that first rendered with
-  the mode at 0 (KWin, for example) keeps working; if it submits a native
-  stream after the switch, the submission fails with EOPNOTSUPP instead of
-  running on an ordinary header.
-- Switching back to 0 returns every later submission to the ordinary path.
-  VMs that started in native mode keep their native support header, which
-  serves ordinary Work exactly as under a native_mesh=1 boot.
-- Switching between 1 and 2 changes only admission, from the next
-  submission on; both use the same native support header.
+- **A VM latches the mode when it is created** (VM_CREATE). Its support header
+  (native for modes 1–4) is built from that latch at its first render, and every
+  one of its renders is decoded with it. A runtime change affects only VMs
+  created afterwards.
+- **A VM created at mode 0** (KWin, for example) never decodes native streams.
+  Userspace must not submit any there: they would run as ordinary Work.
+- **A VM created in a native mode** keeps decoding with that mode after a switch
+  to 0, so its native streams never run with ordinary state.
 
-So start a fresh process (a new VM) after enabling the mode. The module
+So start a fresh process (a new VM) after changing the mode. The module
 parameter is read-only in sysfs; use the debugfs file.

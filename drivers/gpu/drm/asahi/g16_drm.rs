@@ -143,6 +143,9 @@ struct Vm {
     draining: u32,
     reservation: ARef<Object>,
     render_support: Option<Arc<crate::g16::Support>>,
+    /// The native mesh mode when this VM was created. Its support header and
+    /// every decode of its streams use it, whatever the runtime mode is later.
+    native_mode: crate::g16_mesh::Mode,
     render_ready: bool,
     /// The runtime holds this VM root's TVB pool (created by its first render
     /// submission, released with the VM).
@@ -217,6 +220,7 @@ pub(crate) struct Data {
     _profile: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _flags: KVec<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>>,
+    _native_mesh: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::NativeMeshKnob>>>,
     _dep_stats: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::DepStats>>>,
     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
@@ -285,13 +289,17 @@ pub(crate) fn register<'a>(
         (c_str!("fail_prep"), FlagKnob::FAIL_PREP, 0),
         (c_str!("fail_retire"), FlagKnob::FAIL_RETIRE, 0),
         (c_str!("fail_skip"), FlagKnob::FAIL_SKIP, 0),
-        (c_str!("native_mesh"), FlagKnob::NATIVE_MESH, crate::module_parameters::native_mesh.value()),
     ];
     let mut flags = KVec::with_capacity(knobs.len(), GFP_KERNEL)?;
     for (name, knob, value) in knobs {
         knob.init(value);
         flags.push(KBox::pin_init(dir.read_write_file(name, knob), GFP_KERNEL)?, GFP_KERNEL)?;
     }
+    crate::g16_mesh::init_mode(crate::module_parameters::native_mesh.value());
+    let native_mesh = KBox::pin_init(
+        dir.read_write_file(c_str!("native_mesh"), crate::g16_timeline::NativeMeshKnob),
+        GFP_KERNEL,
+    )?;
     let dep_stats = KBox::pin_init(
         dir.read_only_file(c_str!("dep_stats"), crate::g16_timeline::DepStats),
         GFP_KERNEL,
@@ -338,6 +346,7 @@ pub(crate) fn register<'a>(
         _profile: profile,
         _queue_cap: queue_cap,
         _flags: flags,
+        _native_mesh: native_mesh,
         _dep_stats: dep_stats,
         _lane_cap: lane_cap,
         _debugfs: dir, });

@@ -91,7 +91,9 @@ impl Bootstrap {
             return Err(EIO);
         }
         let mut mesh_params;
-        let mesh_mode = g16_mesh::Mode::from_parameter(g16_mesh::mode()).ok_or(EINVAL)?;
+        // The VM's latched mode, not the current one: a VM created native keeps
+        // decoding its streams after a runtime switch to 0.
+        let mesh_mode = support.mode;
         // Peek at the first word without waiting for producers: an ordinary
         // header publishes as at native_mesh=0, with no stall behind earlier
         // work. Userspace writes a native header on the CPU before SUBMIT, and

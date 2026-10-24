@@ -9,17 +9,39 @@
 //! inside shader data, PPP records, or ordinary vertex streams.
 
 /// Runtime copy of `asahi_m4.native_mesh`, writable from debugfs
-/// `asahi_m4/native_mesh` without a reboot. Each submission reads it once.
-/// A VM's support object latches the value at its first render (see
-/// `Support::native`); later changes never rewrite a published header.
-pub(crate) static NATIVE_MESH: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+/// `asahi_m4/native_mesh` without a reboot, and the generation of its last
+/// change: `generation << 8 | mode` in one word, so a writer, a VM's latch and
+/// the advertisement always see a consistent pair. A VM latches the mode when
+/// it is created (`Vm::native_mode`); its support header and every decode use
+/// that latch, so a later change affects only VMs created after it.
+static NATIVE_MESH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The highest accepted `native_mesh` value.
 pub(crate) const MAX_MODE: u32 = 4;
 
+/// The current (generation, mode).
+pub(crate) fn snapshot() -> (u64, u32) {
+    let value = NATIVE_MESH.load(core::sync::atomic::Ordering::Acquire);
+    (value >> 8, (value & 0xff) as u32)
+}
+
 pub(crate) fn mode() -> u32 {
-    NATIVE_MESH.load(core::sync::atomic::Ordering::Relaxed)
+    snapshot().1
+}
+
+/// The boot value: generation 0.
+pub(crate) fn init_mode(mode: u32) {
+    NATIVE_MESH.store(u64::from(mode.min(MAX_MODE)), core::sync::atomic::Ordering::Release);
+}
+
+/// A runtime change. Every call, even to the current mode, starts a new
+/// generation, so a reader that sees one generation twice knows the mode held
+/// in between. Returns the new generation.
+pub(crate) fn set_mode(mode: u32) -> u64 {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    let next = |value: u64| (((value >> 8) + 1) << 8) | u64::from(mode.min(MAX_MODE));
+    let previous = NATIVE_MESH.fetch_update(AcqRel, Acquire, |value| Some(next(value)));
+    next(previous.unwrap_or_else(|value| value)) >> 8
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

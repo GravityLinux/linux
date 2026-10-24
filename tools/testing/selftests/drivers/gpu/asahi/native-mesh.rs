@@ -615,6 +615,24 @@ fn the_unwaited_peek_agrees_with_decode_on_every_first_word() {
     assert!(g16_mesh::may_be_native(stream()[0]));
 }
 
+#[test]
+fn every_mode_write_starts_a_new_generation() {
+    // The only test touching the runtime mode, so it owns the static.
+    g16_mesh::init_mode(4);
+    assert_eq!(g16_mesh::snapshot(), (0, 4));
+    assert_eq!(g16_mesh::set_mode(0), 1);
+    assert_eq!(g16_mesh::snapshot(), (1, 0));
+    // Rewriting the current value still bumps the generation.
+    assert_eq!(g16_mesh::set_mode(0), 2);
+    assert_eq!(g16_mesh::set_mode(4), 3);
+    assert_eq!(g16_mesh::snapshot(), (3, 4));
+    assert_eq!(g16_mesh::mode(), 4);
+    // Out-of-range values are clamped (debugfs rejects them before this).
+    g16_mesh::set_mode(200);
+    assert_eq!(g16_mesh::snapshot(), (4, g16_mesh::MAX_MODE));
+    g16_mesh::init_mode(0);
+}
+
 fn read32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }

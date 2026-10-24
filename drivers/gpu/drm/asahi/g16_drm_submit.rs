@@ -264,7 +264,7 @@ impl File {
                 // Acquire scarce support and its Arc before editing this
                 // root. ENOSPC/ENOMEM here must not quarantine a healthy VM.
                 let support = Arc::new(
-                    runtime.acquire_render_support(&pool)?,
+                    runtime.acquire_render_support(&pool, vm.native_mode)?,
                     GFP_KERNEL,
                 )?;
                 if let Err(error) = vm.space.lock()
