@@ -132,6 +132,9 @@ struct Vm {
     reservation: ARef<Object>,
     render_support: Option<Arc<crate::g16::Support>>,
     render_ready: bool,
+    /// The runtime holds this VM root's TVB pool (created by its first render
+    /// submission, released with the VM).
+    tvb_ready: bool,
     compute_ready: bool,
     render_broken: bool,
     /// Closes waiting for their snapshot to complete (see g16_deferred).
@@ -789,6 +792,7 @@ impl File {
                 reservation,
                 render_support: None,
                 render_ready: false,
+                tvb_ready: false,
                 compute_ready: false,
                 render_broken: false,
                 deferred: KVec::new(),
@@ -2607,6 +2611,22 @@ impl File {
                 runtime.map_compute_work(&mut vm.compute_space.lock(), vm.kernel.clone())?;
                 vm.compute_ready = true;
                 vm.render_broken = false;
+            }
+        }
+        // Provision what this queue's or VM root's first publication would
+        // otherwise allocate in the job worker, so a failure returns here with
+        // nothing queued instead of failing the queue later.
+        let tvb = renders != 0 && !vm.tvb_ready;
+        if tvb || !firmware.lock().provisioned() {
+            let mut runtime = device.runtime.lock();
+            if runtime.render_failed() {
+                return Err(EIO);
+            }
+            runtime.provision_queue(&mut firmware.lock())?;
+            if tvb {
+                let support = vm.render_support.as_deref().ok_or(EIO)?;
+                runtime.provision_tvb(&mut vm.space.lock(), support)?;
+                vm.tvb_ready = true;
             }
         }
         // Every submission retains the VM's mappings until it completes.

@@ -98,6 +98,11 @@ impl Drop for FirmwareQueues {
 }
 
 impl FirmwareQueues {
+    /// Whether the queue's firmware rings exist (see `Runtime::provision_queue`).
+    pub(crate) fn provisioned(&self) -> bool {
+        self.lanes.is_some()
+    }
+
     /// Remember that a published Work on `lane` waited on `dep` (a field-level
     /// borrow, usable while the queue's lanes are borrowed).
     fn note_wait(waited: &mut [[Option<Stamp>; 2]; 3], lane: usize, dep: Stamp) {
@@ -300,6 +305,28 @@ struct LaneBook {
 /// themselves. Also caches the work channels' transport cursors: the tail
 /// is written only by this driver, and stale read/done cursors are behind
 /// the real ones, so a cached view can only under-report ring room.
+/// Encoding scratch for one Work at a time: publication runs under the
+/// runtime lock and copies the encodings into firmware memory before it
+/// returns, so one set allocated with the runtime serves every Work and
+/// publication itself does not allocate. On the heap: two copies of each
+/// encoding on the job worker's stack would overflow it.
+#[derive(Default)]
+pub(crate) struct Encodings {
+    tiling: KVec<u8>,
+    fragment: KVec<u8>,
+    compute: KVec<u8>,
+}
+
+impl Encodings {
+    pub(crate) fn new() -> Result<Self> {
+        let mut encodings = Self::default();
+        encodings.tiling.extend_with(0x940, 0u8, GFP_KERNEL)?;
+        encodings.fragment.extend_with(0xcc0, 0u8, GFP_KERNEL)?;
+        encodings.compute.extend_with(0x8c0, 0u8, GFP_KERNEL)?;
+        Ok(encodings)
+    }
+}
+
 pub(crate) struct Ledger {
     lanes: KVec<LaneBook>,
     /// (lane pointers, ring head) per flight and lane.
@@ -519,9 +546,6 @@ impl Bootstrap {
     /// already mapped into; the device alias exists for every reused slot.
     fn allocate_work(&mut self, render: bool) -> Result<(u64, Option<u64>)> {
         use crate::pgtable::prot::{PROT_FW_PRIV_RW, PROT_FW_SHARED_RW};
-        if self.diagnostics.retire_log.capacity() < RETIRE_LOG {
-            self.diagnostics.retire_log.reserve(RETIRE_LOG, GFP_KERNEL)?;
-        }
         let index = usize::from(render);
         if let Some((va, root)) = self.free_work[index].pop() {
             return Ok((va, Some(root)));
@@ -754,7 +778,54 @@ impl Bootstrap {
         Ok(lanes)
     }
 
+    /// For the SUBMIT ioctl: allocate the queue's firmware rings now rather
+    /// than at its first publication.
+    pub(crate) fn provision_queue(&mut self, owner: &mut FirmwareQueues) -> Result {
+        if self.render_failed {
+            return Err(EIO);
+        }
+        self.prepare_lanes(owner)
+    }
+
+    /// For the SUBMIT ioctl: create the VM root's TVB pool now rather than
+    /// at its first render publication.
+    pub(crate) fn provision_tvb(&mut self, client: &mut g16_vm::AddressSpace, support: &Support) -> Result {
+        if self.render_failed {
+            return Err(EIO);
+        }
+        self.tvb_pool(client, support).map(|_| ())
+    }
+
+    /// The index of the client root's TVB pool, created on first use. Not
+    /// inlined: its creation path would otherwise enlarge the job worker's frame.
+    #[inline(never)]
+    fn tvb_pool(&mut self, client: &mut g16_vm::AddressSpace, support: &Support) -> Result<usize> {
+        let root = client.roots().low;
+        if let Some(index) = self.tvb_pools.iter().position(|p| p.root == root) {
+            return Ok(index);
+        }
+        self.tvb_pools.reserve(1, GFP_KERNEL)?;
+        let base = self.next_object_va;
+        self.next_object_va = base.checked_add(0x44000).ok_or(ENOSPC)?;
+        let pool = crate::g16_tvb::Tvb::new(
+            self._firmware_space.as_mut().ok_or(EIO)?,
+            client,
+            base,
+            7 + u64::from(support.index),
+        )?;
+        self.tvb_pools.push_within_capacity(pool).map_err(|_| ENOMEM)?;
+        Ok(self.tvb_pools.len() - 1)
+    }
+
     fn prepare_queues(&mut self, owner: &mut FirmwareQueues) -> Result {
+        self.prepare_lanes(owner)?;
+        self.prepare_events(owner)
+    }
+
+    /// The queue's firmware rings, allocated once per public queue. Not
+    /// inlined, like `tvb_pool`: it is cold and its frame is large.
+    #[inline(never)]
+    fn prepare_lanes(&mut self, owner: &mut FirmwareQueues) -> Result {
         if owner.lanes.is_none() {
             self.recycle_queues()?;
             let identity = self.next_object_va;
@@ -793,6 +864,12 @@ impl Bootstrap {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// An event index for each busy period of the queue (released when its
+    /// last Work retires). EBUSY while all are in use: admission retries.
+    fn prepare_events(&mut self, owner: &mut FirmwareQueues) -> Result {
         if owner.events.is_none() {
             // Bits 0-31 are the event indices in use; a queue takes the
             // lowest free one.
@@ -1460,7 +1537,8 @@ impl Bootstrap {
                 &render.addresses,
                 &mut render.events,
             );
-            self.tvb_pools.push(pool, GFP_KERNEL)?;
+            // Back into the slot swap_remove freed: no allocation.
+            self.tvb_pools.push_within_capacity(pool).map_err(|_| EIO)?;
             self.flights[index].render = Some(render);
             result?;
             if self._firmware_space.as_ref().ok_or(EIO)?.read_u32(STATE)? == cursor {
@@ -2203,27 +2281,14 @@ impl Bootstrap {
     ) -> Result<Receipt> {
         let mut guard = owner.lock();
         let client = &mut *guard;
-        let root = client.roots().low;
-        let index = match self.tvb_pools.iter().position(|p| p.root == root) {
-            Some(index) => index,
-            None => {
-                self.tvb_pools.reserve(1, GFP_KERNEL)?;
-                let base = self.next_object_va;
-                self.next_object_va = base.checked_add(0x44000).ok_or(ENOSPC)?;
-                let pool = crate::g16_tvb::Tvb::new(
-                    self._firmware_space.as_mut().ok_or(EIO)?,
-                    client,
-                    base,
-                    7 + u64::from(support.index),
-                )?;
-                self.tvb_pools.push(pool, GFP_KERNEL)?;
-                self.tvb_pools.len() - 1
-            }
-        };
+        // The SUBMIT ioctl created the pool (provision_tvb); this finds it.
+        let index = self.tvb_pool(client, support)?;
         let scene = self.tvb_pools[index].reserve_scene().inspect_err(|_| {
             self.report_pressure(4, "scenes");
         })?;
         let mut pool = self.tvb_pools.swap_remove(index);
+        // Out of `self` while publication also borrows it; always returned.
+        let mut encodings = core::mem::take(&mut self.encodings);
         let result = self.submit_render_pool(
             client,
             params,
@@ -2231,15 +2296,18 @@ impl Bootstrap {
             queue,
             queues,
             &mut pool,
+            &mut encodings,
             owner.clone(),
             scene,
             timestamps,
             dependencies,
         );
+        self.encodings = encodings;
         if result.is_err() && !self.render_failed {
             pool.release_scene(scene);
         }
-        self.tvb_pools.push(pool, GFP_KERNEL)?;
+        // Back into the slot swap_remove freed: no allocation.
+        self.tvb_pools.push_within_capacity(pool).map_err(|_| EIO)?;
         result
     }
 
@@ -2252,6 +2320,7 @@ impl Bootstrap {
         queue: &mut FirmwareQueues,
         queues: Arc<Mutex<FirmwareQueues>>,
         pool: &mut crate::g16_tvb::Tvb,
+        encodings: &mut Encodings,
         owner: Arc<Mutex<g16_vm::AddressSpace>>,
         scene: u32,
         timestamps: [u64; 4],
@@ -2353,14 +2422,15 @@ impl Bootstrap {
         a.fragment_user_timestamp_end = timestamps[3];
         // From here any publication failure quarantines the roots.
         self.render_failed = true;
-        // Heap buffers: two copies of each encoding on this frame would
-        // exceed the kernel stack together with the job worker's own frame.
-        let mut ta = KVec::new();
-        ta.extend_with(0x940, 0u8, GFP_KERNEL)?;
-        let mut frag = KVec::new();
-        frag.extend_with(0xcc0, 0u8, GFP_KERNEL)?;
-        params.tiling_work(&a, &mut ta).ok_or(EINVAL)?;
-        params.fragment_work(&a, &mut frag).ok_or(EINVAL)?;
+        let (ta, frag) = (&mut encodings.tiling, &mut encodings.fragment);
+        ta.fill(0);
+        frag.fill(0);
+        // The ioctl validated the parameters and every address here is the
+        // kernel's own, so a failed encoding is a driver bug, not bad input.
+        if params.tiling_work(&a, ta).is_none() || params.fragment_work(&a, frag).is_none() {
+            pr_err!("G16: render Work encoding failed for ioctl-validated parameters\n");
+            return Err(EIO);
+        }
         // No per-Work start or tiling-end profiling stamps; fragment end
         // uses one location shared by the queue, separate from UAPI timestamps.
         ta[0x8c8..0x8d8].fill(0);
@@ -2463,7 +2533,7 @@ impl Bootstrap {
             }
         }
         queue.pending += 1;
-        self.flights.push(
+        self.flights.push_within_capacity(
             Flight {
                 id: va,
                 owner: queues,
@@ -2512,8 +2582,8 @@ impl Bootstrap {
                     scene,
                 }),
             },
-            GFP_KERNEL,
-        )?;
+        )
+        .map_err(|_| EIO)?;
         // Capacity was reserved with the flight in reserve_flight.
         let flight = self.flights.last().ok_or(EIO)?;
         self.ledger.add(flight)?;
@@ -2599,40 +2669,49 @@ impl Bootstrap {
             entries[stage][entry_counts[stage]] = work.to_le_bytes();
             entry_counts[stage] += 1;
         }
-        // At most 8 notifier writes and 9 per stage.
-        let mut writes: KVec<(u64, &[u8])> = KVec::with_capacity(32, GFP_KERNEL)?;
-        macro_rules! push {
-            ($va:expr, $bytes:expr) => {
-                writes.push_within_capacity(($va, $bytes)).map_err(|_| ENOMEM)
-            };
-        }
-        // Shared notifier: count this render's tiling and fragment Works
-        // into the queue's cumulative total. Firmware counts completions
-        // at +0xc and writes the lanes' driver stamps as they retire.
-        push!(a.event_control + 0x24, &context)?;
-        push!(a.event_count_array, &notified)?;
-
-        // The queue lanes persist independently of the physical work channel.
-        for stage in 0..2 {
-            let Lane { ring, .. } = lanes[stage];
+        // Write `n` of the batch, in order: the shared notifier's two words
+        // (firmware counts completions at +0xc and writes the lanes' driver
+        // stamps as they retire), then per stage the prelude, Work,
+        // microsequence, dependency items and ring entries (contiguous except
+        // where the ring wraps). Computed on demand: no list on the job
+        // worker's stack, and nothing to allocate.
+        let (ta, frag): (&[u8], &[u8]) = (ta, frag);
+        let (context, notified, preludes) = (&context, &notified, &preludes);
+        let (tiling_micro, fragment_micro) = (&tiling_micro, &fragment_micro);
+        let (items, entries) = (&items, &entries);
+        let rings = [lanes[0].ring, lanes[1].ring];
+        let per_stage = move |stage: usize| 3 + item_counts[stage] + entry_counts[stage];
+        let count = 2 + per_stage(0) + per_stage(1);
+        let write = move |n: usize| {
+            if n < 2 {
+                return if n == 0 {
+                    (a.event_control + 0x24, &context[..])
+                } else {
+                    (a.event_count_array, &notified[..])
+                };
+            }
+            let (stage, k) = if n - 2 < per_stage(0) { (0, n - 2) } else { (1, n - 2 - per_stage(0)) };
             let (prelude, work, micro) = if stage == 0 {
                 (a.tiling_prelude, a.tiling_work, a.tiling_microsequence)
             } else {
                 (a.fragment_prelude, a.fragment_work, a.fragment_microsequence)
             };
-            push!(prelude, &preludes[stage])?;
-            push!(work, if stage == 0 { ta } else { frag })?;
-            push!(micro, if stage == 0 { &tiling_micro[..] } else { &fragment_micro[..] })?;
-            for index in 0..item_counts[stage] {
-                push!(prelude + 0x40 + index as u64 * 0x40, &items[stage][index])?;
+            match k {
+                0 => (prelude, &preludes[stage][..]),
+                1 => (work, if stage == 0 { ta } else { frag }),
+                2 => (micro, if stage == 0 { &tiling_micro[..] } else { &fragment_micro[..] }),
+                k if k - 3 < item_counts[stage] => {
+                    let index = k - 3;
+                    (prelude + 0x40 + index as u64 * 0x40, &items[stage][index][..])
+                }
+                k => {
+                    let index = k - 3 - item_counts[stage];
+                    let pos = (firsts[stage] + index as u32) % 0x500;
+                    (rings[stage] + u64::from(pos) * 8, &entries[stage][index][..])
+                }
             }
-            // Ring entries are contiguous except where the ring wraps.
-            for (n, entry) in entries[stage][..entry_counts[stage]].iter().enumerate() {
-                let pos = (firsts[stage] + n as u32) % 0x500;
-                push!(ring + u64::from(pos) * 8, entry)?;
-            }
-        }
-        self._firmware_space.as_mut().ok_or(EIO)?.write_batch(&writes)?;
+        };
+        self._firmware_space.as_mut().ok_or(EIO)?.write_batch(count, write)?;
         let mut epochs = [0; 2];
         for stage in [1usize, 0] {
             let mut lane = lanes[stage];
@@ -2829,9 +2908,12 @@ impl Bootstrap {
         let own = queue.lanes.map_or([0; 3], |l| l.map(|lane| lane.firmware_stamp()));
         self.note_dependency_events(dependencies, own);
         a.cdm_entry = Some(alias + compute::ENTRY_OFFSET);
-        let mut work = KVec::new();
-        work.extend_with(0x8c0, 0u8, GFP_KERNEL)?;
-        params.work(&a, &mut work).ok_or(EINVAL)?;
+        let work = &mut self.encodings.compute;
+        work.fill(0);
+        if params.work(&a, work).is_none() {
+            pr_err!("G16: compute Work encoding failed for ioctl-validated parameters\n");
+            return Err(EIO);
+        }
         // Timestamp's user destinations must lie in the validated special-
         // object aperture. Firmware writes nanoseconds directly, as on M1/M2.
         // Firmware consumes this pointer pair, so it lives in the Work's
@@ -2845,7 +2927,7 @@ impl Bootstrap {
         let head = (first + 1 + dependencies.iter().flatten().count() as u32) % 0x500;
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
         fw.write_live(compute::SHARED_STATE, &count32.to_le_bytes())?;
-        fw.write_live(a.work, &work)?;
+        fw.write_live(a.work, &self.encodings.compute)?;
         fw.write_live(a.work + compute::ENTRY_OFFSET, &compute::entry(params.cdm))?;
         let mut microsequence = params.microsequence(&a);
         for base in [0x1bc, 0x20c] {
@@ -2900,7 +2982,7 @@ impl Bootstrap {
             FirmwareQueues::note_wait(&mut queue.waited, 2, *dep);
         }
         queue.pending += 1;
-        self.flights.push(
+        self.flights.push_within_capacity(
             Flight {
                 id: a.work,
                 owner: queues.clone(),
@@ -2929,8 +3011,8 @@ impl Bootstrap {
                 channels: [(channel, (epoch + 1) & 255), (usize::MAX, 0)],
                 render: None,
             },
-            GFP_KERNEL,
-        )?;
+        )
+        .map_err(|_| EIO)?;
         // Capacity was reserved with the flight in reserve_flight.
         let flight = self.flights.last().ok_or(EIO)?;
         self.ledger.add(flight)?;
@@ -3401,7 +3483,7 @@ pub(crate) struct Handover {
     next: u64,
 }
 
-const RETIRE_LOG: usize = 256;
+pub(crate) const RETIRE_LOG: usize = 256;
 
 fn micros(later: Instant<Monotonic>, earlier: Instant<Monotonic>) -> i64 {
     (later - earlier).as_nanos() / 1000

@@ -486,6 +486,7 @@ pub(crate) struct FirmwareSpace {
     external: KVec<core::ops::Range<u64>>,
 }
 
+
 impl FirmwareSpace {
     pub(crate) fn attach(dev: &device::Device) -> Result<Self> {
         let node = dev.of_node().ok_or(EINVAL)?;
@@ -711,20 +712,21 @@ impl FirmwareSpace {
         size: usize,
         mut update: impl FnMut(*mut u8, usize, usize),
     ) -> Result {
-        self.update_batch(&[(va, size)], |_, ptr, offset, size| update(ptr, offset, size))
+        self.update_batch(1, |_| (va, size), |_, ptr, offset, size| update(ptr, offset, size))
     }
 
     /// Several host-owned writes with one barrier pair, the region resolved
     /// again only when a destination leaves the previous one. Nothing in a
     /// batch is visible to firmware before the queue publication that follows
     /// it (flush), which has its own barrier.
-    pub(crate) fn write_batch(&mut self, writes: &[(u64, &[u8])]) -> Result {
-        let mut ranges = KVec::with_capacity(writes.len(), GFP_KERNEL)?;
-        for &(va, bytes) in writes {
-            ranges.push((va, bytes.len()), GFP_KERNEL)?;
-        }
-        self.update_batch(&ranges, |which, ptr, offset, size| {
-            let bytes = writes[which].1;
+    /// `write(n)` is the destination and source of write `n` of `count`.
+    pub(crate) fn write_batch<'a>(&mut self, count: usize, write: impl Fn(usize) -> (u64, &'a [u8])) -> Result {
+        let range = |n| {
+            let (va, bytes) = write(n);
+            (va, bytes.len())
+        };
+        self.update_batch(count, range, |which, ptr, offset, size| {
+            let bytes = write(which).1;
             // SAFETY: update_batch supplies an exclusively host-owned
             // destination and a range within this write's source slice.
             unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), ptr, size) };
@@ -741,9 +743,11 @@ impl FirmwareSpace {
 
     /// Update host-owned bytes, preserving adjacent firmware-owned cache lines.
     /// Cache maintenance completes once per batch, not once per page or write.
+    /// `range(n)` is the destination of write `n` of `count`.
     fn update_batch(
         &mut self,
-        ranges: &[(u64, usize)],
+        count: usize,
+        range: impl Fn(usize) -> (u64, usize),
         mut update: impl FnMut(usize, *mut u8, usize, usize),
     ) -> Result {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_LIVE);
@@ -756,7 +760,8 @@ impl FirmwareSpace {
         const NONE: u8 = u8::MAX;
         let mut found: [Option<&FirmwareRegion>; 4] = [None; 4];
         let mut owner = [NONE; 32];
-        for (n, &(va, size)) in ranges.iter().enumerate() {
+        for n in 0..count {
+            let (va, size) = range(n);
             let region = match found.iter().flatten().position(|r| Self::holds(r, va, size)) {
                 Some(index) => {
                     if let Some(slot) = owner.get_mut(n) {
@@ -778,7 +783,8 @@ impl FirmwareSpace {
             }
         };
         if maint {
-            for (n, &(va, size)) in ranges.iter().enumerate() {
+            for n in 0..count {
+                let (va, size) = range(n);
                 if size == 0 {
                     continue;
                 }
@@ -803,7 +809,8 @@ impl FirmwareSpace {
             }
         }
         crate::mem::sync();
-        for (which, &(va, size)) in ranges.iter().enumerate() {
+        for which in 0..count {
+            let (va, size) = range(which);
             if size == 0 {
                 continue;
             }

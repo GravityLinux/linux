@@ -262,6 +262,8 @@ pub(crate) struct Bootstrap {
     pub(crate) core_mask: u32,
     pub(crate) maximum_frequency_khz: u32,
     tvb_pools: KVec<crate::g16_tvb::Tvb>,
+    /// Work encoding scratch, allocated once so publication never allocates.
+    pub(crate) encodings: render_runtime::Encodings,
     render_publication: u64,
     diagnostics: KBox<Diagnostics>,
     next_work_va: u64,
@@ -770,7 +772,8 @@ impl Bootstrap {
             wedge_signature: 0,
             wedge_reported: false,
             render_ring: render_runtime::RenderRing::new(),
-            retire_log: KVec::new(),
+            // Full capacity now: retirement logs without allocating.
+            retire_log: KVec::with_capacity(render_runtime::RETIRE_LOG, GFP_KERNEL)?,
             retire_next: 0,
             handovers: {
                 let mut v = KVec::new();
@@ -811,6 +814,7 @@ impl Bootstrap {
             core_mask: platform.core_mask,
             maximum_frequency_khz: platform.max_frequency() * 1000,
             tvb_pools: KVec::new(),
+            encodings: render_runtime::Encodings::new()?,
             render_publication: crate::module_parameters::fw_counter_start.value(),
             diagnostics,
             next_work_va: render_runtime::WORK_BASE,
