@@ -292,7 +292,9 @@ impl AddressSpace {
 
     /// Allocate tiler blocks from the shared private aperture. Before mapping,
     /// failure leaves both existing backing and the arena reservation untouched.
-    pub(crate) fn alloc_tvb_blocks(&mut self, count: usize) -> Result<Option<u64>> {
+    /// `gfp` comes from the caller: TVB growth must not enter reclaim. Page
+    /// tables for the new range are still allocated by `map_pages`.
+    pub(crate) fn alloc_tvb_blocks(&mut self, count: usize, gfp: kernel::alloc::Flags) -> Result<Option<u64>> {
         if count == 0 || count > crate::g16_tvb::MAX_BLOCKS as usize {
             return Err(EINVAL);
         }
@@ -302,7 +304,7 @@ impl AddressSpace {
         };
         let base = range.start;
         let mut pages = KVec::new();
-        if pages.reserve(count * 8, GFP_KERNEL).is_err() {
+        if pages.reserve(count * 8, gfp).is_err() {
             return Ok(None);
         }
         for block in 0..count {
@@ -313,16 +315,16 @@ impl AddressSpace {
                 }
             }
             for va in (start..start + 0x20000).step_by(UAT_PGSZ) {
-                let page = match Page::alloc_page(GFP_KERNEL | __GFP_ZERO) {
+                let page = match Page::alloc_page(gfp | __GFP_ZERO) {
                     Ok(page) => page,
                     Err(_) => return Ok(None),
                 };
                 clean_page(&page);
-                let node = match RBTreeNode::new(va, page, GFP_KERNEL) {
+                let node = match RBTreeNode::new(va, page, gfp) {
                     Ok(node) => node,
                     Err(_) => return Ok(None),
                 };
-                pages.push(node, GFP_KERNEL)?;
+                pages.push_within_capacity(node).map_err(|_| EIO)?;
             }
         }
         // Transfer every preallocated node before the first fallible PTE edit.

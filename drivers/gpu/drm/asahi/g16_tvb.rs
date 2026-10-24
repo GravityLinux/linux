@@ -8,6 +8,7 @@ use crate::{
     pgtable::prot,
 };
 use kernel::prelude::*;
+use kernel::alloc::flags::{GFP_NOWAIT, __GFP_NOWARN};
 
 // Match the capacity already advertised in the buffer-manager metadata. The
 // default budget is one third of this, as in Apple8's non-memoryless path.
@@ -156,11 +157,17 @@ impl Tvb {
         // After mapping starts, any error requires retaining the context/reset.
         let mut entries = KVec::new();
         let base = loop {
+            // This answers a firmware request from the fence-signalling path,
+            // so it must not enter reclaim. Nor use the atomic reserves: a block is
+            // 128 KiB, and the emergency reserves belong to interrupt-context
+            // allocators when memory is tight. A failure refuses the render,
+            // which then finishes under its memory limit.
+            let gfp = GFP_NOWAIT | __GFP_NOWARN;
             if entries
-                .extend_with((new - old) as usize * 8, 0u8, GFP_KERNEL)
+                .extend_with((new - old) as usize * 8, 0u8, gfp)
                 .is_ok()
             {
-                if let Some(base) = client.alloc_tvb_blocks((new - old) as usize)? {
+                if let Some(base) = client.alloc_tvb_blocks((new - old) as usize, gfp)? {
                     break base;
                 }
                 entries.clear();
