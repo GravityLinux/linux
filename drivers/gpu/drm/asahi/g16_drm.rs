@@ -1844,6 +1844,41 @@ impl crate::g16_queue_fail::QueueJob for Running {
 /// lists are preallocated to it: run_job and the worker never allocate.
 const JOB_CREDITS: u32 = 128;
 
+impl<T> crate::g16_finished::Bounded<T> for KVec<T> {
+    fn len(&self) -> usize {
+        KVec::len(self)
+    }
+    fn capacity(&self) -> usize {
+        KVec::capacity(self)
+    }
+    fn get_at(&self, index: usize) -> Option<&T> {
+        self.get(index)
+    }
+    fn remove_at(&mut self, index: usize) -> Option<T> {
+        self.remove(index).ok()
+    }
+    fn push_within(&mut self, value: T) -> core::result::Result<(), T> {
+        self.push_within_capacity(value).map_err(|e| e.0)
+    }
+    fn insert_within(&mut self, index: usize, value: T) -> core::result::Result<(), T> {
+        use kernel::alloc::kvec::InsertError;
+        self.insert_within_capacity(index, value).map_err(|e| match e {
+            InsertError::IndexOutOfBounds(value) | InsertError::OutOfCapacity(value) => value,
+        })
+    }
+}
+
+static FINISHED_FULL: AtomicBool = AtomicBool::new(false);
+static ADMIT_FULL: AtomicBool = AtomicBool::new(false);
+
+/// A bookkeeping bound was exceeded: report it once, and let the caller defer
+/// the work rather than fail the device.
+fn warn_once(flag: &AtomicBool, what: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        pr_warn!("G16: {} (bound JOB_CREDITS = {})\n", what, JOB_CREDITS);
+    }
+}
+
 struct Engine {
     cursor: usize,
     jobs: KVec<Running>,
@@ -1859,34 +1894,20 @@ struct Inbox {
 }
 
 impl Engine {
-    /// The finished jobs, in the engine's reusable list. Return it with
-    /// `return_finished` once drained.
-    fn take_finished(&mut self) -> KVec<Running> {
-        // Holds every job: both lists have JOB_CREDITS capacity.
-        let mut finished = core::mem::take(&mut self.finished);
-        let mut index = 0;
-        while index < self.jobs.len() {
-            let job = &self.jobs[index];
-            if job.pending == 0
-                && (job.error.is_some() || job.next == job.execution.parameters.len())
-            {
-                let job = self.jobs.remove(index).expect("index in range");
-                finished.push_within_capacity(job).map_err(|_| ())
-                    .expect("JOB_CREDITS capacity holds every job");
-            } else {
-                index += 1;
-            }
+    /// Move the finished jobs into `self.finished`, in order. The list keeps its
+    /// JOB_CREDITS capacity: the caller takes it only to signal its jobs and
+    /// puts it back. A job that does not fit (an accounting bug: both lists
+    /// have JOB_CREDITS capacity) stays in `jobs` for a later pass.
+    fn take_finished(&mut self) {
+        let done = |job: &Running| {
+            job.pending == 0 && (job.error.is_some() || job.next == job.execution.parameters.len())
+        };
+        if !crate::g16_finished::collect(&mut self.jobs, &mut self.finished, done) {
+            warn_once(&FINISHED_FULL, "finished list full; signalling deferred");
         }
         // Removal shifts later entries; keep the admission cursor valid.
         if self.cursor > self.jobs.len() {
             self.cursor = 0;
-        }
-        finished
-    }
-
-    fn return_finished(&mut self, finished: KVec<Running>) {
-        if finished.capacity() >= self.finished.capacity() {
-            self.finished = finished;
         }
     }
 
@@ -1895,12 +1916,20 @@ impl Engine {
     /// error path to fail.
     fn admit(&mut self, inbox: &Mutex<Inbox>) -> Result {
         let mut inbox = inbox.lock();
-        // Inbox and engine together hold at most JOB_CREDITS jobs.
-        if self.jobs.capacity() - self.jobs.len() < inbox.jobs.len() {
-            return Err(EIO);
+        // Inbox and engine together hold at most JOB_CREDITS jobs. If that ever
+        // fails, admit what fits and leave the rest queued for a later pass.
+        let room = self.jobs.capacity() - self.jobs.len();
+        if room < inbox.jobs.len() {
+            warn_once(&ADMIT_FULL, "engine job list full; admission deferred");
         }
-        for job in inbox.jobs.drain_all() {
-            self.jobs.push_within_capacity(job).map_err(|_| EIO)?;
+        // Oldest first, removed in place: the inbox keeps its capacity.
+        for _ in 0..room.min(inbox.jobs.len()) {
+            let job = inbox.jobs.remove(0).map_err(|_| EIO)?;
+            if let Err(job) = self.jobs.push_within_capacity(job) {
+                // Unreachable within `room`; keep the job queued.
+                let _ = inbox.jobs.insert_within_capacity(0, job.0);
+                break;
+            }
         }
         Ok(())
     }
@@ -2040,20 +2069,21 @@ impl WorkItem for Execution {
             // Signal every finished job before admitting more work, with the
             // locks dropped: a completed fence must not wait behind a
             // publication pass. Upstream signals from its event path.
-            let mut finished = if result.is_ok() {
-                engine.take_finished()
-            } else {
-                KVec::new()
-            };
-            let signalled = !finished.is_empty();
+            if result.is_ok() {
+                engine.take_finished();
+            }
+            let signalled = !engine.finished.is_empty();
             if signalled {
+                // Out of the engine only while its jobs are signalled with the
+                // locks dropped; always put back, keeping its capacity.
+                let mut finished = core::mem::take(&mut engine.finished);
                 drop(runtime);
                 drop(engine);
                 for job in finished.drain_all() {
                     this.signal_finished(job);
                 }
                 engine = this.device.engine.lock();
-                engine.return_finished(finished);
+                engine.finished = finished;
                 runtime = this.device.runtime.lock();
             }
             let result = result.and_then(|progress| (|| -> Result<bool> {

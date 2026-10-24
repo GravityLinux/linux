@@ -12,6 +12,7 @@ mod g16_compute;
 mod g16_deferred;
 mod g16_drain;
 mod g16_drm;
+mod g16_finished;
 mod g16_fw;
 mod g16_platform;
 mod g16_power;

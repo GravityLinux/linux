@@ -80,4 +80,23 @@ assert 'events.reserve(65, GFP_KERNEL)?' in submit and 'renders + computes == 64
 assert 'job.history.take()' in function(drm, 'run(job: &mut sched::Job<Self>)')
 checks += 1
 
+# The reusable finished list (the p2 boot panic, 2026-10-24): take_finished
+# collects in place, and the worker takes the list only to signal its jobs and
+# always puts it back before relocking; a pass that found nothing must not
+# lose its capacity.
+take = function(drm, 'take_finished(')
+assert 'core::mem::take' not in take and 'g16_finished::collect(&mut self.jobs, &mut self.finished' in take
+assert worker.count('core::mem::take(&mut engine.finished)') == 1
+block = worker[worker.index('let signalled = !engine.finished.is_empty();'):]
+block = block[:block.index('let result = result.and_then')]
+assert re.search(r'if signalled \{[\s\S]*core::mem::take\(&mut engine\.finished\)[\s\S]*'
+                 r'engine = this\.device\.engine\.lock\(\);\s*engine\.finished = finished;\s*'
+                 r'runtime = this\.device\.runtime\.lock\(\);\s*\}', block)
+checks += 1
+# A bound exceeded is deferred and warned once, never a panic.
+for name, body in [('take_finished', take), ('admit', function(drm, 'admit(')),
+                   ('run_job', function(drm, 'run(job: &mut sched::Job<Self>)'))]:
+    assert '.expect(' not in body and 'panic!' not in body and '.unwrap()' not in body, name
+checks += 1
+
 print(f'test-bounded-flights: {checks} checks passed')
