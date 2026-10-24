@@ -5,6 +5,11 @@ The default is **0 and must remain 0**. No capability bit or execution UAPI
 is provided. The paired stream starts with complete native object/mesh state.
 The decoder runs only with the option enabled; ordinary streams are identified
 by their first packet, without searching their contents for native state.
+In a nonzero mode, that first word is read before waiting for the render's
+producers. An ordinary first word publishes the render exactly as at mode 0,
+with no CPU wait. Only a native header, or an unreadable first word, waits for
+the producers and then decodes the whole stream. That relies on userspace
+writing native headers on the CPU before SUBMIT.
 
 The admitted class has physical T16 or T32 mesh execution, one direct object dispatch,
 four-vertex storage and one triangle primitive. It supports 4–128 per-vertex

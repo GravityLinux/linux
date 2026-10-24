@@ -41,7 +41,13 @@ runtime_expr = r'g16_mesh::Mode::from_parameter\(g16_mesh::mode\(\)\)\s*\.ok_or\
 assert re.search(mode_expr, bootstrap)
 assert re.search(r'let native =\s*' + runtime_expr + r'\s*\.enabled\(\);', runtime)
 assert re.search(r'if lease\.native\s*\{\s*render::initialize_native_support', runtime)
-assert re.search(r'let mesh_mode =\s*' + runtime_expr + r';\s*let params = if mesh_mode.enabled\(\)', runtime)
+assert re.search(r'let mesh_mode =\s*' + runtime_expr + r';[\s\S]*?let params = if mesh_mode.enabled\(\)', runtime)
+# The unwaited peek comes first: only a possibly native (or unreadable) first
+# word reaches the producer-stamp wait and the decode.
+assert re.search(r'let params = if mesh_mode\.enabled\(\)\s*&& owner\.lock\(\)\.command_word\(params\.encoder\)'
+                 r'\.map_or\(true, g16_mesh::may_be_native\)\s*\{', runtime)
+peek = runtime.index('g16_mesh::may_be_native)')
+assert peek < runtime.index('return Err(EBUSY);', peek) < runtime.index('g16_mesh::decode(params.encoder, mesh_mode,', peek)
 assert re.search(r'params\.mesh\.is_some\(\) && !support\.native', runtime)
 assert 'native_mesh.value()' not in runtime
 mesh = (driver / 'g16_mesh.rs').read_text()

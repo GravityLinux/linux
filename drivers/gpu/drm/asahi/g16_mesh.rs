@@ -88,6 +88,17 @@ pub(crate) enum DecodeError {
 /// Mode 3 replaces the state check with `research_state` and also admits point
 /// and line draws; the stream structure and object dispatch rules are mode 2's.
 /// The packet budget bounds malformed streams, including a missing terminator.
+/// The first word of a native object/mesh stream.
+const NATIVE_HEADER: u32 = 0x4000_0d2c;
+
+/// Whether a stream starting with `header` may be native: the native header,
+/// or an unfamiliar header with the native state extension (bit 11), which
+/// `decode` rejects. Any other first word makes `decode` return `Ok(None)`
+/// without reading further, so an ordinary render needs nothing else.
+pub(crate) fn may_be_native(header: u32) -> bool {
+    header == NATIVE_HEADER || (header >> 29 == 2 && header & (1 << 11) != 0)
+}
+
 pub(crate) fn decode(
     start: u64,
     mode: Mode,
@@ -108,10 +119,10 @@ pub(crate) fn decode(
         Ok(value)
     };
     let header = next()?;
-    if header != 0x4000_0d2c {
+    if header != NATIVE_HEADER {
         // Bit 11 marks the native state extension. Reject unfamiliar native
         // layouts rather than submitting them with ordinary TA state.
-        return if header >> 29 == 2 && header & (1 << 11) != 0 {
+        return if may_be_native(header) {
             Err(DecodeError::Unsupported)
         } else {
             Ok(None)

@@ -62,9 +62,11 @@ impl AddressSpace {
         }
     }
 
-    /// Read a command word only while the execution owns its GEM mappings and
-    /// after its GPU producer dependencies have completed. Volatile access also
-    /// avoids creating Rust references to memory userspace can still write.
+    /// Read a command word only while the execution owns its GEM mappings.
+    /// A decode must also wait for the GPU producer dependencies first; the
+    /// unwaited first-word peek relies on userspace writing native headers on
+    /// the CPU (see `submit_render`). Volatile access also avoids creating Rust
+    /// references to memory userspace can still write.
     pub(crate) fn command_word(&mut self, va: u64) -> Result<u32> {
         if va & 3 != 0 {
             return Err(EINVAL);

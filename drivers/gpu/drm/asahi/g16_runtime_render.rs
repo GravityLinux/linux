@@ -92,7 +92,17 @@ impl Bootstrap {
         }
         let mut mesh_params;
         let mesh_mode = g16_mesh::Mode::from_parameter(g16_mesh::mode()).ok_or(EINVAL)?;
-        let params = if mesh_mode.enabled() {
+        // Peek at the first word without waiting for producers: an ordinary
+        // header publishes as at native_mesh=0, with no stall behind earlier
+        // work. Userspace writes a native header on the CPU before SUBMIT, and
+        // no GPU job rewrites a render's first word (Honeykrisp audit,
+        // 2026-10-24), so a stale read can only see a native header that is
+        // gone by now: that case still waits and decodes, which is
+        // authoritative. An unreadable first word also waits and then fails
+        // in the decode, as before.
+        let params = if mesh_mode.enabled()
+            && owner.lock().command_word(params.encoder).map_or(true, g16_mesh::may_be_native)
+        {
             mesh_params = *params;
             let params = &mut mesh_params;
             // These are the raw producer dependencies, before same-lane wait

@@ -584,6 +584,37 @@ fn qualified_mutations_are_rejected() {
     }
 }
 
+#[test]
+fn the_unwaited_peek_agrees_with_decode_on_every_first_word() {
+    // decode returns Ok(None) after reading only the first word exactly when
+    // may_be_native is false; otherwise it reads on (and decides only then).
+    let mut first_words: Vec<u32> = vec![0x40000d2c, 0x40000d2d, 0x40000c2c, 0x4000082c, 0x40000000, 0x5fffffff,
+                                        0, 1, 0x20000013, 0x70000600, 0xc0000000, 0x60000000, u32::MAX];
+    let mut x = 0x9e3779b9u32;
+    for _ in 0..20000 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        first_words.push(x);
+        first_words.push((x & !0xe000_0000) | 0x4000_0000);
+    }
+    for first in first_words {
+        for mode in [Mode::SingleParent, Mode::MultipleParents, Mode::Research, Mode::Qualified] {
+            let mut reads = 0;
+            let result = g16_mesh::decode(0x1000, mode, |va| {
+                reads += 1;
+                (va == 0x1000).then_some(first)
+            });
+            if g16_mesh::may_be_native(first) {
+                assert!(result.is_err() || reads > 1, "{first:#x} {mode:?}");
+            } else {
+                assert_eq!((result, reads), (Ok(None), 1), "{first:#x} {mode:?}");
+            }
+        }
+    }
+    assert!(g16_mesh::may_be_native(stream()[0]));
+}
+
 fn read32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
