@@ -327,6 +327,11 @@ impl Encodings {
     }
 }
 
+/// Most Works in flight at once. Flight bookkeeping is preallocated to this at
+/// init so publication and retirement never allocate; at the cap, admission
+/// waits for retirement (EBUSY). Logged peaks under churn are below 400.
+pub(crate) const MAX_FLIGHTS: usize = 1024;
+
 pub(crate) struct Ledger {
     lanes: KVec<LaneBook>,
     /// (lane pointers, ring head) per flight and lane.
@@ -338,8 +343,14 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    pub(crate) fn new() -> Self {
-        Self { lanes: KVec::new(), heads: KVec::new(), targets: KVec::new(), cursors: [None; 12] }
+    /// Room for `flights` flights: each adds at most two lanes, heads and targets.
+    pub(crate) fn with_capacity(flights: usize) -> Result<Self> {
+        Ok(Self {
+            lanes: KVec::with_capacity(2 * flights, GFP_KERNEL)?,
+            heads: KVec::with_capacity(2 * flights, GFP_KERNEL)?,
+            targets: KVec::with_capacity(2 * flights, GFP_KERNEL)?,
+            cursors: [None; 12],
+        })
     }
 
     fn lane(&self, pointers: u64) -> Option<&LaneBook> {
@@ -347,11 +358,14 @@ impl Ledger {
     }
 
     /// Room for one more flight, so `add` cannot fail after publication.
-    fn reserve(&mut self) -> Result {
-        self.lanes.reserve(2, GFP_KERNEL)?;
-        self.heads.reserve(2, GFP_KERNEL)?;
-        self.targets.reserve(2, GFP_KERNEL)?;
-        Ok(())
+    fn has_room(&self) -> bool {
+        [
+            (self.lanes.capacity(), self.lanes.len()),
+            (self.heads.capacity(), self.heads.len()),
+            (self.targets.capacity(), self.targets.len()),
+        ]
+        .iter()
+        .all(|&(capacity, len)| capacity - len >= 2)
     }
 
     fn add(&mut self, f: &Flight) -> Result {
@@ -1066,9 +1080,14 @@ impl Bootstrap {
                 }
             }
         }
-        self.flights.reserve(1, GFP_KERNEL)?;
-        self.ledger.reserve()?;
-        self.publications.reserve(stages.len(), GFP_KERNEL)?;
+        // Preallocated at init (MAX_FLIGHTS): at the cap, wait for retirement.
+        if self.flights.len() >= MAX_FLIGHTS
+            || !self.ledger.has_room()
+            || self.publications.capacity() - self.publications.len() < stages.len()
+        {
+            self.report_pressure(128, "flights");
+            return Err(EBUSY);
+        }
         Ok(())
     }
 
@@ -1126,16 +1145,16 @@ impl Bootstrap {
             .filter(|p| p.channel == channel)
             .count() as u32;
         let epoch = (tail + reserved) & 255;
-        self.publications.push(
-            Publication {
+        // reserve_flight checked the room.
+        self.publications
+            .push_within_capacity(Publication {
                 channel,
                 epoch,
                 lane,
                 event,
                 sequence,
-            },
-            GFP_KERNEL,
-        )?;
+            })
+            .map_err(|_| EIO)?;
         Ok(epoch)
     }
 
@@ -1578,7 +1597,10 @@ impl Bootstrap {
             let tail = guard.try_read32(0xd60060)?;
             guard.try_read32(0xd640c0)? == tail && guard.try_read32(0xd640c8)? == tail
         };
-        self.retired.reserve(self.flights.len(), GFP_KERNEL)?;
+        // Preallocated to MAX_FLIGHTS, which bounds the flights scanned here.
+        if self.retired.capacity() < self.flights.len() {
+            return Err(EIO);
+        }
         // Like upstream's per-queue event check, read each lane's stamp and
         // ring cursors once per scan and judge every flight on that lane
         // against the same snapshot: flights share a lane's stamp address
@@ -1753,7 +1775,10 @@ impl Bootstrap {
             }
             self.diagnostics.retire_next = self.diagnostics.retire_next.wrapping_add(1);
             flight.client.lock().release_scratch(flight.scratch)?;
-            self.free_work[usize::from(render_work)].push((id, root), GFP_KERNEL)?;
+            // allocate_work reserved a slot for every outstanding lease.
+            self.free_work[usize::from(render_work)]
+                .push_within_capacity((id, root))
+                .map_err(|_| EIO)?;
             self.retired.push_within_capacity((id, limited)).map_err(|_| ENOMEM)?;
         }
         crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_SCAN, scan_before);

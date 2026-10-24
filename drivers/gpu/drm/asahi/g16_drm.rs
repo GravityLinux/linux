@@ -315,14 +315,22 @@ pub(crate) fn register<'a>(
     let data = try_pin_init!(Data {
         gpu_revision: runtime.gpu_revision,
         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
-        scheduler: sched::Scheduler::new(pdev.as_ref(), 4, 128, 0, 30000, c_str!("asahi_m4"))?,
+        scheduler: sched::Scheduler::new(pdev.as_ref(), 4, JOB_CREDITS, 0, 30000, c_str!("asahi_m4"))?,
         admission <- kernel::new_mutex!(KVec::new()),
         failed: AtomicBool::new(false),
         notifications: runtime.notifications.clone(),
         _fw_mem: fw_mem,
         runtime <- kernel::new_mutex!(runtime),
-        engine <- kernel::new_mutex!(Engine { cursor: 0, jobs: KVec::new(), issued: KVec::new() }),
-        inbox <- kernel::new_mutex!(Inbox { running: false, jobs: KVec::new() }),
+        engine <- kernel::new_mutex!(Engine {
+            cursor: 0,
+            jobs: KVec::with_capacity(JOB_CREDITS as usize, GFP_KERNEL)?,
+            finished: KVec::with_capacity(JOB_CREDITS as usize, GFP_KERNEL)?,
+            issued: KVec::with_capacity(crate::g16::MAX_FLIGHTS, GFP_KERNEL)?,
+        }),
+        inbox <- kernel::new_mutex!(Inbox {
+            running: false,
+            jobs: KVec::with_capacity(JOB_CREDITS as usize, GFP_KERNEL)?,
+        }),
         timeline,
         _profile: profile,
         _maint: maint,
@@ -1831,9 +1839,17 @@ impl crate::g16_queue_fail::QueueJob for Running {
     }
 }
 
+/// Scheduler credits; each job takes one, so at most this many jobs are ever
+/// between run_job and their fence signalling. The inbox and the engine's job
+/// lists are preallocated to it: run_job and the worker never allocate.
+const JOB_CREDITS: u32 = 128;
+
 struct Engine {
     cursor: usize,
     jobs: KVec<Running>,
+    /// take_finished's reusable output (empty between passes).
+    finished: KVec<Running>,
+    /// One entry per published Work, bounded like the flights (MAX_FLIGHTS).
     issued: KVec<Issued>,
 }
 struct Inbox {
@@ -1843,12 +1859,11 @@ struct Inbox {
 }
 
 impl Engine {
-    /// Collect without removing anything if allocation fails, as before.
+    /// The finished jobs, in the engine's reusable list. Return it with
+    /// `return_finished` once drained.
     fn take_finished(&mut self) -> KVec<Running> {
-        let mut finished = KVec::new();
-        if finished.reserve(self.jobs.len(), GFP_KERNEL).is_err() {
-            return finished;
-        }
+        // Holds every job: both lists have JOB_CREDITS capacity.
+        let mut finished = core::mem::take(&mut self.finished);
         let mut index = 0;
         while index < self.jobs.len() {
             let job = &self.jobs[index];
@@ -1857,7 +1872,7 @@ impl Engine {
             {
                 let job = self.jobs.remove(index).expect("index in range");
                 finished.push_within_capacity(job).map_err(|_| ())
-                    .expect("reserved for every job");
+                    .expect("JOB_CREDITS capacity holds every job");
             } else {
                 index += 1;
             }
@@ -1869,15 +1884,23 @@ impl Engine {
         finished
     }
 
-    /// Take the jobs drm_sched has run since the last pass, in order.
-    /// On failure the jobs stay in the inbox for the error path to fail.
+    fn return_finished(&mut self, finished: KVec<Running>) {
+        if finished.capacity() >= self.finished.capacity() {
+            self.finished = finished;
+        }
+    }
+
+    /// Take the jobs drm_sched has run since the last pass, in order. The
+    /// inbox keeps its capacity. On failure the jobs stay in the inbox for the
+    /// error path to fail.
     fn admit(&mut self, inbox: &Mutex<Inbox>) -> Result {
         let mut inbox = inbox.lock();
-        self.jobs.reserve(inbox.jobs.len(), GFP_KERNEL)?;
-        let incoming = core::mem::take(&mut inbox.jobs);
-        drop(inbox);
-        for job in incoming {
-            self.jobs.push_within_capacity(job).map_err(|_| ENOMEM)?;
+        // Inbox and engine together hold at most JOB_CREDITS jobs.
+        if self.jobs.capacity() - self.jobs.len() < inbox.jobs.len() {
+            return Err(EIO);
+        }
+        for job in inbox.jobs.drain_all() {
+            self.jobs.push_within_capacity(job).map_err(|_| EIO)?;
         }
         Ok(())
     }
@@ -2030,6 +2053,7 @@ impl WorkItem for Execution {
                     this.signal_finished(job);
                 }
                 engine = this.device.engine.lock();
+                engine.return_finished(finished);
                 runtime = this.device.runtime.lock();
             }
             let result = result.and_then(|progress| (|| -> Result<bool> {
@@ -2069,7 +2093,8 @@ impl WorkItem for Execution {
                             let previous = firmware.last;
                             drop(firmware);
                             for (history, stamp) in job.history.iter_mut().zip(previous) {
-                                history.push(stamp, GFP_KERNEL)?;
+                                // SUBMIT reserved 65: at most 64 commands plus this one.
+                                history.push_within_capacity(stamp).map_err(|_| EIO)?;
                             }
                         }
                         let dependencies =
@@ -2079,7 +2104,6 @@ impl WorkItem for Execution {
                             matches!(execution.parameters[job.next], Parameters::Compute(_));
                         // Intra-queue UAPI dependencies are encoded into firmware
                         // rings; preparation does not read GPU-produced data.
-                        engine.issued.reserve(1, GFP_KERNEL)?;
                         let job = &mut engine.jobs[index];
                         crate::mem::sync();
                         let injected = crate::g16_timeline::take_injection(
@@ -2129,7 +2153,9 @@ impl WorkItem for Execution {
                             }
                             Err(error) => return Err(error),
                         };
-                        job.history[usize::from(compute)].push(Some(receipt.stamp), GFP_KERNEL)?;
+                        job.history[usize::from(compute)]
+                            .push_within_capacity(Some(receipt.stamp))
+                            .map_err(|_| EIO)?;
                         let issued = Issued {
                             id: receipt.id,
                             owner: execution.id,
@@ -2143,7 +2169,9 @@ impl WorkItem for Execution {
                         }
                         job.next += 1;
                         job.pending += 1;
-                        engine.issued.push(issued, GFP_KERNEL)?;
+                        // One entry per flight, and reserve_flight keeps
+                        // flights below MAX_FLIGHTS: always room.
+                        engine.issued.push_within_capacity(issued).map_err(|_| EIO)?;
                         // Resume after the last admitted job when a scarce slot
                         // becomes free, rather than repeatedly favoring index zero.
                         engine.cursor = index + 1;
@@ -2247,10 +2275,15 @@ impl PinnedDrop for Execution {
 
 struct SubmissionJob {
     execution: Arc<Execution>,
+    /// The job's publication history, allocated by SUBMIT so run_job does not
+    /// allocate (it is in the fence-signalling path).
+    history: Option<[KVec<Option<crate::g16::Stamp>>; 2]>,
 }
 
 impl sched::JobImpl for SubmissionJob {
     fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
+        // SUBMIT allocated it; run_job runs once per job.
+        let history = job.history.take();
         let execution = &job.execution;
         if crate::module_parameters::timeline.value() != 0 {
             execution.trace.run.store(ticks(), Ordering::Relaxed);
@@ -2260,12 +2293,8 @@ impl sched::JobImpl for SubmissionJob {
             return Err(EIO);
         }
         let fence = execution.completion.clone();
-        // Allocate before taking the inbox lock: it is held only to append.
         let running = (|| -> Result<Running> {
-            let mut history = [KVec::new(), KVec::new()];
-            for events in &mut history {
-                events.reserve(65, GFP_KERNEL)?;
-            }
+            let history = history.ok_or(EIO)?;
             Ok(Running {
                 execution: execution.clone(),
                 next: 0,
@@ -2284,7 +2313,8 @@ impl sched::JobImpl for SubmissionJob {
             })
         })();
         let mut inbox = execution.device.inbox.lock();
-        if let Err(error) = running.and_then(|r| inbox.jobs.push(r, GFP_KERNEL).map_err(Into::into)) {
+        // JOB_CREDITS capacity: drm_sched never runs more jobs than that at once.
+        if let Err(error) = running.and_then(|r| inbox.jobs.push_within_capacity(r).map_err(|_| EIO)) {
             drop(inbox);
             execution.completion.set_error(error);
             let _ = execution.completion.signal();
@@ -2674,7 +2704,13 @@ impl File {
             .iter_mut()
             .find(|q| q.id == data.queue_id)
             .ok_or(ENOENT)?;
-        let mut job = queue.entity.new_job(1, SubmissionJob { execution })?;
+        let mut history = [KVec::new(), KVec::new()];
+        // One entry per command (at most 64, checked above) plus the queue's
+        // previous stamp: run_job and the worker never grow them.
+        for events in &mut history {
+            events.reserve(65, GFP_KERNEL)?;
+        }
+        let mut job = queue.entity.new_job(1, SubmissionJob { execution, history: Some(history) })?;
         for fence in dependencies {
             job.add_dependency(fence)?;
         }

@@ -196,7 +196,7 @@ impl rtkit::Operations for BootOps {
 /// No render node is published until the submission backend is available.
 #[path = "g16_runtime.rs"]
 mod render_runtime;
-pub(crate) use render_runtime::{FirmwareQueues, Stamp, Support};
+pub(crate) use render_runtime::{FirmwareQueues, Stamp, Support, MAX_FLIGHTS};
 
 #[path = "g16_notify.rs"]
 mod notify;
@@ -829,10 +829,10 @@ impl Bootstrap {
             destroying_queues: KVec::new(),
             free_queues: KVec::new(),
             render_failed: false,
-            flights: KVec::new(),
-            retired: KVec::new(),
-            publications: KVec::new(),
-            ledger: KBox::new(render_runtime::Ledger::new(), GFP_KERNEL)?,
+            flights: KVec::with_capacity(render_runtime::MAX_FLIGHTS, GFP_KERNEL)?,
+            retired: KVec::with_capacity(render_runtime::MAX_FLIGHTS, GFP_KERNEL)?,
+            publications: KVec::with_capacity(2 * render_runtime::MAX_FLIGHTS, GFP_KERNEL)?,
+            ledger: KBox::new(render_runtime::Ledger::with_capacity(render_runtime::MAX_FLIGHTS)?, GFP_KERNEL)?,
             progress: None,
             batch_works: 0,
             context_roots: [None; 64],
