@@ -3159,6 +3159,37 @@ impl Bootstrap {
                     use core::sync::atomic::Ordering::Relaxed;
                     tl::TVB_REQUESTS.fetch_add(1, Relaxed);
                     if grown { &tl::TVB_GROWN } else { &tl::TVB_REFUSED }.fetch_add(1, Relaxed);
+                    if !grown {
+                        let reason = pool.refusal.unwrap_or(crate::g16_tvb::Refusal::Memory);
+                        match reason {
+                            crate::g16_tvb::Refusal::Cap => &tl::TVB_REFUSED_CAP,
+                            crate::g16_tvb::Refusal::Va => &tl::TVB_REFUSED_VA,
+                            crate::g16_tvb::Refusal::Memory => &tl::TVB_REFUSED_MEMORY,
+                        }
+                        .fetch_add(1, Relaxed);
+                        if !pool.warned {
+                            pool.warned = true;
+                            // Warn for the first refusal of the boot only: CTS
+                            // performance cases refuse in every process.
+                            if !crate::g16_tvb::REFUSAL_WARNED.swap(true, Relaxed) {
+                                dev_warn!(
+                                    self.dev.as_ref(),
+                                    "G16: TVB slot {} growth refused at {} blocks ({}); its renders throttle until pages free (later pools: info)\n",
+                                    pool.addresses.buffer_manager_slot,
+                                    pool.blocks,
+                                    reason.name()
+                                );
+                            } else {
+                                dev_info!(
+                                    self.dev.as_ref(),
+                                    "G16: TVB slot {} growth refused at {} blocks ({})\n",
+                                    pool.addresses.buffer_manager_slot,
+                                    pool.blocks,
+                                    reason.name()
+                                );
+                            }
+                        }
+                    }
                 }
                 dev_info!(
                     self.dev.as_ref(),

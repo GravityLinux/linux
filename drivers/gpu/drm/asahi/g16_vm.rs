@@ -319,6 +319,12 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// TVB blocks that still fit in the render arena's free VA (each block
+    /// reserves 0x28000). Scratch shares the arena from its other end.
+    pub(crate) fn tvb_va_blocks(&self) -> u32 {
+        (self.render_arena.free() / 0x28000).min(u64::from(u32::MAX)) as u32
+    }
+
     /// Allocate tiler blocks from the shared private aperture. Before mapping,
     /// failure leaves both existing backing and the arena reservation untouched.
     /// `gfp` comes from the caller: TVB growth must not enter reclaim. Page

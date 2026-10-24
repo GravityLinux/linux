@@ -14,6 +14,32 @@ use kernel::alloc::flags::{GFP_NOWAIT, __GFP_NOWARN};
 // default budget is one third of this, as in Apple8's non-memoryless path.
 pub(crate) const MAX_BLOCKS: u32 = 6579;
 
+/// Why a growth request was refused (debugfs dep_stats counters and the
+/// pool's one-time warning). At any of these the firmware re-requests about
+/// every 355 ms until pages free up, so renders crawl (2026-10-24).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Refusal {
+    /// At tvb_max_blocks.
+    Cap,
+    /// The VM's render arena has no VA for another block.
+    Va,
+    /// A non-reclaiming allocation failed.
+    Memory,
+}
+
+/// Set by the first refusal of the boot, which alone is a warning.
+pub(crate) static REFUSAL_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+impl Refusal {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Cap => "at tvb_max_blocks",
+            Self::Va => "render arena VA full",
+            Self::Memory => "allocation failed",
+        }
+    }
+}
+
 /// Scene records initialized in the pool (render::Addresses::private_page).
 /// Each lease owns a distinct cursor and 48-byte scene record.
 const SCENES: u32 = 80;
@@ -26,6 +52,9 @@ pub(crate) struct Tvb {
     pub(crate) counter: u32,
     submissions: u32,
     pub(crate) refused: bool,
+    /// The reason of the last refusal, and whether the pool already warned.
+    pub(crate) refusal: Option<Refusal>,
+    pub(crate) warned: bool,
     scenes: u128,
     next_scene: u32,
 }
@@ -77,6 +106,8 @@ impl Tvb {
             counter: 0,
             submissions: 0,
             refused: false,
+            refusal: None,
+            warned: false,
             scenes: 0,
             next_scene: 0,
         })
@@ -151,6 +182,7 @@ impl Tvb {
             return Err(EIO);
         }
         if new == old {
+            self.refusal = Some(Refusal::Cap);
             return Ok(false);
         }
         // Allocation is all-or-nothing before publishing any leaf or list entry.
@@ -176,6 +208,11 @@ impl Tvb {
             // smaller allocation before asking firmware to partially render.
             let add = new - old;
             if add == 1 {
+                self.refusal = Some(if client.tvb_va_blocks() == 0 {
+                    Refusal::Va
+                } else {
+                    Refusal::Memory
+                });
                 return Ok(false);
             }
             new = old + add / 2;

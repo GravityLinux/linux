@@ -32,6 +32,11 @@ impl Arena {
         Some(start..end)
     }
 
+    /// Bytes not yet taken from either end.
+    pub(crate) fn free(&self) -> u64 {
+        self.remaining.end.saturating_sub(self.remaining.start)
+    }
+
     pub(crate) fn alloc_back(&mut self, size: u64, align: u64) -> Option<Range<u64>> {
         if size == 0 || !align.is_power_of_two() {
             return None;

@@ -57,6 +57,7 @@ for name in ('g16_render', 'g16_stamp', 'g16_mesh'):
     fixture += f'#[path = "{driver / (name + ".rs")}"] mod {name};\n'
 fixture += 'use g16_render as render;\n'
 fixture += re.search(r'const SCENES: u32 = .*?;', tvb).group() + '\n'
+fixture += '#[allow(dead_code)]\n' + item(tvb, r'pub\(crate\) enum Refusal') + '\n'
 fixture += '#[derive(Default)]\n' + item(tvb, r'pub\(crate\) struct Tvb')
 fixture += '\nimpl Tvb {\n'
 for name in ('reserve_scene', 'release_scene', 'work_addresses'):

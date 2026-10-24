@@ -36,7 +36,7 @@ assert 'client.alloc_tvb_blocks((new - old) as usize, gfp)?' in grow
 assert re.search(r'extend_with\(\(new - old\) as usize \* 8, 0u8, gfp\)', grow)
 checks += 1
 # The fallback: halve, then refuse at one block.
-assert re.search(r'if add == 1 \{\s*return Ok\(false\);\s*\}\s*new = old \+ add / 2;', grow)
+assert re.search(r'if add == 1 \{\s*self\.refusal = Some\(.*?\);\s*return Ok\(false\);\s*\}\s*new = old \+ add / 2;', grow, re.S)
 checks += 1
 # Every allocation in alloc_tvb_blocks takes the caller's flags; none fails the context.
 assert 'Page::alloc_page(gfp | __GFP_ZERO)' in blocks and 'RBTreeNode::new(va, page, gfp)' in blocks
