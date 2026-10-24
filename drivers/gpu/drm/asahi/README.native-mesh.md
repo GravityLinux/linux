@@ -101,6 +101,27 @@ which is the study's largest payload. The firmware TA size and gate are the
 fixed mesh values from modes 1 and 2. Whether they hold for wider shapes is a
 device question, so admission here is not GPU qualification.
 
+## Qualified classes (`native_mesh=4`)
+
+Mode 4 admits exactly the 31 device-qualified native-index classes of Mesa's
+`hk_apple9_native_index_shapes.def` and nothing else from mode 3's research
+model. Those are position-only, taskless triangle mesh classes at physical T16
+or T32, with the single-parent object dispatch they were qualified with:
+(16, 1, 1), as Honeykrisp emits it, or the scalar (1, 1, 1) carrier of the
+qualification fixtures.
+- **The state check:** four position planes (`0x504`), no primitive data
+  (`0x10`), no primitive components, one triangle draw (`0x70000600`), and total
+  = local = (16, 1, 1) or (1, 1, 1).
+- **The layout:** one of the 29 `(mesh width, primitive word, vertex rows)`
+  layouts in `g16_mesh::QUALIFIED`. The kernel sees vertices only as ceil(V / 4)
+  quads, so V3 and V4 share a layout at P1 and P2, and the exact class is
+  Mesa's.
+- **Excluded:** T16V16P16, physical W64, point and line draws, primitive data
+  and multi-parent dispatch.
+
+It is the only mode intended for a production default. That needs device
+qualification at mode 4, not mode 3.
+
 ## Switching at runtime
 
 The boot value only sets the initial state. As root, with debugfs mounted:

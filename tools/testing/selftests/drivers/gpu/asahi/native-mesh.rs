@@ -22,12 +22,13 @@ fn mode_values_keep_disabled_and_single_parent_behavior_explicit() {
         (1, Mode::SingleParent),
         (2, Mode::MultipleParents),
         (3, Mode::Research),
+        (4, Mode::Qualified),
     ] {
         let mode = Mode::from_parameter(value).unwrap();
         assert_eq!(mode, expected);
         assert_eq!(mode.enabled(), value != 0);
     }
-    for value in [4, 5, 255, u32::MAX] {
+    for value in [5, 6, 255, u32::MAX] {
         assert_eq!(Mode::from_parameter(value), None);
     }
     assert_eq!(
@@ -478,6 +479,107 @@ fn research_mode_admits_physical_w64_only_for_the_probe_shape() {
             let mut bad = words.clone();
             bad[11] = state;
             assert_eq!(decode_mode(&bad, Mode::Research), REJECT);
+        }
+    }
+}
+
+// The 31 qualified classes, (physical width, maximum V, maximum P), in
+// Mesa's hk_apple9_native_index_shapes.def order.
+const QUALIFIED_CLASSES: [(u32, u32, u32); 31] = [
+    (16, 3, 1), (16, 3, 2), (16, 3, 3), (16, 3, 4), (16, 3, 5), (16, 3, 6), (16, 3, 7), (16, 3, 8),
+    (16, 3, 11), (16, 3, 17), (16, 3, 20), (16, 3, 21), (16, 4, 1), (16, 4, 2), (16, 6, 2), (16, 8, 3),
+    (16, 8, 5), (16, 8, 8), (16, 16, 4), (16, 16, 8), (16, 16, 17), (16, 16, 21), (32, 3, 1), (32, 24, 3),
+    (32, 24, 17), (32, 24, 31), (32, 24, 32), (32, 32, 16), (32, 32, 32), (32, 32, 41), (32, 32, 42),
+];
+fn width_word(width: u32) -> u32 {
+    if width == 16 { 0x400810 } else { 0x400820 }
+}
+fn qualified_stream(width: u32, vertices: u32, primitives: u32) -> Vec<u32> {
+    let mut words = research(4, primitives, vertices.div_ceil(4), 0, 0x70000600);
+    words[11] = width_word(width);
+    words
+}
+
+#[test]
+fn qualified_mode_admits_the_31_classes() {
+    for (t, v, p) in QUALIFIED_CLASSES {
+        // The scalar fixture carrier and Honeykrisp's (16, 1, 1) single parent.
+        for local in [1, 16] {
+            let mut words = qualified_stream(t, v, p);
+            words[18..24].copy_from_slice(&[local, 1, 1, local, 1, 1]);
+            assert_eq!(decode_mode(&words, Mode::Qualified), ACCEPT, "T{t}V{v}P{p} local {local}");
+            // The research mode they were qualified under admits them too.
+            assert_eq!(decode_mode(&words, Mode::Research), ACCEPT, "T{t}V{v}P{p} local {local}");
+        }
+    }
+}
+
+#[test]
+fn qualified_mode_admits_nothing_else_from_the_research_model() {
+    let layout = |t: u32, q: u32, p: u32| {
+        QUALIFIED_CLASSES.iter().any(|&(ct, cv, cp)| ct == t && cv.div_ceil(4) == q && cp == p)
+    };
+    let mut admitted = 0;
+    for t in [16, 32] {
+        for planes in [4, 5, 8] {
+            for components in [0, 1] {
+                for quads in 1..=10 {
+                    for p in 1..=64 {
+                        for draw in DRAWS {
+                            let mut words = research(planes, p, quads, components, draw);
+                            words[11] = width_word(t);
+                            if components > 0 && planes < 5 {
+                                continue;
+                            }
+                            let expected = planes == 4 && components == 0 && draw == 0x70000600 && layout(t, quads, p);
+                            let result = decode_mode(&words, Mode::Qualified);
+                            assert_eq!(result, if expected { ACCEPT } else { REJECT },
+                                       "T{t} n{planes} C{components} q{quads} P{p} draw {draw:#x}");
+                            admitted += usize::from(expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 29 layouts: V3 and V4 share one at P1 and P2.
+    assert_eq!(admitted, 29);
+    // Excluded on purpose: T16V16P16, W64 and multi-parent dispatch.
+    assert_eq!(decode_mode(&qualified_stream(16, 16, 16), Mode::Qualified), REJECT);
+    let mut w64 = research(4, 1, 1, 0, 0x70000600);
+    w64[11] = 0x400840;
+    assert_eq!(decode_mode(&w64, Mode::Research), ACCEPT);
+    assert_eq!(decode_mode(&w64, Mode::Qualified), REJECT);
+    // Multiple parents (scalar or T16), and the T32 local size, stay rejected.
+    for dispatch in [[2, 1, 1, 1, 1, 1], [32, 1, 1, 16, 1, 1], [16, 2, 1, 16, 1, 1], [32, 1, 1, 32, 1, 1], [64, 1, 1, 32, 1, 1]] {
+        let mut words = qualified_stream(16, 3, 1);
+        words[18..24].copy_from_slice(&dispatch);
+        assert_eq!(decode_mode(&words, Mode::Qualified), REJECT, "dispatch {dispatch:?}");
+    }
+}
+
+#[test]
+fn qualified_mutations_are_rejected() {
+    for (t, v, p) in QUALIFIED_CLASSES {
+        let words = qualified_stream(t, v, p);
+        for index in 1..words.len() {
+            for flip in [1u32, 0x10, 0x100, 0x10000, 0x80000000] {
+                let mut bad = words.clone();
+                bad[index] ^= flip;
+                let result = decode_mode(&bad, Mode::Qualified);
+                if result != ACCEPT {
+                    continue;
+                }
+                // Only a flip that lands on another qualified layout may pass,
+                // or one outside the state, draw and dispatch: launch handles
+                // (words 5..8, consumed as submitted) and the PPP update and
+                // coherency barrier (words 14..16), which every mode accepts
+                // alike, as the research mode confirms.
+                let other = QUALIFIED_CLASSES.iter().any(|&(ct, cv, cp)| qualified_stream(ct, cv, cp) == bad);
+                let structural = (5..=8).contains(&index)
+                    || ((14..=16).contains(&index) && decode_mode(&bad, Mode::Research) == ACCEPT);
+                assert!(other || structural, "T{t}V{v}P{p} word {index} ^ {flip:#x}");
+            }
         }
     }
 }

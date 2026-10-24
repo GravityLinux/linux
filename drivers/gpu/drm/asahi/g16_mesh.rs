@@ -16,7 +16,7 @@ pub(crate) static NATIVE_MESH: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
 /// The highest accepted `native_mesh` value.
-pub(crate) const MAX_MODE: u32 = 3;
+pub(crate) const MAX_MODE: u32 = 4;
 
 pub(crate) fn mode() -> u32 {
     NATIVE_MESH.load(core::sync::atomic::Ordering::Relaxed)
@@ -30,6 +30,10 @@ pub(crate) enum Mode {
     /// Research admission for the capability study: the wider state model in
     /// `research_state`, with mode 2's object dispatch rules. Not qualified.
     Research,
+    /// Exactly the 31 device-qualified native-index classes (`QUALIFIED`), with
+    /// the single-parent dispatches they were qualified with: Honeykrisp's
+    /// (16, 1, 1) and the scalar (1, 1, 1) fixture carrier.
+    Qualified,
 }
 
 impl Mode {
@@ -39,6 +43,7 @@ impl Mode {
             1 => Some(Self::SingleParent),
             2 => Some(Self::MultipleParents),
             3 => Some(Self::Research),
+            4 => Some(Self::Qualified),
             _ => None,
         }
     }
@@ -129,6 +134,10 @@ pub(crate) fn decode(
         if !research_state(&state) {
             return Err(DecodeError::Unsupported);
         }
+    } else if mode == Mode::Qualified {
+        if !qualified_state(&state) {
+            return Err(DecodeError::Unsupported);
+        }
     } else if !(4..=128).contains(&components)
         || state[0] != components | ((components + 1) << 8)
         || state[1] != 0x10
@@ -164,6 +173,8 @@ pub(crate) fn decode(
                 let local = [next()?, next()?, next()?];
                 if !matches!(local, [1, 1, 1] | [16, 1, 1] | [32, 1, 1])
                     || (mode == Mode::SingleParent && total != local)
+                    || (mode == Mode::Qualified
+                        && (!matches!(local, [1, 1, 1] | [16, 1, 1]) || total != local))
                     || total
                         .iter()
                         .zip(local)
@@ -179,6 +190,40 @@ pub(crate) fn decode(
             _ => return Err(DecodeError::Unsupported),
         }
     }
+}
+
+/// The qualified layouts (`native_mesh=4`): (mesh state word 11, primitive
+/// word 10, vertex row word 13) of the 31 classes in Mesa's
+/// `hk_apple9_native_index_shapes.def`, from their qualification fixtures. The
+/// kernel sees vertices only as ceil(V / 4) quads, so V3 and V4 share a layout
+/// at P1 and P2; the exact class is Mesa's. T16V16P16 is deliberately absent.
+const QUALIFIED: [(u32, u32, u32); 29] = [
+    // T16, one vertex quad (V3, V4): P1..P8, P11, P17, P20, P21.
+    (0x400810, 0, 5), (0x400810, 1, 5), (0x400810, 2, 5), (0x400810, 3, 5),
+    (0x400810, 4, 5), (0x400810, 5, 5), (0x400810, 6, 5), (0x400810, 7, 5),
+    (0x400810, 10, 5), (0x400810, 0x10010, 5), (0x400810, 0x10013, 5), (0x400810, 0x10014, 5),
+    // T16, two quads (V6, V8): P2, P3, P5, P8.
+    (0x400810, 1, 9), (0x400810, 2, 9), (0x400810, 4, 9), (0x400810, 7, 9),
+    // T16, four quads (V16): P4, P8, P17, P21.
+    (0x400810, 3, 17), (0x400810, 7, 17), (0x400810, 0x10010, 17), (0x400810, 0x10014, 17),
+    // T32: V3P1; V24 (six quads) P3, P17, P31, P32; V32 (eight quads) P16, P32, P41, P42.
+    (0x400820, 0, 5),
+    (0x400820, 2, 25), (0x400820, 0x10010, 25), (0x400820, 0x1001e, 25), (0x400820, 0x1001f, 25),
+    (0x400820, 15, 33), (0x400820, 0x1001f, 33), (0x400820, 0x20028, 33), (0x400820, 0x20029, 33),
+];
+
+/// Mode 4's state check: position-only (four planes, no primitive data or
+/// components), as qualified, at one of the `QUALIFIED` layouts. The object
+/// dispatch must be a single parent of (16, 1, 1), as Honeykrisp emits, or the
+/// scalar (1, 1, 1) of the qualification fixtures.
+fn qualified_state(state: &[u32; 13]) -> bool {
+    state[0] == 0x504
+        && state[1] == 0x10
+        && state[2] == 0
+        && state[3] == 0
+        && state[8] == 1
+        && state[11] == 0
+        && QUALIFIED.contains(&(state[10], state[9], state[12]))
 }
 
 /// Research state model (`native_mesh=3`), from the 2026-10-22 capability
