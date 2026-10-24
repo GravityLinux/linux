@@ -429,7 +429,7 @@ impl kernel::debugfs::Writer for DepStats {
             f,
             "works {}\nitems {}\nsame_lane {}\nrepeat {}\nreached {}\ndropped {}\npoll_timeouts {}\npoll_retired {}\n\
              tvb_requests {}\ntvb_grown {}\ntvb_refused {}\ntvb_memory_limit {}\npartial_renders {}\n\
-             tvb_refused_cap {}\ntvb_refused_va {}\ntvb_refused_memory {}",
+             tvb_refused_cap {}\ntvb_refused_va {}\ntvb_refused_memory {}\nsubmit_rejected {}",
             DEP_WORKS.load(Relaxed),
             DEP_ITEMS.load(Relaxed),
             DEP_SAME_LANE.load(Relaxed),
@@ -445,7 +445,8 @@ impl kernel::debugfs::Writer for DepStats {
             PARTIAL_RENDERS.load(Relaxed),
             TVB_REFUSED_CAP.load(Relaxed),
             TVB_REFUSED_VA.load(Relaxed),
-            TVB_REFUSED_MEMORY.load(Relaxed)
+            TVB_REFUSED_MEMORY.load(Relaxed),
+            SUBMIT_REJECTED.load(Relaxed)
         )
     }
 }
@@ -491,6 +492,9 @@ pub(crate) static PARTIAL_RENDERS: core::sync::atomic::AtomicU64 = core::sync::a
 pub(crate) static TVB_REFUSED_CAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static TVB_REFUSED_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static TVB_REFUSED_MEMORY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRM_IOCTL_ASAHI_SUBMIT calls rejected with EINVAL or ENOTSUPP; each names
+/// its check in the kernel log, up to a per-boot budget.
+pub(crate) static SUBMIT_REJECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Debug: read-only view of the firmware regions that live as long as the
 /// firmware (debugfs `asahi_m4/fw_mem`), for sampling the firmware's own

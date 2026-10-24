@@ -41,9 +41,9 @@ assert 'let mut new = old.saturating_mul(3).min(limit).max(old);' in grow and 't
 checks += 1
 
 # dep_stats: three new fields appended after the existing ones.
-assert re.search(r'partial_renders \{\}\\n\\\s*tvb_refused_cap \{\}\\ntvb_refused_va \{\}\\ntvb_refused_memory \{\}"', timeline)
+assert re.search(r'partial_renders \{\}\\n\\\s*tvb_refused_cap \{\}\\ntvb_refused_va \{\}\\ntvb_refused_memory \{\}', timeline)
 assert re.search(r'PARTIAL_RENDERS\.load\(Relaxed\),\s*TVB_REFUSED_CAP\.load\(Relaxed\),\s*TVB_REFUSED_VA\.load\(Relaxed\),\s*'
-                 r'TVB_REFUSED_MEMORY\.load\(Relaxed\)\s*\)', timeline)
+                 r'TVB_REFUSED_MEMORY\.load\(Relaxed\)', timeline)
 checks += 1
 
 service = function(runtime, 'service_render_events')

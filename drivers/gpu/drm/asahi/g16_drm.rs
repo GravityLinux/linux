@@ -100,7 +100,7 @@ impl Mapping {
         if crate::g16_deferred::covered(mappings, start, size, permissions) {
             Ok(())
         } else {
-            Err(EINVAL)
+            Err(reject(format_args!("{:#x}+{:#x} not mapped with access {:#x}", start, size, permissions)))
         }
     }
 }
@@ -1551,6 +1551,39 @@ impl Vm {
 
 static FENCE_KEY: Pin<&kernel::sync::LockClassKey> = kernel::static_lock_class!();
 
+/// SUBMIT rejections logged per boot; all are counted in dep_stats
+/// (submit_rejected).
+const REJECT_LOG: u64 = 32;
+
+/// EINVAL for a submission, naming the check that failed. A bare EINVAL
+/// reached userspace as device loss with nothing in the kernel log.
+fn reject(why: core::fmt::Arguments<'_>) -> Error {
+    log_rejection(EINVAL, "EINVAL", why)
+}
+
+/// ENOTSUPP for a submission using something this driver doesn't implement.
+fn unsupported(why: core::fmt::Arguments<'_>) -> Error {
+    log_rejection(ENOTSUPP, "ENOTSUPP", why)
+}
+
+fn log_rejection(error: Error, name: &str, why: core::fmt::Arguments<'_>) -> Error {
+    let n = crate::g16_timeline::SUBMIT_REJECTED.fetch_add(1, Ordering::Relaxed);
+    if n < REJECT_LOG {
+        let comm = current_comm();
+        let len = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+        pr_warn!(
+            "G16: SUBMIT rejected with {}: {} ({} pid {})\n",
+            name,
+            why,
+            core::str::from_utf8(&comm[..len]).unwrap_or("?"),
+            kernel::current!().group_leader().pid()
+        );
+    } else if n == REJECT_LOG {
+        pr_warn!("G16: further SUBMIT rejections are not logged (debugfs dep_stats submit_rejected counts them)\n");
+    }
+    error
+}
+
 /// The calling process's name, for hang reports.
 fn current_comm() -> [u8; 16] {
     let task = kernel::current!();
@@ -2404,7 +2437,7 @@ impl File {
             || data.in_sync_count > 4096
             || data.out_sync_count > 4096
         {
-            return Err(EINVAL);
+            return Err(reject(format_args!("bad flags/pad, cmdbuf size {} or sync counts {}/{}", data.cmdbuf_size, data.in_sync_count, data.out_sync_count)));
         }
         let mut bytes = KVVec::new();
         UserSlice::new(
@@ -2422,9 +2455,9 @@ impl File {
         while offset < bytes.len() {
             let mut reader = crate::util::Reader::new(&bytes[offset..]);
             let header: uapi::drm_asahi_cmd_header = reader.read()?;
-            offset = offset.checked_add(8).ok_or(EINVAL)?;
-            let end = offset.checked_add(header.size as usize).ok_or(EINVAL)?;
-            let payload = bytes.get(offset..end).ok_or(EINVAL)?;
+            offset = offset.checked_add(8).ok_or_else(|| reject(format_args!("command header past the buffer")))?;
+            let end = offset.checked_add(header.size as usize).ok_or_else(|| reject(format_args!("command size overflows")))?;
+            let payload = bytes.get(offset..end).ok_or_else(|| reject(format_args!("command payload past the buffer ({} > {})", end, bytes.len())))?;
             offset = end;
             match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
@@ -2432,7 +2465,7 @@ impl File {
                         || (header.cdm_barrier != 0xffff && header.cdm_barrier > computes)
                         || renders + computes == 64
                     {
-                        return Err(EINVAL);
+                        return Err(reject(format_args!("render barrier {}/{} beyond {} renders/{} computes, or 64 commands", header.vdm_barrier, header.cdm_barrier, renders, computes)));
                     }
                     let command = crate::util::Reader::new(payload)
                         .read_up_to::<uapi::drm_asahi_cmd_render>(payload.len())?;
@@ -2445,7 +2478,7 @@ impl File {
                         || (header.cdm_barrier != 0xffff && header.cdm_barrier > computes)
                         || renders + computes == 64
                     {
-                        return Err(EINVAL);
+                        return Err(reject(format_args!("compute barrier {}/{} beyond {} renders/{} computes, or 64 commands", header.vdm_barrier, header.cdm_barrier, renders, computes)));
                     }
                     let command = crate::util::Reader::new(payload)
                         .read_up_to::<uapi::drm_asahi_cmd_compute>(payload.len())?;
@@ -2461,7 +2494,7 @@ impl File {
                         || payload.len() % 24 != 0
                         || payload.len() / 24 > 16
                     {
-                        return Err(EINVAL);
+                        return Err(reject(format_args!("attachment command with barriers, or {} bytes (not 24 x 1..16)", payload.len())));
                     }
                     let mut reader = crate::util::Reader::new(payload);
                     while !reader.is_empty() {
@@ -2470,16 +2503,16 @@ impl File {
                             || attachment.pad != 0
                             || attachment.pointer.checked_add(attachment.size).is_none()
                         {
-                            return Err(EINVAL);
+                            return Err(reject(format_args!("attachment flags/pad nonzero or range overflows")));
                         }
                         attachments.push(attachment, GFP_KERNEL)?;
                     }
                 }
-                _ => return Err(ENOTSUPP),
+                kind => return Err(unsupported(format_args!("command type {}", kind))),
             }
         }
         if renders + computes == 0 {
-            return Err(EINVAL);
+            return Err(reject(format_args!("no render or compute command")));
         }
         let count = data.in_sync_count + data.out_sync_count;
         let mut sync_bytes = KVec::new();
@@ -2496,7 +2529,7 @@ impl File {
             let handle = u32::from_ne_bytes(bytes[4..8].try_into().map_err(|_| EINVAL)?);
             let point = u64::from_ne_bytes(bytes[8..16].try_into().map_err(|_| EINVAL)?);
             if kind > 1 || (kind == 0 && point != 0) {
-                return Err(EINVAL);
+                return Err(reject(format_args!("sync {} kind {} point {}", index, kind, point)));
             }
             let object = drm::syncobj::SyncObj::lookup_handle(file, handle)?;
             if index >= data.in_sync_count as usize {
@@ -2513,7 +2546,7 @@ impl File {
                     GFP_KERNEL,
                 )?;
             } else {
-                let fence = object.fence_get().ok_or(EINVAL)?;
+                let fence = object.fence_get().ok_or_else(|| reject(format_args!("in-sync {} (handle {}) has no fence: waited before any signal was submitted", index, handle)))?;
                 let fence = if kind == 1 {
                     fence.chain_find_seqno(point)?
                 } else {
@@ -2589,7 +2622,7 @@ impl File {
                 return if stamp.offset == 0 {
                     Ok(0)
                 } else {
-                    Err(EINVAL)
+                    Err(reject(format_args!("timestamp offset {} without a handle", stamp.offset)))
                 };
             }
             let binding = state
@@ -2598,8 +2631,8 @@ impl File {
                 .find(|t| t.id == stamp.handle)
                 .ok_or(ENOENT)?;
             let offset = u64::from(stamp.offset);
-            if offset & 7 != 0 || offset.checked_add(8).ok_or(EINVAL)? > binding.size {
-                return Err(EINVAL);
+            if offset & 7 != 0 || offset.checked_add(8).ok_or_else(|| reject(format_args!("timestamp offset overflows")))? > binding.size {
+                return Err(reject(format_args!("timestamp offset {} unaligned or beyond {}", offset, binding.size)));
             }
             Ok(binding.address + offset)
         };
@@ -2648,7 +2681,7 @@ impl File {
             }
             if renders != 0 && !vm.render_ready {
                 let pool =
-                    render::OperandPool::new(vm.kernel.start, vm.kernel.end).ok_or(EINVAL)?;
+                    render::OperandPool::new(vm.kernel.start, vm.kernel.end).ok_or_else(|| reject(format_args!("VM kernel VA {:#x}..{:#x} too small for the render operand pool", vm.kernel.start, vm.kernel.end)))?;
                 // Acquire scarce support and its Arc before editing this
                 // root. ENOSPC/ENOMEM here must not quarantine a healthy VM.
                 let support = Arc::new(
@@ -2771,19 +2804,19 @@ impl Vm {
 
     fn compute_parameters(&self, c: &uapi::drm_asahi_cmd_compute) -> Result<compute::Parameters> {
         if c.flags != 0 || c.helper.binary != 0 || c.helper.cfg != 0 || c.helper.data != 0 {
-            return Err(ENOTSUPP);
+            return Err(unsupported(format_args!("compute flags {:#x} or a helper program", c.flags)));
         }
         let size = c
             .cdm_ctrl_stream_end
             .checked_sub(c.cdm_ctrl_stream_base)
-            .ok_or(EINVAL)?;
+            .ok_or_else(|| reject(format_args!("compute stream end before base")))?;
         if (c.cdm_ctrl_stream_base | c.cdm_ctrl_stream_end) & 3 != 0
             || size < 4
             || c.sampler_heap & 7 != 0
             || c.sampler_count > 1024
             || (c.sampler_count == 0) != (c.sampler_heap == 0)
         {
-            return Err(EINVAL);
+            return Err(reject(format_args!("compute stream {:#x}..{:#x} or sampler heap {:#x} x {}", c.cdm_ctrl_stream_base, c.cdm_ctrl_stream_end, c.sampler_heap, c.sampler_count)));
         }
         self.cover(c.cdm_ctrl_stream_base, size, 2)?;
         if c.sampler_count != 0 {
@@ -2818,14 +2851,18 @@ impl Vm {
             || c.fragment_helper.cfg != 0
             || c.fragment_helper.data != 0
         {
-            return Err(ENOTSUPP);
+            return Err(unsupported(format_args!(
+                "render flags {:#x} (known {:#x}) or a vertex/fragment helper program",
+                c.flags,
+                PROCESS_EMPTY_TILES | DBIAS_IS_INT | VDM_BARRIER_FRAGMENT | FEW_PRIMITIVES
+            )));
         }
         let mut p = render::Parameters::default();
         p.tgid = kernel::current!().group_leader().pid();
         p.comm = current_comm();
         p.vdm_barrier_fragment = c.flags & VDM_BARRIER_FRAGMENT != 0;
         p.set_private(self.kernel.start, self.kernel.end)
-            .ok_or(EINVAL)?;
+            .ok_or_else(|| reject(format_args!("render private area outside the kernel VA")))?;
         p.width = u64::from(c.width_px);
         p.height = u64::from(c.height_px);
         p.layers = u64::from(c.layers);
@@ -2836,7 +2873,7 @@ impl Vm {
         p.tib_blocks = (p.sample_size * p.utile_width * p.utile_height * p.samples).div_ceil(2048);
         p.encoder = c.vdm_ctrl_stream_base;
         if !p.valid() || p.encoder == 0 || p.encoder & 3 != 0 {
-            return Err(EINVAL);
+            return Err(reject(format_args!("render parameters or encoder {:#x}", p.encoder)));
         }
         self.cover(p.encoder, 4, 2)?;
         p.utile_config = (p.utile_width / 16) << 12
@@ -2845,7 +2882,7 @@ impl Vm {
                 1 => 0,
                 2 => 1,
                 4 => 2,
-                _ => return Err(EINVAL),
+                _ => return Err(reject(format_args!("render samples {}", p.samples))),
             };
         p.process_empty_tiles = c.flags & PROCESS_EMPTY_TILES != 0;
         p.tile_config =
@@ -2867,7 +2904,7 @@ impl Vm {
         p.depth_bias_array = c.isp_dbias_base;
         p.occlusion_query_base = c.isp_oclqry_base;
         if p.scissor_array == 0 {
-            return Err(EINVAL);
+            return Err(reject(format_args!("render without a scissor array")));
         }
         for (address, access) in [
             (p.scissor_array, 2),
@@ -2876,7 +2913,7 @@ impl Vm {
         ] {
             if address != 0 {
                 if address & 7 != 0 {
-                    return Err(EINVAL);
+                    return Err(reject(format_args!("render array {:#x} unaligned", address)));
                 }
                 self.cover(address, 8, access)?;
             }
@@ -2888,7 +2925,7 @@ impl Vm {
                 || (zls.stride != 0 && zls.stride & 0x3fff != 1)
                 || zls.comp_stride & 0x3fff != 0
             {
-                return Err(EINVAL);
+                return Err(reject(format_args!("render depth/stencil base {:#x} stride {:#x} comp stride {:#x} layers {}", zls.base, zls.stride, zls.comp_stride, p.layers)));
             }
             if zls.base != 0 {
                 let stride = if zls.stride == 0 {
@@ -2921,7 +2958,7 @@ impl Vm {
         p.sampler_array = c.sampler_heap;
         p.sampler_count = u64::from(c.sampler_count);
         if !p.valid() || p.sampler_count > 1024 {
-            return Err(EINVAL);
+            return Err(reject(format_args!("render parameters or {} samplers", p.sampler_count)));
         }
         if p.sampler_count != 0 {
             self.cover(p.sampler_array, p.sampler_count * 8, 2)?;
@@ -2934,7 +2971,7 @@ impl Vm {
         ] {
             if program.usc == 0 {
                 if !optional || program.rsrc_spec != 0 {
-                    return Err(EINVAL);
+                    return Err(reject(format_args!("render background/end-of-tile program missing or with resources")));
                 }
             } else {
                 self.cover((1 << 40) + u64::from(program.usc & !7), 4, 2)?;
