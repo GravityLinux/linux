@@ -8,8 +8,14 @@ by their first packet, without searching their contents for native state.
 In a nonzero mode, that first word is read before waiting for the render's
 producers. An ordinary first word publishes the render exactly as at mode 0,
 with no CPU wait. Only a native header, or an unreadable first word, waits for
-the producers and then decodes the whole stream. That relies on userspace
-writing native headers on the CPU before SUBMIT.
+the producers and then decodes the whole stream. That relies on a userspace
+contract: native headers are written on the CPU before SUBMIT, and no GPU job
+writes or rewrites a render's first encoder word. claude-compiler confirmed it
+for every Honeykrisp emit path (`hk_apple9_mesh_command_build`, isolated at
+`cs->start`; secondaries are replayed on the CPU; the GPU VDM writers emit only
+ordinary words) in `tmp/claude-ct/native-header-peek-hk-audit-20261024.md`
+(2026-10-24). A userspace that emits native streams any other way must use the
+waiting path; the alternative is an explicit per-render flag.
 
 The admitted class has physical T16 or T32 mesh execution, one direct object dispatch,
 four-vertex storage and one triangle primitive. It supports 4–128 per-vertex
