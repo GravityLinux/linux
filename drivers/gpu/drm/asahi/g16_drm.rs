@@ -20,6 +20,7 @@ use kernel::drm::{
     ioctl,
 };
 use kernel::sync::{Arc, CondVar, Mutex, MutexGuard};
+use kernel::error::to_result;
 use kernel::sync::aref::ARef;
 use kernel::uaccess::{UserPtr, UserSlice};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
@@ -221,6 +222,7 @@ pub(crate) struct Data {
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _flags: KVec<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>>,
     _native_mesh: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::NativeMeshKnob>>>,
+    _native_mesh_attribute: NativeMeshAttribute,
     _dep_stats: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::DepStats>>>,
     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _debugfs: kernel::debugfs::Dir,
@@ -256,6 +258,81 @@ impl drm::driver::Driver for Driver {
         (ASAHI_QUEUE_CREATE, drm_asahi_queue_create, ioctl::RENDER_ALLOW, File::queue_create),
         (ASAHI_QUEUE_DESTROY, drm_asahi_queue_destroy, ioctl::RENDER_ALLOW, File::queue_destroy),
         (ASAHI_SUBMIT, drm_asahi_submit, ioctl::RENDER_ALLOW, File::submit),
+    }
+}
+
+/// sysfs `asahi_native_mesh` on the GPU platform device: the native-index
+/// advertisement (`g16_mesh::advertise`), readable by anyone (0444).
+struct AttributeCell(core::cell::UnsafeCell<bindings::device_attribute>);
+
+// SAFETY: The attribute is written only here, at compile time; the device core
+// only reads it.
+unsafe impl Sync for AttributeCell {}
+
+static NATIVE_MESH_ATTRIBUTE: AttributeCell = AttributeCell(core::cell::UnsafeCell::new(bindings::device_attribute {
+    attr: bindings::attribute {
+        name: c"asahi_native_mesh".as_ptr(),
+        mode: 0o444,
+        // SAFETY: Zero is valid for the remaining (lockdep) fields.
+        ..unsafe { core::mem::zeroed() }
+    },
+    __bindgen_anon_1: bindings::device_attribute__bindgen_ty_1 { show: Some(show_native_mesh) },
+    __bindgen_anon_2: bindings::device_attribute__bindgen_ty_2 { store: None },
+}));
+
+/// A bounded line buffer for the advertisement.
+struct Line {
+    bytes: [u8; crate::g16_mesh::ADVERTISEMENT_MAX],
+    len: usize,
+}
+
+impl core::fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len.checked_add(s.len()).filter(|&end| end <= self.bytes.len()).ok_or(core::fmt::Error)?;
+        self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+unsafe extern "C" fn show_native_mesh(
+    _dev: *mut bindings::device,
+    _attr: *mut bindings::device_attribute,
+    buf: *mut core::ffi::c_char,
+) -> isize {
+    let (generation, mode) = crate::g16_mesh::snapshot();
+    let mut line = Line { bytes: [0; crate::g16_mesh::ADVERTISEMENT_MAX], len: 0 };
+    if crate::g16_mesh::advertise(generation, mode, &mut line).is_err() {
+        return EIO.to_errno() as isize;
+    }
+    // SAFETY: sysfs passes a PAGE_SIZE buffer; the line is at most ADVERTISEMENT_MAX bytes.
+    unsafe { core::ptr::copy_nonoverlapping(line.bytes.as_ptr(), buf.cast(), line.len) };
+    line.len as isize
+}
+
+/// Keeps `asahi_native_mesh` on the device until the driver unbinds.
+struct NativeMeshAttribute(*mut bindings::device);
+
+// SAFETY: The pointer is only passed to device_remove_file, which may run on any thread.
+unsafe impl Send for NativeMeshAttribute {}
+// SAFETY: No method takes `&self`.
+unsafe impl Sync for NativeMeshAttribute {}
+
+impl NativeMeshAttribute {
+    fn new<C: kernel::device::DeviceContext>(dev: &kernel::device::Device<C>) -> Result<Self> {
+        // `Device` is a transparent wrapper of the C `struct device`.
+        let raw = core::ptr::from_ref(dev).cast_mut().cast::<bindings::device>();
+        // SAFETY: The device is bound; the attribute is static.
+        to_result(unsafe { bindings::device_create_file(raw, NATIVE_MESH_ATTRIBUTE.0.get()) })?;
+        Ok(Self(raw))
+    }
+}
+
+impl Drop for NativeMeshAttribute {
+    fn drop(&mut self) {
+        // SAFETY: Dropped with the driver data at unbind, while the platform
+        // device (which outlives its driver data) still exists.
+        unsafe { bindings::device_remove_file(self.0, NATIVE_MESH_ATTRIBUTE.0.get()) };
     }
 }
 
@@ -296,6 +373,7 @@ pub(crate) fn register<'a>(
         flags.push(KBox::pin_init(dir.read_write_file(name, knob), GFP_KERNEL)?, GFP_KERNEL)?;
     }
     crate::g16_mesh::init_mode(crate::module_parameters::native_mesh.value());
+    let native_mesh_attribute = NativeMeshAttribute::new(pdev.as_ref())?;
     let native_mesh = KBox::pin_init(
         dir.read_write_file(c_str!("native_mesh"), crate::g16_timeline::NativeMeshKnob),
         GFP_KERNEL,
@@ -347,6 +425,7 @@ pub(crate) fn register<'a>(
         _queue_cap: queue_cap,
         _flags: flags,
         _native_mesh: native_mesh,
+        _native_mesh_attribute: native_mesh_attribute,
         _dep_stats: dep_stats,
         _lane_cap: lane_cap,
         _debugfs: dir, });

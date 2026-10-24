@@ -259,6 +259,30 @@ fn qualified_state(state: &[u32; 13]) -> bool {
         && QUALIFIED.contains(&(state[10], state[9], state[12]))
 }
 
+/// sha256 of the canonical class list `QUALIFIED` was taken from: one line
+/// `T<t>V<v>P<p>\n` per `HK_NATIVE_INDEX_SHAPE(t, v, p)` of Mesa's
+/// `hk_apple9_native_index_shapes.def`, in file order (31 classes).
+pub(crate) const QUALIFIED_CLASSES_SHA256: &str =
+    "5550ecf263192c596c3f9d8c3b84c0324ac3d0c8ee76da37c378205247f1a3bd";
+
+/// The longest advertisement line, newline included.
+pub(crate) const ADVERTISEMENT_MAX: usize = 160;
+
+/// The native-index advertisement (sysfs `asahi_native_mesh` on the GPU
+/// device), one line: `asahi-native-mesh v1 generation=<G> profile=<P>
+/// classes=<H>`. `qualified` (mode 4) carries the class-list hash, `research`
+/// (mode 3) and `none` (modes 0-2) carry `-`. Userspace treats only
+/// `qualified` with the expected hash as positive, and samples it before and
+/// after VM_CREATE (see `snapshot`).
+pub(crate) fn advertise(generation: u64, mode: u32, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    let (profile, classes) = match Mode::from_parameter(mode) {
+        Some(Mode::Qualified) => ("qualified", QUALIFIED_CLASSES_SHA256),
+        Some(Mode::Research) => ("research", "-"),
+        _ => ("none", "-"),
+    };
+    writeln!(out, "asahi-native-mesh v1 generation={generation} profile={profile} classes={classes}")
+}
+
 /// Research state model (`native_mesh=3`), from the 2026-10-22 capability
 /// study's own-MSL captures: n vertex planes, P primitives, ceil(V / 4) vertex
 /// quads and C 32-bit primitive components.

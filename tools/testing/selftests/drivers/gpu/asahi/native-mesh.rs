@@ -633,6 +633,25 @@ fn every_mode_write_starts_a_new_generation() {
     g16_mesh::init_mode(0);
 }
 
+#[test]
+fn the_advertisement_line_is_exact_per_mode() {
+    let line = |generation, mode| {
+        let mut out = String::new();
+        g16_mesh::advertise(generation, mode, &mut out).unwrap();
+        out
+    };
+    let hash = g16_mesh::QUALIFIED_CLASSES_SHA256;
+    assert_eq!(line(7, 4), format!("asahi-native-mesh v1 generation=7 profile=qualified classes={hash}\n"));
+    assert_eq!(line(0, 3), "asahi-native-mesh v1 generation=0 profile=research classes=-\n");
+    for mode in [0, 1, 2] {
+        assert_eq!(line(3, mode), "asahi-native-mesh v1 generation=3 profile=none classes=-\n");
+    }
+    // The longest line fits the sysfs buffer bound.
+    assert!(line(u64::MAX >> 8, 4).len() <= g16_mesh::ADVERTISEMENT_MAX);
+    assert_eq!(hash.len(), 64);
+    assert!(hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+}
+
 fn read32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }

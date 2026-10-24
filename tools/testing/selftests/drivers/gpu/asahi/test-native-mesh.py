@@ -60,6 +60,20 @@ mesh = (driver / 'g16_mesh.rs').read_text()
 assert 'pub(crate) const MAX_MODE: u32 = 4;' in mesh
 assert 'g16_mesh::decode(params.encoder, mesh_mode,' in runtime
 assert 'native_mesh.value() == 1' not in runtime
+# The advertised class-list hash is the canonical list of the qualified classes
+# (the test's table, and Mesa's .def when that checkout is present).
+import hashlib
+classes = re.findall(r'\((16|32), (\d+), (\d+)\)', Path(__file__).resolve().with_name('native-mesh.rs').read_text().split('const QUALIFIED_CLASSES')[1].split('];')[0])
+assert len(classes) == 31
+canonical = ''.join(f'T{t}V{v}P{p}\n' for t, v, p in classes).encode()
+advertised = re.search(r'QUALIFIED_CLASSES_SHA256: &str =\s*"([0-9a-f]{64})"', mesh).group(1)
+assert hashlib.sha256(canonical).hexdigest() == advertised
+mesa_def = Path('/home/nsheth/Projects/asahi/tmp/codex-upstream/native-mesh/mesa/src/asahi/vulkan/hk_apple9_native_index_shapes.def')
+if mesa_def.exists():
+    shapes = re.findall(r'^HK_NATIVE_INDEX_SHAPE\((\d+), (\d+), (\d+)\)$', mesa_def.read_text(), re.M)
+    assert ''.join(f'T{t}V{v}P{p}\n' for t, v, p in shapes).encode() == canonical
+# The attribute is created at probe and read-only.
+assert re.search(r'name: c"asahi_native_mesh"\.as_ptr\(\),\s*mode: 0o444,', drm)
 params = (driver / 'asahi_m4.rs').read_text()
 assert re.search(r'native_mesh:\s*u32\s*\{\s*default: 0,', params)
 
