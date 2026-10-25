@@ -203,7 +203,6 @@ pub(crate) struct Data {
     /// directory).
     timeline: Option<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Ring>>>>,
     _profile: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::Profile>>>,
-    _maint: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::MaintKnob>>>,
     _queue_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
     _flags: KVec<Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FlagKnob>>>>,
     _dep_stats: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::DepStats>>>,
@@ -255,10 +254,6 @@ pub(crate) fn register<'a>(
         pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)?;
     }
     let runtime = crate::g16::Bootstrap::new(pdev)?;
-    crate::g16_timeline::FW_CACHE_MAINT.store(
-        crate::module_parameters::fw_cache_maint.value(),
-        Ordering::Relaxed,
-    );
     crate::g16_timeline::init_caps(
         crate::module_parameters::max_queue_entries.value(),
         crate::module_parameters::max_lane_entries.value(),
@@ -286,10 +281,6 @@ pub(crate) fn register<'a>(
     }
     let dep_stats = KBox::pin_init(
         dir.read_only_file(c_str!("dep_stats"), crate::g16_timeline::DepStats),
-        GFP_KERNEL,
-    )?;
-    let maint = KBox::pin_init(
-        dir.read_write_file(c_str!("fw_cache_maint"), crate::g16_timeline::MaintKnob),
         GFP_KERNEL,
     )?;
     let timeline = if crate::module_parameters::timeline.value() != 0 {
@@ -332,7 +323,6 @@ pub(crate) fn register<'a>(
         }),
         timeline,
         _profile: profile,
-        _maint: maint,
         _queue_cap: queue_cap,
         _flags: flags,
         _dep_stats: dep_stats,

@@ -232,17 +232,6 @@ impl kernel::debugfs::Writer for Profile {
     }
 }
 
-/// Runtime copy of `fw_cache_maint`, writable from debugfs
-/// `asahi_m4/fw_cache_maint` for same-boot A/B. Maintenance uses clean+invalidate
-/// (`dc civac`), so switching it back on never discards lines written while it
-/// was off.
-pub(crate) static FW_CACHE_MAINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-#[inline(always)]
-pub(crate) fn fw_cache_maint() -> bool {
-    FW_CACHE_MAINT.load(core::sync::atomic::Ordering::Relaxed) != 0
-}
-
 /// Shared bounded text read; individual knobs retain their accepted syntax.
 fn knob_text<'a>(reader: &mut kernel::uaccess::UserSliceReader, buf: &'a mut [u8; 8]) -> Result<&'a str> {
     let n = reader.len();
@@ -255,31 +244,6 @@ fn knob_text<'a>(reader: &mut kernel::uaccess::UserSliceReader, buf: &'a mut [u8
 
 fn knob_u32(reader: &mut kernel::uaccess::UserSliceReader) -> Result<u32> {
     knob_text(reader, &mut [0; 8])?.parse().map_err(|_| EINVAL)
-}
-
-/// The debugfs view of `FW_CACHE_MAINT` (accepts 0 or 1).
-pub(crate) struct MaintKnob;
-
-impl kernel::debugfs::Writer for MaintKnob {
-    fn write(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "{}", FW_CACHE_MAINT.load(core::sync::atomic::Ordering::Relaxed))
-    }
-}
-
-impl kernel::debugfs::Reader for MaintKnob {
-    fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
-        let mut buf = [0; 8];
-        let value = match knob_text(reader, &mut buf)? {
-            "0" => 0,
-            "1" => 1,
-            _ => return Err(EINVAL),
-        };
-        // Order earlier maintained writes before later unmaintained ones.
-        crate::mem::sync();
-        FW_CACHE_MAINT.store(value, core::sync::atomic::Ordering::Relaxed);
-        pr_info!("G16: fw_cache_maint={}\n", value);
-        Ok(())
-    }
 }
 
 /// Runtime copies of `max_queue_entries` and `max_lane_entries`, writable from
@@ -504,7 +468,7 @@ pub(crate) static DEFERRED_CPU_HOLD: core::sync::atomic::AtomicU64 = core::sync:
 /// File offset = firmware VA - `FW_MEM_BASE`; offsets and lengths are whole
 /// 32-bit words, and a read stops at the first unmapped page (ENXIO if that
 /// is the first). Reads take no driver lock and do no cache maintenance
-/// (firmware memory is coherent; see `fw_cache_maint`).
+/// (firmware memory is coherent).
 pub(crate) const FW_MEM_BASE: u64 = 0xffff_fc00_0000_0000;
 
 pub(crate) struct FwMem {
