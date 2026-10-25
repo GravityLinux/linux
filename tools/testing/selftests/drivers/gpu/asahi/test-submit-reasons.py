@@ -40,8 +40,8 @@ checks += 1
 assert 'const REJECT_LOG: u64 = 32;' in drm
 # Every rejection is counted in dep_stats (review R2), appended last.
 timeline = (root / 'drivers/gpu/drm/asahi/g16_timeline.rs').read_text()
-assert re.search(r'tvb_refused_memory \{\}\\nsubmit_rejected \{\}"', timeline)
-assert re.search(r'TVB_REFUSED_MEMORY\.load\(Relaxed\),\s*SUBMIT_REJECTED\.load\(Relaxed\)\s*\)', timeline)
+assert re.search(r'tvb_refused_memory \{\}\\nsubmit_rejected \{\}(?:"|\\n)', timeline)
+assert re.search(r'TVB_REFUSED_MEMORY\.load\(Relaxed\),\s*SUBMIT_REJECTED\.load\(Relaxed\)\s*[,)]', timeline)
 assert 'let n = crate::g16_timeline::SUBMIT_REJECTED.fetch_add(1, Ordering::Relaxed);' in drm
 # Docs stay with their items (review R1).
 assert re.search(r"/// The calling process's name, for hang reports\.\nfn current_comm\(\)", drm)

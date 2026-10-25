@@ -2195,6 +2195,7 @@ impl WorkItem for Execution {
                         let receipt = match receipt {
                             Ok(receipt) => receipt,
                             Err(EBUSY) if !runtime.render_failed() => {
+                                crate::g16_timeline::DEFERRED.fetch_add(1, Ordering::Relaxed);
                                 if crate::module_parameters::timeline.value() != 0 {
                                     job.busy += 1;
                                     job.why |= match runtime.take_pressure() {

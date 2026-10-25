@@ -288,6 +288,31 @@ pub(super) struct Flight {
     lane_items: [u32; 2],
 }
 
+/// Dependency items of one submission attempt, counted into dep_stats only
+/// when it publishes: a deferred (EBUSY) command is resolved again on its
+/// next try.
+#[derive(Default)]
+struct DepTally {
+    items: u64,
+    same_lane: u64,
+    repeat: u64,
+    reached: u64,
+    dropped: u64,
+}
+
+impl DepTally {
+    fn publish(&self) {
+        use crate::g16_timeline as t;
+        use core::sync::atomic::Ordering::Relaxed;
+        t::DEP_WORKS.fetch_add(1, Relaxed);
+        t::DEP_ITEMS.fetch_add(self.items, Relaxed);
+        t::DEP_SAME_LANE.fetch_add(self.same_lane, Relaxed);
+        t::DEP_REPEAT.fetch_add(self.repeat, Relaxed);
+        t::DEP_REACHED.fetch_add(self.reached, Relaxed);
+        t::DEP_DROPPED.fetch_add(self.dropped, Relaxed);
+    }
+}
+
 /// Per-lane totals of the unretired flights on that lane.
 struct LaneBook {
     pointers: u64,
@@ -518,6 +543,9 @@ impl Bootstrap {
 
     fn report_pressure(&self, bit: u64, resource: &str) {
         self.diagnostics.pressure_seen.fetch_or(bit, Ordering::Relaxed);
+        if let Some(count) = crate::g16_timeline::DEFERRED_BY.get(bit.trailing_zeros() as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         // Every resource here is released when work retires. Backpressure with
         // nothing in flight can therefore never clear: it means an accounting
         // leak, and submission stalls indefinitely with an idle GPU. Always
@@ -2192,18 +2220,25 @@ impl Bootstrap {
     /// or a later one (Works on a lane start in order), or when the stamp has
     /// already been reached at publish. An item on the same lane's earlier
     /// Work is only counted: lane order implies it, but it is kept.
-    fn elide_item(&self, queue: &FirmwareQueues, lane: usize, dep: &Stamp, same_lane: bool) -> Result<bool> {
+    fn elide_item(
+        &self,
+        queue: &FirmwareQueues,
+        lane: usize,
+        dep: &Stamp,
+        same_lane: bool,
+        tally: &mut DepTally,
+    ) -> Result<bool> {
         use crate::g16_timeline as t;
-        t::DEP_ITEMS.fetch_add(1, Ordering::Relaxed);
+        tally.items += 1;
         let drop = if same_lane {
-            t::DEP_SAME_LANE.fetch_add(1, Ordering::Relaxed);
+            tally.same_lane += 1;
             false
         } else if queue.waited[lane]
             .iter()
             .flatten()
             .any(|w| w.address == dep.address && g16_stamp::reached(w.value, dep.value))
         {
-            t::DEP_REPEAT.fetch_add(1, Ordering::Relaxed);
+            tally.repeat += 1;
             true
         } else {
             let before = t::reads();
@@ -2217,12 +2252,12 @@ impl Bootstrap {
             t::attribute(&t::P_RD_ELIDE, before);
             let reached = now.is_some_and(|v| g16_stamp::reached(v, dep.value));
             if reached {
-                t::DEP_REACHED.fetch_add(1, Ordering::Relaxed);
+                tally.reached += 1;
             }
             reached
         };
         if drop {
-            t::DEP_DROPPED.fetch_add(1, Ordering::Relaxed);
+            tally.dropped += 1;
         }
         Ok(drop)
     }
@@ -2238,15 +2273,15 @@ impl Bootstrap {
         queue: &mut FirmwareQueues,
         params: &render::Parameters,
         dependencies: &[Option<Stamp>; 2],
+        tally: &mut DepTally,
     ) -> Result<[Option<Stamp>; 2]> {
-        crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
         let own_fragment = queue.lanes.as_ref().map(|lanes| lanes[1].firmware_stamp());
         let mut kept = *dependencies;
         for (slot, dep) in dependencies.iter().enumerate() {
             let Some(dep) = dep else { continue };
             let lane = Self::render_item_lane(params, slot);
             let same_lane = lane == 1 && own_fragment == Some(dep.address);
-            if self.elide_item(queue, lane, dep, same_lane)? {
+            if self.elide_item(queue, lane, dep, same_lane, tally)? {
                 kept[slot] = None;
             }
         }
@@ -2276,6 +2311,7 @@ impl Bootstrap {
             let fw = self._firmware_space.as_ref().ok_or(EIO)?;
             for dep in dependencies.iter().flatten() {
                 if !g16_stamp::reached(fw.read_u32(dep.address)?, dep.value) {
+                    crate::g16_timeline::DEFERRED_CPU_HOLD.fetch_add(1, Ordering::Relaxed);
                     return Err(EBUSY);
                 }
             }
@@ -2296,7 +2332,8 @@ impl Bootstrap {
             params
         };
         let mut queue = queues.lock();
-        let resolved = self.resolve_render_dependencies(&mut queue, params, dependencies)?;
+        let mut tally = DepTally::default();
+        let resolved = self.resolve_render_dependencies(&mut queue, params, dependencies, &mut tally)?;
         let dependencies = &resolved;
         let root = owner.lock().roots().low;
         let initbm = !self
@@ -2325,6 +2362,9 @@ impl Bootstrap {
         );
         if queue.pending == 0 {
             queue.events = None;
+        }
+        if result.is_ok() {
+            tally.publish();
         }
         result
     }
@@ -2835,6 +2875,7 @@ impl Bootstrap {
         &self,
         queue: &mut FirmwareQueues,
         dependencies: &[Option<Stamp>; 2],
+        tally: &mut DepTally,
     ) -> Result<[Option<Stamp>; 2]> {
         let own_lane = queue.lanes.as_ref().map(|lanes| lanes[2].firmware_stamp());
         // A wait on this queue's own render lanes (the
@@ -2847,11 +2888,10 @@ impl Bootstrap {
             .map(|lanes| [lanes[0].firmware_stamp(), lanes[1].firmware_stamp()]);
         let mut kept = [None; 2];
         let fw = self._firmware_space.as_ref().ok_or(EIO)?;
-        crate::g16_timeline::DEP_WORKS.fetch_add(1, Ordering::Relaxed);
         for (slot, dep) in dependencies.iter().enumerate() {
             let Some(dep) = dep else { continue };
             if own_render.is_some_and(|r| r.contains(&dep.address)) {
-                if !self.elide_item(queue, 2, dep, false)? {
+                if !self.elide_item(queue, 2, dep, false, tally)? {
                     kept[slot] = Some(*dep);
                 }
                 continue;
@@ -2863,6 +2903,7 @@ impl Bootstrap {
                 if !done {
                     queue.deps.compute_held += 1;
                     queue.deps.defer();
+                    crate::g16_timeline::DEFERRED_CPU_HOLD.fetch_add(1, Ordering::Relaxed);
                     return Err(EBUSY);
                 }
             }
@@ -2882,7 +2923,8 @@ impl Bootstrap {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_SUBMIT_COMPUTE);
         let mut queue = queues.lock();
         let mut client = owner.lock();
-        let resolved = self.resolve_compute_dependencies(&mut queue, dependencies)?;
+        let mut tally = DepTally::default();
+        let resolved = self.resolve_compute_dependencies(&mut queue, dependencies, &mut tally)?;
         let dependencies = &resolved;
         self.reserve_flight(
             &queue,
@@ -2902,6 +2944,9 @@ impl Bootstrap {
         );
         if queue.pending == 0 {
             queue.events = None;
+        }
+        if result.is_ok() {
+            tally.publish();
         }
         result
     }
