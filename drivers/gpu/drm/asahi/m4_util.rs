@@ -28,6 +28,13 @@ where
     (a + b - one) & !(b - one)
 }
 
+/// Types for which every bit pattern is a valid value, so `Reader` may build
+/// them from untrusted bytes.
+///
+/// # Safety
+///
+/// Implementors must be plain data: integers, integer arrays and structs of
+/// them, with no padding-sensitive invariants, references, enums or bools.
 pub(crate) unsafe trait AnyBitPattern: Default + Sized + Copy + 'static {}
 
 pub(crate) struct Reader<'a> {

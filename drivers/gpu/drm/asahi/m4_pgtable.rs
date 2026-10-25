@@ -464,11 +464,11 @@ impl UatPageTable {
                 count,
                 iova
             );
-            // SAFETY: Page table addresses are either allocated by us, or
-            // firmware-managed and safe to borrow a struct page from.
             if write {
                 self.mark_dirty(phys)?;
             }
+            // SAFETY: Page table addresses are either allocated by us, or
+            // firmware-managed and safe to borrow a struct page from.
             let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
             pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
                 let ptep = p as *const _ as *const Pte;

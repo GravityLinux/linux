@@ -393,6 +393,7 @@ impl Bootstrap {
         validate_boot_resources(pdev)?;
         let platform = crate::g16_platform::Platform::new(pdev.as_ref())?;
         // All board inputs are checked before any firmware is started.
+        // SAFETY: get_random_u32 has no preconditions.
         let mut bundle = platform.bundle(unsafe { kernel::bindings::get_random_u32() })?;
         // The firmware Timestamp handler accepts user destinations only in
         // this 64 MiB aperture, based at header+0x28.
@@ -939,6 +940,8 @@ impl Bootstrap {
             .reserved_mem_region_to_resource_byname(c_str!("ttbs"))?;
         // SAFETY: This is the loader's validated context table reservation.
         let ttbs = unsafe { io::mem::Mem::try_new(res, io::mem::MemFlag::WB.into())? };
+        // SAFETY: Offsets 16 and 24 are context one's two roots, inside the
+        // mapped table page, and the cache clean covers that line.
         unsafe {
             // Context one has ASID one, with independently allocated roots.
             ttbs.ptr()
@@ -1073,6 +1076,8 @@ impl Bootstrap {
         drop(sgx_guard);
         // Slot zero's high root is empty. Firmware keeps using its separate
         // bootstrap root from the loader reservation, not this context entry.
+        // SAFETY: Offsets 0 and 8 are slot zero's two roots, inside the
+        // mapped context table, and the cache clean covers that line.
         unsafe {
             ttbs.ptr()
                 .cast::<u64>()

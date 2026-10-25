@@ -248,7 +248,9 @@ pub(crate) fn register<'a>(
     pdev: &'a platform::Device<Core<'_>>,
 ) -> Result<drm::Registration<'a, Driver>> {
     use kernel::dma::{Device as _, DmaMask};
-    // SAFETY: G16's hardware output address width was validated at bootstrap.
+    // SAFETY: This is the initial probe, before bootstrap, DRM registration
+    // or any client DMA, so no DMA allocation or mapping runs concurrently
+    // with the mask change. T8132's GPU addresses 42 bits.
     unsafe {
         pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)?;
     }
