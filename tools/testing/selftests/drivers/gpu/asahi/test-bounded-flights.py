@@ -13,13 +13,13 @@ import re
 here = Path(__file__).resolve()
 root = next(p for p in here.parents if (p / 'drivers/gpu/drm/asahi/g16_runtime.rs').exists())
 driver = root / 'drivers/gpu/drm/asahi'
-runtime = (driver / 'g16_runtime.rs').read_text()
+runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
 drm = (driver / 'g16_drm.rs').read_text()
 g16 = (driver / 'g16.rs').read_text()
 
 
 def function(source, signature, nth=0):
-    starts = [m for m in re.finditer(r'\n(\s*)(?:pub\(crate\) )?fn ' + re.escape(signature), source)]
+    starts = [m for m in re.finditer(r'\n(\s*)(?:pub\((?:crate|super)\) )?fn ' + re.escape(signature), source)]
     assert len(starts) > nth, signature
     m = starts[nth]
     indent = m.group(1).lstrip('\n')

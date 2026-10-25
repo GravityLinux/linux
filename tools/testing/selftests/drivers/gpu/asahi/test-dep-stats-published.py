@@ -8,7 +8,7 @@ import re
 root = next(p for p in Path(__file__).resolve().parents
             if (p / 'drivers/gpu/drm/asahi/g16_runtime.rs').exists())
 driver = root / 'drivers/gpu/drm/asahi'
-runtime = (driver / 'g16_runtime.rs').read_text()
+runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
 drm = (driver / 'g16_drm.rs').read_text()
 timeline = (driver / 'g16_timeline.rs').read_text()
 

@@ -8,7 +8,7 @@ import re
 root = next(p for p in Path(__file__).resolve().parents
             if (p / 'drivers/gpu/drm/asahi/g16_runtime.rs').exists())
 driver = root / 'drivers/gpu/drm/asahi'
-runtime = (driver / 'g16_runtime.rs').read_text()
+runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
 m4 = (driver / 'asahi_m4.rs').read_text()
 
 # Render-to-render items default to kind 0, as production boots pass.

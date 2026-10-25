@@ -18,7 +18,7 @@ vm = (driver / 'g16_vm.rs').read_text()
 
 
 def function(source, name):
-    m = re.search(r'\n(\s*)(?:pub\(crate\) )?fn ' + name + r'\b', source)
+    m = re.search(r'\n(\s*)(?:pub\((?:crate|super)\) )?fn ' + name + r'\b', source)
     assert m, name
     indent = m.group(1).lstrip('\n')
     end = re.search(r'\n' + indent + r'}\n', source[m.end():])

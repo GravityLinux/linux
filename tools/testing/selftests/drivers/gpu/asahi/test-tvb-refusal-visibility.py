@@ -16,12 +16,12 @@ here = Path(__file__).resolve()
 root = next(p for p in here.parents if (p / 'drivers/gpu/drm/asahi/g16_tvb.rs').exists())
 driver = root / 'drivers/gpu/drm/asahi'
 tvb = (driver / 'g16_tvb.rs').read_text()
-runtime = (driver / 'g16_runtime.rs').read_text()
+runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
 timeline = (driver / 'g16_timeline.rs').read_text()
 
 
 def function(source, name):
-    m = re.search(r'\n(\s*)(?:pub\(crate\) )?fn ' + name + r'\b', source)
+    m = re.search(r'\n(\s*)(?:pub\((?:crate|super)\) )?fn ' + name + r'\b', source)
     assert m, name
     indent = m.group(1).lstrip('\n')
     end = re.search(r'\n' + indent + r'}\n', source[m.end():])
