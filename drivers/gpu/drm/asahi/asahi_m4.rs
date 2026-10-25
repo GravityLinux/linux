@@ -132,38 +132,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 logs each queue's kernel-resolved dependency counts when it is destroyed (TA holds, cross-queue holds, lane-ordered fragment waits, compute holds)",
         },
-        dump_render_from: u32 {
-            default: 0,
-            description: "Debug: with dump_render_to, log the register table and descriptor words of every render Work whose queue ordinal is in [from, to], at submission, for diffing against hang reports",
-        },
-        dump_render_to: u32 {
-            default: 0,
-            description: "Debug: last queue ordinal dumped (0 disables dump_render)",
-        },
-        dump_render_reg: u32 {
-            default: 0,
-            description: "Debug: dump_render only keeps renders whose 3D register table holds this register with value dump_render_value (0: no filter), e.g. 0x15211 = 0x2d000000500 for 1280x720",
-        },
-        dump_render_value: u64 {
-            default: 0,
-            description: "Debug: the value dump_render_reg must hold",
-        },
-        dump_render_context: u32 {
-            default: 0xffffffff,
-            description: "Debug: dump_render only keeps renders on this firmware context slot (default: any)",
-        },
-        dump_render_recent: u32 {
-            default: 0,
-            description: "Debug: N > 0 keeps the last N submitted renders of any shape in a second ring, printed in full by the hang report (each header names tgid, VM, context, size and stamps), for what ran just before a stuck render",
-        },
-        dump_render_buffered: u32 {
-            default: 0,
-            description: "Debug: N > 0 keeps the last N submitted renders (within dump_render_from/to if set, otherwise all) in a ring and prints them only in the hang report, with no printing on the submission path",
-        },
-        dump_render_max: u32 {
-            default: 400,
-            description: "Debug: at most this many renders are dumped per boot",
-        },
         wedge_ms: u32 {
             default: 2000,
             description: "A4 wedge detection window: a render with TA done and all waits met whose 3D never starts, with all channels drained and no fragment progress on any lane for this long",

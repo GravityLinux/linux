@@ -222,9 +222,6 @@ struct Diagnostics {
     wedge_signature: u64,
     /// The current wedge has been logged.
     wedge_reported: bool,
-    /// Debug (dump_render_buffered): the most recent submitted renders,
-    /// printed only by the hang report.
-    render_ring: render_runtime::RenderRing,
     retire_log: KVec<render_runtime::Retired>,
     retire_next: usize,
     /// Heap-allocated: Bootstrap is built on the probe stack.
@@ -237,7 +234,6 @@ struct Diagnostics {
     /// The last 64 stale tags: (time ns, stamp, want, tag, current, live).
     stale_recent: KVec<(i64, u64, u32, u32, u32, bool)>,
     stale_next: usize,
-    recent_ring: render_runtime::RenderRing,
     pressure_reported: core::sync::atomic::AtomicU64,
     /// Backpressure bits seen since the last take_pressure() (timeline=1).
     pressure_seen: core::sync::atomic::AtomicU64,
@@ -774,7 +770,6 @@ impl Bootstrap {
             wedge_sampled: None,
             wedge_signature: 0,
             wedge_reported: false,
-            render_ring: render_runtime::RenderRing::new(),
             // Full capacity now: retirement logs without allocating.
             retire_log: KVec::with_capacity(render_runtime::RETIRE_LOG, GFP_KERNEL)?,
             retire_next: 0,
@@ -794,7 +789,6 @@ impl Bootstrap {
                 v
             },
             stale_next: 0,
-            recent_ring: render_runtime::RenderRing::new(),
             pressure_reported: core::sync::atomic::AtomicU64::new(0),
             pressure_seen: core::sync::atomic::AtomicU64::new(0),
             hold_key: core::sync::atomic::AtomicU64::new(0),

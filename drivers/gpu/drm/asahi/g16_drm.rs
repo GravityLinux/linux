@@ -1358,7 +1358,7 @@ impl Vm {
     fn detach(&self, runtime: &mut crate::g16::Bootstrap) -> Result {
         {
             let space = self.space.lock();
-            runtime.flush_render_ring(space.roots().low);
+            runtime.report_vm_detach(space.roots().low);
             runtime.release_render_vm(space.roots())?;
         }
         let compute = self.compute_space.lock();
