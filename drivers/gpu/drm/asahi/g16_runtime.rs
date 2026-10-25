@@ -42,7 +42,7 @@ pub(crate) struct FirmwareQueues {
     /// Per lane (TA, 3D, compute), the latest stamps its published Works
     /// waited on as firmware items, keyed by address.
     waited: [[Option<Stamp>; 2]; 3],
-    /// read_opt: the last (read, done) cursors admission read per lane;
+    /// The last (read, done) cursors admission read per lane;
     /// u32::MAX until read. Cursors only advance, so a stale view
     /// underestimates room.
     cursors: [core::cell::Cell<(u32, u32)>; 3],
@@ -1049,8 +1049,7 @@ impl Bootstrap {
                 let fw = self._firmware_space.as_ref().ok_or(EIO)?;
                 let before = crate::g16_timeline::reads();
                 let (mut read, mut done) = queue.cursors[stage].get();
-                if !crate::g16_timeline::read_opt()
-                    || read >= 0x500
+                if read >= 0x500
                     || done >= 0x500
                     || !ring_room(lane.head, read, done, entries[stage], 0x500)
                 {
@@ -1664,11 +1663,7 @@ impl Bootstrap {
                 let notified = match flight.notifier_count {
                     // The shared notifier has counted this render's Works.
                     Some((completed, total)) => {
-                        let count = if crate::g16_timeline::read_opt() {
-                            snapshot.read(fw, completed)?
-                        } else {
-                            fw.read_u32(completed)?
-                        };
+                        let count = snapshot.read(fw, completed)?;
                         (count.wrapping_sub(total) as i32) >= 0
                     }
                     None => {
@@ -1823,8 +1818,7 @@ impl Bootstrap {
         // Wedge detection needs a few samples per wedge_ms window (default
         // 2 s), not one per pump pass: each sample reads two stamps per
         // outstanding render and 36 channel registers.
-        let sample = !crate::g16_timeline::read_opt()
-            || self.diagnostics.wedge_sampled.is_none_or(|t| t.elapsed().as_millis() >= 50);
+        let sample = self.diagnostics.wedge_sampled.is_none_or(|t| t.elapsed().as_millis() >= 50);
         if sample {
             self.diagnostics.wedge_sampled = Some(Instant::now());
             let before = crate::g16_timeline::reads();
@@ -1888,11 +1882,10 @@ impl Bootstrap {
         } else {
             watchdog
         };
-        // safety_poll_ms: with work outstanding, recheck at least this often,
-        // so a late or lost completion notification costs milliseconds.
-        let safety = crate::g16_timeline::SAFETY_POLL_MS.load(Ordering::Relaxed);
-        if safety != 0 && !self.flights.is_empty() {
-            watchdog.min(safety)
+        // With work outstanding, recheck at least this often, so a late or
+        // lost completion notification costs milliseconds.
+        if !self.flights.is_empty() {
+            watchdog.min(crate::g16_timeline::SAFETY_POLL_MS)
         } else {
             watchdog
         }
@@ -2241,13 +2234,9 @@ impl Bootstrap {
             true
         } else {
             let before = t::reads();
-            let now = if t::read_opt() {
-                // The last retire scan's value: stamps only advance, so a
-                // value that already reached the target still does.
-                self.last_scan.peek(dep.address)
-            } else {
-                Some(self._firmware_space.as_ref().ok_or(EIO)?.read_u32(dep.address)?)
-            };
+            // The last retire scan's value: stamps only advance, so a value
+            // that already reached the target still does.
+            let now = self.last_scan.peek(dep.address);
             t::attribute(&t::P_RD_ELIDE, before);
             let reached = now.is_some_and(|v| g16_stamp::reached(v, dep.value));
             if reached {

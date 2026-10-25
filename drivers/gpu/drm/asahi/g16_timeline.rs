@@ -340,9 +340,6 @@ pub(crate) fn init_caps(queue: u32, lane: u32) -> Result {
     Ok(())
 }
 
-/// How much of a reused scratch lease to zero (asahi_m4.scratch_zero).
-pub(crate) static SCRATCH_ZERO: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
-
 /// Test: one-shot failure injection for queue-failure tests (debugfs
 /// `fail_prep`, `fail_retire`, `fail_skip`). Writing a TGID arms the next
 /// command of that process to fail preparation with EINVAL, or to retire
@@ -384,9 +381,6 @@ impl FlagKnob {
     }
 
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
-    pub(crate) const READ_OPT: Self = Self { cell: &READ_OPT, name: "read_opt", max: 1 };
-    pub(crate) const SAFETY_POLL_MS: Self = Self { cell: &SAFETY_POLL_MS, name: "safety_poll_ms", max: 10000 };
-    pub(crate) const SCRATCH_ZERO: Self = Self { cell: &SCRATCH_ZERO, name: "scratch_zero", max: 2 };
     pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", max: i32::MAX as u32 };
     pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", max: i32::MAX as u32 };
     pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", max: 4096 };
@@ -464,27 +458,11 @@ impl kernel::debugfs::Writer for DepStats {
     }
 }
 
-/// Fewer firmware reads per pass (asahi_m4.read_opt, runtime: debugfs
-/// `asahi_m4/read_opt`; 0 restores #167's reads):
-/// - admission reuses the last lane cursors it read and rereads them only when
-///   they show no room (cursors only advance, so a stale view is conservative);
-/// - retirement reads the shared render-notifier count through the scan
-///   snapshot;
-/// - the dependency-item already-reached test uses the last retire scan's values and
-///   keeps the item when the stamp wasn't seen there, with no read.
-pub(crate) static READ_OPT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
-
-#[inline(always)]
-pub(crate) fn read_opt() -> bool {
-    READ_OPT.load(core::sync::atomic::Ordering::Relaxed) != 0
-}
-
 /// With work outstanding, the pump rechecks completion at least every this
-/// many ms (asahi_m4.safety_poll_ms, runtime: debugfs `asahi_m4/safety_poll_ms`;
-/// 0 = only the watchdog windows of #170). Counters in dep_stats:
-/// poll_timeouts (waits that timed out), poll_retired (Works those polls
-/// retired, i.e. completions whose notification was late or lost).
-pub(crate) static SAFETY_POLL_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(50);
+/// many ms, so a late or lost notification costs milliseconds. Counters in
+/// dep_stats: poll_timeouts (waits that timed out), poll_retired (Works those
+/// polls retired, i.e. completions whose notification was late or lost).
+pub(crate) const SAFETY_POLL_MS: u32 = 50;
 pub(crate) static POLL_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static POLL_RETIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Rate limit for "retired 0" poll warnings (slow work, not a fault): the

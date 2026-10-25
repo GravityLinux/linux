@@ -192,18 +192,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 times publish-path sections into debugfs asahi_m4/publish_profile (two serialized counter reads per section, per firmware read). Runtime: debugfs asahi_m4/profile",
         },
-        safety_poll_ms: u32 {
-            default: 50,
-            description: "With Work outstanding, recheck completion at least every this many ms, so a late or lost completion notification costs milliseconds (0: only the 250 ms render / 10 s watchdog windows). Counters poll_timeouts/poll_retired in debugfs asahi_m4/dep_stats. Runtime: debugfs asahi_m4/safety_poll_ms",
-        },
-        scratch_zero: u32 {
-            default: 1,
-            description: "Reused render/compute scratch leases (tilemap, TPC, metadata pages; compute scratch and marker): 2 zeroes the whole lease, as fresh pages are; 1 (default; full VK CTS clean on #181, 2026-10-12) zeroes only the render metadata pages and the compute marker page; 0 zeroes nothing (upstream Apple8 never clears these per scene). Runtime: debugfs asahi_m4/scratch_zero",
-        },
-        read_opt: u32 {
-            default: 1,
-            description: "1 (default) cuts per-pass firmware reads: cached admission lane cursors (reread when they show no room), the shared render-notifier count through the retire snapshot, the dependency-item reached test from the last scan, and wedge sampling at most every 50 ms instead of every pump pass; 0 restores #167's reads. Runtime: debugfs asahi_m4/read_opt",
-        },
         timeline_records: u32 {
             default: 131072,
             description: "Debug: timeline ring capacity in records (160 bytes each), allocated at probe only when timeline is nonzero",

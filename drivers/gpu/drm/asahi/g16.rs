@@ -216,7 +216,7 @@ const BOOT_BARRIER: u64 = 0xffff_fc20_c052_0080;
 struct Diagnostics {
     /// A4 wedge detection state (check_wedge).
     wedge_since: Option<kernel::time::Instant<kernel::time::Monotonic>>,
-    /// read_opt: when check_wedge last sampled (it reads every render
+    /// When check_wedge last sampled (at most every 50 ms; it reads every render
     /// flight's stamps and every channel's registers).
     wedge_sampled: Option<kernel::time::Instant<kernel::time::Monotonic>>,
     wedge_signature: u64,
@@ -274,7 +274,7 @@ pub(crate) struct Bootstrap {
     /// Queue storage returned by dropped queues, awaiting context destruction.
     /// It holds a reserved slot for every region, so dropping never allocates.
     retired_queues: Arc<kernel::sync::Mutex<KVec<u64>>>,
-    /// The last retire scan's firmware words (read_opt), on the heap: this
+    /// The last retire scan's firmware words, on the heap: this
     /// struct is built by value on the probe stack.
     pub(crate) last_scan: KBox<render_runtime::WordSnapshot>,
     queue_regions: usize,

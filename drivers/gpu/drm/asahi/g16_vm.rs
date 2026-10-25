@@ -201,7 +201,7 @@ impl AddressSpace {
                 crate::g16_mesh::Profile::PAYLOAD_BYTES
             } else { 0 }))
             .ok_or(ENOMEM)?;
-        // Only the trailing metadata pages may need clearing (scratch_zero=1).
+        // Only the trailing metadata pages need clearing.
         let scratch = self.lease_scratch(true, size, tilemap + tpc)?;
         let base = scratch.range.start;
         p.tilemap = base;
@@ -218,7 +218,7 @@ impl AddressSpace {
         if let Some(mesh) = &mut p.mesh {
             mesh.payload = meta + 0x14000;
             // The lease lasts through both TA and fragment retirement. Clear
-            // the entire payload even when the ordinary scratch_zero knob is 0.
+            // the entire payload, not only the metadata pages.
             for offset in (0..crate::g16_mesh::Profile::PAYLOAD_BYTES).step_by(256) {
                 self.write_low(mesh.payload + offset as u64, &[0; 256])?;
             }
@@ -247,7 +247,7 @@ impl AddressSpace {
         Ok(scratch)
     }
 
-    /// `metadata`: the lease offset from which scratch_zero=1 still clears.
+    /// `metadata`: the lease offset from which a reused lease is cleared.
     fn lease_scratch(&mut self, render: bool, size: usize, metadata: usize) -> Result<Scratch> {
         if size == 0 || size & (UAT_PGSZ - 1) != 0 {
             return Err(EINVAL);
@@ -267,14 +267,11 @@ impl AddressSpace {
             } else {
                 self.scratch_free[index][slot].start = end;
             }
-            // All previous GPU writes have retired. Reinitialize the leased
-            // range (all of it by default, as fresh pages are zeroed) without
+            // All previous GPU writes have retired. Reinitialize the
+            // metadata pages of the leased range (the tilemap, TPC and compute
+            // scratch need no clearing; full VK CTS clean, #181) without
             // touching PTEs or neighbouring active jobs.
-            let clear_from = match crate::g16_timeline::SCRATCH_ZERO.load(core::sync::atomic::Ordering::Relaxed) {
-                0 => end,
-                1 => (start + metadata as u64).min(end),
-                _ => start,
-            };
+            let clear_from = (start + metadata as u64).min(end);
             for va in (clear_from..end).step_by(UAT_PGSZ) {
                 let page = self.pages.get(&va).ok_or(EIO)?;
                 page.with_page_mapped(|ptr| {
