@@ -62,7 +62,9 @@ impl platform::Driver for M4Gpu {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = pdev.as_ref();
-        if !(11..=g16_tvb::MAX_BLOCKS).contains(&module_parameters::tvb_max_blocks.value()) {
+        if !(11..=g16_tvb::MAX_BLOCKS).contains(&module_parameters::tvb_max_blocks.value())
+            || module_parameters::dependency_kind.value() > 1
+        {
             return Err(EINVAL);
         }
 
@@ -199,8 +201,8 @@ kernel::module_platform_driver! {
             description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16 per-vertex one-group profile; no capability advertisement",
         },
         dependency_kind: u32 {
-            default: 1,
-            description: "Experiment: firmware kind of render-to-render dependencies (1 normal, 0 as the internal TA-to-fragment wait)",
+            default: 0,
+            description: "Firmware kind of render-to-render dependencies: 0 (default) as the internal TA-to-fragment wait, which every production boot has passed since early October 2026; 1 the dynamic dependency graph",
         },
         fault_control: u32 {
             default: 3,
