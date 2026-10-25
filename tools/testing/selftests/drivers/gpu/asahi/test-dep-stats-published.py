@@ -9,7 +9,7 @@ root = next(p for p in Path(__file__).resolve().parents
             if (p / 'drivers/gpu/drm/asahi/g16_runtime.rs').exists())
 driver = root / 'drivers/gpu/drm/asahi'
 runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
-drm = (driver / 'g16_drm.rs').read_text()
+drm = ''.join(p.read_text() for p in sorted(driver.glob('g16_drm*.rs')))
 timeline = (driver / 'g16_timeline.rs').read_text()
 
 # No DEP_* counter outside DepTally::publish: resolution only tallies.

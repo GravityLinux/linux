@@ -14,7 +14,7 @@ here = Path(__file__).resolve()
 root = next(p for p in here.parents if (p / 'drivers/gpu/drm/asahi/g16_runtime.rs').exists())
 driver = root / 'drivers/gpu/drm/asahi'
 runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
-drm = (driver / 'g16_drm.rs').read_text()
+drm = ''.join(p.read_text() for p in sorted(driver.glob('g16_drm*.rs')))
 g16 = (driver / 'g16.rs').read_text()
 
 

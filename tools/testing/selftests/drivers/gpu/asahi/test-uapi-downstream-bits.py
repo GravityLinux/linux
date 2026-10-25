@@ -43,7 +43,7 @@ assert {k: v[0] for k, v in flags.items() if v[1]} == {
     'DRM_ASAHI_RENDER_FEW_PRIMITIVES': 30, 'DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT': 29}
 
 # The render path's accepted-flag mask, by name, resolved through the header.
-driver = (root / 'drivers/gpu/drm/asahi/g16_drm.rs').read_text()
+driver = ''.join(p.read_text() for p in sorted((root / 'drivers/gpu/drm/asahi').glob('g16_drm*.rs')))
 aliases = dict(re.findall(r'drm_asahi_render_flags_(DRM_ASAHI_RENDER_\w+) as (\w+)', driver))
 mask = re.search(r'c\.flags & !\(([^)]*)\)', driver).group(1)
 accepted = {flags[{v: k for k, v in aliases.items()}[n.strip()]][0] for n in mask.split('|')}

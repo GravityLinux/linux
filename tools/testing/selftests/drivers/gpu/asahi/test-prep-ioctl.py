@@ -16,7 +16,7 @@ root = next(p for p in here.parents if (p / 'drivers/gpu/drm/asahi/g16_runtime.r
 driver = root / 'drivers/gpu/drm/asahi'
 runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
 vm = (driver / 'g16_vm.rs').read_text()
-drm = (driver / 'g16_drm.rs').read_text()
+drm = ''.join(p.read_text() for p in sorted(driver.glob('g16_drm*.rs')))
 render = (driver / 'g16_render.rs').read_text()
 compute = (driver / 'g16_compute.rs').read_text()
 

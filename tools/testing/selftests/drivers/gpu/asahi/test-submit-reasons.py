@@ -13,7 +13,7 @@ import re
 
 here = Path(__file__).resolve()
 root = next(p for p in here.parents if (p / 'drivers/gpu/drm/asahi/g16_drm.rs').exists())
-drm = (root / 'drivers/gpu/drm/asahi/g16_drm.rs').read_text()
+drm = ''.join(p.read_text() for p in sorted((root / 'drivers/gpu/drm/asahi').glob('g16_drm*.rs')))
 
 
 def function(source, name):
