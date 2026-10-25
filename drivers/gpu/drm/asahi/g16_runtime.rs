@@ -46,55 +46,6 @@ pub(crate) struct FirmwareQueues {
     /// u32::MAX until read. Cursors only advance, so a stale view
     /// underestimates room.
     cursors: [core::cell::Cell<(u32, u32)>; 3],
-    /// Kernel-side dependency resolution statistics (logged at teardown with
-    /// dep_stats=1).
-    deps: DependencyStats,
-}
-
-/// Cumulative per-queue counts of kernel-resolved dependencies.
-#[derive(Default)]
-struct DependencyStats {
-    /// Compute admissions deferred on another queue's stamp.
-    compute_held: u64,
-    /// Works admitted after at least one deferral, and the total time from
-    /// their first deferral to admission.
-    held_works: u64,
-    held_us: u64,
-    /// First deferral of the Work currently waiting, if any.
-    hold_start: Option<Instant<Monotonic>>,
-}
-
-impl DependencyStats {
-    fn defer(&mut self) {
-        if self.hold_start.is_none() {
-            self.hold_start = Some(Instant::now());
-        }
-    }
-
-    fn admit(&mut self) {
-        if let Some(start) = self.hold_start.take() {
-            self.held_works += 1;
-            self.held_us += start.elapsed().as_micros_ceil() as u64;
-        }
-    }
-}
-
-impl Drop for FirmwareQueues {
-    fn drop(&mut self) {
-        let d = &self.deps;
-        if crate::module_parameters::dep_stats.value() != 0
-            && d.compute_held != 0
-        {
-            pr_info!(
-                "G16: queue deps renders={} computes={} compute_held={} held_works={} held_us={}\n",
-                self.render_count,
-                self.compute_count,
-                d.compute_held,
-                d.held_works,
-                d.held_us
-            );
-        }
-    }
 }
 
 impl FirmwareQueues {
@@ -199,7 +150,6 @@ impl FirmwareQueues {
             last: [None; 2],
             waited: [[None; 2]; 3],
             cursors: [const { core::cell::Cell::new((u32::MAX, u32::MAX)) }; 3],
-            deps: DependencyStats::default(),
             rejected: false,
         }
     }
@@ -2880,14 +2830,11 @@ impl Bootstrap {
                 let done = g16_stamp::reached(now, dep.value);
                 self.hold_check("compute", dep, now, done)?;
                 if !done {
-                    queue.deps.compute_held += 1;
-                    queue.deps.defer();
                     crate::g16_timeline::DEFERRED_CPU_HOLD.fetch_add(1, Ordering::Relaxed);
                     return Err(EBUSY);
                 }
             }
         }
-        queue.deps.admit();
         Ok(kept)
     }
 

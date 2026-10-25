@@ -128,10 +128,6 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Trace mask: 1=firmware KTrace/publications, 2=admission saturation, 4=publication batches, 8=queued dependencies, 16=retirement delays, 32=dump one render's Work structs, 64=firmware RX ring activity, 128=firmware mappings and configuration dump, 256=queue event index changes",
         },
-        dep_stats: u32 {
-            default: 0,
-            description: "Debug: 1 logs each queue's kernel-resolved dependency counts when it is destroyed (TA holds, cross-queue holds, lane-ordered fragment waits, compute holds)",
-        },
         wedge_ms: u32 {
             default: 2000,
             description: "A4 wedge detection window: a render with TA done and all waits met whose 3D never starts, with all channels drained and no fragment progress on any lane for this long",
