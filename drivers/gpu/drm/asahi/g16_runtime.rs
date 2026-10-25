@@ -438,8 +438,6 @@ fn ring_room(tail: u32, read: u32, done: u32, entries: u32, capacity: u32) -> bo
 }
 
 impl Bootstrap {
-    /// Report each exhausted resource once, without logging every retry or
-    /// enabling firmware KTrace (which changes command execution timing).
     /// A Work held on a stamp waits for a completion to advance it. With no
     /// Work in flight anywhere nothing can write that stamp, so the hold
     /// would never clear and the pump would keep the job forever with an
@@ -491,6 +489,8 @@ impl Bootstrap {
         self.diagnostics.pressure_seen.swap(0, Ordering::Relaxed)
     }
 
+    /// Report each exhausted resource once, without logging every retry or
+    /// enabling firmware KTrace (which changes command execution timing).
     fn report_pressure(&self, bit: u64, resource: &str) {
         self.diagnostics.pressure_seen.fetch_or(bit, Ordering::Relaxed);
         if let Some(count) = crate::g16_timeline::DEFERRED_BY.get(bit.trailing_zeros() as usize) {
@@ -2145,18 +2145,6 @@ impl Bootstrap {
         Ok(())
     }
 
-    /// The caller retains all client mappings throughout this call. On failure
-    /// after publication it must quarantine those mappings until reset.
-    /// Experiment (render_deps=1): order a render against earlier work in the
-    /// kernel instead of with firmware dependency items, as for compute. A
-    /// render waiting on this queue's own fragment lane from its fragment
-    /// stage (VDM_BARRIER_FRAGMENT) is ordered by that lane. Every other
-    /// awaited stamp, including the previous render's fragment stamp that a
-    /// tiling stage must wait for when the render reads earlier fragment
-    /// output, must be reached before admission; until then return EBUSY and
-    /// let the worker retry after the next completion. The render then
-    /// reaches the firmware with no dependency items; its internal TA-to-3D
-    /// link is unchanged. render_deps=0 keeps the items.
     /// Count a firmware dependency item and decide whether to drop it as
     /// redundant: when this lane's previous Work already waited on that stamp
     /// or a later one (Works on a lane start in order), or when the stamp has
@@ -3247,8 +3235,6 @@ impl Bootstrap {
         }
     }
 }
-
-/// Diagnostics: a process name from a NUL-padded comm.
 
 /// Diagnostics: one retired Work, kept to explain later reuse of its slot
 /// and its Work memory in hang reports.

@@ -90,6 +90,7 @@ pub(crate) fn task_comm(task: &kernel::task::Task) -> [u8; 16] {
     core::array::from_fn(|i| comm[i] as u8)
 }
 
+/// Diagnostics: a process name from a NUL-padded comm.
 pub(crate) fn comm_str(comm: &[u8; 16]) -> &str {
     let len = comm.iter().position(|&c| c == 0).unwrap_or(16);
     core::str::from_utf8(&comm[..len]).unwrap_or("?")
