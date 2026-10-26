@@ -14,6 +14,17 @@ config ARM_CPUIDLE
 	  initialized by calling the CPU operations init idle hook
 	  provided by architecture code.
 
+config ARM_APPLE_M4_CPUIDLE
+	bool "Apple M4 power-down CPU idle driver"
+	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
+	depends on CPU_PM
+	select CPU_IDLE_MULTIPLE_DRIVERS
+	help
+	  Select this to enable a power-down idle state on Apple M4 (T8132)
+	  SoCs, whose cores lose their state in WFI. It needs a boot loader
+	  that provides per-CPU resume slots and is off unless the
+	  cpuidle_apple_m4.enable=1 kernel parameter is given.
+
 config ARM_PSCI_CPUIDLE
 	bool "PSCI CPU idle Driver"
 	depends on ARM_PSCI_FW
