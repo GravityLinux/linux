@@ -236,6 +236,11 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
 
+static bool panic_on_crash;
+module_param(panic_on_crash, bool, 0644);
+MODULE_PARM_DESC(panic_on_crash,
+		 "Panic when the ANS co-processor crashes instead of failing all I/O");
+
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
 
@@ -266,7 +271,9 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 {
 	struct apple_nvme *anv = cookie;
 
-	dev_warn(anv->dev, "RTKit crashed; unable to recover without a reboot");
+	dev_crit(anv->dev, "RTKit crashed; unable to recover without a reboot");
+	if (panic_on_crash)
+		panic("%s: ANS co-processor crashed", dev_name(anv->dev));
 	nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -894,16 +901,18 @@ static int apple_nvme_init_request(struct blk_mq_tag_set *set,
 static void apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
 {
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
-	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 	bool dead = false, freeze = false;
 	unsigned long flags;
+	u32 csts;
 
-	if (apple_rtkit_is_crashed(anv->rtk))
+	/* Don't touch the controller's registers once its firmware is dead. */
+	if (apple_rtkit_is_crashed(anv->rtk)) {
 		dead = true;
-	if (!(csts & NVME_CSTS_RDY))
-		dead = true;
-	if (csts & NVME_CSTS_CFS)
-		dead = true;
+	} else {
+		csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+		if (!(csts & NVME_CSTS_RDY) || (csts & NVME_CSTS_CFS))
+			dead = true;
+	}
 
 	if (state == NVME_CTRL_LIVE ||
 	    state == NVME_CTRL_RESETTING) {
@@ -976,7 +985,6 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	struct apple_nvme_queue *q = iod->q;
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 	unsigned long flags;
-	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 
 	if (nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE) {
 		/*
@@ -1006,7 +1014,8 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	}
 
 	/* check if we just missed an interrupt if we're still alive */
-	if (!apple_rtkit_is_crashed(anv->rtk) && !(csts & NVME_CSTS_CFS)) {
+	if (!apple_rtkit_is_crashed(anv->rtk) &&
+	    !(readl(anv->mmio_nvme + NVME_REG_CSTS) & NVME_CSTS_CFS)) {
 		spin_lock_irqsave(&anv->lock, flags);
 		apple_nvme_handle_cq(q, false);
 		spin_unlock_irqrestore(&anv->lock, flags);
