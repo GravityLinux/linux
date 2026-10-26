@@ -442,6 +442,17 @@ static void apple_rtkit_system7_rx(struct apple_rtkit *rtk, u64 msg)
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->system7_buffer,
 						 APPLE_RTKIT_EP_UNKNOWN7, msg);
 		break;
+	/*
+	 * Endpoint 7 follows the IOReport protocol: a buffer request, then
+	 * reports that are answered by echoing them back.  PMP sends these
+	 * once it is running.
+	 */
+	case 0x8:
+	case 0xc:
+		dev_dbg(rtk->dev, "RTKit: system endpoint 7 message %llx, acked\n", msg);
+		apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_UNKNOWN7, msg,
+					 NULL, false);
+		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown system endpoint 7 message: %llx\n",
 			 msg);
