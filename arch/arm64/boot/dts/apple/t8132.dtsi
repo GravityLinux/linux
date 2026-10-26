@@ -424,6 +424,91 @@
 				#power-domain-cells = <0>;
 			};
 
+			pmp_report_agx: report@4 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x4>;
+				label = "pmp-agx";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_gfx>;
+			};
+
+			pmp_report_disp: report@7 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x7>;
+				label = "pmp-disp";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_atc1: report@13 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x13>;
+				label = "pmp-atc1";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_atc2: report@14 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x14>;
+				label = "pmp-atc2";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_soc_ni0: report@16 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x16>;
+				label = "pmp-soc-ni0";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_soc_ni1: report@17 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x17>;
+				label = "pmp-soc-ni1";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_soc_ni3: report@19 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x19>;
+				label = "pmp-soc-ni3";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_soc_ni4: report@1a {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x1a>;
+				label = "pmp-soc-ni4";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_soc_ni5: report@1b {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x1b>;
+				label = "pmp-soc-ni5";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_ans: report@1d {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x1d>;
+				label = "pmp-ans";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_pcie: report@1e {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x1e>;
+				label = "pmp-pcie";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_sio: report@22 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x22>;
+				label = "pmp-sio";
+				#power-domain-cells = <0>;
+			};
+
 			pmp_report_boot_18: report@18 {
 				compatible = "apple,t6000-pmp-v2-report-entry";
 				reg = <0x18>;

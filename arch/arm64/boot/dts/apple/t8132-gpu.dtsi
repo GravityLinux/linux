@@ -32,7 +32,8 @@
 		      <0x3 0x00000000 0 0x4000000>;
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
-		power-domains = <&ps_gfx>;
+		/* Research (t8132-pmp-votes): tell PMP when the GPU is powered. */
+		power-domains = <&pmp_report_agx>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_l2>,
 				<&uat_handoff>, <&gpu_firmware>;
 		memory-region-names = "ttbs", "pagetables", "l2",

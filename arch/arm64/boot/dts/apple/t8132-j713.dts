@@ -276,3 +276,88 @@
 		label = "CPU Rail Current";
 	};
 };
+
+/*
+ * Research (t8132-pmp-votes): run PMP with steady votes for everything the
+ * system uses; the GPU vote follows its genpd (t8132-gpu.dtsi).
+ */
+&pmp_report_boot_f {
+	apple,always-on;
+};
+
+&pmp_report_boot_10 {
+	apple,always-on;
+};
+
+&pmp_report_atc0_common {
+	apple,always-on;
+};
+
+&pmp_report_atc1 {
+	apple,always-on;
+};
+
+&pmp_report_atc2 {
+	apple,always-on;
+};
+
+&pmp_report_atc3_common {
+	apple,always-on;
+};
+
+&pmp_report_boot_18 {
+	apple,always-on;
+};
+
+&pmp_report_disp {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni0 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni1 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni3 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni4 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni5 {
+	apple,always-on;
+};
+
+&pmp_report_ans {
+	apple,always-on;
+};
+
+&pmp_report_pcie {
+	apple,always-on;
+};
+
+&pmp_report_sio {
+	apple,always-on;
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+

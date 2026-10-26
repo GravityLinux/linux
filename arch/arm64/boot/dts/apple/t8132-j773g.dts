@@ -359,3 +359,49 @@
 &pmp {
 	status = "okay";
 };
+
+/* Research (t8132-pmp-votes): steady votes for everything the system uses; the GPU vote follows its genpd. */
+&pmp_report_disp {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni0 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni1 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni3 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni4 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni5 {
+	apple,always-on;
+};
+
+&pmp_report_ans {
+	apple,always-on;
+};
+
+&pmp_report_pcie {
+	apple,always-on;
+};
+
+&pmp_report_sio {
+	apple,always-on;
+};
+
+&pmp_report_atc1 {
+	apple,always-on;
+};
+
+&pmp_report_atc2 {
+	apple,always-on;
+};
+
