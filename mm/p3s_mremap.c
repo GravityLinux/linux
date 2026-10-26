@@ -133,6 +133,10 @@ static struct folio *p3s_mremap_alloc_folio(struct vm_area_struct *vma,
 {
 	struct folio *folio;
 
+	/*
+	 * Zeroed: slots of the window that no moved slice fills can later be
+	 * handed out by the sibling lookaround of a fault.
+	 */
 	folio = vma_alloc_zeroed_movable_folio(vma, addr);
 	if (!folio)
 		return NULL;
@@ -259,11 +263,20 @@ struct p3s_mremap_ctx *p3s_mremap_prepare(
 	}
 	ctx->nr_sources = nr;
 
-	/* Locked, the folios can be neither reclaimed nor migrated meanwhile */
+	/*
+	 * Locked, the folios can be neither reclaimed nor migrated meanwhile.
+	 * Only the first lock waits: should another path hold a later one,
+	 * give up with -EAGAIN rather than wait while holding the others.
+	 */
 	for (i = 0; i < nr; i++) {
-		ret = folio_lock_killable(ctx->sources[i]);
-		if (ret)
+		if (!i) {
+			ret = folio_lock_killable(ctx->sources[i]);
+			if (ret)
+				goto err;
+		} else if (!folio_trylock(ctx->sources[i])) {
+			ret = -EAGAIN;
 			goto err;
+		}
 		ctx->nr_locked++;
 		if (folio_maybe_dma_pinned(ctx->sources[i])) {
 			ret = -EBUSY;
@@ -342,6 +355,8 @@ void p3s_mremap_reslice(struct p3s_mremap_ctx *ctx,
 
 	if (!ctx || !ctx->nr_sources)
 		return;
+	mmap_assert_write_locked(mm);
+	vma_assert_write_locked(vma);
 	raw_write_seqcount_begin(&mm->write_protect_seq);
 	smp_mb();
 	for (w = 0; w < ctx->nr_windows; w++) {
