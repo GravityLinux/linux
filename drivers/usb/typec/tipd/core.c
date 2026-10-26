@@ -570,6 +570,16 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 	}
 }
 
+/*
+ * Does @st report a data connection, i.e. should the PHY leave safe mode?
+ * The single test for this, shared by the mode update and the decision to
+ * restart the role.
+ */
+static bool cd321x_data_connected(const struct cd321x_status *st)
+{
+	return st->data_status & TPS_DATA_STATUS_DATA_CONNECTION;
+}
+
 static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
@@ -577,7 +587,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
 	};
 
-	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
+	if (!cd321x_data_connected(st)) {
 		if (cd321x->state.mode == TYPEC_STATE_SAFE)
 			return;
 		cd321x->state.alt = NULL;
