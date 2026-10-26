@@ -46,6 +46,8 @@ static inline bool mm_mremap_fixed_keeps_slice(const struct vm_area_struct *vma,
  * @map_flags: MAP_* flags for get_unmapped_area
  * @old_addr: Source address being remapped
  * @mremap_flags: MREMAP_* flags (e.g. MREMAP_FIXED, MREMAP_DONTUNMAP)
+ * @reslice: The source is private anonymous memory that p3s_mremap_prepare()
+ *           and p3s_mremap_reslice() can move to another slice
  *
  * In a 4KB process, mremap() moves the PTEs as they are, so each one still
  * maps the slice that the old address used. Later faults, COW, migration
@@ -77,12 +79,19 @@ static inline bool mm_mremap_fixed_keeps_slice(const struct vm_area_struct *vma,
  *
  * An MREMAP_FIXED @addr goes to __get_unmapped_area() unchanged.
  * check_prep_vma() rejects cross-slice anonymous moves before unmapping the
- * destination. File and object mappings retain their source slice instead.
+ * destination, unless @reslice. File and object mappings retain their
+ * source slice instead.
+ *
+ * Private anonymous memory (@reslice) may move to any slice: the move copies
+ * the slices of each destination window into a new folio, and refuses pinned
+ * source folios (p3s_mremap_prepare()). FEX's 32-bit allocator and code cache
+ * do such MREMAP_FIXED moves at 4KB granularity. A MREMAP_DONTUNMAP hint is
+ * likewise used as is at any slice if @reslice.
  */
 static inline unsigned long mm_mremap_get_unmapped_area(struct file *file,
 		unsigned long addr, unsigned long len, unsigned long pgoff,
 		unsigned long map_flags, unsigned long old_addr,
-		unsigned long mremap_flags)
+		unsigned long mremap_flags, bool reslice)
 {
 	if (mm_is_p3s_4k(current->mm)) {
 		unsigned int slice =
@@ -94,11 +103,12 @@ static inline unsigned long mm_mremap_get_unmapped_area(struct file *file,
 			/*
 			 * MREMAP_DONTUNMAP treats a non-zero destination as an
 			 * mmap-style hint. Use an available hint as is only if
-			 * it is at the source slice. Otherwise search from the
-			 * start of its 16KB window, adding padding to preserve
-			 * the source slice.
+			 * it is at the source slice, or the range can be
+			 * resliced. Otherwise search from the start of its 16KB
+			 * window, adding padding to preserve the source slice.
 			 */
-			if (addr && !((old_addr ^ addr) & ~PAGE_MASK_KERNEL)) {
+			if (addr && (reslice ||
+				     !((old_addr ^ addr) & ~PAGE_MASK_KERNEL))) {
 				res = __get_unmapped_area(file, addr, len,
 							  pgoff, map_flags, EMPTY_VMA_FLAGS);
 				if (res == addr || IS_ERR_VALUE(res))
