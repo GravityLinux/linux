@@ -21,9 +21,9 @@ config ARM_APPLE_M4_CPUIDLE
 	select CPU_IDLE_MULTIPLE_DRIVERS
 	help
 	  Select this to enable a power-down idle state on Apple M4 (T8132)
-	  SoCs, whose cores lose their state in WFI. It needs a boot loader
-	  that provides per-CPU resume slots and is off unless the
-	  cpuidle_apple_m4.enable=1 kernel parameter is given.
+	  SoCs, whose cores lose their general purpose registers in WFI. It
+	  is off unless the cpuidle_apple_m4.enable=1 kernel parameter is
+	  given.
 
 config ARM_PSCI_CPUIDLE
 	bool "PSCI CPU idle Driver"

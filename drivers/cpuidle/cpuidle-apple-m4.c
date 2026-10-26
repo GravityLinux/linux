@@ -4,35 +4,30 @@
  *
  * CPU idle support for Apple M4 (T8132) and later SoCs
  *
- * On these cores WFI and WFE do not retain CPU state, and a core that wakes
- * from a state-losing WFI restarts at its reset vector. The boot loader's reset
- * vector checks a per-CPU resume slot (its address is in the CPU node's
- * "apple,idle-resume-addr" property) and, if it is armed, jumps there with the
- * MMU off. Idle therefore saves the CPU context with cpu_suspend(), arms the
- * slot with the physical address of cpu_resume and executes WFI. Should WFI
- * return with the context intact, the slot is disarmed and the idle period
- * ends normally.
+ * On these cores a WFI that lets the core power down does not keep the
+ * general purpose registers: execution continues after the WFI, with the stack
+ * pointer and the system registers intact but x0-x30 cleared. The power-down
+ * state therefore saves the callee-saved registers and the link register on
+ * the stack around WFI and reloads them afterwards, as the deep WFI of the
+ * Asahi cpuidle-apple driver does on earlier SoCs (without its CYC_OVRD
+ * write, which M4 does not have). The CPU PM notifiers save and restore what
+ * the rest of the kernel keeps in the core: FP state, timers and the
+ * interrupt controller's per-CPU setup.
  */
 
 #define pr_fmt(fmt) "cpuidle-apple-m4: " fmt
 
+#include <linux/context_tracking.h>
 #include <linux/cpu.h>
 #include <linux/cpu_pm.h>
 #include <linux/cpuidle.h>
-#include <linux/debugfs.h>
 #include <linux/init.h>
-#include <linux/io.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
-#include <linux/percpu.h>
 #include <linux/platform_device.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/idle.h>
-#include <linux/seq_file.h>
 #include <linux/string.h>
-
-#include <asm/cacheflush.h>
-#include <asm/suspend.h>
 
 enum idle_state {
 	STATE_POLL,
@@ -58,19 +53,11 @@ static unsigned int target_residency_us = 2000;
 module_param(target_residency_us, uint, 0444);
 MODULE_PARM_DESC(target_residency_us, "Power-down state target residency in us");
 
-struct apple_m4_idle_cpu {
-	u64 *slot;
-	u64 resumed;
-	u64 retained;
-};
-
-static DEFINE_PER_CPU(struct apple_m4_idle_cpu, apple_m4_idle_cpu);
-
 #define POLL_RELAX_COUNT	200
 
 /*
- * WFI is not usable as a shallow state here, so the shallow state polls, in
- * the same way as the generic poll state (which arm64 does not build).
+ * The shallow state polls, in the same way as the generic poll state (which
+ * arm64 does not build): a plain WFI is the state below.
  */
 static __cpuidle int apple_m4_enter_poll(struct cpuidle_device *dev,
 					 struct cpuidle_driver *drv, int index)
@@ -103,56 +90,59 @@ static __cpuidle int apple_m4_enter_poll(struct cpuidle_device *dev,
 	return index;
 }
 
-static __always_inline void apple_m4_set_slot(u64 *slot, u64 entry)
-{
-	WRITE_ONCE(*slot, entry);
-	/* The reset vector reads the slot with the MMU and caches off */
-	dcache_clean_poc((unsigned long)slot, (unsigned long)(slot + 1));
-}
+/*
+ * WFI, with the registers it does not keep saved on the stack: x18 (shadow
+ * call stack) to x30. x0-x17 are caller-saved. Interrupts are masked, so a
+ * wakeup shows in ISR_EL1; sleep again until one is pending.
+ */
+asm(
+	".pushsection .cpuidle.text, \"ax\"\n"
+	".type apple_m4_lossy_wfi, @function\n"
+	"apple_m4_lossy_wfi:\n"
+		"stp x29, x30, [sp, #-16]!\n"
+		"stp x27, x28, [sp, #-16]!\n"
+		"stp x25, x26, [sp, #-16]!\n"
+		"stp x23, x24, [sp, #-16]!\n"
+		"stp x21, x22, [sp, #-16]!\n"
+		"stp x19, x20, [sp, #-16]!\n"
+		"str x18, [sp, #-16]!\n"
+	"1:\n"
+		"dsb sy\n"
+		"wfi\n"
+		"mrs x0, ISR_EL1\n"
+		"cbz x0, 1b\n"
+		"ldr x18, [sp], #16\n"
+		"ldp x19, x20, [sp], #16\n"
+		"ldp x21, x22, [sp], #16\n"
+		"ldp x23, x24, [sp], #16\n"
+		"ldp x25, x26, [sp], #16\n"
+		"ldp x27, x28, [sp], #16\n"
+		"ldp x29, x30, [sp], #16\n"
+		"ret\n"
+	".size apple_m4_lossy_wfi, . - apple_m4_lossy_wfi\n"
+	".popsection\n"
+);
 
-/* Runs with RCU idle, after cpu_suspend()'s ct_cpuidle_enter() */
-static noinstr int apple_m4_powerdown_finisher(unsigned long arg)
-{
-	u64 *slot = (u64 *)arg;
-
-	apple_m4_set_slot(slot, __pa_symbol(cpu_resume));
-	dsb(sy);
-	wfi();
-
-	/* Still here: WFI kept the context, so cpu_suspend() returns 1 */
-	apple_m4_set_slot(slot, 0);
-	return 1;
-}
+void apple_m4_lossy_wfi(void);
 
 static __cpuidle int apple_m4_enter_pwrdown(struct cpuidle_device *dev,
 					    struct cpuidle_driver *drv, int index)
 {
-	struct apple_m4_idle_cpu *cpu = this_cpu_ptr(&apple_m4_idle_cpu);
-	int ret;
-
 	/*
 	 * Powering down clobbers FP state, the timers and the AIC's per-CPU
 	 * masks, among other things. The CPU PM notifiers save and restore
-	 * them. cpu_suspend() handles the RCU/context-tracking transition, so
-	 * this state is CPUIDLE_FLAG_RCU_IDLE.
+	 * them.
 	 */
 	if (cpu_pm_enter())
 		return -1;
 
-	ret = cpu_suspend((unsigned long)cpu->slot, apple_m4_powerdown_finisher);
-	if (ret == 0) {
-		/* Resumed through the reset vector; the slot is still armed */
-		apple_m4_set_slot(cpu->slot, 0);
-		if (!cpu->resumed++)
-			pr_info("CPU%d: first resume through the reset vector\n",
-				smp_processor_id());
-	} else if (ret == 1) {
-		cpu->retained++;
-	}
+	ct_cpuidle_enter();
+	apple_m4_lossy_wfi();
+	ct_cpuidle_exit();
 
 	cpu_pm_exit();
 
-	return ret < 0 ? -1 : index;
+	return index;
 }
 
 static struct cpuidle_driver apple_m4_idle_driver = {
@@ -181,73 +171,10 @@ static struct cpuidle_driver apple_m4_idle_driver = {
 	.state_count = STATE_COUNT,
 };
 
-static int apple_m4_idle_stats_show(struct seq_file *s, void *unused)
-{
-	unsigned int cpu;
-
-	seq_puts(s, "cpu resumed retained\n");
-	for_each_possible_cpu(cpu) {
-		struct apple_m4_idle_cpu *c = per_cpu_ptr(&apple_m4_idle_cpu, cpu);
-
-		seq_printf(s, "%u %llu %llu\n", cpu, READ_ONCE(c->resumed),
-			   READ_ONCE(c->retained));
-	}
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(apple_m4_idle_stats);
-
-static int apple_m4_map_slots(void)
-{
-	unsigned int cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct device_node *np = of_get_cpu_node(cpu, NULL);
-		u64 addr;
-		int ret;
-
-		if (!np)
-			return -ENODEV;
-		ret = of_property_read_u64(np, "apple,idle-resume-addr", &addr);
-		of_node_put(np);
-		if (ret) {
-			pr_info("CPU%u has no resume slot, not registering\n", cpu);
-			return -ENODEV;
-		}
-		if (!IS_ALIGNED(addr, sizeof(u64)))
-			return -EINVAL;
-
-		per_cpu(apple_m4_idle_cpu, cpu).slot =
-			memremap(addr, sizeof(u64), MEMREMAP_WB);
-		if (!per_cpu(apple_m4_idle_cpu, cpu).slot)
-			return -ENOMEM;
-	}
-
-	return 0;
-}
-
-static void apple_m4_unmap_slots(void)
-{
-	unsigned int cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct apple_m4_idle_cpu *c = per_cpu_ptr(&apple_m4_idle_cpu, cpu);
-
-		if (c->slot)
-			memunmap(c->slot);
-		c->slot = NULL;
-	}
-}
-
 static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 {
 	struct cpuidle_state *pd = &apple_m4_idle_driver.states[STATE_PWRDOWN];
 	int ret;
-
-	ret = apple_m4_map_slots();
-	if (ret) {
-		apple_m4_unmap_slots();
-		return ret;
-	}
 
 	pd->exit_latency = exit_latency_us;
 	pd->target_residency = target_residency_us;
@@ -259,31 +186,24 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	cpumask_copy(&apple_m4_idle_cpus, cpu_possible_mask);
 	if (cpus && cpulist_parse(cpus, &apple_m4_idle_cpus)) {
 		pr_err("invalid cpus=%s\n", cpus);
-		apple_m4_unmap_slots();
 		return -EINVAL;
 	}
 	cpumask_and(&apple_m4_idle_cpus, &apple_m4_idle_cpus, cpu_possible_mask);
-	if (cpumask_empty(&apple_m4_idle_cpus)) {
-		apple_m4_unmap_slots();
+	if (cpumask_empty(&apple_m4_idle_cpus))
 		return -EINVAL;
-	}
 	apple_m4_idle_driver.cpumask = &apple_m4_idle_cpus;
 
 	ret = cpuidle_register(&apple_m4_idle_driver, NULL);
-	if (ret) {
-		apple_m4_unmap_slots();
+	if (ret)
 		return ret;
-	}
 
 	/*
 	 * The kernel boots with nohlt, because the default idle's WFI would
-	 * lose the CPU. Now that idle goes through this driver, whose only
-	 * other state polls, stop forcing the poll loop.
+	 * lose the CPU's registers. Now that idle goes through this driver,
+	 * whose only other state polls, stop forcing the poll loop.
 	 */
 	cpu_idle_poll_ctrl(false);
 
-	debugfs_create_file("cpuidle_apple_m4", 0444, NULL, NULL,
-			    &apple_m4_idle_stats_fops);
 	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us)\n",
 		cpumask_pr_args(&apple_m4_idle_cpus), exit_latency_us,
 		target_residency_us);
