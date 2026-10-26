@@ -23,6 +23,7 @@
 		disp0_piodma = &disp0_piodma;
 		dispext0_piodma = &dispext0_piodma;
 		dispext1_piodma = &dispext1_piodma;
+		pmp = &pmp;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
 	};

@@ -314,3 +314,48 @@
 		sound-name-prefix = "Jack";
 	};
 };
+
+/*
+ * Research (t8132-pmp-power): bring up the PMP co-processor and the report
+ * votes macOS holds at steady state (mask 0x1278000), to measure whether PMP
+ * lowers idle power.
+ */
+&pmp_report_boot_f {
+	apple,always-on;
+};
+
+&pmp_report_boot_10 {
+	apple,always-on;
+};
+
+&pmp_report_dispext1 {
+	apple,always-on;
+};
+
+&pmp_report_atc0_common {
+	apple,always-on;
+};
+
+&pmp_report_atc3_common {
+	apple,always-on;
+};
+
+&pmp_report_boot_18 {
+	apple,always-on;
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};

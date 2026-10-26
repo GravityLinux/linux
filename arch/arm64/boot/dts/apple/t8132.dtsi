@@ -362,6 +362,107 @@
 			status = "disabled";
 		};
 
+		pmp_dart: iommu@380300000 {
+			compatible = "apple,t8132-dart", "apple,t8110-dart";
+			reg = <0x3 0x80300000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 881 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pmp>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		pmp_report: pmp-report@3803c0000 {
+			compatible = "apple,t8132-pmp-v2-report";
+			reg = <0x3 0x803c0000 0x0 0x20000>,
+			      <0x3 0x828ac000 0x0 0x2c>;
+			reg-names = "report", "event-config";
+			power-domains = <&ps_pms_sram>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			/* Native macOS asserts these two undocumented PMP startup
+			 * votes before the DISPEXT1_SYS vote and before starting PMP. */
+			pmp_report_boot_f: report@f {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0xf>;
+				label = "pmp-boot-f";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_boot_10: report@10 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x10>;
+				label = "pmp-boot-10";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_dispext1: report@11 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x11>;
+				label = "pmp-dispext1";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_dispext1_sys>;
+			};
+
+			/* Native macOS retains these votes after probing the ATC paths
+			 * and before PMP reports ready.  Keep them separately named so
+			 * their necessity can be tested independently on J773g. */
+			pmp_report_atc0_common: report@12 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x12>;
+				label = "pmp-atc0-common";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_atc3_common: report@15 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x15>;
+				label = "pmp-atc3-common";
+				#power-domain-cells = <0>;
+			};
+
+			pmp_report_boot_18: report@18 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <0x18>;
+				label = "pmp-boot-18";
+				#power-domain-cells = <0>;
+			};
+		};
+
+		pmp: pmp@380500000 {
+			compatible = "apple,t8132-pmp-v2", "apple,t6000-pmp-v2";
+			reg = <0x3 0x80500000 0x0 0xc0000>,
+			      <0x3 0x80e00000 0x0 0x4000>;
+			reg-names = "pmp", "asc";
+			mboxes = <&pmp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&pmp_dart 0>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
+		};
+
+		pmp_mbox: mailbox@380e08000 {
+			compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x80e08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			/*
+			 * In the binding's order, empty before not-empty. The ADT
+			 * lists each pair the other way round (878, 877, 880, 879).
+			 */
+			interrupts = <AIC_IRQ 877 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 878 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>,
+			             <AIC_IRQ 880 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+			                  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_pmp>, <&ps_pms_sram>;
+			status = "disabled";
+		};
+
 		dispext0_dart: iommu@286300000 {
 			compatible = "apple,t8132-dart", "apple,t8110-dart";
 			reg = <0x2 0x86300000 0x0 0xc000>;
