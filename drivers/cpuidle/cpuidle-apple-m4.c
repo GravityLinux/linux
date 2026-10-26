@@ -5,8 +5,10 @@
  * CPU idle support for Apple M4 (T8132) and later SoCs
  *
  * On these cores a WFI that lets the core power down does not keep the
- * general purpose registers: execution continues after the WFI, with the stack
- * pointer and the system registers intact but x0-x30 cleared. The power-down
+ * general purpose registers: execution continues after the WFI with x0-x30
+ * cleared, while SP, SP_EL0, TPIDR_EL1 and the timer registers survive (a
+ * loss of any of them would fault on the first resume). The local timer does
+ * not wake the core from this state. The power-down
  * state therefore saves the callee-saved registers and the link register on
  * the stack around WFI and reloads them afterwards, as the deep WFI of the
  * Asahi cpuidle-apple driver does on earlier SoCs (without its CYC_OVRD
@@ -55,15 +57,6 @@ static unsigned int target_residency_us = 2000;
 module_param(target_residency_us, uint, 0444);
 MODULE_PARM_DESC(target_residency_us, "Power-down state target residency in us");
 
-/*
- * Unlike the M1-M3 deep WFI, the M4 power-down state does not wake on the
- * local arch timer: without TIMER_STOP the first CPU to enter it never came
- * back. With it, the tick moves to the hrtimer broadcast, whose owner CPU is
- * kept out of the state, so a single power-down CPU never enters it.
- */
-static bool timer_stop = true;
-module_param(timer_stop, bool, 0444);
-MODULE_PARM_DESC(timer_stop, "The local timer stops in the power-down state (default: on)");
 
 #define POLL_RELAX_COUNT	200
 
@@ -175,7 +168,16 @@ static struct cpuidle_driver apple_m4_idle_driver = {
 			.power_usage		= 0,
 			.name			= "CPU PD",
 			.desc			= "CPU powered down",
-			.flags			= CPUIDLE_FLAG_RCU_IDLE,
+			/*
+			 * Unlike the M1-M3 deep WFI, this state does not wake on
+			 * the local arch timer: without TIMER_STOP the first CPU
+			 * to enter it never came back. With it, the tick moves
+			 * to the hrtimer broadcast, whose owner CPU is kept out
+			 * of the state, so a single power-down CPU never enters
+			 * it.
+			 */
+			.flags			= CPUIDLE_FLAG_RCU_IDLE |
+						  CPUIDLE_FLAG_TIMER_STOP,
 		},
 	},
 	.safe_state_index = STATE_POLL,
@@ -189,8 +191,6 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 
 	pd->exit_latency = exit_latency_us;
 	pd->target_residency = target_residency_us;
-	if (timer_stop)
-		pd->flags |= CPUIDLE_FLAG_TIMER_STOP;
 
 	/*
 	 * The other CPUs get no cpuidle driver and keep the default idle,
@@ -226,9 +226,9 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	 */
 	cpu_idle_poll_ctrl(false);
 
-	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us%s)\n",
+	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us)\n",
 		cpumask_pr_args(&apple_m4_idle_cpus), exit_latency_us,
-		target_residency_us, timer_stop ? ", timer stop" : "");
+		target_residency_us);
 	return 0;
 }
 
