@@ -1303,6 +1303,9 @@ static int write_protect_page(struct vm_area_struct *vma, struct folio *folio,
 
 	if (WARN_ON_ONCE(folio_test_large(folio)))
 		return err;
+	/* KSM refuses 4KB mms: this walk would see only one slice of a window. */
+	if (WARN_ON_ONCE(vma_is_p3s_4k(vma)))
+		return err;
 
 	pvmw.address = page_address_in_vma(folio, folio_page(folio, 0), vma);
 	if (pvmw.address == -EFAULT)
