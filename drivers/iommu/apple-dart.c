@@ -556,8 +556,6 @@ apple_dart_t8110_hw_tlb_command(struct apple_dart_stream_map *stream_map,
 
 		if (ret)
 			break;
-		/* Since remap is used only the first sid needs to be invalidated. */
-		break;
 	}
 
 	spin_unlock_irqrestore(&dart->lock, flags);
