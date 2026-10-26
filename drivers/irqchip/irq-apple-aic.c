@@ -1154,7 +1154,9 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	cpuhp_setup_state(CPUHP_AP_IRQ_APPLE_AIC_STARTING,
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
-	cpu_pm_register_notifier(&aic_cpu_pm_nb);
+	/* Only M4 (T8132) idles through states that lose the per-CPU setup. */
+	if (of_machine_is_compatible("apple,t8132"))
+		cpu_pm_register_notifier(&aic_cpu_pm_nb);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {
