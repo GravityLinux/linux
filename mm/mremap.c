@@ -1323,9 +1323,21 @@ static int copy_vma_and_data(struct vma_remap_struct *vrm,
 	pmc.old = vma;
 	pmc.new = new_vma;
 
-	/* A 4KB anonymous range moving to other slices is repacked after */
-	p3s_ctx = p3s_mremap_prepare(vma, new_vma, vrm->addr, vrm->new_addr,
-				     vrm->old_len);
+	/*
+	 * A 4KB anonymous range moving to other slices is repacked after. Its
+	 * folios are locked without waiting for all but the first: retry a
+	 * few times before failing the call over a transiently held lock.
+	 */
+	for (int tries = 0; ; tries++) {
+		p3s_ctx = p3s_mremap_prepare(vma, new_vma, vrm->addr,
+					     vrm->new_addr, vrm->old_len);
+		if (PTR_ERR_OR_ZERO(p3s_ctx) != -EAGAIN || tries == 8)
+			break;
+		cond_resched();
+	}
+	if (PTR_ERR_OR_ZERO(p3s_ctx) == -EAGAIN)
+		pr_warn_ratelimited("%s (%d): mremap: 4KB slice move gave up on busy folios\n",
+				    current->comm, current->pid);
 	if (IS_ERR(p3s_ctx)) {
 		err = PTR_ERR(p3s_ctx);
 		p3s_ctx = NULL;
