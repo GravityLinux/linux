@@ -892,8 +892,10 @@ static void aic_mask_cpu_fiq_sources(void)
 static DEFINE_PER_CPU(u64, aic_vm_tmr_fiq_ena);
 
 /*
- * On M4 and later, a CPU that idled in a state-losing WFI comes back with its
- * implementation-defined registers reset. Redo the per-CPU setup and put back
+ * On M4, a CPU that idled in a state-losing WFI comes back with its general
+ * purpose registers cleared. Whether its implementation-defined registers
+ * survive is untested, so redo the per-CPU setup, which is harmless if they
+ * did, and put back
  * the guest timer FIQ enables, which follow the per-CPU irq mask state. The
  * timer owners reprogram the timers after us, and so does a PMU driver that
  * owns PMCR0, since this notifier is registered first.
