@@ -44,6 +44,7 @@ module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPUs that may power down in idle, as a cpulist (default: all)");
 
 static struct cpumask apple_m4_idle_cpus;
+static bool apple_m4_idle_nop;
 
 static unsigned int exit_latency_us = 100;
 module_param(exit_latency_us, uint, 0444);
@@ -191,6 +192,15 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	cpumask_and(&apple_m4_idle_cpus, &apple_m4_idle_cpus, cpu_possible_mask);
 	if (cpumask_empty(&apple_m4_idle_cpus))
 		return -EINVAL;
+	/*
+	 * Once polling is off, the CPUs left out fall back to the default idle,
+	 * whose WFI only idle=nop keeps them from executing.
+	 */
+	if (!cpumask_equal(&apple_m4_idle_cpus, cpu_possible_mask) &&
+	    !apple_m4_idle_nop) {
+		pr_err("cpus=%s needs idle=nop on the command line\n", cpus);
+		return -EINVAL;
+	}
 	apple_m4_idle_driver.cpumask = &apple_m4_idle_cpus;
 
 	ret = cpuidle_register(&apple_m4_idle_driver, NULL);
@@ -217,19 +227,17 @@ static struct platform_driver apple_m4_cpuidle_driver = {
 	.probe = apple_m4_cpuidle_probe,
 };
 
-/*
- * cpu_idle_force_poll is private to the scheduler, so look for the nohlt that
- * raised it before lowering it in probe.
- */
-static bool __init apple_m4_have_nohlt(void)
+/* Whether the boot command line has @tok as a whole word. */
+static bool __init apple_m4_cmdline_has(const char *tok)
 {
 	const char *p = boot_command_line;
+	size_t len = strlen(tok);
 
-	while ((p = strstr(p, "nohlt"))) {
+	while ((p = strstr(p, tok))) {
 		if ((p == boot_command_line || p[-1] == ' ') &&
-		    (p[5] == ' ' || p[5] == '\0'))
+		    (p[len] == ' ' || p[len] == '\0'))
 			return true;
-		p += 5;
+		p += len;
 	}
 	return false;
 }
@@ -242,10 +250,16 @@ static int __init apple_m4_cpuidle_init(void)
 	if (!enable)
 		return 0;
 
-	if (!apple_m4_have_nohlt()) {
+	/*
+	 * cpu_idle_force_poll is private to the scheduler, so look for the
+	 * nohlt that raised it before lowering it in probe.
+	 */
+	if (!apple_m4_cmdline_has("nohlt")) {
 		pr_warn("needs nohlt on the command line, not registering\n");
 		return 0;
 	}
+
+	apple_m4_idle_nop = apple_m4_cmdline_has("idle=nop");
 
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
