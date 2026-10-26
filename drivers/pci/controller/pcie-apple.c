@@ -1156,6 +1156,22 @@ static void apple_pcie_remove_downstream(struct pci_bus *bus)
 	}
 }
 
+/*
+ * The initial scan sized the tunneled root port's bus range for an empty
+ * link. Give it the rest of the host's buses before scanning what the tunnel
+ * brought, so a switch behind it can number its own buses. This assumes one
+ * tunneled port per host; with more, the range would need splitting.
+ */
+static void apple_pcie_tunnel_widen_buses(struct pci_dev *root)
+{
+	struct pci_bus *bus = root->subordinate;
+	int max = root->bus->busn_res.end;
+
+	if (bus->busn_res.end >= max || pci_bus_update_busn_res_end(bus, max))
+		return;
+	pci_write_config_byte(root, PCI_SUBORDINATE_BUS, max);
+}
+
 static void apple_pcie_rescan(struct work_struct *work)
 {
 	struct apple_pcie *pcie = container_of(to_delayed_work(work),
@@ -1185,8 +1201,11 @@ static void apple_pcie_rescan(struct work_struct *work)
 		    (readl(port->base + PORT_LTSSMCTL) & PORT_LTSSMCTL_START) &&
 		    (readl(port->base + PORT_LINKSTS) & PORT_LINKSTS_UP)) {
 			WRITE_ONCE(port->recovering, false);
-			if (root->subordinate)
+			if (root->subordinate) {
+				if (pcie->hw->tunneled)
+					apple_pcie_tunnel_widen_buses(root);
 				pci_rescan_bus(root->subordinate);
+			}
 		}
 		pci_dev_put(root);
 
@@ -1302,10 +1321,10 @@ static struct platform_driver apple_pcie_driver = {
 /*
  * The tunneled root port has no Slot Capabilities, but its link comes up
  * only once the connection manager activates the PCIe tunnel, often after
- * the host's initial scan has trimmed the root port to a single bus. Mark it
- * a hotplug bridge so the scan reserves the remaining bus range and windows
- * for the switch the tunnel brings, as PCIe hotplug would; this also keeps
- * it out of D3, which would drop the tunnel.
+ * the host's initial scan. Mark it a hotplug bridge so the scan reserves
+ * hotplug windows for the switch the tunnel brings, as PCIe hotplug would;
+ * this also keeps it out of D3, which would drop the tunnel. Its bus range is
+ * widened when the link comes up.
  */
 static void apple_pcie_tunnel_root_port_fixup(struct pci_dev *pdev)
 {
