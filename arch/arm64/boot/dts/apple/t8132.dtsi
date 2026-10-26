@@ -1169,6 +1169,14 @@
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
 			};
+
+			smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					<&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+					"boot_error_count", "panic_count";
+			};
 		};
 
 		nub_spmi_a0: spmi@388908000 {
@@ -1211,6 +1219,30 @@
 
 					rtc_offset: rtc-offset@2100 {
 						reg = <0x2100 0x6>;
+					};
+
+					/*
+					 * Boot bookkeeping for the macsmc reboot driver, at
+					 * the ADT's info-leg_scrpad (0xf800) plus the same
+					 * offsets as t8103 (0x9f00) and t8112 (0xf700).
+					 */
+					boot_stage: boot-stage@f801 {
+						reg = <0xf801 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f802,0 {
+						reg = <0xf802 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f802,4 {
+						reg = <0xf802 0x1>;
+						bits = <4 4>;
+					};
+
+					shutdown_flag: shutdown-flag@f80f,3 {
+						reg = <0xf80f 0x1>;
+						bits = <3 1>;
 					};
 				};
 			};
