@@ -219,18 +219,22 @@ impl Platform {
             GFP_KERNEL,
         )?;
         // Native HAL declarations and the three platform-specific windows.
-        for (slot, offset, size, relative) in [
-            (17, 0, 0x20000, true),
-            (26, 0xd04000, 0x8000, true),
-            (27, 0xd0d000, 0x1000, true),
-            (28, 0xd58000, 0x8000, true),
-            (29, 0xd10000, 0x4000, true),
-            (31, 0xd40000, 0x4000, true),
-            (32, 0xd60000, 0x8000, true),
-            (40, 0xe1c000, 0x4000, true),
-            (22, 0x1000000, 0x8000, false),
-            (39, 0xe08000, 0x8000, false),
-            (41, 0xe1f800, 0x4000, false),
+        for (slot, offset, size, relative, flags) in [
+            (17, 0, 0x20000, true, 2),
+            (26, 0xd04000, 0x8000, true, 2),
+            (27, 0xd0d000, 0x1000, true, 2),
+            (28, 0xd58000, 0x8000, true, 2),
+            (29, 0xd10000, 0x4000, true, 2),
+            (31, 0xd40000, 0x4000, true, 2),
+            (32, 0xd60000, 0x8000, true, 2),
+            // The GPU-side thermal sensor (MTR) block: the firmware looks it
+            // up when an MTR alarm arrives, which happens once PMP arms the
+            // mtr_top_agx alarm.
+            (36, 0xe00000, 0x4000, true, 0),
+            (40, 0xe1c000, 0x4000, true, 2),
+            (22, 0x1000000, 0x8000, false, 2),
+            (39, 0xe08000, 0x8000, false, 2),
+            (41, 0xe1f800, 0x4000, false, 2),
         ] {
             if offset + u64::from(size) > span {
                 return Err(EINVAL);
@@ -243,7 +247,7 @@ impl Platform {
                     size,
                     stride: size,
                     relative: if relative { offset } else { 0 },
-                    flags: 2,
+                    flags,
                 },
                 GFP_KERNEL,
             )?;
