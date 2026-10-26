@@ -1054,7 +1054,8 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 			pr_warn_once("Unsupported ZONE_DEVICE page type.\n");
 			goto abort;
 		}
-		entry = mk_pte(page, vma->vm_page_prot);
+		entry = vma_pte_add_slice(vma, addr,
+					  mk_pte(page, vma->vm_page_prot));
 		if (vma->vm_flags & VM_WRITE)
 			entry = pte_mkwrite(pte_mkdirty(entry), vma);
 	}
