@@ -46,7 +46,8 @@ MODULE_PARM_DESC(cpus, "CPUs that may power down in idle, as a cpulist (default:
 static struct cpumask apple_m4_idle_cpus;
 static bool apple_m4_idle_nop;
 
-static unsigned int exit_latency_us = 100;
+/* Measured: a wake from the state adds about 13 us to a cross-CPU round trip. */
+static unsigned int exit_latency_us = 20;
 module_param(exit_latency_us, uint, 0444);
 MODULE_PARM_DESC(exit_latency_us, "Power-down state exit latency in us");
 
@@ -55,14 +56,14 @@ module_param(target_residency_us, uint, 0444);
 MODULE_PARM_DESC(target_residency_us, "Power-down state target residency in us");
 
 /*
- * The arch timer keeps waking a core from the M1-M3 deep WFI (cpuidle-apple
- * does not mark that state TIMER_STOP). If it stops in the M4 power-down
- * state, the kernel must move the tick to the hrtimer broadcast, whose owner
- * CPU can then never enter the state.
+ * Unlike the M1-M3 deep WFI, the M4 power-down state does not wake on the
+ * local arch timer: without TIMER_STOP the first CPU to enter it never came
+ * back. With it, the tick moves to the hrtimer broadcast, whose owner CPU is
+ * kept out of the state, so a single power-down CPU never enters it.
  */
-static bool timer_stop;
+static bool timer_stop = true;
 module_param(timer_stop, bool, 0444);
-MODULE_PARM_DESC(timer_stop, "The local timer stops in the power-down state (default: off)");
+MODULE_PARM_DESC(timer_stop, "The local timer stops in the power-down state (default: on)");
 
 #define POLL_RELAX_COUNT	200
 
