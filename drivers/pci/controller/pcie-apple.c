@@ -1298,6 +1298,32 @@ static struct platform_driver apple_pcie_driver = {
 		.suppress_bind_attrs	= true,
 	},
 };
+
+/*
+ * The tunneled root port has no Slot Capabilities, but its link comes up
+ * only once the connection manager activates the PCIe tunnel, often after
+ * the host's initial scan has trimmed the root port to a single bus. Mark it
+ * a hotplug bridge so the scan reserves the remaining bus range and windows
+ * for the switch the tunnel brings, as PCIe hotplug would; this also keeps
+ * it out of D3, which would drop the tunnel.
+ */
+static void apple_pcie_tunnel_root_port_fixup(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+	struct device *host = bridge->dev.parent;
+
+	if (pci_pcie_type(pdev) != PCI_EXP_TYPE_ROOT_PORT ||
+	    !host || host->driver != &apple_pcie_driver.driver)
+		return;
+
+	if (!apple_pcie_lookup(host)->hw->tunneled)
+		return;
+
+	pci_info(pdev, "tunneled root port: reserving hotplug resources\n");
+	pdev->is_hotplug_bridge = 1;
+}
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_APPLE, PCI_ANY_ID,
+			 apple_pcie_tunnel_root_port_fixup);
 module_platform_driver(apple_pcie_driver);
 
 MODULE_DESCRIPTION("Apple PCIe host bridge driver");
