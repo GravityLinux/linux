@@ -828,8 +828,12 @@ static unsigned int gs_write_room(struct tty_struct *tty)
 	unsigned long	flags;
 	unsigned int room = 0;
 
+	/*
+	 * Also take data while disconnected: it goes out once the host
+	 * connects again, and a writer must not sleep until then.
+	 */
 	spin_lock_irqsave(&port->port_lock, flags);
-	if (port->port_usb)
+	if (kfifo_initialized(&port->port_write_buf))
 		room = kfifo_avail(&port->port_write_buf);
 	spin_unlock_irqrestore(&port->port_lock, flags);
 
@@ -845,8 +849,13 @@ static unsigned int gs_chars_in_buffer(struct tty_struct *tty)
 	unsigned long	flags;
 	unsigned int	chars;
 
+	/*
+	 * Without a host nothing is in flight, and nothing would ever drain
+	 * the buffer: report it empty, or tcdrain() and TCSETSW on the tty
+	 * wait forever.
+	 */
 	spin_lock_irqsave(&port->port_lock, flags);
-	chars = kfifo_len(&port->port_write_buf);
+	chars = port->port_usb ? kfifo_len(&port->port_write_buf) : 0;
 	spin_unlock_irqrestore(&port->port_lock, flags);
 
 	pr_vdebug("gs_chars_in_buffer: (%d,%p) chars=%u\n",
@@ -1456,6 +1465,8 @@ void gserial_disconnect(struct gserial *gser)
 	port->port_usb = NULL;
 	gser->ioport = NULL;
 	if (port->port.count > 0) {
+		/* Like a dropped carrier: what was not sent is not for the next host */
+		kfifo_reset(&port->port_write_buf);
 		wake_up_interruptible(&port->drain_wait);
 		if (port->port.tty)
 			tty_hangup(port->port.tty);
