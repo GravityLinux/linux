@@ -394,9 +394,10 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	/*
 	 * create a shadow copy here to make sure the co-processor isn't able
 	 * to change the log while we're dumping it. this also ensures
-	 * the buffer is in normal memory and not iomem for e.g. the SMC
+	 * the buffer is in normal memory and not iomem for e.g. the SMC.
+	 * No I/O: the crashed co-processor may be the one backing writeback.
 	 */
-	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_KERNEL);
+	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_NOIO);
 	if (bfr) {
 		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0,
 				   rtk->crashlog_buffer.size);
