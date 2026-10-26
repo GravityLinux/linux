@@ -44,6 +44,12 @@ static bool enable;
 module_param(enable, bool, 0444);
 MODULE_PARM_DESC(enable, "Register the power-down idle state (default: off)");
 
+static char *cpus;
+module_param(cpus, charp, 0444);
+MODULE_PARM_DESC(cpus, "CPUs that may power down in idle, as a cpulist (default: all)");
+
+static struct cpumask apple_m4_idle_cpus;
+
 static unsigned int exit_latency_us = 100;
 module_param(exit_latency_us, uint, 0444);
 MODULE_PARM_DESC(exit_latency_us, "Power-down state exit latency in us");
@@ -137,7 +143,9 @@ static __cpuidle int apple_m4_enter_pwrdown(struct cpuidle_device *dev,
 	if (ret == 0) {
 		/* Resumed through the reset vector; the slot is still armed */
 		apple_m4_set_slot(cpu->slot, 0);
-		cpu->resumed++;
+		if (!cpu->resumed++)
+			pr_info("CPU%d: first resume through the reset vector\n",
+				smp_processor_id());
 	} else if (ret == 1) {
 		cpu->retained++;
 	}
@@ -243,7 +251,23 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 
 	pd->exit_latency = exit_latency_us;
 	pd->target_residency = target_residency_us;
-	apple_m4_idle_driver.cpumask = (struct cpumask *)cpu_possible_mask;
+
+	/*
+	 * The other CPUs get no cpuidle driver and keep the default idle,
+	 * which idle=nop keeps from executing WFI.
+	 */
+	cpumask_copy(&apple_m4_idle_cpus, cpu_possible_mask);
+	if (cpus && cpulist_parse(cpus, &apple_m4_idle_cpus)) {
+		pr_err("invalid cpus=%s\n", cpus);
+		apple_m4_unmap_slots();
+		return -EINVAL;
+	}
+	cpumask_and(&apple_m4_idle_cpus, &apple_m4_idle_cpus, cpu_possible_mask);
+	if (cpumask_empty(&apple_m4_idle_cpus)) {
+		apple_m4_unmap_slots();
+		return -EINVAL;
+	}
+	apple_m4_idle_driver.cpumask = &apple_m4_idle_cpus;
 
 	ret = cpuidle_register(&apple_m4_idle_driver, NULL);
 	if (ret) {
@@ -260,8 +284,9 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 
 	debugfs_create_file("cpuidle_apple_m4", 0444, NULL, NULL,
 			    &apple_m4_idle_stats_fops);
-	pr_info("registered power-down idle (exit %u us, residency %u us)\n",
-		exit_latency_us, target_residency_us);
+	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us)\n",
+		cpumask_pr_args(&apple_m4_idle_cpus), exit_latency_us,
+		target_residency_us);
 	return 0;
 }
 
