@@ -719,7 +719,7 @@ static void cd321x_update_work(struct work_struct *work)
 	enum typec_orientation orientation = TYPEC_ORIENTATION_NONE;
 
 	if (usb_connection) {
-		if (tps->data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
+		if (st.data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
 			new_role = USB_ROLE_DEVICE;
 		else
 			new_role = USB_ROLE_HOST;
