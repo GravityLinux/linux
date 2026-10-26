@@ -54,6 +54,16 @@ static unsigned int target_residency_us = 2000;
 module_param(target_residency_us, uint, 0444);
 MODULE_PARM_DESC(target_residency_us, "Power-down state target residency in us");
 
+/*
+ * The arch timer keeps waking a core from the M1-M3 deep WFI (cpuidle-apple
+ * does not mark that state TIMER_STOP). If it stops in the M4 power-down
+ * state, the kernel must move the tick to the hrtimer broadcast, whose owner
+ * CPU can then never enter the state.
+ */
+static bool timer_stop;
+module_param(timer_stop, bool, 0444);
+MODULE_PARM_DESC(timer_stop, "The local timer stops in the power-down state (default: off)");
+
 #define POLL_RELAX_COUNT	200
 
 /*
@@ -164,8 +174,7 @@ static struct cpuidle_driver apple_m4_idle_driver = {
 			.power_usage		= 0,
 			.name			= "CPU PD",
 			.desc			= "CPU powered down",
-			.flags			= CPUIDLE_FLAG_RCU_IDLE |
-						  CPUIDLE_FLAG_TIMER_STOP,
+			.flags			= CPUIDLE_FLAG_RCU_IDLE,
 		},
 	},
 	.safe_state_index = STATE_POLL,
@@ -179,6 +188,8 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 
 	pd->exit_latency = exit_latency_us;
 	pd->target_residency = target_residency_us;
+	if (timer_stop)
+		pd->flags |= CPUIDLE_FLAG_TIMER_STOP;
 
 	/*
 	 * The other CPUs get no cpuidle driver and keep the default idle,
@@ -214,9 +225,9 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	 */
 	cpu_idle_poll_ctrl(false);
 
-	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us)\n",
+	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us%s)\n",
 		cpumask_pr_args(&apple_m4_idle_cpus), exit_latency_us,
-		target_residency_us);
+		target_residency_us, timer_stop ? ", timer stop" : "");
 	return 0;
 }
 
