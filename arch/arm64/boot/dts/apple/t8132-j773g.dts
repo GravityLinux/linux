@@ -274,6 +274,7 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-mini.dtsi"
+#include "t8132-usb4.dtsi"
 
 &i2c3 {
 	status = "okay";

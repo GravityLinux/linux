@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M4, 2025) with experimental USB4 on ACIO1
+ *
+ * target-type: J713
+ *
+ * Opt-in DTB: the ACIO1 resources come from the J773g ADT and are untested on
+ * this board, so t8132-j713.dtb leaves ACIO1 disabled.
+ */
+
+#include "t8132-j713.dts"
+#include "t8132-usb4.dtsi"

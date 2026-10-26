@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* T8132 ACIO1 bring-up: resources from J773g ADT and runtime traces. */
+/* T8132 ACIO1 USB4/Thunderbolt (resources from the J773g ADT; J713 is untested). */
 / {
 	aliases {
 		usb4_1_rc = &usb4_1_acio;
