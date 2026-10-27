@@ -37,9 +37,9 @@ enum idle_state {
 	STATE_COUNT
 };
 
-static bool enable;
+static bool enable = true;
 module_param(enable, bool, 0444);
-MODULE_PARM_DESC(enable, "Register the power-down idle state (default: off)");
+MODULE_PARM_DESC(enable, "Register the power-down idle state (default: on; 0 turns it off)");
 
 static char *cpus;
 module_param(cpus, charp, 0444);
