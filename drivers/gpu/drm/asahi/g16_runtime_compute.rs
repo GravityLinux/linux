@@ -268,6 +268,7 @@ impl Bootstrap {
                 comm: params.comm,
                 started: Instant::now(),
                 notifier_count: None,
+                job_notifier: None,
                 stamps_seen: None,
                 blocked: 0,
                 dependencies: *dependencies,

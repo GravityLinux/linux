@@ -247,6 +247,9 @@ pub(super) struct Flight {
     /// Shared-notifier renders: the notifier's completed-Work counter and the
     /// total that includes this render. Other flights own a per-Work notifier.
     notifier_count: Option<(u64, u32)>,
+    /// shared_notifier=1: the Work whose notifier slot this render's
+    /// submission shares (see `JobNotifier`).
+    job_notifier: Option<u64>,
     /// Retirement trace (fw_trace & 16): when the stage stamps were first seen
     /// complete, and which later conditions still blocked retirement.
     stamps_seen: Option<Instant<Monotonic>>,
@@ -255,6 +258,23 @@ pub(super) struct Flight {
     dependencies: [Option<Stamp>; 2],
     /// Firmware dependency items this flight queued on each of `queues`.
     lane_items: [u32; 2],
+}
+
+/// shared_notifier=1: one completion notifier per submission, as Metal has
+/// one per command buffer. It lives in the notifier slot of the submission's
+/// first published render Work (the owner), whose storage is kept until
+/// every render using the notifier has retired.
+pub(crate) struct JobNotifier {
+    job: u64,
+    owner: u64,
+    /// The owner's free_work root, set once the owner itself has retired.
+    owner_root: Option<u64>,
+    /// Works counted into the notifier so far (two per render).
+    works: u32,
+    /// The Work count the owner wrote into the notifier header.
+    promised: u32,
+    /// Published renders using the notifier and not yet retired.
+    refs: u32,
 }
 
 /// Dependency items of one submission attempt, counted into dep_stats only

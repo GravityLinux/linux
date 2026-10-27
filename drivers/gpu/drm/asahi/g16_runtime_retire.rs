@@ -316,10 +316,55 @@ impl Bootstrap {
             }
             self.diagnostics.retire_next = self.diagnostics.retire_next.wrapping_add(1);
             flight.client.lock().release_scratch(flight.scratch)?;
-            // allocate_work reserved a slot for every outstanding lease.
-            self.free_work[usize::from(render_work)]
-                .push_within_capacity((id, root))
-                .map_err(|_| EIO)?;
+            // allocate_work reserved a slot for every outstanding lease. A
+            // render whose submission shares its notifier keeps the owner
+            // Work's storage leased until the last render using it retires.
+            let mut free = [Some((id, root)), None];
+            if let Some(owner_va) = flight.job_notifier {
+                if let Some(p) = self.job_notifiers.iter().position(|j| j.owner == owner_va) {
+                    let entry = &mut self.job_notifiers[p];
+                    entry.refs = entry.refs.saturating_sub(1);
+                    if id == owner_va {
+                        entry.owner_root = Some(root);
+                        free[0] = None;
+                    }
+                    if entry.refs == 0 {
+                        if let Some(owner_root) = entry.owner_root {
+                            // Fewer renders published than the header
+                            // promised (a submission cut short): the slot is
+                            // reused while the firmware may still hold the
+                            // notifier. Research: report its +0x94 word.
+                            if entry.works < entry.promised {
+                                use core::sync::atomic::{AtomicU32, Ordering};
+                                static REPORTED: AtomicU32 = AtomicU32::new(0);
+                                if REPORTED.fetch_add(1, Ordering::Relaxed) < 16 {
+                                    // A diagnostic must never fail retirement:
+                                    // an unreadable word prints as 0xffffffff.
+                                    let word = self
+                                        ._firmware_space
+                                        .as_ref()
+                                        .and_then(|fw| fw.read_u32(owner_va + 0x200 + 0x94).ok())
+                                        .unwrap_or(u32::MAX);
+                                    pr_info!(
+                                        "G16: job notifier {:#x} freed at {}/{} Works, +0x94={:#x}\n",
+                                        owner_va,
+                                        entry.works,
+                                        entry.promised,
+                                        word
+                                    );
+                                }
+                            }
+                            free[1] = Some((owner_va, owner_root));
+                            self.job_notifiers.swap_remove(p);
+                        }
+                    }
+                }
+            }
+            for (va, root) in free.into_iter().flatten() {
+                self.free_work[usize::from(render_work)]
+                    .push_within_capacity((va, root))
+                    .map_err(|_| EIO)?;
+            }
             self.retired.push_within_capacity((id, limited)).map_err(|_| ENOMEM)?;
         }
         crate::g16_timeline::attribute(&crate::g16_timeline::P_RD_SCAN, scan_before);

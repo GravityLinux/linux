@@ -33,11 +33,14 @@ impl Bootstrap {
         if let Some((va, root)) = self.free_work[index].pop() {
             return Ok((va, Some(root)));
         }
-        // Retirement must not allocate. Space for every outstanding lease
-        // also covers all of them completing before another acquisition.
-        self.free_work[index].reserve(self.flights.len() + 1, GFP_KERNEL)?;
         let stride = if render { 0x1c000 } else { 0x8000 };
         if self.work_arenas[index].is_empty() {
+            // Retirement must not allocate, so the free list keeps room for
+            // every slot ever carved. Counting flights instead misses slots
+            // still leased after their own flight retired (a submission's
+            // notifier owner, held for its later renders).
+            let slots = self.work_slots[index] + 16;
+            self.free_work[index].reserve(slots - self.free_work[index].len(), GFP_KERNEL)?;
             let base = self.next_work_va;
             let end = base.checked_add(16 * stride).ok_or(ENOSPC)?;
             if end > WORK_BASE + WORK_WINDOW {
@@ -67,6 +70,7 @@ impl Bootstrap {
             }
             fw.sync();
             self.work_arenas[index] = base..end;
+            self.work_slots[index] = slots;
         }
         let va = self.work_arenas[index].start;
         self.work_arenas[index].start += stride;

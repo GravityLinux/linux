@@ -269,6 +269,10 @@ pub(crate) struct Bootstrap {
     /// Retired Work slots: VA and the client root their alias was last
     /// mapped into (the device alias is mapped on first use).
     free_work: [KVec<(u64, u64)>; 2],
+    /// Work slots carved from arenas so far; free_work keeps room for all.
+    work_slots: [usize; 2],
+    /// shared_notifier=1: per-submission notifiers, capacity MAX_FLIGHTS.
+    job_notifiers: KVec<render_runtime::JobNotifier>,
     compute_publication: u64,
     queue_events: Arc<core::sync::atomic::AtomicU64>,
     /// Queue storage returned by dropped queues, awaiting context destruction.
@@ -818,6 +822,8 @@ impl Bootstrap {
             next_object_va: render_runtime::OBJECT_BASE,
             work_arenas: [0..0, 0..0],
             free_work: [KVec::new(), KVec::new()],
+            work_slots: [0, 0],
+            job_notifiers: KVec::with_capacity(render_runtime::MAX_FLIGHTS, GFP_KERNEL)?,
             compute_publication: crate::module_parameters::fw_counter_start.value(),
             queue_events: Arc::new(core::sync::atomic::AtomicU64::new(0), GFP_KERNEL)?,
             retired_queues: Arc::pin_init(kernel::new_mutex!(KVec::new()), GFP_KERNEL)?,
