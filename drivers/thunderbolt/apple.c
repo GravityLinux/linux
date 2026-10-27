@@ -88,6 +88,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/tunable.h>
@@ -794,6 +795,33 @@ remove_links:
 }
 
 /**
+ * apple_cio_wait_powered_off - Wait for ACIO's power-domain votes to drop
+ * @acio: ACIO complex that was just stopped
+ *
+ * Dropping the device links releases the domains asynchronously. Wait for
+ * each domain device to suspend so that a following start begins from a
+ * power cycle rather than resuming a block that never went down.
+ *
+ * Return: the number of domain devices still active after the wait.
+ */
+static int apple_cio_wait_powered_off(struct apple_cio *acio)
+{
+	int i, active = 0;
+
+	for (i = 0; i < acio->pd_list->num_pds; i++) {
+		struct device *pd_dev = acio->pd_list->pd_devs[i];
+		bool off;
+
+		pm_runtime_barrier(pd_dev);
+		if (read_poll_timeout(pm_runtime_suspended, off, off, 1000, 500000,
+				      false, pd_dev))
+			active++;
+	}
+
+	return active;
+}
+
+/**
  * apple_cio_tbt_switch_set - Handle a USB4/Thunderbolt cable transition
  * @sw: USB4/Thunderbolt switch
  * @data: New cable state and negotiated cable details
@@ -873,8 +901,29 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	 * Bring up or power down the ACIO complex
 	 * current_cable_info will be updated in the start/stop functions
 	 */
-	if (acio->target_cable_info)
-		return apple_cio_start(acio);
+	if (acio->target_cable_info) {
+		int ret = apple_cio_start(acio);
+
+		/*
+		 * The host router occasionally stops answering config reads while
+		 * the NHI enumerates it at boot. A failed start has already torn
+		 * the block down as apple_cio_stop() would; let its domains power
+		 * off, then start it again.
+		 */
+		if (ret == -ETIMEDOUT) {
+			int active = apple_cio_wait_powered_off(acio);
+
+			if (active)
+				dev_warn(acio->dev,
+					 "ACIO start timed out, retrying once; %d power domain(s) stayed on, so only the co-processor restarts\n",
+					 active);
+			else
+				dev_warn(acio->dev,
+					 "ACIO start timed out, retrying once after a power cycle\n");
+			ret = apple_cio_start(acio);
+		}
+		return ret;
+	}
 
 	apple_cio_stop(acio);
 	return 0;
