@@ -580,6 +580,20 @@ static bool cd321x_data_connected(const struct cd321x_status *st)
 	return st->data_status & TPS_DATA_STATUS_DATA_CONNECTION;
 }
 
+/*
+ * Switch the Type-C mux to cd321x->state. The PHY can only change modes while
+ * dwc3 has released its PIPE interface: a switch under an active USB role
+ * leaves the port on USB2. The role is restored by the caller afterwards.
+ */
+static void cd321x_mux_set(struct tps6598x *tps)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	if (usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)
+		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+	typec_mux_set(cd321x->mux, &cd321x->state);
+}
+
 static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
@@ -594,7 +608,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -634,7 +648,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.data = &dp_data;
 		cd321x->state.mode = mode;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
@@ -658,7 +672,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
 
 		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
 		tbt_switch_data.tbt = tbt_data;
@@ -679,7 +693,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
 
 		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
 		tbt_switch_data.usb4 = eusb_data;
@@ -694,7 +708,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.mode = TYPEC_STATE_USB;
 		cd321x->state.data = NULL;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
 	}
 
 	/* Clear data since it's no longer used after typec_mux_set and points to the stack */
