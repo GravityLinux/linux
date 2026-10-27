@@ -152,6 +152,10 @@ kernel::module_platform_driver! {
             default: 2193,
             description: "Maximum retained 128 KiB TVB blocks per context (11 through 6579)",
         },
+        extra0: u32 {
+            default: 1,
+            description: "1 (default) fills the extra_0 policy object (power and thermal controller parameters) from the bundle; 0 leaves it zero, as before",
+        },
         probe_only: u32 {
             default: 0,
             description: "Identify the GPU without starting firmware or registering DRM",

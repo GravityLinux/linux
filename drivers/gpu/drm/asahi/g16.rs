@@ -536,6 +536,28 @@ impl Bootstrap {
             firmware_space.write(va + 4, &1u32.to_le_bytes())?;
         }
         firmware_space.write(pointers.region_c, &region_c)?;
+        // The extra_0 policy object carries the power and thermal limits the
+        // firmware uses when PMP manages the GPU's power.
+        if crate::module_parameters::extra0.value() != 0 {
+            match crate::g16_power::extra0(&bundle) {
+                Ok(extra0) => {
+                    firmware_space.write(pointers.extra_0, &extra0)?;
+                    let (limit, release, power) = crate::g16_power::extra0_limits(&extra0);
+                    dev_info!(
+                        dev,
+                        "G16: extra_0 policy object built from the bundle: fast-die limit {}.{:02} C release {}.{:02} C, max power {} mW\n",
+                        limit / 100,
+                        limit % 100,
+                        release / 100,
+                        release % 100,
+                        power
+                    );
+                }
+                // A wrong thermal limit is a safety bug: leave the object
+                // zero (the previous behaviour) and say so.
+                Err(e) => dev_err!(dev, "G16: extra_0 not built, bundle limits out of range: {:?}\n", e),
+            }
+        }
         // Extra policy objects, computed descriptors, PB/UMA tables and
         // scheduler counters begin zero, exactly as the current shim.
         firmware_space.alloc(

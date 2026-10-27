@@ -328,3 +328,73 @@ impl Platform {
         Ok(())
     }
 }
+
+/// Size of the root's extra_0 policy object (root +0xb8).
+pub(crate) const EXTRA0_SIZE: usize = 0x680;
+
+/// The extra_0 policy object: a compact copy of the power and thermal
+/// controllers' parameters, which the firmware reads when PMP manages the
+/// GPU's power (without it, the fast-die loop runs with zero thresholds and
+/// holds the GPU at its lowest state). Every field is taken from the bundle
+/// built above, so the two always agree.
+pub(crate) fn extra0(bundle: &[u8]) -> Result<[u8; EXTRA0_SIZE]> {
+    let word = |offset: usize| -> Result<u32> {
+        let bytes = bundle.get(offset..offset + 4).ok_or(EINVAL)?;
+        Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| EINVAL)?))
+    };
+    let mut out = [0u8; EXTRA0_SIZE];
+    // Average-power controller: input filter length, Ki*dt, Kp, minimum
+    // duty, enabled.
+    put32(&mut out, 0x010, word(0x7d3c)? / 4);
+    put32(&mut out, 0x014, word(0x7d58)?);
+    put32(&mut out, 0x018, word(0x7d68)?);
+    put32(&mut out, 0x01c, word(0x7d74)?);
+    put32(&mut out, 0x020, 1);
+    // Fast-die thermal controller: limit and release (0.01 C), Kp, Ki*dt.
+    put32(&mut out, 0x0c8, word(0x7644)?);
+    put32(&mut out, 0x0cc, word(0x75f0)?);
+    put32(&mut out, 0x0d8, word(0x7624)?);
+    put32(&mut out, 0x0dc, word(0x7614)?);
+    // Turbo controller: target, filter length, Kp, Ki; the 625 constant.
+    put32(&mut out, 0x0f0, word(0x7aea)?);
+    put32(&mut out, 0x0f4, word(0x7b3a)?);
+    put32(&mut out, 0x108, word(0x7aca)?);
+    put32(&mut out, 0x10c, word(0x7aba)?);
+    put32(&mut out, 0x110, word(0x5d38)?);
+    // Power-performance (PPM) controller: enabled, maximum power (mW), Kp,
+    // and the 1.2 the firmware itself places at bundle +0x5e80.
+    put32(&mut out, 0x128, 1);
+    put32(&mut out, 0x12c, word(0x5e3c)?);
+    put32(&mut out, 0x130, word(0x5e1c)?);
+    put32(&mut out, 0x134, f32!(1.2).to_bits());
+    // The 0x81xx controller: gains, filter length, top and top - 100.
+    put32(&mut out, 0x604, word(0x81d8)?);
+    put32(&mut out, 0x608, word(0x81c8)?);
+    put32(&mut out, 0x60c, 32);
+    put32(&mut out, 0x610, word(0x81e8)?);
+    put32(&mut out, 0x620, word(0x81e4)?);
+    // The fast-die limit and release are thermal limits (0.01 C) the
+    // firmware acts on: refuse anything outside a sane band rather than
+    // hand it a wrong limit. Release must sit below the limit.
+    let (limit, release) = (word(0x7644)?, word(0x75f0)?);
+    if !(5000..=12500).contains(&limit) || !(3000..limit).contains(&release) {
+        return Err(EINVAL);
+    }
+    // The PPM controller's power budget (mW): an M4 GPU's is tens of watts.
+    if !(1..=80_000).contains(&word(0x5e3c)?) {
+        return Err(EINVAL);
+    }
+    Ok(out)
+}
+
+/// The thermal and power limits an extra_0 object carries, for the boot log:
+/// fast-die limit and release (0.01 C) and maximum power (mW).
+pub(crate) fn extra0_limits(extra0: &[u8; EXTRA0_SIZE]) -> (u32, u32, u32) {
+    let word = |offset: usize| u32::from_le_bytes([
+        extra0[offset],
+        extra0[offset + 1],
+        extra0[offset + 2],
+        extra0[offset + 3],
+    ]);
+    (word(0x0c8), word(0x0cc), word(0x12c))
+}
