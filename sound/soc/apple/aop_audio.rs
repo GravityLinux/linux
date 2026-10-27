@@ -19,7 +19,6 @@ use kernel::{
     device::property::FwNode,
     device::Core,
     error::from_err_ptr,
-    module,
     module_platform_driver,
     of,
     platform,
@@ -940,7 +939,7 @@ impl SndSocAopDriver {
                 data.dev.as_raw(),
                 -1,
                 ptr::null(),
-                module::this_module::<crate::LocalModule>().as_ptr(),
+                <DriverModule as kernel::ModuleMetadata>::THIS_MODULE.as_ptr(),
                 0,
                 &mut this.0,
             )

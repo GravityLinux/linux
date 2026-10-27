@@ -774,7 +774,7 @@ impl AopData {
         };
         // probe can call back into us, run it with locks dropped.
         let work = AopServiceRegisterWork::new(dev_name, self, svc)?;
-        workqueue::system_dfl().enqueue(work);
+        workqueue::system().enqueue(work);
         Ok(())
     }
 

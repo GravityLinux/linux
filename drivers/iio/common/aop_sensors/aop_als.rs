@@ -9,7 +9,7 @@ use kernel::{
     device::Core,
     firmware::Firmware,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
-    module, module_platform_driver, of, platform,
+    module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, AOP},
     sync::Arc,
@@ -101,7 +101,7 @@ struct IIOAopAlsDriver(IIORegistration<MsgProc>);
 
 kernel::of_device_table!(
     OF_TABLE,
-    (),
+    <IIOAopAlsDriver as platform::Driver>::IdInfo,
     [(of::DeviceId::new(c_str!("apple,aop-als")), ())]
 );
 
@@ -133,7 +133,7 @@ impl platform::Driver for IIOAopAlsDriver {
             c"aop-sensors-als",
             ty,
             info_mask,
-            module::this_module::<crate::LocalModule>(),
+            kernel::module::this_module::<LocalModule>(),
         )?))
     }
 }

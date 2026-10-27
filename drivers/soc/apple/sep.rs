@@ -302,7 +302,7 @@ impl MailCallback for SepData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, msg: Message) {
         let work = SepReceiveWork::new(data.into(), msg);
         if let Ok(work) = work {
-            let res = workqueue::system_dfl().enqueue(work);
+            let res = workqueue::system().enqueue(work);
             if res.is_err() {
                 dev_err!(
                     data.dev,
@@ -325,7 +325,11 @@ unsafe impl Sync for SepData {}
 
 struct SepDriver(Arc<SepData>);
 
-kernel::of_device_table!(OF_TABLE, (), [(of::DeviceId::new(c"apple,sep"), ())]);
+kernel::of_device_table!(
+    OF_TABLE,
+    <SepDriver as platform::Driver>::IdInfo,
+    [(of::DeviceId::new(c"apple,sep"), ())]
+);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();

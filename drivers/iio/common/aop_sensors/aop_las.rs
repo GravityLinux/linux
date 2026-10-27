@@ -8,7 +8,7 @@ use kernel::{
     bindings, c_str,
     device::Core,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor},
-    module, module_platform_driver, of, platform,
+    module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, AOP},
     sync::Arc,
@@ -28,7 +28,7 @@ struct IIOAopLasDriver(IIORegistration<MsgProc>);
 
 kernel::of_device_table!(
     OF_TABLE,
-    (),
+    <IIOAopLasDriver as platform::Driver>::IdInfo,
     [(of::DeviceId::new(c_str!("apple,aop-las")), ())]
 );
 
@@ -59,7 +59,7 @@ impl platform::Driver for IIOAopLasDriver {
             c"aop-sensors-las",
             ty,
             info_mask,
-            module::this_module::<crate::LocalModule>(),
+            kernel::module::this_module::<LocalModule>(),
         )?))
     }
 }
