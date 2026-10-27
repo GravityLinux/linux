@@ -13,6 +13,7 @@ const REGISTER_BASE: u64 = 0xffff_fc21_8020_0000;
 const REGISTER_LIMIT: u64 = 0xffff_fc21_8100_0000;
 const MCC_BASE: u64 = 0x2201c4000;
 const MCC_SIZE: u32 = 0x18000;
+const REGION_C_IDLE_ENABLE: usize = 0x30;
 
 
 
@@ -360,6 +361,10 @@ impl Platform {
 
     pub(crate) fn region_c(&self) -> Result<KVec<u8>> {
         let mut out = zeroed(PAGE as usize)?;
+        // Let firmware request automatic idle transitions. With this word
+        // zero, T8132 keeps PMGR GFX ACTUAL at 15 even with no queued work.
+        // Setting it to one permits idle state 0 and wake on new submissions.
+        put32(&mut out, REGION_C_IDLE_ENABLE, 1);
         for (off, value) in [
             (0x78, 1),
             (0x7ec, 1),
