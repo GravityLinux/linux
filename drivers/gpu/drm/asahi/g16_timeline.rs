@@ -332,13 +332,13 @@ pub(crate) fn take_injection(cell: &core::sync::atomic::AtomicU32, tgid: i32) ->
     fired
 }
 
-/// Each render's own completion notifier (0, default) or the queue-shared one
-/// (1, for comparison: its cumulative count holds completion messages back
-/// until the queue drains). asahi_m4.shared_notifier; runtime: debugfs
+/// One completion notifier per submission, shared by its renders (1,
+/// default, as Metal shares one per command buffer), or each render's own
+/// (0, the fallback). asahi_m4.shared_notifier; runtime: debugfs
 /// asahi_m4/shared_notifier, for renders published afterwards.
-pub(crate) static SHARED_NOTIFIER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static SHARED_NOTIFIER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
-/// Whether new renders use the queue-shared notifier (see `SHARED_NOTIFIER`).
+/// Whether new renders share their submission's notifier (see `SHARED_NOTIFIER`).
 pub(crate) fn shared_notifier() -> bool {
     SHARED_NOTIFIER.load(core::sync::atomic::Ordering::Relaxed) != 0
 }

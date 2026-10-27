@@ -177,8 +177,8 @@ kernel::module_platform_driver! {
             description: "1 advertises soft faults to userspace (needs fault_control=3; Mesa with hk 243c5ac0c43 and 31b9d1d5bfb); 0 hides them",
         },
         shared_notifier: u32 {
-            default: 0,
-            description: "0 (default): each render has its own completion notifier; 1: renders share the queue's notifier with a cumulative Work count, which delays completion messages until the queue drains (2026-10-03 to 10-27 behaviour, kept for comparison). Runtime: debugfs asahi_m4/shared_notifier",
+            default: 1,
+            description: "1 (default): the renders of one submission share a completion notifier, as Metal shares one per command buffer; 0: each render has its own (fallback). Runtime: debugfs asahi_m4/shared_notifier",
         },
         timeline: u32 {
             default: 0,

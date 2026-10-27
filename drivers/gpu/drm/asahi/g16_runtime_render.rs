@@ -278,11 +278,11 @@ impl Bootstrap {
         // The notifier pass stores driver stamps, then sends the IRQ after
         // a DSB. These destinations must be firmware-uncached: a DSB does
         // not clean a cached stamp, leaving Linux asleep on stale memory.
-        // Each render has its own notifier, count and driver stamps, so the
-        // firmware announces it as soon as it completes. A notifier shared
-        // by the queue, with a cumulative count (shared_notifier=1, for
-        // comparison), is only announced once every Work published to it
-        // has completed: a busy queue then waited for the safety poll.
+        // Each render has its own driver stamps and, with shared_notifier=0,
+        // its own notifier and count. A notifier shared by the whole queue
+        // with a cumulative count (2026-10-03 to 10-27) was announced only
+        // once every Work published to it had completed, so a busy queue
+        // waited for the safety poll; one per submission (below) is not.
         a.event_control = va + 0x200;
         a.event_count_array = va + 0x300;
         a.tiling_driver_stamp = va + 0x18000;
@@ -580,8 +580,6 @@ impl Bootstrap {
         // lookup per destination region and one barrier pair, rather than a
         // lookup and two barriers for each of about twenty writes.
         let context = (a.context_id as u32).to_le_bytes();
-        // The notifier header: the Work's own notifier and driver stamps, or
-        // (shared_notifier=1) two words into the queue's shared notifier.
         // The notifier header: the full header with its Work count when this
         // render owns the notifier (its own, or its submission's first), else
         // only this render's driver stamps.
