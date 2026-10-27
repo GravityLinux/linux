@@ -169,6 +169,7 @@ impl Bootstrap {
             }
             let mut done = true;
             let mut blocked = 0u32;
+            let mut notifier_seen = None;
             // The notifier pass drops embedded JobMeta references and cleans
             // their cache lines before publishing these later driver stamps.
             for stamp in flight.driver_stamps.iter().flatten() {
@@ -182,6 +183,7 @@ impl Bootstrap {
                     // The shared notifier has counted this render's Works.
                     Some((completed, total)) => {
                         let count = snapshot.read(fw, completed)?;
+                        notifier_seen = Some((count, total));
                         (count.wrapping_sub(total) as i32) >= 0
                     }
                     None => {
@@ -255,6 +257,47 @@ impl Bootstrap {
                 continue;
             }
             let flight = &self.flights[index];
+            if self.poll_scan {
+                // Classify each rescue. Stamps first seen in this very scan
+                // (after_stamps_us ~0) mean no scan ran between completion
+                // and the timeout: no notification came. Stamps seen earlier
+                // with retirement blocked (bit 1: the shared notifier's count
+                // short) mean the notification came and the retirement
+                // condition held the Work back. Rescues are rare; the limit
+                // only bounds a pathological boot.
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static REPORTED: AtomicU32 = AtomicU32::new(0);
+                if REPORTED.fetch_add(1, Ordering::Relaxed) < 256 {
+                    let (relation, owner_retired) = match flight.job_notifier {
+                        None => ("own", false),
+                        Some(owner) => (
+                            if owner == flight.id { "job-owner" } else { "job-member" },
+                            self.job_notifiers
+                                .iter()
+                                .find(|j| j.owner == owner)
+                                .is_some_and(|j| j.owner_root.is_some()),
+                        ),
+                    };
+                    let (count, total) = notifier_seen.unwrap_or((u32::MAX, u32::MAX));
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "G16: rescue {:#x} render={} comm={} ordinal={} age_ms={} after_stamps_us={} last_blocked={:#x} notifier={} owner_retired={} count={:#x}/{:#x}\n",
+                        flight.id,
+                        flight.render.is_some(),
+                        core::str::from_utf8(&flight.comm)
+                            .unwrap_or("?")
+                            .trim_end_matches('\0'),
+                        flight.ordinal,
+                        flight.started.elapsed().as_millis(),
+                        flight.stamps_seen.map_or(0, |t| t.elapsed().as_micros_ceil()),
+                        flight.blocked,
+                        relation,
+                        owner_retired,
+                        count,
+                        total
+                    );
+                }
+            }
             if crate::module_parameters::fw_trace.value() & 16 != 0 {
                 dev_info!(
                     self.dev.as_ref(),
@@ -392,6 +435,11 @@ impl Bootstrap {
     pub(super) fn flight_ms(&self, flight: &Flight, now: Instant<Monotonic>) -> i64 {
         let age = now - flight.started;
         self.progress.map_or(age, |p| age.min(now - p)).as_millis()
+    }
+
+    /// Mark the following retire scans as safety-poll rescues.
+    pub(crate) fn set_poll_scan(&mut self, on: bool) {
+        self.poll_scan = on;
     }
 
     pub(crate) fn oldest_flight_ms(&self) -> u64 {

@@ -109,6 +109,7 @@ impl WorkItem for Execution {
                 }
                 let mut progress = false;
                 let mut polled_retired = 0u32;
+                runtime.set_poll_scan(timed_out.is_some());
                 while let Some((id, result)) = runtime.retire().inspect_err(|error| {
                     pr_err!("G16: firmware retirement failed: {:?}\n", error);
                 })? {
@@ -158,14 +159,17 @@ impl WorkItem for Execution {
                     progress = true;
                     polled_retired += 1;
                 }
+                runtime.set_poll_scan(false);
                 if let Some(age) = timed_out {
                     use crate::g16_timeline as t;
                     t::POLL_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     t::POLL_RETIRED.fetch_add(u64::from(polled_retired), Ordering::Relaxed);
                     // A safety poll every few ms is routine; report only polls
-                    // that found finished work, or long waits. Long waits with
-                    // nothing retired are slow work (the retirement watchdog
-                    // reports hangs): at most one line per 10 s.
+                    // that found finished work (each such Work is also
+                    // classified by the retire scan: "G16: rescue"), or long
+                    // waits. Long waits with nothing retired are slow work (the
+                    // retirement watchdog reports hangs): at most one line per
+                    // 10 s.
                     if polled_retired != 0 {
                         pr_warn!(
                             "G16: notification wait timed out; polling retired {} Work(s), oldest flight {} ms\n",
