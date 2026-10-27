@@ -220,9 +220,10 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
-	 * The kernel boots with nohlt, because the default idle's WFI would
-	 * lose the CPU's registers. Now that idle goes through this driver,
-	 * whose only other state polls, stop forcing the poll loop.
+	 * The kernel boots T8132 polling in idle (see setup_arch()), because
+	 * the default idle's WFI would lose the CPU's registers. Now that idle
+	 * goes through this driver, whose only other state polls, stop forcing
+	 * the poll loop.
 	 */
 	cpu_idle_poll_ctrl(false);
 
@@ -263,11 +264,12 @@ static int __init apple_m4_cpuidle_init(void)
 		return 0;
 
 	/*
-	 * cpu_idle_force_poll is private to the scheduler, so look for the
-	 * nohlt that raised it before lowering it in probe.
+	 * "hlt" undoes the poll idle that setup_arch() forces on T8132; probe
+	 * would then underflow cpu_idle_force_poll. WFI loses state here, so
+	 * don't pretend to manage idle after the user asked for it.
 	 */
-	if (!apple_m4_cmdline_has("nohlt")) {
-		pr_warn("needs nohlt on the command line, not registering\n");
+	if (apple_m4_cmdline_has("hlt")) {
+		pr_warn("hlt given: WFI loses state on T8132, not registering\n");
 		return 0;
 	}
 
