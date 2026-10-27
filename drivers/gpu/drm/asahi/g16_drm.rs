@@ -363,6 +363,7 @@ pub(crate) fn register<'a>(
     use crate::g16_timeline::FlagKnob;
     let knobs = [
         (c_str!("profile"), FlagKnob::PROFILE, crate::module_parameters::profile.value()),
+        (c_str!("shared_notifier"), FlagKnob::SHARED_NOTIFIER, crate::module_parameters::shared_notifier.value()),
         (c_str!("fail_prep"), FlagKnob::FAIL_PREP, 0),
         (c_str!("fail_retire"), FlagKnob::FAIL_RETIRE, 0),
         (c_str!("fail_skip"), FlagKnob::FAIL_SKIP, 0),

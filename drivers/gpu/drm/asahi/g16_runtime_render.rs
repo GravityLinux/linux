@@ -273,12 +273,22 @@ impl Bootstrap {
         // The notifier pass stores driver stamps, then sends the IRQ after
         // a DSB. These destinations must be firmware-uncached: a DSB does
         // not clean a cached stamp, leaving Linux asleep on stale memory.
-        // One notifier and one stamp per lane for the whole queue, as
-        // macOS does: the notifier pass then does not walk each Work.
-        a.event_control = render_notifier(lanes);
-        a.event_count_array = render_notifier_count(lanes);
-        a.tiling_driver_stamp = lanes[0].driver_stamp();
-        a.fragment_driver_stamp = lanes[1].driver_stamp();
+        // Each render has its own notifier, count and driver stamps, so the
+        // firmware announces it as soon as it completes. A notifier shared
+        // by the queue, with a cumulative count (shared_notifier=1, for
+        // comparison), is only announced once every Work published to it
+        // has completed: a busy queue then waited for the safety poll.
+        if crate::g16_timeline::shared_notifier() {
+            a.event_control = render_notifier(lanes);
+            a.event_count_array = render_notifier_count(lanes);
+            a.tiling_driver_stamp = lanes[0].driver_stamp();
+            a.fragment_driver_stamp = lanes[1].driver_stamp();
+        } else {
+            a.event_control = va + 0x200;
+            a.event_count_array = va + 0x300;
+            a.tiling_driver_stamp = va + 0x18000;
+            a.fragment_driver_stamp = va + 0x18040;
+        }
 
         a.tiling_firmware_stamp = lanes[0].firmware_stamp();
         a.fragment_firmware_stamp = lanes[1].firmware_stamp();
@@ -410,8 +420,12 @@ impl Bootstrap {
         support.submissions.store(next_submitted, Ordering::Relaxed);
         self.render_publication = self.render_publication.wrapping_add(1);
         queue.render_count = queue_ordinal.wrapping_add(1);
-        queue.notified_works = queue.notified_works.wrapping_add(2);
-        let notifier_count = Some((a.event_control + 0xc, queue.notified_works));
+        let notifier_count = if a.event_control == render_notifier(queue.lanes.as_ref().ok_or(EIO)?) {
+            queue.notified_works = queue.notified_works.wrapping_add(2);
+            Some((a.event_control + 0xc, queue.notified_works))
+        } else {
+            None
+        };
         let lanes = queue.lanes.as_mut().ok_or(EIO)?;
         for stage in 0..2 {
             lanes[stage].head = heads[stage];
@@ -525,6 +539,27 @@ impl Bootstrap {
         // lookup and two barriers for each of about twenty writes.
         let context = (a.context_id as u32).to_le_bytes();
         let notified = queue.notified_works.wrapping_add(2).to_le_bytes();
+        // The notifier header: the Work's own notifier and driver stamps, or
+        // (shared_notifier=1) two words into the queue's shared notifier.
+        let shared = a.event_control == render_notifier(lanes);
+        let count_array = a.event_count_array.to_le_bytes();
+        let fragment_stamp = (a.fragment_stamp as u32).to_le_bytes();
+        let zero = 0u32.to_le_bytes();
+        let flags = 0x50u32.to_le_bytes();
+        let two = 2u32.to_le_bytes();
+        let tiling_previous = g16_stamp::previous(a.tiling_stamp as u32).to_le_bytes();
+        let fragment_previous = g16_stamp::previous(a.fragment_stamp as u32).to_le_bytes();
+        let own: [(u64, &[u8]); 8] = [
+            (a.event_control, &count_array[..]),
+            (a.event_control + 8, &fragment_stamp[..]),
+            (a.event_control + 12, &zero[..]),
+            (a.event_control + 0x10, &flags[..]),
+            (a.event_control + 0x24, &context[..]),
+            (a.event_count_array, &two[..]),
+            (a.tiling_driver_stamp, &tiling_previous[..]),
+            (a.fragment_driver_stamp, &fragment_previous[..]),
+        ];
+        let header = if shared { 2 } else { own.len() };
         let preludes = [a.tiling_prelude(blocks), a.fragment_prelude()];
         let tiling_micro = a.tiling_microsequence();
         let fragment_micro = a.fragment_microsequence();
@@ -578,15 +613,19 @@ impl Bootstrap {
         let (items, entries) = (&items, &entries);
         let rings = [lanes[0].ring, lanes[1].ring];
         let per_stage = move |stage: usize| 3 + item_counts[stage] + entry_counts[stage];
-        let count = 2 + per_stage(0) + per_stage(1);
+        let own = &own;
+        let count = header + per_stage(0) + per_stage(1);
         let write = move |n: usize| {
-            if n < 2 {
-                return if n == 0 {
+            if n < header {
+                return if !shared {
+                    own[n]
+                } else if n == 0 {
                     (a.event_control + 0x24, &context[..])
                 } else {
                     (a.event_count_array, &notified[..])
                 };
             }
+            let n = n - header + 2;
             let (stage, k) = if n - 2 < per_stage(0) { (0, n - 2) } else { (1, n - 2 - per_stage(0)) };
             let (prelude, work, micro) = if stage == 0 {
                 (a.tiling_prelude, a.tiling_work, a.tiling_microsequence)

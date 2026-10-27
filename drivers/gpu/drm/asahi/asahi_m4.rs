@@ -176,6 +176,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "1 advertises soft faults to userspace (needs fault_control=3; Mesa with hk 243c5ac0c43 and 31b9d1d5bfb); 0 hides them",
         },
+        shared_notifier: u32 {
+            default: 0,
+            description: "0 (default): each render has its own completion notifier; 1: renders share the queue's notifier with a cumulative Work count, which delays completion messages until the queue drains (2026-10-03 to 10-27 behaviour, kept for comparison). Runtime: debugfs asahi_m4/shared_notifier",
+        },
         timeline: u32 {
             default: 0,
             description: "Debug: 1 records each submission when its fence signals into a binary ring at debugfs asahi_m4/timeline (format in g16_timeline.rs): the client pid and file, input fences pending at the ioctl, CNTVCT ticks (1 GHz) at the ioctl, scheduler run, first and last publication and completion, plus admission deferrals and their reasons. 2 also records the doorbell, and for the notification that retired the submission its IRQ, RTKit delivery, pump wake and retire-scan times",

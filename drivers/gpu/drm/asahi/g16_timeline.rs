@@ -332,6 +332,17 @@ pub(crate) fn take_injection(cell: &core::sync::atomic::AtomicU32, tgid: i32) ->
     fired
 }
 
+/// Each render's own completion notifier (0, default) or the queue-shared one
+/// (1, for comparison: its cumulative count holds completion messages back
+/// until the queue drains). asahi_m4.shared_notifier; runtime: debugfs
+/// asahi_m4/shared_notifier, for renders published afterwards.
+pub(crate) static SHARED_NOTIFIER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Whether new renders use the queue-shared notifier (see `SHARED_NOTIFIER`).
+pub(crate) fn shared_notifier() -> bool {
+    SHARED_NOTIFIER.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// A 0/1 debugfs switch over a static.
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
@@ -345,6 +356,7 @@ impl FlagKnob {
     }
 
     pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
+    pub(crate) const SHARED_NOTIFIER: Self = Self { cell: &SHARED_NOTIFIER, name: "shared_notifier", max: 1 };
     pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", max: i32::MAX as u32 };
     pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", max: i32::MAX as u32 };
     pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", max: 4096 };
