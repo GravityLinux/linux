@@ -26,6 +26,7 @@
 #include <linux/panic_notifier.h>
 #include <linux/proc_fs.h>
 #include <linux/memblock.h>
+#include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/efi.h>
 #include <linux/psci.h>
@@ -340,6 +341,15 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	if (acpi_disabled)
 		unflatten_device_tree();
+
+	/*
+	 * Apple T8132 cores lose their register state in a plain WFI, so the
+	 * default idle must never run there. Poll instead, as "nohlt" would,
+	 * until cpuidle-apple-m4 takes idle over. This has to happen before
+	 * the boot CPU first idles in rest_init().
+	 */
+	if (of_machine_is_compatible("apple,t8132"))
+		cpu_idle_poll_ctrl(true);
 
 	bootmem_init();
 
