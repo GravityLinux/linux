@@ -430,6 +430,13 @@
 				label = "pmp-agx";
 				#power-domain-cells = <0>;
 				power-domains = <&ps_gfx>;
+				/*
+				 * PMP reads the GPU block (SGX) while it runs, and takes a
+				 * bus error if the GPU domain is off. Keep the vote, and
+				 * through it ps_gfx, on even when the GPU driver does not
+				 * bind or fails before it starts its mailbox.
+				 */
+				apple,always-on;
 			};
 
 			pmp_report_disp: report@7 {
