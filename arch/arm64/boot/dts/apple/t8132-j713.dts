@@ -341,10 +341,6 @@
 	apple,always-on;
 };
 
-&pmp_report_sio {
-	apple,always-on;
-};
-
 &pmp_dart {
 	status = "okay";
 };
