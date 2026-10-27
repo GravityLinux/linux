@@ -85,7 +85,7 @@ impl Bootstrap {
         support: &Support,
         timestamps: [u64; 4],
         dependencies: &[Option<Stamp>; 2],
-        job: (u64, u32),
+        job: u64,
     ) -> Result<Receipt> {
         let _t = crate::g16_timeline::Timer::start(&crate::g16_timeline::P_SUBMIT_RENDER);
         if self.render_failed {
@@ -186,7 +186,7 @@ impl Bootstrap {
         support: &Support,
         timestamps: [u64; 4],
         dependencies: &[Option<Stamp>; 2],
-        job: (u64, u32),
+        job: u64,
     ) -> Result<Receipt> {
         let mut guard = owner.lock();
         let client = &mut *guard;
@@ -235,7 +235,7 @@ impl Bootstrap {
         scene: u32,
         timestamps: [u64; 4],
         dependencies: &[Option<Stamp>; 2],
-        job: (u64, u32),
+        job: u64,
     ) -> Result<Receipt> {
         if self.render_failed {
             return Err(EIO);
@@ -283,29 +283,42 @@ impl Bootstrap {
         // with a cumulative count (2026-10-03 to 10-27) was announced only
         // once every Work published to it had completed, so a busy queue
         // waited for the safety poll; one per submission (below) is not.
+        // The Work count lives with the stamps in the firmware-uncached page:
+        // a shared notifier's count is raised while the firmware reads it.
         a.event_control = va + 0x200;
-        a.event_count_array = va + 0x300;
+        a.event_count_array = va + 0x18080;
         a.tiling_driver_stamp = va + 0x18000;
         a.fragment_driver_stamp = va + 0x18040;
         // shared_notifier=1: the submission's renders share the notifier of
         // its first published render (the owner), as Metal shares one per
-        // command buffer. The owner writes the header with the count of
-        // every render it will cover; the others only their driver stamps.
+        // command buffer. Like Metal, each render raises the notifier's Work
+        // count by its own two Works as it is published: the owner writes
+        // the header with count 2, the others the new count and their driver
+        // stamps. The count never runs ahead of what was published. A render
+        // published after the owner has retired (a submission held back)
+        // starts a fresh notifier rather than re-arming one that may have
+        // drained, which Metal, publishing a command buffer at once, never does.
         let job_owner = if crate::g16_timeline::shared_notifier() {
-            let owner = self.job_notifiers.iter().find(|j| j.job == job.0).map(|j| j.owner);
+            let owner = self
+                .job_notifiers
+                .iter()
+                .find(|j| j.job == job && j.owner_root.is_none())
+                .map(|j| j.owner);
             let owner_va = owner.unwrap_or(va);
             a.event_control = owner_va + 0x200;
-            a.event_count_array = owner_va + 0x300;
+            a.event_count_array = owner_va + 0x18080;
             Some((owner_va, owner.is_none()))
         } else {
             None
         };
-        // The notifier header this render writes: its own (count 2), the
-        // submission's (count of its remaining renders' Works), or none.
-        let header_count = match job_owner {
-            None => Some(2u32),
-            Some((_, true)) => Some(job.1.max(1) * 2),
-            Some((_, false)) => None,
+        // What this render writes into the notifier: the full header (its
+        // own notifier, or a submission's first) and the Work count.
+        let notifier_write = match job_owner {
+            None | Some((_, true)) => (true, 2u32),
+            Some((owner_va, false)) => {
+                let entry = self.job_notifiers.iter().find(|j| j.owner == owner_va).ok_or(EIO)?;
+                (false, entry.works + 2)
+            }
         };
         // Fail before publication: past it, a render must have its Flight.
         if matches!(job_owner, Some((_, true))) && self.job_notifiers.len() == self.job_notifiers.capacity() {
@@ -436,7 +449,7 @@ impl Bootstrap {
         self.note_dependency_events(dependencies, own);
         let (heads, epochs, lane_items) = self.publish_render(
             &a, &ta, &frag, queue, initbm, pool.blocks, dependencies,
-            params.vdm_barrier_fragment, header_count,
+            params.vdm_barrier_fragment, notifier_write,
         )?;
         pool.initialized = true;
         support.submissions.store(next_submitted, Ordering::Relaxed);
@@ -450,11 +463,10 @@ impl Bootstrap {
                 if first {
                     self.job_notifiers
                         .push_within_capacity(JobNotifier {
-                            job: job.0,
+                            job,
                             owner: owner_va,
                             owner_root: None,
                             works: 0,
-                            promised: header_count.unwrap_or(2),
                             refs: 0,
                         })
                         .map_err(|_| EIO)?;
@@ -556,7 +568,7 @@ impl Bootstrap {
         blocks: u32,
         dependencies: &[Option<Stamp>; 2],
         vdm_barrier_fragment: bool,
-        header_count: Option<u32>,
+        notifier_write: (bool, u32),
     ) -> Result<([u32; 2], [u32; 2], [u32; 2])> {
         let priority = queue.priority;
         let lanes = queue.lanes.as_ref().ok_or(EIO)?;
@@ -580,14 +592,14 @@ impl Bootstrap {
         // lookup per destination region and one barrier pair, rather than a
         // lookup and two barriers for each of about twenty writes.
         let context = (a.context_id as u32).to_le_bytes();
-        // The notifier header: the full header with its Work count when this
-        // render owns the notifier (its own, or its submission's first), else
-        // only this render's driver stamps.
+        // The notifier header: the full header when this render owns the
+        // notifier (its own, or its submission's first), else only the raised
+        // Work count; then this render's driver stamps.
         let count_array = a.event_count_array.to_le_bytes();
         let fragment_stamp = (a.fragment_stamp as u32).to_le_bytes();
         let zero = 0u32.to_le_bytes();
         let flags = 0x50u32.to_le_bytes();
-        let count = header_count.unwrap_or(2).to_le_bytes();
+        let count = notifier_write.1.to_le_bytes();
         let tiling_previous = g16_stamp::previous(a.tiling_stamp as u32).to_le_bytes();
         let fragment_previous = g16_stamp::previous(a.fragment_stamp as u32).to_le_bytes();
         let own: [(u64, &[u8]); 8] = [
@@ -600,10 +612,10 @@ impl Bootstrap {
             (a.tiling_driver_stamp, &tiling_previous[..]),
             (a.fragment_driver_stamp, &fragment_previous[..]),
         ];
-        let (own, header): (&[(u64, &[u8])], usize) = if header_count.is_some() {
+        let (own, header): (&[(u64, &[u8])], usize) = if notifier_write.0 {
             (&own[..], own.len())
         } else {
-            (&own[6..], 2)
+            (&own[5..], 3)
         };
         let preludes = [a.tiling_prelude(blocks), a.fragment_prelude()];
         let tiling_micro = a.tiling_microsequence();

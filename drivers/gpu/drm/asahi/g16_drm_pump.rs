@@ -273,16 +273,9 @@ impl WorkItem for Execution {
                                 execution.support.as_deref().ok_or(EIO)?,
                                 execution.timestamps[job.next],
                                 &dependencies,
-                                // The submission's identity and how many of its
-                                // renders, this one included, are still to come:
-                                // with shared_notifier=1 they share a notifier.
-                                (
-                                    execution.id,
-                                    execution.parameters[job.next..]
-                                        .iter()
-                                        .filter(|p| matches!(p, Parameters::Render(_)))
-                                        .count() as u32,
-                                ),
+                                // The submission's identity: with
+                                // shared_notifier=1 its renders share a notifier.
+                                execution.id,
                             ),
                             Parameters::Compute(p) => runtime.submit_compute(
                                 execution.firmware.clone(),

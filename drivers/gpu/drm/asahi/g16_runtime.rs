@@ -271,8 +271,6 @@ pub(crate) struct JobNotifier {
     owner_root: Option<u64>,
     /// Works counted into the notifier so far (two per render).
     works: u32,
-    /// The Work count the owner wrote into the notifier header.
-    promised: u32,
     /// Published renders using the notifier and not yet retired.
     refs: u32,
 }
