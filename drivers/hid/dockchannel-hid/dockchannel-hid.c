@@ -25,7 +25,7 @@
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
 
-#define MAX_INTERFACES 16
+#define MAX_INTERFACES 32
 
 /* Complete frame, including the largest aligned body and its checksum. */
 #define MAX_PKT_SIZE (8 + 0xfffc + 4)
@@ -1031,7 +1031,7 @@ static void dchid_packet_work(struct work_struct *ws)
 	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
 		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, work->hdr.length - sizeof(*shdr));
-		return;
+		goto done;
 	}
 
 	switch (type) {
@@ -1046,6 +1046,7 @@ static void dchid_packet_work(struct work_struct *ws)
 		break;
 	}
 
+done:
 	kfree(work);
 }
 
@@ -1086,7 +1087,7 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 
 	iface->resp_size = shdr->length;
 	iface->out_report = -1;
-	iface->retcode = shdr->retcode;
+	iface->retcode = hdr->pad >> 8 ? -EIO : shdr->retcode;
 	complete(&iface->out_complete);
 }
 
@@ -1125,6 +1126,9 @@ static int dchid_dispatch(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
 	}
 
 	if (hdr->iface >= MAX_INTERFACES || hdr->length < sizeof(struct dchid_subhdr))
+		return 0;
+	if (((struct dchid_subhdr *)data)->length >
+	    hdr->length - sizeof(struct dchid_subhdr))
 		return 0;
 	iface = dchid->ifaces[hdr->iface];
 	if (!iface) {
@@ -1241,10 +1245,10 @@ done:
 
 static int dockchannel_hid_probe(struct platform_device *pdev)
 {
+	struct fwnode_handle *stm;
 	struct device *dev = &pdev->dev;
 	struct dockchannel_hid *dchid;
 	struct device_node *child, *helper;
-	struct fwnode_handle *stm;
 	struct platform_device *helper_pdev;
 	struct property *prop;
 	int ret;
@@ -1259,11 +1263,18 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	/* Retain the generic STM-less setup used by the shared platform tree. */
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
 	fwnode_handle_put(stm);
 	mutex_init(&dchid->ring_mutex);
-	dchid->use_ring = of_device_is_compatible(dev->of_node, "apple,t8132-dockchannel-hid");
+	dchid->use_ring = of_device_is_compatible(dev->of_node, "apple,t8132-dockchannel-hid") ||
+			  of_device_is_compatible(dev->of_node, "apple,t8140-dockchannel-hid");
+	/* Neo has no STM interface from which to obtain common HID IDs. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dockchannel-hid")) {
+		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
+		dchid->id_ready = true;
+	}
 
 	/*
 	 * First make sure all the GPIOs are available, in cased we need to defer.
@@ -1356,6 +1367,7 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
 	{ .compatible = "apple,t8132-dockchannel-hid" },
+	{ .compatible = "apple,t8140-dockchannel-hid" },
 	{ .compatible = "apple,dockchannel-hid" },
 	{},
 };

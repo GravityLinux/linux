@@ -348,7 +348,7 @@ static int dockchannel_probe(struct platform_device *pdev)
 	writel_relaxed(0, dcc->irq_base + IRQ_MASK);
 	writel_relaxed(~0, dcc->irq_base + IRQ_FLAG);
 
-	dcc->domain = irq_domain_create_linear(dev->fwnode, DOCKCHANNEL_MAX_IRQ,
+	dcc->domain = irq_domain_create_linear(of_fwnode_handle(dev->of_node), DOCKCHANNEL_MAX_IRQ,
 					    &dockchannel_irq_domain_ops, dcc);
 	if (!dcc->domain)
 		return -ENOMEM;
