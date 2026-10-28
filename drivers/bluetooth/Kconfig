@@ -473,3 +473,10 @@ config BT_INTEL_PCIE
 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
 	  the kernel or say M to compile it as module (btintel_pcie)
 endmenu
+
+config BT_HCIMT793B
+	tristate "Private Neo MT793B PCIe Bluetooth"
+	depends on BT && PCI
+	select FW_LOADER
+	help
+	  Private native-trace based bring-up transport for the Neo.
