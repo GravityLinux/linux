@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Scheduled-family TA/fragment descriptor DATA, macOS 26.6.2.
 //! Byte-array layouts apply only to exclusive CPU staging, never live DMA.
@@ -149,6 +149,8 @@ fn preflight(p: &Parameters, s: &State, item: u32, grid: u32) -> Result<(u32, u6
 
 #[versions(AGX_SCHEDULED)]
 #[repr(C)]
+// Native adjacent allocations prove these bounds for both G16C and G17P.
+// Bytes beyond the object can be the next job header, not an extension.
 pub(crate) struct TilingDescriptor {
     pub(crate) opcode: [u8; 0x4],
     pub(crate) counter: [u8; 0x8],
@@ -214,15 +216,10 @@ pub(crate) struct TilingDescriptor {
     pub(crate) shared_tail: [u8; 0x8],
     pub(crate) tail_flags: [u8; 0x1],
     pub(crate) pad_094e: [u8; 0x72],
-    #[ver(G == G16C)]
-    pub(crate) extension: [u8; 0x38],
 }
 
 #[versions(AGX_SCHEDULED)]
 const TILING_LAYOUT: () = {
-    #[ver(G == G16C)]
-    assert!(core::mem::size_of::<TilingDescriptor::ver>() == 0x9f8);
-    #[ver(G == G17P)]
     assert!(core::mem::size_of::<TilingDescriptor::ver>() == 0x9c0);
     assert!(core::mem::align_of::<TilingDescriptor::ver>() == 1);
     assert!(core::mem::offset_of!(TilingDescriptor::ver, opcode) == 0x0);
@@ -289,8 +286,6 @@ const TILING_LAYOUT: () = {
     assert!(core::mem::offset_of!(TilingDescriptor::ver, shared_tail) == 0x945);
     assert!(core::mem::offset_of!(TilingDescriptor::ver, tail_flags) == 0x94d);
     assert!(core::mem::offset_of!(TilingDescriptor::ver, pad_094e) == 0x94e);
-    #[ver(G == G16C)]
-    assert!(core::mem::offset_of!(TilingDescriptor::ver, extension) == 0x9c0);
 };
 
 #[versions(AGX_SCHEDULED)]
@@ -429,15 +424,10 @@ pub(crate) struct FragmentDescriptor {
     pub(crate) pad_220d: [u8; 0x1f],
     pub(crate) field_222c: [u8; 0x4],
     pub(crate) pad_2230: [u8; 0x10],
-    #[ver(G == G16C)]
-    pub(crate) extension: [u8; 0x40],
 }
 
 #[versions(AGX_SCHEDULED)]
 const FRAGMENT_LAYOUT: () = {
-    #[ver(G == G16C)]
-    assert!(core::mem::size_of::<FragmentDescriptor::ver>() == 0x2280);
-    #[ver(G == G17P)]
     assert!(core::mem::size_of::<FragmentDescriptor::ver>() == 0x2240);
     assert!(core::mem::align_of::<FragmentDescriptor::ver>() == 1);
     assert!(core::mem::offset_of!(FragmentDescriptor::ver, opcode) == 0x0);
@@ -573,8 +563,6 @@ const FRAGMENT_LAYOUT: () = {
     assert!(core::mem::offset_of!(FragmentDescriptor::ver, pad_220d) == 0x220d);
     assert!(core::mem::offset_of!(FragmentDescriptor::ver, field_222c) == 0x222c);
     assert!(core::mem::offset_of!(FragmentDescriptor::ver, pad_2230) == 0x2230);
-    #[ver(G == G16C)]
-    assert!(core::mem::offset_of!(FragmentDescriptor::ver, extension) == 0x2240);
 };
 
 #[versions(AGX_SCHEDULED)]

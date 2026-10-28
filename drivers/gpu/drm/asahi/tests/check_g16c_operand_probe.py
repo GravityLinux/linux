@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Identify the own pressure shader's DATA in all five appended operand buffers.
 
 This verifies the 4096-word/16384-invocation/selector9 pressure workload, not an
@@ -41,7 +41,7 @@ assert len({r['context'] for r in heads.values()}) == 1
 # model below computes both values written by that shader to each array cell:
 # initialization and its single in-place update. Retired backing is not assumed
 # to contain every cell's final shader value.
-code = r'''/* SPDX-License-Identifier: MIT */
+code = r'''/* SPDX-License-Identifier: GPL-2.0-only */
 #include <stdint.h>
 #include <stdio.h>
 static uint32_t rotate(uint32_t v,unsigned n){return (v<<n)|(v>>(32-n));}

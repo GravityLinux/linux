@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Raw asynchronous ioctls: two immutable-VM queues, disjoint outputs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"
@@ -23,12 +23,13 @@ static uint32_t oracle(unsigned lane, unsigned steps)
 }
 int main(int argc,char **argv)
 {
-	setbuf(stdout,NULL); CHECK(argc==2 || (argc==3 && (!strcmp(argv[2],"--preflight") || !strcmp(argv[2],"--serial") || !strcmp(argv[2],"--queued") || !strcmp(argv[2],"--warm") || !strcmp(argv[2],"--same-queue") || !strcmp(argv[2],"--same-queue-warm") || !strcmp(argv[2],"--same-queue-close"))));
+	setbuf(stdout,NULL); CHECK(argc==2 || (argc==3 && (!strcmp(argv[2],"--preflight") || !strcmp(argv[2],"--serial") || !strcmp(argv[2],"--queued") || !strcmp(argv[2],"--warm") || !strcmp(argv[2],"--same-queue") || !strcmp(argv[2],"--same-queue-warm") || !strcmp(argv[2],"--same-queue-close") || !strcmp(argv[2],"--dependency") || !strcmp(argv[2],"--dependency-close"))));
     int serial=argc==3 && !strcmp(argv[2],"--serial");
     int queued=argc==3 && !strcmp(argv[2],"--queued");
     int same_queue=argc==3 && (!strcmp(argv[2],"--same-queue") || !strcmp(argv[2],"--same-queue-warm") || !strcmp(argv[2],"--same-queue-close"));
-    int closing=argc==3 && !strcmp(argv[2],"--same-queue-close");
-    int warm=argc==3 && (!strcmp(argv[2],"--warm") || !strcmp(argv[2],"--same-queue-warm") || closing);
+    int dependent=argc==3 && (!strcmp(argv[2],"--dependency") || !strcmp(argv[2],"--dependency-close"));
+    int closing=argc==3 && (!strcmp(argv[2],"--same-queue-close") || !strcmp(argv[2],"--dependency-close"));
+    int warm=argc==3 && (!strcmp(argv[2],"--warm") || !strcmp(argv[2],"--same-queue-warm") || closing || dependent);
     queued |= same_queue;
 	size_t n; unsigned char *input=read_input(argv[1],"inputs.bin",&n);
 	CHECK(n>=32); uint32_t h[8]; memcpy(h,input,32);
@@ -78,6 +79,7 @@ int main(int argc,char **argv)
 		cmd->ts.end=(struct drm_asahi_timestamp){.handle=obj.object_handle,.offset=72+j*32};
 		submits[j]=(struct drm_asahi_submit){.queue_id=q[j].queue_id,.cmdbuf=(uintptr_t)(commands+j*72),.cmdbuf_size=72,.syncs=(uintptr_t)&sync[j],.out_sync_count=1};
 	}
+    struct drm_asahi_sync dependency_syncs[2]={sync[0],sync[1]};
     unsigned phases=closing?2U:warm?3U:1U;
     for(unsigned phase=0;phase<phases;phase++) {
         int closing_now=closing && phase+1==phases;
@@ -89,10 +91,24 @@ int main(int argc,char **argv)
             OK(fd,DRM_IOCTL_SYNCOBJ_RESET,&reset);
         }
         printf("OVERLAP_PHASE phase=%u warm=%d\n",phase,warm);
+	/* Warm both physical bindings first. Later phases pass the producer's
+	 * still-pending fence to a distinct queue before either completion wait. */
+    if(dependent && phase) {
+        submits[1].syncs=(uintptr_t)dependency_syncs;
+        submits[1].in_sync_count=1;
+    }
 	puts("G16C_COMPUTE_OVERLAP_BEGIN");
 	/* Both accepted before ANY completion wait. No g17p_drm_wait wrapper. */
 	for(unsigned j=0;j<2;j++) {
         OK(fd,DRM_IOCTL_ASAHI_SUBMIT,&submits[j]);printf("OVERLAP_ACCEPTED job=%u queue=%u\n",j,q[j].queue_id);
+        if(dependent && phase && !j) {
+            struct drm_syncobj_handle export={.handle=done[0].handle,.flags=DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE};
+            OK(fd,DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,&export);
+            struct pollfd pending={.fd=export.fd,.events=POLLIN};
+            CHECK(poll(&pending,1,0)==0);CHECK(!close(export.fd));
+            printf("DEPENDENCY_PRODUCER_PENDING producer_queue=%u consumer_queue=%u distinct_queues=1\n",q[0].queue_id,q[1].queue_id);
+            CHECK(q[0].queue_id!=q[1].queue_id);
+        }
         if(serial && !j) {
             struct timespec now;CHECK(!clock_gettime(CLOCK_MONOTONIC,&now));
             struct drm_syncobj_wait wait={.handles=(uintptr_t)&done[j].handle,.count_handles=1,.timeout_nsec=(int64_t)now.tv_sec*1000000000+now.tv_nsec+15000000000LL,.flags=DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL};OK(fd,DRM_IOCTL_SYNCOBJ_WAIT,&wait);
@@ -114,7 +130,7 @@ int main(int argc,char **argv)
         BAD(fd,DRM_IOCTL_ASAHI_QUEUE_DESTROY,&destroy,ENOENT);
         struct drm_asahi_vm_destroy destroy_vm={.vm_id=vm.vm_id};
         BAD(fd,DRM_IOCTL_ASAHI_VM_DESTROY,&destroy_vm,EBUSY);
-        puts("PENDING_QUEUE_DESTROY_PASS stale_queue=ENOENT VM_destroy=EBUSY");
+        printf("PENDING_QUEUE_DESTROY_PASS stale_queue=ENOENT VM_destroy=EBUSY cross_queue_dependency=%d\n",dependent);
         CHECK(!close(fd));fd=-1;
     }
     for(unsigned j=0;j<2;j++) {
@@ -137,16 +153,16 @@ int main(int argc,char **argv)
 	}
 	uint64_t times[2][2];for(unsigned j=0;j<2;j++){memcpy(times[j],ts+PAGE+64+j*32,16);CHECK(times[j][0] && times[j][1]>times[j][0]);printf("OVERLAP_TIMESTAMP job=%u start=%"PRIu64" end=%"PRIu64"\n",j,times[j][0],times[j][1]);}
 	for(unsigned i=0;i<PAGE*3;i++)if(!(i>=PAGE+64 && i<PAGE+80) && !(i>=PAGE+96 && i<PAGE+112))CHECK(ts[i]==0xa5);
-	if(serial || queued)CHECK(times[0][1]<times[1][0]);
+	if(serial || queued || (dependent && phase))CHECK(times[0][1]<times[1][0]);
     // Independent queues have no API ordering. Cold bindings serialize in
     // publication order, which may differ from the order of the two ioctls.
     else if(warm && phase==0)CHECK(times[0][1]<times[1][0] || times[1][1]<times[0][0]);
     else CHECK(times[1][0]<times[0][1] && times[0][0]<times[1][1]);
         printf("OVERLAP_PHASE_PASS phase=%u actual_overlap=%d full_outputs_and_guards=1\n",phase,
             times[1][0]<times[0][1] && times[0][0]<times[1][1]);
-        if(closing && !closing_now)puts("CLOSE_WARMUP_PASS one_queue=1 first_pair_output_verified=1");
+        if(closing && !closing_now)printf("CLOSE_WARMUP_PASS logical_queues=%u first_pair_output_verified=1\n",same_queue?1U:2U);
     }
 	if(fd>=0)CHECK(!close(fd));
-	printf("G16C_COMPUTE_%s_PASS logical_queues=%u, two commands, exact all BOs, timestamp guards, checks=%u\n",closing?"CLOSED_QUEUE_PIPELINE":same_queue?(warm?"ORDERED_QUEUE_REUSE":"ORDERED_QUEUE_PIPELINE"):serial?"SERIAL_CONTROL":queued?"PENDING_PAIR":warm?"WARM_REUSE":"OVERLAP",same_queue?1U:2U,checks);
+	printf("G16C_COMPUTE_%s_PASS logical_queues=%u, two commands, exact all BOs, timestamp guards, checks=%u\n",dependent?(closing?"DEPENDENT_QUEUES_CLOSE":"DEPENDENT_QUEUES_REUSE"):closing?"CLOSED_QUEUE_PIPELINE":same_queue?(warm?"ORDERED_QUEUE_REUSE":"ORDERED_QUEUE_PIPELINE"):serial?"SERIAL_CONTROL":queued?"PENDING_PAIR":warm?"WARM_REUSE":"OVERLAP",same_queue?1U:2U,checks);
 	return 0;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Execute production Max resource allocation against real source allocation.
 
 The test models RAM and low/root PTE APIs; neither CPU cache operations nor GPU
@@ -39,7 +39,7 @@ for context,memory,allocations in [(1,space,None),(2,b.firmware,source.metadata.
             expected.append((context,va,owner.attributes,memory))
 expected.sort(key=lambda row:row[:2])
 private_source=(tests.parent/'scheduled_compute_runtime.rs').read_text()
-def item(marker):
+def item(marker,private_source=private_source):
     start=private_source.index(marker);brace=private_source.index('{',start);at=brace+1;depth=1
     while depth:
         if private_source[at]=='{':depth+=1
@@ -54,6 +54,7 @@ with tempfile.TemporaryDirectory()as directory:
     for name,file in [('resources','scheduled_render_resources.rs'),('admission','scheduled_render_admission.rs'),('growth','scheduled_parameter_growth.rs')]:
         code+=f'#[path={json.dumps(str(tests.parent/file))}]pub mod {name};\n'
     code+='}\n'+f'#[path={json.dumps(str(tests.parent/"scheduled_operands.rs"))}]mod scheduled_operands;\n'
+    code+=f'#[path={json.dumps(str(tests.parent/"scheduled_dispatch.rs"))}]mod scheduled_dispatch;\n'
     code+='''
 mod g17p_user_vm {
     use super::prelude::*;use std::collections::BTreeMap;
@@ -83,21 +84,71 @@ mod g17p_vm{
 mod g17p_boot{
     use super::{prelude::*,g17p_memory::Memory,g17p_vm::Vm,g17p_render::admission::RegistrationG16C};
     pub struct Session{pub memory:Option<Memory>,pub vm:Option<Vm>,pub ttbs:u64,pub requests:Vec<Vec<u8>>}
-    impl Session{pub fn g16c_register_flist(&mut self,r:&RegistrationG16C)->Result{let(req,mut receipt)=r.prepare().unwrap();let mut reply=[0u8;72];for(at,value)in[(0,13u32),(4,r.context),(8,r.reply_value),(36,r.added*8)]{reply[at..at+4].copy_from_slice(&value.to_le_bytes());}for(at,value)in[(12,r.support),(20,r.table),(28,r.table+r.previous as u64*64)]{reply[at..at+8].copy_from_slice(&value.to_le_bytes());}assert!(receipt.consume(&reply));self.requests.push(req.bytes().to_vec());Ok(())}}
+    impl Session{pub fn g16c_register_flist(&mut self,r:&RegistrationG16C)->Result{let(req,mut receipt)=r.prepare().unwrap();let mut reply=[0u8;72];for(at,value)in[(0,13u32),(4,r.context),(8,r.bank),(36,r.added*8)]{reply[at..at+4].copy_from_slice(&value.to_le_bytes());}for(at,value)in[(12,r.support),(20,r.table),(28,r.table+r.previous as u64*64)]{reply[at..at+8].copy_from_slice(&value.to_le_bytes());}assert!(receipt.consume(&reply));self.requests.push(req.bytes().to_vec());Ok(())}}
     pub mod g16c_compute{
         use crate::{prelude::*,g17p_memory::Memory,g17p_vm::Vm,g17p_user_vm::UserVm,scheduled_operands as operands};use super::Session;
         mod boot{use super::*;pub fn read_words(m:&Memory,v:&Vm,va:u64,out:&mut[u8])->Result{let mut off=0;while off<out.len(){let at=va+off as u64;let n=(out.len()-off).min(0x4000-(at&0x3fff)as usize);m.read_firmware_words(v.physical(m,2,at)?,&mut out[off..off+n])?;off+=n;}Ok(())}}
+        use crate::scheduled_dispatch::DispatchStateG16C;
+        mod compute {pub struct Client {pub root:crate::g17p_user_vm::UserVm}}
         const PAGE:u64=0x4000;const PRIVATE:u64=0x00c0000000000443;const SHARED:u64=0x00c000000000044b;
         const GPU_READ:u64=0x0080000000000c8b;const ADDRESS:u64=0x000003ffffffc000;
 '''
-    for marker in ['struct PrivateBlock','fn bytes(','fn private_span(','fn map_private(','fn map_prepared_private(','fn write_blocks(','fn write_low(','fn fw_span(']:code+=item(marker)+'\n'
+    for marker in ['struct PrivateBlock','fn bytes(','fn private_span(','fn map_private(','fn map_prepared_private(','fn validate_mapped_private(','fn reset_mapped_private(','fn write_blocks(','fn write_low(','fn fw_span(','pub(crate) struct OwnerPrivateG16C','impl OwnerPrivateG16C','pub(crate) struct WorkBackingG16C','impl WorkBackingG16C','fn owner_layout(','fn encode_operand_directory(','fn initialize_operand_data(','fn initialize_operand_support(']:code+=item(marker)+'\n'
+    owner_reference_revision='d138dcd9c'
+    old_owner=subprocess.check_output(['git','show',owner_reference_revision+':drivers/gpu/drm/asahi/scheduled_compute_runtime.rs'],cwd=tests.parent,text=True)
+    code+=item('fn initialize_operand_data(',old_owner).replace('fn initialize_operand_data(', 'fn original_initialize_operand_data(')+'\n'
     code+=f'#[path={json.dumps(str(tests.parent/"scheduled_render_runtime.rs"))}]mod render;\n'
     code+='''
+        fn owner_private_gate()->Result {
+            for base in [0x7000000000u64,0x10e0000000] {
+                let limit=base+0x20000000;
+                let mut caller=compute::Client{root:UserVm{maps:std::collections::BTreeMap::new(),identity:0x21000000000}};
+                let mut plan=OwnerPrivateG16C::build(&mut caller,base,limit)?;
+                assert!(plan.matches(&caller,base,limit));assert!(caller.root.maps.is_empty());
+                assert!(!plan.matches(&caller,base+0x4000,limit));assert!(!plan.matches(&caller,base,limit-0x4000));
+                caller.root.identity+=0x4000;assert!(!plan.matches(&caller,base,limit));caller.root.identity-=0x4000;
+                let calls=plan.memory.calls;
+                for failed in [0,1,8,calls-1] {
+                    crate::g17p_memory::DETACHED_FAIL_AFTER.store(failed,std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(OwnerPrivateG16C::build(&mut caller,base,limit).err(),Some(ENOMEM));
+                    assert!(caller.root.maps.is_empty());
+                }
+                crate::g17p_memory::DETACHED_FAIL_AFTER.store(usize::MAX,std::sync::atomic::Ordering::Relaxed);
+                let mut reference=Memory::new();
+                for block in &plan.private {reference.reserve(block.physical,block.size);}
+                for physical in [plan.support_pages[0],plan.support_pages[1],plan.high_root] {reference.reserve(physical,PAGE);}
+                map_prepared_private(&mut caller.root,base,&plan.private)?;
+                let mut vm=Vm{maps:std::collections::BTreeMap::new()};let support=0xfffffc2207000000;
+                for (i,physical)in plan.support_pages.iter().enumerate() {vm.span(&mut plan.memory,2,support+i as u64*PAGE,*physical,PAGE as usize,PRIVATE)?;}
+                let mut directory=bytes(PAGE as usize)?;let mut entries=bytes(operands::TABLE_SIZE as usize)?;
+                let expected=original_initialize_operand_data(&mut reference,&vm,&caller.root,base,support,&plan.operand_buffers,&mut directory,&mut entries)?;
+                let actual=initialize_operand_support(&mut plan.memory,&vm,base,support,plan.operand_buffers.len())?;
+                assert_eq!(actual,expected);
+                for block in &plan.private {for offset in (0..block.size).step_by(PAGE as usize) {
+                    assert_eq!(plan.memory.read(block.physical+offset,PAGE as usize)?,reference.read(block.physical+offset,PAGE as usize)?,"owner private base={base:#x} offset={:#x}",block.offset+offset);
+                }}
+                for physical in [plan.support_pages[0],plan.support_pages[1],plan.high_root] {assert_eq!(plan.memory.read(physical,PAGE as usize)?,reference.read(physical,PAGE as usize)?);}
+            }
+            return Ok(());
+        }
         pub fn run()->Result{
+            owner_private_gate()?;
+            let work=WorkBackingG16C::new()?;
+            assert_eq!(work.memory.calls,7);
+            for &page in &work.pages {assert_eq!(work.memory.read(page,PAGE as usize)?,vec![0;PAGE as usize]);}
+            drop(work);
+            for failed in 0..7 {
+                crate::g17p_memory::DETACHED_FAIL_AFTER.store(failed,std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(WorkBackingG16C::new().err(),Some(ENOMEM));
+            }
+            crate::g17p_memory::DETACHED_FAIL_AFTER.store(usize::MAX,std::sync::atomic::Ordering::Relaxed);
             let mut m=Memory::new();let mut v=Vm{maps:std::collections::BTreeMap::new()};
             let mut root=UserVm{maps:std::collections::BTreeMap::new(),identity:0x20000000000};
             let pa=m.allocate(0x4000)?;v.span(&mut m,2,crate::scheduled_initgraph::BASE+0x1548000,pa,0x4000,PRIVATE)?;
-            let (staged,probe)=render::ResourcesG16C::prepare(&mut m,&mut v,&mut root,0,0,0x7000000000,0x7020000000)?;
+            let before_vm=v.maps.clone();let before_root=root.maps.clone();let before_calls=m.calls;
+            let (staged,mut probe)=render::ResourcesG16C::build(0,0,0x7000000000,0x7020000000)?;
+            assert_eq!(v.maps,before_vm);assert_eq!(root.maps,before_root);assert_eq!(m.calls,before_calls);
+            probe.preflight(&mut m,&mut v,&mut root)?;
             let complete_calls=staged.calls;drop(staged);drop(probe);
             let saved_maps=v.maps.clone();let saved_calls=m.calls;let seed=m.read(pa,0x4000)?;
             for failed in [0,1,8,complete_calls-1] {
@@ -114,7 +165,18 @@ mod g17p_boot{
                 assert_eq!(root.maps,geometry_maps);assert_eq!(m.calls,geometry_calls);assert_eq!(r.geometry_addresses(),[0;3]);
             }
             crate::g17p_memory::DETACHED_FAIL_AFTER.store(usize::MAX,std::sync::atomic::Ordering::Relaxed);
+            let plan=r.geometry_plan(&root,[1280,8192,512])?.unwrap();
+            let before=root.maps.clone();let before_calls=m.calls;
+            let (unpublished,mut ready)=plan.prepare(root.lease()?)?;
+            assert_eq!(root.maps,before);assert_eq!(m.calls,before_calls);
+            let guard=0x1001004000;assert!(root.maps.insert(guard,1).is_none());
+            assert!(!r.preflight_geometry(&mut root,&plan,&mut ready)?);assert_eq!(root.maps.remove(&guard),Some(1));assert_eq!(root.maps,before);
+            let mut foreign=UserVm{maps:root.maps.clone(),identity:root.identity+0x4000};
+            assert!(!r.preflight_geometry(&mut foreign,&plan,&mut ready)?);assert_eq!(foreign.maps,before);
             let geometry=r.fit_geometry(&mut m,&mut root,[1280,8192,512])?;
+            let installed=root.maps.clone();let installed_calls=m.calls;
+            assert!(!r.preflight_geometry(&mut root,&plan,&mut ready)?);assert_eq!(root.maps,installed);assert_eq!(m.calls,installed_calls);
+            drop(unpublished);drop(ready);
             assert_eq!(geometry,[0x1001000000,0x1001008000,0x1001010000]);
             let allocations=m.calls;assert_eq!(r.fit_geometry(&mut m,&mut root,[1280,8192,512])?,geometry);assert_eq!(m.calls,allocations);
             let ttbs=m.allocate(0x4000)?;let high=m.allocate(0x4000)?;
@@ -171,6 +233,13 @@ fn main(){g17p_boot::g16c_compute::run().unwrap();}
             session.memory.as_mut().unwrap().write64(ttbs+16,fresh.root()|(1<<48)|1)?;
             r.admit(&mut session,&fresh,1,high,0)?;r.admit(&mut session,&fresh,1,high,0)?;
             assert_eq!(session.requests.len(),2);assert_eq!(session.memory.as_ref().unwrap().calls,calls);
+            // Reconstruct identical retired DATA through the already-mapped
+            // path, without allocating backing or changing the physical root.
+            r.detach()?;let identity=fresh.root();let mappings=fresh.maps.clone();
+            r.rebind_mapped(session.memory.as_mut().unwrap(),session.vm.as_mut().unwrap(),&mut fresh,0x7100000000,0x7120000000)?;
+            assert_eq!(fresh.root(),identity);assert_eq!(fresh.maps,mappings);
+            session.requests.pop();r.admit(&mut session,&fresh,1,high,0)?;
+            assert_eq!(session.memory.as_ref().unwrap().calls,calls);
             let m=session.memory.as_ref().unwrap();let v=session.vm.as_ref().unwrap();
             let mut stdout=std::io::BufWriter::new(std::io::stdout().lock());
             for(context,map)in[(1u32,&fresh.maps),(2,&v.maps)]{for(&va,&pte)in map{
@@ -216,13 +285,13 @@ fn main(){g17p_boot::g16c_compute::run().unwrap();}
             digest.update(head+actual);total+=20+len(actual)
         assert proc.stdout.read(64)==register_flist(1,source.links.support,pool.table,5,previous=23)
     assert proc.stdout.read(1)==b'';assert proc.wait()==0
-summary=dict(source_RenderResources_allocate_executed=True,
+summary=dict(source_RenderResources_allocate_executed=True,detached_build_without_live_vm_or_root=True,detached_work_page_zero_images=7,detached_work_allocation_failure_boundaries=7,owner_private_whole_image_cases=2,owner_private_original_initializer_revision=owner_reference_revision,owner_private_allocation_failure_cases=8,owner_private_exact_root_extent_rejects=6,
         detached_allocation_failure_cases=4,
-        detached_geometry_allocation_failure_boundaries=3,
+        detached_geometry_allocation_failure_boundaries=3,geometry_detached_plan_allocation_without_live_root=True,geometry_stale_or_foreign_plan_rejects=3,
         geometry_failure_preserves_all_leaves_and_addresses=True,
         failure_installs_no_resource_leaves_or_descriptor=True,
         same_reservation_retry_after_failures=True,production_Rust_allocator_executed=True,
-    complete_virtual_pages=len(expected)*(2 if a.recycle else 1),relocated_rebind_and_physical_reuse=a.recycle,PB_metadata_mutations_preserved=a.recycle,zero_new_backing_allocations_on_rebind=a.recycle,geometry_guard_and_last_metadata_foreign_mapping_rejected_before_clear=a.recycle,all_virtual_DATA_bytes_and_flags_match=True,whole_bytes=total,
+    complete_virtual_pages=len(expected)*(2 if a.recycle else 1),relocated_rebind_and_physical_reuse=a.recycle,mapped_rebind_preserves_physical_root_and_all_PTEs=a.recycle,PB_metadata_mutations_preserved=a.recycle,zero_new_backing_allocations_on_rebind=a.recycle,geometry_guard_and_last_metadata_foreign_mapping_rejected_before_clear=a.recycle,all_virtual_DATA_bytes_and_flags_match=True,whole_bytes=total,
     whole_sha256=digest.hexdigest(),owned_FList_request_matches=True,one_idempotent_admission=True,admission_lifetimes=2 if a.recycle else 1,
     last_alias_and_installed_root_mismatches_reject_before_control=True,
     models='RAM, low/root PTE APIs, receipt reply and cache primitives; not native CPU/GPU',native_GPU_execution=False,

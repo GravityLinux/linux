@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare complete Max compute FList pages with the qualified source builder."""
 import argparse, hashlib, json, struct, subprocess, sys, tempfile
 from pathlib import Path

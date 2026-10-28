@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Differentially execute the real Python build_initdata function without hardware.
 
 Only the two builder function definitions are compiled from the experiment's AST.

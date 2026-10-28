@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Exercise the real m1n1/libfdt population code and expose typed OF fixtures."""
 import ctypes as C
 import json

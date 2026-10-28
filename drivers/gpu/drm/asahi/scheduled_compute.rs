@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Scheduled-family compute descriptor DATA, macOS 26.6.2.
 //! Only exclusive CPU staging is cast to a wire layout. Firmware mappings

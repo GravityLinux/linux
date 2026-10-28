@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Ordered G16C render programs. Inputs reuse the common render command;
 //! firmware lifecycle/gate/partial-pass scalars stay explicit owner state.

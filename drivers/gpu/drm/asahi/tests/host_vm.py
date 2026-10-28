@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Bounded RAM and allocation ownership for the actual Rust UAT walker."""
 import host_fdt
 

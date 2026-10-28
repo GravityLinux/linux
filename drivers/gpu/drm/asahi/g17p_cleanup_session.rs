@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G17PShimBackend.begin_compute_cleanup / begin_compute_maintenance.
 //! Receipts remain Session-owned, including ambiguous publication failures.
@@ -122,7 +122,7 @@ impl Session {
         }
         self.independent_compute.require_owner_idle(owner)?;
         self.restore_owned_render_fault()?;
-        if *crate::module_parameters::cleanup_diagnostics.value() & !15 != 0 {
+        if crate::module_parameters::cleanup_diagnostics.value() & !15 != 0 {
             return Err(EINVAL);
         }
         if let Some(context) = self.compute_contexts.as_ref().and_then(|contexts| {
@@ -139,7 +139,7 @@ impl Session {
             let cleanup = self.run_compute_cleanup(image)?;
             self.run_compute_maintenance(image, cleanup)?;
             self.release_native_compute_context(owner, cleanup)?;
-        } else if *crate::module_parameters::cleanup_diagnostics.value() != 0
+        } else if crate::module_parameters::cleanup_diagnostics.value() != 0
             && self
                 .compute
                 .as_ref()

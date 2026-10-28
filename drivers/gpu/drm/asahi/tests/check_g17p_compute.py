@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare the Rust compute builders with current source Python constructors."""
 import host_versions
 import argparse,importlib,struct,subprocess,sys,tempfile,types

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! First synchronous native owner, retained inside the dual-ASC Session.
 //! Admission currently requires the source's completed compute primer. The

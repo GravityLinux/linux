@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Caller-first partial render and a retained pair-zero append.
 //! Firmware objects and caller GEMs remain owned through both RTKit shutdowns.
@@ -62,7 +62,21 @@ struct ScratchLease {
 }
 /// Unpublished geometry backing. No installed root or firmware object is
 /// borrowed during allocation; commit checks the geometry and address cursor.
-pub(crate) struct ScratchSeed {
+pub(crate) enum ScratchSeed {
+    G17P(ScratchSeedG17P),
+    G16C(super::g17p_boot::GeometrySeedG16C),
+}
+pub(crate) enum PreparedScratch {
+    G17P(PreparedScratchG17P),
+    G16C(super::g17p_boot::PreparedScratchG16C),
+}
+impl ScratchSeed {
+    pub(crate) fn prepare(self)->Result<PreparedScratch> {
+        match self {Self::G17P(seed)=>seed.prepare().map(PreparedScratch::G17P),
+            Self::G16C(seed)=>seed.prepare().map(PreparedScratch::G16C)}
+    }
+}
+pub(crate) struct ScratchSeedG17P {
     key: ScratchKey,
     cursor: u64,
     base: u64,
@@ -70,13 +84,13 @@ pub(crate) struct ScratchSeed {
     pair_stride: u64,
     span: u64,
 }
-pub(crate) struct PreparedScratch {
-    seed: ScratchSeed,
+pub(crate) struct PreparedScratchG17P {
+    seed: ScratchSeedG17P,
     memory: Memory,
     pages: KVec<(u64, u64)>,
 }
-impl ScratchSeed {
-    pub(crate) fn prepare(self) -> Result<PreparedScratch> {
+impl ScratchSeedG17P {
+    pub(crate) fn prepare(self) -> Result<PreparedScratchG17P> {
         let mut memory = Memory::detached();
         let mut pages = KVec::with_capacity(
             usize::try_from(self.span / PAGE as u64).map_err(|_| EOVERFLOW)?, GFP_KERNEL)?;
@@ -85,26 +99,30 @@ impl ScratchSeed {
             memory.clean(pa, PAGE)?;
             pages.push((self.base + offset, pa), GFP_KERNEL)?;
         }
-        if *crate::module_parameters::submission_log.value() >= 3 {
+        if crate::module_parameters::submission_log.value() >= 3 {
             pr_info!("G17P: RENDER_SCRATCH_PREPARED bytes {} outside_runtime_lock\n", self.span);
         }
-        Ok(PreparedScratch { seed: self, memory, pages })
+        Ok(PreparedScratchG17P { seed: self, memory, pages })
     }
 }
+#[path="scheduled_render_preparation.rs"]
+mod wrapped;
+pub(crate) use wrapped::{WrappedSeed,Lane as WrappedLane,storage_base as wrapped_storage_base};
+
 struct Deferred {
     address: u64,
     body: KVVec<u8>,
     previous: Option<KVVec<u8>>,
 }
-fn pool_count() -> u64 {
-    if *crate::module_parameters::partial_independent_owner.value() != 1 { 1 }
-    else if *crate::module_parameters::alternate_queue_pairs.value() != 1
-        || *crate::module_parameters::native_render_vms.value() == 1 { 2 }
+pub(crate) fn pool_count() -> u64 {
+    if crate::module_parameters::partial_independent_owner.value() != 1 { 1 }
+    else if crate::module_parameters::alternate_queue_pairs.value() != 1
+        || crate::module_parameters::native_render_vms.value() == 1 { 2 }
     else { life::POOL_SLOTS as u64 }
 }
 pub(crate) fn scratch_table_budget(p: &Parameters) -> Result<usize> {
     let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-    let span = align_page(stride.checked_mul(8).ok_or(EOVERFLOW)?)?
+    let span = align_page(stride.checked_mul(u64::from(life::SCRATCH_SLOTS)).ok_or(EOVERFLOW)?)?
         .checked_add(align_page(tpc)?).ok_or(EOVERFLOW)?
         .checked_mul(pool_count()).ok_or(EOVERFLOW)?;
     // Each leaf table covers 32 MiB; account for alignment and its parent.
@@ -138,7 +156,13 @@ pub(crate) struct PreparationSeed {
     stamps: Option<super::g17p_timestamp::Cache>,
     clearing: Option<KVec<super::g17p_memory::ZeroSpan>>,
     reservation: Option<PreparationReservation>,
+    pool_reservation: Option<PreparationReservation>,
+    wrapped: Option<WrappedSeed>,
 }
+/// The same preparation lease protects a pool's retired scratch or an
+/// independently recycled work slot. Pool and slot identities never alias.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationKey { Pool(u32), Storage(u32) }
 pub(crate) struct PreparationReservation(pub(crate) kernel::sync::Arc<core::sync::atomic::AtomicBool>);
 impl PreparationReservation {
     pub(crate) fn release(&self) { self.0.store(false, core::sync::atomic::Ordering::Release); }
@@ -152,8 +176,16 @@ pub(crate) struct PreparedAppend {
 }
 impl PreparationSeed {
     pub(crate) fn pair(&self) -> u32 { self.item.layout.pair }
+    pub(crate) fn wrapped_storage(&self) -> Option<u32> { self.wrapped.map(|wire|wire.storage) }
     pub(crate) fn set_clearing(&mut self, clearing: KVec<super::g17p_memory::ZeroSpan>, reservation: PreparationReservation) {
         self.clearing = Some(clearing); self.reservation = Some(reservation);
+    }
+    pub(crate) fn set_pool_reservation(&mut self,reservation:PreparationReservation) {
+        self.pool_reservation=Some(reservation);
+    }
+    pub(crate) fn wrapped_tilemap_span(&self)->Result<(u64,u64)> {
+        if self.wrapped.is_none() {return Err(EINVAL);}
+        Ok((self.parameters.tilemap,self.parameters.scratch_layout().map_err(|_|EINVAL)?.1))
     }
     pub(crate) fn set_timestamp_cache(&mut self, stamps: super::g17p_timestamp::Cache) { self.stamps = Some(stamps); }
     /// Execute after dropping the runtime mutex. Source descriptor construction,
@@ -163,8 +195,9 @@ impl PreparationSeed {
         if let Some(clearing) = &mut seed.clearing { for span in clearing { span.clear(); } }
         seed.client.cache(false)?;
         if let Some(stamps) = &seed.stamps { stamps.run(false)?; }
-        let objects = build_host_objects(seed.item, &seed.parameters)?;
-        if *crate::module_parameters::submission_log.value() >= 3 && seed.item.ordinal % 16 == 0 {
+        let objects=if let Some(wrapped)=seed.wrapped {wrapped.build(&seed.parameters)?}
+            else {build_host_objects(seed.item,&seed.parameters)?};
+        if crate::module_parameters::submission_log.value() >= 3 && seed.item.ordinal % 16 == 0 {
             pr_info!("G17P: RENDER_DESCRIPTOR_PREPARED ordinal {} pair {} outside_runtime_lock\n",
                 seed.item.ordinal, seed.item.layout.pair);
         }
@@ -196,8 +229,39 @@ fn build_host_objects(item: life::Item, p: &Parameters) -> Result<[KVec<Deferred
     }
     Ok(objects)
 }
+impl PreparationSeed {
+    pub(crate) fn wrapped(wire:WrappedSeed,parameters:Parameters,client:&Client,
+        stamps:super::g17p_timestamp::Cache)->Result<KBox<Self>> {
+        let mut bindings=KVec::new();bindings.extend_from_slice(&client.bindings,GFP_KERNEL)?;
+        let layout=life::Layout {
+            queues:wire.lanes.map(|l|l.queue),
+            contexts:wire.lanes.map(|l|(l.scratch_high,l.scratch_low)),
+            control:wire.queue_control,uuid:wire.uuid,context:u32::from(wire.context),
+            pair:wire.slot,pools:[wire.base+0x200,wire.scene],shared:[wire.manager,wire.empty],
+            support:wire.support,..life::ORDINARY
+        };
+        let item=life::Item {ordinal:wire.ordinal,index:wire.sequence,storage:wire.storage,layout};
+        Ok(KBox::new(Self {item,parameters,client:client.lease()?,bindings,
+            stamps:Some(stamps),clearing:None,reservation:None,pool_reservation:None,wrapped:Some(wire)},GFP_KERNEL)?)
+    }
+}
 impl PreparedAppend {
-    pub(crate) fn release_reservation(&mut self) { self.seed.reservation.take(); }
+    pub(crate) fn matches_wrapped(&self,wire:WrappedSeed,p:&Parameters,client:&Client)->bool {
+        self.seed.wrapped==Some(wire) && self.seed.parameters==*p
+            && self.seed.client.owner==client.owner && self.seed.bindings==client.bindings
+            && self.seed.client.matches_buffers(client)
+    }
+    pub(crate) fn write_wrapped(&self,memory:&mut Memory,vm:&Vm)->Result {
+        if self.seed.wrapped.is_none() {return Err(EINVAL);}
+        for stage in 0..2 {for object in &self.objects[stage] {vm.write(memory,2,object.address,&object.body)?;}}
+        Ok(())
+    }
+}
+impl PreparedAppend {
+    pub(crate) fn wrapped_storage_cleared(&self) -> bool {
+        self.seed.wrapped.is_some() && self.seed.clearing.is_some()
+    }
+    pub(crate) fn release_reservation(&mut self) { self.seed.reservation.take(); self.seed.pool_reservation.take(); }
     pub(crate) fn matches_seed(&self, current: &PreparationSeed) -> bool {
         let mut expected = self.seed.item;
         expected.layout.pointers = current.item.layout.pointers;
@@ -302,7 +366,7 @@ impl Submission {
     pub(crate) fn scratch_seed(&self, p: &Parameters) -> Result<Option<ScratchSeed>> {
         p.validate().map_err(|_| EINVAL)?;
         let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-        let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
+        let ring = stride.checked_mul(u64::from(life::SCRATCH_SLOTS)).ok_or(EOVERFLOW)?;
         if pool_count() <= 2 && ring <= 0x24000 && tpc <= PAGE as u64 { return Ok(None); }
         let key = ScratchKey::of(p);
         if self.scratch_leases.iter().any(|lease| lease.key == key) { return Ok(None); }
@@ -314,13 +378,13 @@ impl Submission {
         if base < p.context_base || end > p.context_base.checked_add(1 << 32).ok_or(EOVERFLOW)? {
             return Err(ENOMEM);
         }
-        Ok(Some(ScratchSeed { key, cursor: self.scratch_cursor, base, tilemap_size, pair_stride, span }))
+        Ok(Some(ScratchSeed::G17P(ScratchSeedG17P { key, cursor: self.scratch_cursor, base, tilemap_size, pair_stride, span })))
     }
-    pub(crate) fn commit_scratch(&mut self, memory: &mut Memory, prepared: PreparedScratch) -> Result<bool> {
+    pub(crate) fn commit_scratch(&mut self, memory: &mut Memory, prepared: PreparedScratchG17P) -> Result<bool> {
         if self.scratch_leases.iter().any(|lease| lease.key == prepared.seed.key) { return Ok(true); }
         if self.scratch_cursor != prepared.seed.cursor { return Ok(false); }
         self.scratch_leases.reserve(1, GFP_KERNEL)?;
-        let PreparedScratch { seed, memory: detached, pages } = prepared;
+        let PreparedScratchG17P { seed, memory: detached, pages } = prepared;
         memory.absorb(detached)?;
         self.scratch_leases.push(ScratchLease { key: seed.key, tilemap: seed.base,
             tpc: seed.base + seed.tilemap_size, pair_stride: seed.pair_stride,
@@ -369,7 +433,7 @@ impl Submission {
         if self.layout.native { return Ok(None); }
         let mut p = p.with_geometry_scratch().map_err(|_| EINVAL)?;
         let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-        if pool_count() > 2 || stride.checked_mul(8).ok_or(EOVERFLOW)? > 0x24000 || tpc > PAGE as u64 {
+        if pool_count() > 2 || stride.checked_mul(u64::from(life::SCRATCH_SLOTS)).ok_or(EOVERFLOW)? > 0x24000 || tpc > PAGE as u64 {
             let key = ScratchKey::of(&p);
             let Some(lease) = self.scratch_leases.iter().find(|lease| lease.key == key) else {
                 return Ok(None); // New private geometry requires locked allocation.
@@ -392,7 +456,7 @@ impl Submission {
         let client = client.unwrap_or(&self.client);
         let mut bindings = KVec::new();
         bindings.extend_from_slice(&client.bindings, GFP_KERNEL)?;
-        Ok(Some(KBox::new(PreparationSeed { item, parameters: p, client: client.lease()?, bindings, stamps: None, clearing: None, reservation: None }, GFP_KERNEL)?))
+        Ok(Some(KBox::new(PreparationSeed { item, parameters: p, client: client.lease()?, bindings, stamps: None, clearing: None, reservation: None, pool_reservation: None, wrapped: None }, GFP_KERNEL)?))
     }
     pub(crate) fn clearing_seed(&self, memory: &Memory, seed: &PreparationSeed)
         -> Result<KVec<super::g17p_memory::ZeroSpan>> {
@@ -404,7 +468,7 @@ impl Submission {
         let delta = u64::from(pair) * p.scratch_pair_stride;
         let mut ranges = [(0,0);2];
         let count = if !self.pair_same_geometry(pair, p) {
-            ranges = [(p.tilemap + delta, stride * 8), (p.tpc + delta, tpc)]; 2
+            ranges = [(p.tilemap + delta, stride * u64::from(life::SCRATCH_SLOTS)), (p.tpc + delta, tpc)]; 2
         } else if let Some(address) = seed.item.tilemap_reset(p) {
             ranges[0] = (address, stride); 1
         } else { 0 };
@@ -576,7 +640,7 @@ fn overlap(client: &Client, address: u64, size: u64) -> bool {
 
 pub(crate) fn validate_client(client: &Client, p: &Parameters) -> Result {
     p.validate().map_err(|_| EINVAL)?;
-    if *crate::module_parameters::partial_independent_owner.value() == 1 {
+    if crate::module_parameters::partial_independent_owner.value() == 1 {
         for (address, size) in super::g17p_partial_runtime::private_ranges() {
             if overlap(client, address, size as u64) {
                 return Err(EINVAL);
@@ -691,7 +755,7 @@ fn select_scratch(memory: &mut Memory, client: &mut Client,
                   p: &Parameters) -> Result<Parameters> {
     p.validate().map_err(|_| EINVAL)?;
     let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-    let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
+    let ring = stride.checked_mul(u64::from(life::SCRATCH_SLOTS)).ok_or(EOVERFLOW)?;
     if pool_count() <= 2 && ring <= 0x24000 && tpc <= PAGE as u64 {
         return p.with_geometry_scratch().map_err(|_| EINVAL);
     }
@@ -744,7 +808,7 @@ fn select_scratch(memory: &mut Memory, client: &mut Client,
 }
 fn validate_scratch_backing(client: &Client, p: &Parameters) -> Result {
     let (_, stride, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-    let ring = stride.checked_mul(8).ok_or(EOVERFLOW)?;
+    let ring = stride.checked_mul(u64::from(life::SCRATCH_SLOTS)).ok_or(EOVERFLOW)?;
     let pairs = pool_count();
     for pair in 0..pairs {
         let delta = pair.checked_mul(p.scratch_pair_stride).ok_or(EOVERFLOW)?;
@@ -771,7 +835,7 @@ pub(crate) fn build(
     let configured = p.with_geometry_scratch().map_err(|_| EINVAL)?;
     let p = &configured;
     validate_client(&client, p)?;
-    if *crate::module_parameters::partial_independent_owner.value() == 1 {
+    if crate::module_parameters::partial_independent_owner.value() == 1 {
         for (base, size) in super::g17p_partial_runtime::private_ranges() {
             let pa = memory.allocate(size)?;
             if base == 0x1001004000 {
@@ -1447,7 +1511,7 @@ impl Submission {
             return Ok(());
         }
         for (slot, pa) in self.empty_high.into_iter().enumerate() {
-            let high = if slot == 1 && *crate::module_parameters::native_render_vms.value() == 1 {
+            let high = if slot == 1 && crate::module_parameters::native_render_vms.value() == 1 {
                 vm.firmware_root()
             } else {
                 pa
@@ -1486,7 +1550,7 @@ impl Submission {
     ) -> Result {
         validate_client(&client, p)?;
         if self.adopted || self.ordinal != 0
-            || (self.growth.is_some() && *crate::module_parameters::compute_queues.value()!=1) {
+            || (self.growth.is_some() && crate::module_parameters::compute_queues.value()!=1) {
             return Err(EINVAL);
         }
         for index in 0..2 {
@@ -1529,6 +1593,13 @@ impl Submission {
         self.client.buffers = client.buffers;
         self.client.bindings = client.bindings;
         self.client.owner = client.owner;
+        // The compute bootstrap staged only a 1x1 dormant graph. Select the
+        // incoming geometry's already-prepared lease before authoring either
+        // descriptor; the default fixed scratch cannot cover large frames.
+        let configured = select_scratch(memory, &mut self.client,
+            &mut self.scratch_leases, &mut self.scratch_cursor, p)?;
+        let p = &configured;
+        validate_scratch_backing(&self.client, p)?;
         for (index, kind) in [Kind::Tiling, Kind::Fragment].into_iter().enumerate() {
             first_descriptor(index, p, &mut body[..kind.size()])?;
             vm.write(memory, 2, DESCRIPTORS[index], &body[..kind.size()])?;
@@ -1544,6 +1615,9 @@ impl Submission {
             p.fragment_user_timestamp_start,
             p.fragment_user_timestamp_end,
         ];
+        self.scratch_layout = p.scratch_layout().map_err(|_| EINVAL)?;
+        self.scratch_key = Some(ScratchKey::of(p));
+        self.queue_owner = p.queue_owner;
         self.adopted = true;
         g17p_memory::sync();
         Ok(())
@@ -1656,7 +1730,7 @@ pub(crate) fn stage_next_prepared(
         pr_err!("G17P: append fail site stage_counters ordinal {} pair {} TA {:?} FR {:?}\n",item.ordinal,item.layout.pair,counters[0].0,counters[1].0);
         return Err(EIO);
     }
-    let profile = (*crate::module_parameters::submission_log.value() >= 3 && item.ordinal % 16 == 0)
+    let profile = (crate::module_parameters::submission_log.value() >= 3 && item.ordinal % 16 == 0)
         .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
     let configured = select_scratch(memory, &mut work.client,
         &mut work.scratch_leases, &mut work.scratch_cursor, p)?;
@@ -1679,7 +1753,7 @@ pub(crate) fn stage_next_prepared(
         let end = if selected { first + 1 } else { pairs };
         for pair in first..end {
         let delta = pair * p.scratch_pair_stride;
-        for (base, len) in [(p.tilemap + delta, stride * 8), (p.tpc + delta, tpc)] {
+        for (base, len) in [(p.tilemap + delta, stride * u64::from(life::SCRATCH_SLOTS)), (p.tpc + delta, tpc)] {
             let mut offset = 0;
             while offset < len {
                 let size = (len - offset).min(PAGE as u64) as usize;
@@ -1750,7 +1824,7 @@ pub(crate) fn stage_next_prepared(
         work.caller_cache_prepared = false;
         // Stale ordinal/layout/BO/flag/VA/offset/geometry identities never
         // publish an old plan. Rebuild against the exact current owner.
-        if *crate::module_parameters::submission_log.value() >= 3 {
+        if crate::module_parameters::submission_log.value() >= 3 {
             pr_info!("G17P: RENDER_DESCRIPTOR_LOCKED_FALLBACK ordinal {} pair {}\n", item.ordinal, item.layout.pair);
         }
         build_host_objects(item, p)?
@@ -1855,7 +1929,7 @@ pub(crate) fn stage_next_prepared(
             item.ordinal,
             queued,
         )?;
-        if *crate::module_parameters::native_limit_reply.value() == 1 {
+        if crate::module_parameters::native_limit_reply.value() == 1 {
             service.bind_limit_reply(item.descriptor_address(Kind::Fragment),
                 work.layout.queues[1], stamp)?;
         }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Max render resources within the existing Session/Memory/UAT ownership.
 //! Allocation does not publish roots or work. Admission retains the root and
@@ -10,8 +10,8 @@ use super::super::super::{
     scheduled_initgraph,
 };
 use super::{
-    bytes, map_private, map_prepared_private, operands, private_span, write_blocks, write_low, Memory, PrivateBlock, Session,
-    UserVm, Vm, ADDRESS, GPU_READ, PAGE, PRIVATE, SHARED,
+    bytes, map_private, map_prepared_private, validate_mapped_private, reset_mapped_private, operands, private_span, write_blocks, write_low, Memory, PrivateBlock, Session,
+    UserVm, Vm, DispatchStateG16C, ADDRESS, GPU_READ, PAGE, PRIVATE, SHARED,
 };
 use kernel::prelude::*;
 
@@ -25,6 +25,23 @@ pub(super) struct GrowthSnapshot {
     counter: u32,
     region: [u8;16],
     pages: KVVec<u8>,
+}
+
+pub(crate) struct GeometryPlanG16C {
+    previous: [(u64,u64);3],
+    cursor: u64,
+    geometry: [(u64,u64);3],
+    next: u64,
+}
+impl GeometryPlanG16C {
+    pub(super) fn prepare(&self,root:RootLease)->Result<(Memory,PreparedGeometryG16C)> {
+        let mut memory=Memory::detached();let mut blocks=KVec::new();
+        for (old,new) in self.previous.iter().zip(self.geometry) {
+            if *old!=new {private_span(&mut memory,&mut blocks,new.0-raw::CONTEXT_BASE,new.1)?;}
+        }
+        for block in &blocks {memory.clean(block.physical,block.size as usize)?;}
+        Ok((memory,PreparedGeometryG16C {blocks,geometry:self.geometry,next:self.next,root}))
+    }
 }
 
 pub(super) struct PreparedGeometryG16C {
@@ -201,10 +218,8 @@ impl ResourcesG16C {
             .ok_or(EOVERFLOW)
     }
 
-    pub(super) fn prepare(
-        memory: &mut Memory,
-        vm: &mut Vm,
-        root: &mut UserVm,
+    /// Construct unpublished backing without a live Session, Vm or root borrow.
+    pub(super) fn build(
         slot: u32,
         bank: u32,
         directory: u64,
@@ -213,7 +228,10 @@ impl ResourcesG16C {
         if slot >= 15 || bank >= 15 || directory & (PAGE - 1) != 0 || directory == 0 {
             return Err(EINVAL);
         }
-        let start = 0xfffffc20c3000000 + u64::from(bank) * 0x200000;
+        // Bootstrap retains two scratch objects at c4000000/c4028000.
+        // Logical pool identity is independent of its firmware heap bank.
+        let placement=bank+u32::from(bank>=8);
+        let start = 0xfffffc20c3000000 + u64::from(placement) * 0x200000;
         let support = start;
         let auxiliary = start + PAGE;
         let manager = start + 0x100000;
@@ -235,21 +253,6 @@ impl ResourcesG16C {
         let private_end = Self::private_end(directory)?;
         if private_end > limit || limit > 1 << 42 {
             return Err(ENOSPC);
-        }
-        // Reserve firmware and application paths before writing metadata. A
-        // collision retains existing leaves; never replace caller mappings.
-        for (va, size) in [
-            (support, PAGE),
-            (auxiliary, PAGE),
-            (manager, PAGE),
-            (scenes, PAGE),
-            (parameter.block_control, PAGE),
-            (parameter.counter, PAGE),
-            (parameter.scene_list, PAGE),
-            (parameter.block_list, raw::BLOCK_LIST_SIZE as u64),
-            (parameter.page_list, raw::PAGE_LIST_SIZE as u64),
-        ] {
-            vm.prepare_g16c_empty(memory, 2, va, size as usize)?;
         }
         let mut staged = Memory::detached();
         let mut private = KVec::new();
@@ -278,24 +281,6 @@ impl ResourcesG16C {
         for (va, size) in parameter.backing_ranges().map_err(|_| EINVAL)? {
             private_span(&mut staged, &mut compact, va - raw::CONTEXT_BASE, size)?;
         }
-        // Preflight both sets and the aliases as one owned mapping plan.
-        for block in &private {
-            root.prepare(directory + block.offset, block.size)?;
-        }
-        for block in &compact {
-            root.prepare(raw::CONTEXT_BASE + block.offset, block.size)?;
-        }
-        for i in 0..INITIAL_BUFFERS {
-            root.prepare(
-                base + u64::from(i) * operands::BUFFER_STRIDE + operands::BUFFER_SIZE,
-                0x8000,
-            )?;
-        }
-        for (va, size) in parameter.backing_ranges().map_err(|_| EINVAL)? {
-            root.prepare(va + size, 0x8000)?;
-        }
-        root.prepare(raw::GPU_PAGE_LIST, raw::PAGE_LIST_SIZE as u64)?;
-        root.prepare(0x1000080000, PAGE)?;
         let mut entries = bytes(PAGE as usize)?;
         let mut directory_page = bytes(PAGE as usize)?;
         for i in 0..INITIAL_BUFFERS as usize {
@@ -366,7 +351,6 @@ impl ResourcesG16C {
         )?;
         let mut block_page_ids = KVec::new();
         for i in 0..REGISTERED { block_page_ids.push(0x11+i*5,GFP_KERNEL)?; }
-        let root = root.lease()?;
         for block in Iterator::chain(private.iter(), &compact) {
             staged.clean(block.physical, block.size as usize)?;
         }
@@ -380,7 +364,7 @@ impl ResourcesG16C {
             private_end,
             directory,
             table,
-            root: Some(root),
+            root: None,
             private,
             compact,
             metadata: records,
@@ -392,6 +376,56 @@ impl ResourcesG16C {
             sequence: 0,
             sequence_base: 0,
         }))
+    }
+
+    /// Validate and reserve mappings only after the common template seed matches.
+    pub(super) fn preflight(&mut self, memory: &mut Memory, vm: &mut Vm, root: &mut UserVm) -> Result {
+        let support=self.support;let auxiliary=self.auxiliary;let manager=self.manager;
+        let scenes=self.scene-0x80;let parameter=&self.parameter;let directory=self.directory;
+        let table=self.table;let base=table+PAGE;
+        let private=&self.private;let compact=&self.compact;
+        // Reserve firmware and application paths before writing metadata. A
+        // collision retains existing leaves; never replace caller mappings.
+        for (va, size) in [
+            (support, PAGE),
+            (auxiliary, PAGE),
+            (manager, PAGE),
+            (scenes, PAGE),
+            (parameter.block_control, PAGE),
+            (parameter.counter, PAGE),
+            (parameter.scene_list, PAGE),
+            (parameter.block_list, raw::BLOCK_LIST_SIZE as u64),
+            (parameter.page_list, raw::PAGE_LIST_SIZE as u64),
+        ] {
+            vm.prepare_g16c_empty(memory, 2, va, size as usize)?;
+        }
+        // Preflight both sets and the aliases as one owned mapping plan.
+        for block in private {
+            root.prepare(directory + block.offset, block.size)?;
+        }
+        for block in compact {
+            root.prepare(raw::CONTEXT_BASE + block.offset, block.size)?;
+        }
+        for i in 0..INITIAL_BUFFERS {
+            root.prepare(
+                base + u64::from(i) * operands::BUFFER_STRIDE + operands::BUFFER_SIZE,
+                0x8000,
+            )?;
+        }
+        for (va, size) in parameter.backing_ranges().map_err(|_| EINVAL)? {
+            root.prepare(va + size, 0x8000)?;
+        }
+        root.prepare(raw::GPU_PAGE_LIST, raw::PAGE_LIST_SIZE as u64)?;
+        root.prepare(0x1000080000, PAGE)?;
+        self.root=Some(root.lease()?);
+        Ok(())
+    }
+
+    pub(super) fn prepare(memory:&mut Memory,vm:&mut Vm,root:&mut UserVm,
+        slot:u32,bank:u32,directory:u64,limit:u64)->Result<(Memory,Self)> {
+        let (staged,mut resource)=Self::build(slot,bank,directory,limit)?;
+        resource.preflight(memory,vm,root)?;
+        Ok((staged,resource))
     }
 
     pub(super) fn install(&self, memory: &mut Memory, vm: &mut Vm, root: &mut UserVm) -> Result {
@@ -439,6 +473,9 @@ impl ResourcesG16C {
 
     pub(super) fn admitted(&self)->bool {self.admitted && self.root.is_some()}
 
+    pub(super) fn refresh_root(&mut self,root:&UserVm)->Result {
+        self.root.as_mut().ok_or(EIO)?.refresh(root)
+    }
     pub(super) fn attached(&self) -> bool {
         self.root.is_some()
     }
@@ -446,6 +483,17 @@ impl ResourcesG16C {
     /// No application mapping/lease or in-flight FList admission may move.
     pub(super) fn dormant(&self) -> bool {
         self.root.is_none() && !self.admitted && self.sequence == 0
+    }
+
+    pub(super) fn append_private_blocks(&self,base:u64,out:&mut KVec<(u64,u64,u64)>)->Result {
+        let delta=self.directory.checked_sub(base).ok_or(EIO)?;
+        out.reserve(self.private.len(),GFP_KERNEL)?;
+        for block in &self.private {out.push((delta+block.offset,block.physical,block.size),GFP_KERNEL)?;}
+        Ok(())
+    }
+    pub(super) fn rebind_mapped(&mut self,memory:&mut Memory,vm:&mut Vm,root:&mut UserVm,
+        directory:u64,limit:u64)->Result {
+        self.rebind_inner(memory,vm,root,directory,limit,true)
     }
 
     /// Reattach retired backing to a fresh caller root. Metadata pages contain
@@ -458,6 +506,10 @@ impl ResourcesG16C {
         directory: u64,
         limit: u64,
     ) -> Result {
+        self.rebind_inner(memory,vm,root,directory,limit,false)
+    }
+    fn rebind_inner(&mut self,memory:&mut Memory,vm:&mut Vm,root:&mut UserVm,
+        directory:u64,limit:u64,mapped:bool)->Result {
         if self.root.is_some() || self.admitted || directory == 0 || directory & (PAGE - 1) != 0 {
             return Err(EINVAL);
         }
@@ -475,40 +527,55 @@ impl ResourcesG16C {
                 }
             }
         }
-        for (base, blocks) in [
-            (directory, &self.private),
-            (raw::CONTEXT_BASE, &self.compact),
-        ] {
-            for block in blocks {
-                root.prepare(base + block.offset, block.size)?;
+        if mapped {
+            validate_mapped_private(root,directory,&self.private)?;
+            validate_mapped_private(root,raw::CONTEXT_BASE,&self.compact)?;
+            for (alias_va,original,size) in [(raw::GPU_PAGE_LIST,self.parameter.page_list,raw::PAGE_LIST_SIZE as u64),
+                (0x1000080000,self.parameter.scene_list,PAGE)] {
+                for page in (0..size).step_by(PAGE as usize) {
+                    if root.pte(alias_va+page)?!=(vm.pte(memory,2,original+page)?&ADDRESS)|GPU_WRITE {return Err(EIO);}
+                }
             }
-        }
-        // Geometry blocks may be chunked; internal chunk ends are already
-        // covered by the following block. The final end retains its guard.
-        for block in &self.compact {
-            if raw::CONTEXT_BASE + block.offset >= 0x1001000000 {
-                root.prepare(raw::CONTEXT_BASE + block.offset + block.size, PAGE)?;
+            reset_mapped_private(memory,root,directory,&self.private)?;
+            reset_mapped_private(memory,root,raw::CONTEXT_BASE,&self.compact)?;
+        } else {
+            for (base, blocks) in [
+                (directory, &self.private),
+                (raw::CONTEXT_BASE, &self.compact),
+            ] {
+                for block in blocks {
+                    root.prepare(base + block.offset, block.size)?;
+                }
             }
+            // Geometry blocks may be chunked; internal chunk ends are already
+            // covered by the following block. The final end retains its guard.
+            for block in &self.compact {
+                if raw::CONTEXT_BASE + block.offset >= 0x1001000000 {
+                    root.prepare(raw::CONTEXT_BASE + block.offset + block.size, PAGE)?;
+                }
+            }
+            let table = directory + operands::DIRECTORY_SIZE;
+            let base = table + PAGE;
+            for i in 0..INITIAL_BUFFERS {
+                root.prepare(
+                    base + u64::from(i) * operands::BUFFER_STRIDE + operands::BUFFER_SIZE,
+                    0x8000,
+                )?;
+            }
+            for id in &self.block_page_ids {
+                root.prepare(raw::CONTEXT_BASE + u64::from(*id)*0x8000 + 0x20000, 0x8000)?;
+            }
+            for &(va, size) in &[
+                (raw::GPU_PAGE_LIST, raw::PAGE_LIST_SIZE as u64),
+                (0x1000080000, PAGE),
+            ] {
+                root.prepare(va, size)?;
+            }
+            map_private(memory, root, directory, &self.private)?;
+            map_private(memory, root, raw::CONTEXT_BASE, &self.compact)?;
         }
-        let table = directory + operands::DIRECTORY_SIZE;
-        let base = table + PAGE;
-        for i in 0..INITIAL_BUFFERS {
-            root.prepare(
-                base + u64::from(i) * operands::BUFFER_STRIDE + operands::BUFFER_SIZE,
-                0x8000,
-            )?;
-        }
-        for id in &self.block_page_ids {
-            root.prepare(raw::CONTEXT_BASE + u64::from(*id)*0x8000 + 0x20000, 0x8000)?;
-        }
-        for &(va, size) in &[
-            (raw::GPU_PAGE_LIST, raw::PAGE_LIST_SIZE as u64),
-            (0x1000080000, PAGE),
-        ] {
-            root.prepare(va, size)?;
-        }
-        map_private(memory, root, directory, &self.private)?;
-        map_private(memory, root, raw::CONTEXT_BASE, &self.compact)?;
+        let table=directory+operands::DIRECTORY_SIZE;
+        let base=table+PAGE;
         let mut entries = bytes(PAGE as usize)?;
         let mut page = bytes(PAGE as usize)?;
         for i in 0..INITIAL_BUFFERS as usize {
@@ -534,21 +601,23 @@ impl ResourcesG16C {
         vm.write(memory, 2, self.support, &page)?;
         page.fill(0);
         vm.write(memory, 2, self.auxiliary, &page)?;
-        for (alias_va, original, size) in [
-            (
-                raw::GPU_PAGE_LIST,
-                self.parameter.page_list,
-                raw::PAGE_LIST_SIZE as u64,
-            ),
-            (0x1000080000, self.parameter.scene_list, PAGE),
-        ] {
-            for offset in (0..size).step_by(PAGE as usize) {
-                alias(
-                    root,
-                    alias_va + offset,
-                    vm.pte(memory, 2, original + offset)? & ADDRESS,
-                    PAGE,
-                )?;
+        if !mapped {
+            for (alias_va, original, size) in [
+                (
+                    raw::GPU_PAGE_LIST,
+                    self.parameter.page_list,
+                    raw::PAGE_LIST_SIZE as u64,
+                ),
+                (0x1000080000, self.parameter.scene_list, PAGE),
+            ] {
+                for offset in (0..size).step_by(PAGE as usize) {
+                    alias(
+                        root,
+                        alias_va + offset,
+                        vm.pte(memory, 2, original + offset)? & ADDRESS,
+                        PAGE,
+                    )?;
+                }
             }
         }
         self.directory = directory;
@@ -558,16 +627,14 @@ impl ResourcesG16C {
         Ok(())
     }
 
-    pub(super) fn prepare_geometry(
-        &mut self,
-        root: &mut UserVm,
+    pub(super) fn geometry_plan(
+        &self,
+        root: &UserVm,
         sizes: [u64; 3],
-    ) -> Result<Option<(Memory, PreparedGeometryG16C)>> {
+    ) -> Result<Option<GeometryPlanG16C>> {
         if self.root.as_ref().is_none_or(|r| r.root() != root.root()) { return Err(EIO); }
-        let mut staged = Memory::detached();
         let mut geometry = self.geometry;
         let mut cursor = self.geometry_next;
-        let mut blocks = KVec::new();
         for (i, size) in sizes.into_iter().enumerate() {
             if size == 0 {
                 return Err(EINVAL);
@@ -599,22 +666,44 @@ impl ResourcesG16C {
                 }
                 break;
             }
-            root.prepare(address, span)?;
-            private_span(&mut staged, &mut blocks, address - raw::CONTEXT_BASE, capacity)?;
             geometry[i] = (address, capacity);
             cursor = address + span;
         }
-        if blocks.is_empty() {
-            self.root.as_mut().ok_or(EIO)?.refresh(root)?;
-            return Ok(None);
+        if geometry==self.geometry {return Ok(None);}
+        Ok(Some(GeometryPlanG16C {previous:self.geometry,cursor:self.geometry_next,geometry,next:cursor}))
+    }
+    pub(super) fn preflight_geometry(&mut self,root:&mut UserVm,plan:&GeometryPlanG16C,
+        prepared:&mut PreparedGeometryG16C)->Result<bool> {
+        if self.geometry!=plan.previous || self.geometry_next!=plan.cursor
+            || self.root.as_ref().is_none_or(|r|r.root()!=root.root())
+            || prepared.root.root()!=root.root() {return Ok(false);}
+        for (old,new)in plan.previous.iter().zip(plan.geometry) {
+            if *old==new {continue;}
+            let span=new.1.checked_add(PAGE).ok_or(EOVERFLOW)?;
+            if self.compact_conflict(new.0,span).is_some() {return Ok(false);}
+            for offset in (0..span).step_by(PAGE as usize) {
+                if root.pte(new.0+offset)?!=0 {return Ok(false);}
+            }
         }
-        self.compact.reserve(blocks.len(), GFP_KERNEL)?;
-        let lease = root.lease()?;
-        for block in &blocks { staged.clean(block.physical, block.size as usize)?; }
-        Ok(Some((staged, PreparedGeometryG16C { blocks, geometry, next: cursor, root: lease })))
+        self.compact.reserve(prepared.blocks.len(),GFP_KERNEL)?;
+        for (old,new)in plan.previous.iter().zip(plan.geometry) {
+            if *old!=new {root.prepare(new.0,new.1+PAGE)?;}
+        }
+        prepared.root.refresh(root)?;
+        Ok(true)
+    }
+    pub(super) fn prepare_geometry(&mut self,root:&mut UserVm,sizes:[u64;3])
+        ->Result<Option<(Memory,PreparedGeometryG16C)>> {
+        let Some(plan)=self.geometry_plan(root,sizes)? else {
+            self.root.as_mut().ok_or(EIO)?.refresh(root)?;return Ok(None);
+        };
+        let (memory,mut prepared)=plan.prepare(root.lease()?)?;
+        if !self.preflight_geometry(root,&plan,&mut prepared)? {return Err(EBUSY);}
+        Ok(Some((memory,prepared)))
     }
 
     pub(super) fn geometry_addresses(&self) -> [u64; 3] { self.geometry.map(|(address, _)| address) }
+    pub(super) fn tilemap_span(&self)->(u64,u64) {self.geometry[0]}
 
     pub(super) fn install_geometry(&mut self, root: &mut UserVm,
         prepared: PreparedGeometryG16C) -> Result<[u64; 3]> {
@@ -706,15 +795,15 @@ impl ResourcesG16C {
         self.root.as_mut().ok_or(EIO)?.refresh(root)?;
         vm.flush_tables(memory)?;
         Vm::invalidate_gpu();
+        let bank = DispatchStateG16C::bank_for_context(context).ok_or(EINVAL)?;
         session.g16c_register_flist(&RegistrationG16C {
             context: u32::from(context),
             support: self.support,
             table: self.table,
             added: INITIAL_BUFFERS - REGISTERED,
             previous: REGISTERED,
-            mode: 0,
+            bank,
             tag,
-            reply_value: 0,
         })?;
         self.admitted = true;
         Ok(())

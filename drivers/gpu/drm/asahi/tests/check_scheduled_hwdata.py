@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Qualify actual macro-expanded hardware-data layouts and complete encodings.
 
 Reads only source builders and saved ADT scalar inputs. No device access.

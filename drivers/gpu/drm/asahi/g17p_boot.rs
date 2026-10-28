@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Dual-ASC management boot for the synchronous G17P shim port.
 //! Both transports exist before either CPU starts. Descriptor publication is
@@ -14,14 +14,12 @@ use super::{
     g17p_queue as queue, g17p_render_runtime as render,
     g17p_vm::Vm,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
     c_str,
     device::Core,
-    devres::Devres,
     dma_fence::RawDmaFence,
-    io::{self, mem::IoMem, Io},
-    iosys_map::IoSysMapRef,
+    io::{self, mem::DevresIoMem, Io},
     platform,
     prelude::*,
     rbtree::{RBTree, RBTreeNode},
@@ -53,7 +51,7 @@ impl rtkit::Buffer for CrashBuffer {
     fn iova(&self) -> Result<usize> {
         Ok(self.address)
     }
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+    fn buf(&mut self) -> Result<io::IoSysMap<'_, io::Region>> {
         self.memory.as_iosys_map(self.offset, self.size)
     }
 }
@@ -62,6 +60,8 @@ struct Operations;
 
 #[vtable]
 impl rtkit::Operations for Operations {
+    const QUIRKS: rtkit::Quirks = rtkit::Quirks::EARLY_CRASHLOG;
+
     type Data = Arc<Data>;
     type Buffer = CrashBuffer;
 
@@ -132,7 +132,7 @@ impl rtkit::Operations for Operations {
 }
 
 struct Peer {
-    asc: Pin<KBox<Devres<IoMem<0x4000>>>>,
+    asc: DevresIoMem<0x4000>,
     rtkit: Option<Pin<KBox<rtkit::RtKit<Operations>>>>,
     data: Arc<Data>,
     control: u32,
@@ -147,6 +147,7 @@ mod bootstrap;
 mod g16c;
 #[path = "scheduled_compute_runtime.rs"]
 mod g16c_compute;
+pub(crate) use g16c_compute::{OwnerPrivateG16C,WorkBackingG16C,GeometrySeedG16C,PreparedScratchG16C};
 
 #[path = "g17p_cleanup_session.rs"]
 #[allow(dead_code)]
@@ -161,7 +162,7 @@ mod native;
 mod relocation;
 #[path = "g17p_render_context_session.rs"]
 mod render_contexts;
-pub(crate) use render_contexts::PreparedPoolRebind;
+pub(crate) use render_contexts::{PreparedPoolRebind,PoolRebindSeed};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -180,7 +181,7 @@ pub(crate) struct Session {
     defer_cache: bool,
     completions: KVec<Completion>,
     render_cpu_leases: KVec<(u32, kernel::dma_fence::Fence)>,
-    render_prepare_leases: KVec<(u32, Arc<AtomicBool>)>,
+    render_prepare_leases: KVec<(render::PreparationKey, Arc<AtomicBool>)>,
     compute: Option<compute::Submission>,
     compute_contexts: Option<super::g17p_context::NativeComputeContexts>,
     render_contexts: Option<super::g17p_context::NativeRenderContexts>,
@@ -215,12 +216,17 @@ pub(crate) struct Session {
     render_control: Option<KBox<RenderControl>>,
     g16c_transport: Option<KBox<super::scheduled_transport::StateG16C>>,
     g16c_compute: Option<KBox<g16c_compute::State>>,
-    g16c_sgx: Option<Pin<KBox<Devres<IoMem<0x3758000>>>>>,
+    g16c_sgx: Option<DevresIoMem<0x3758000>>,
     events: Arc<super::g17p_drm::asynchronous::Events>,
 }
 
+#[path = "g17p_render_wave.rs"]
+mod render_wave;
+use render_wave::{RenderWave, RetainedFrame};
+
 enum PendingWork {
     Render(RenderWave),
+    WrappedRender(RenderWave<g16c_compute::RenderTicket>),
     Control(KBox<RenderControl>),
     Native,
 }
@@ -234,10 +240,6 @@ struct RenderControl {
     receipt: Arc<RenderReceipt>,
     started: kernel::time::Instant<kernel::time::Monotonic>,
 }
-struct RenderWave {
-    frames: KVec<RenderPending>,
-    next: usize,
-}
 pub(crate) struct RenderPublication {
     pub(crate) ordinal: u32,
     pub(crate) milestones: [render::Milestone; 2],
@@ -250,12 +252,14 @@ pub(crate) struct RenderReceipt {
     pub(crate) fence: kernel::dma_fence::Fence,
     publication_ready: AtomicBool,
     milestones: [core::sync::atomic::AtomicU64; 2],
+    retained_pool: AtomicU32,
 }
 impl RenderReceipt {
     fn new(ordinal: u32) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { ordinal, fence: super::g17p_sync::work_fence()?,
             publication_ready: AtomicBool::new(false),
-            milestones: [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)] }, GFP_KERNEL)?)
+            milestones: [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)],
+            retained_pool:AtomicU32::new(u32::MAX) }, GFP_KERNEL)?)
     }
     pub(crate) fn is_published(&self) -> bool {
         self.publication_ready.load(Ordering::Acquire)
@@ -266,6 +270,11 @@ impl RenderReceipt {
         if value == 0 { return None; } // Special/native serialized profile.
         Some(render::Milestone { event_slot: (value >> 40) as u8,
             grid: (value >> 32) as u8, value: value as u32 })
+    }
+    pub(crate) fn retained_pool(&self)->Option<u32> {
+        if !self.is_published() {return None;}
+        let pool=self.retained_pool.load(Ordering::Relaxed);
+        (pool<super::g17p_render_lifecycle::POOL_SLOTS).then_some(pool)
     }
     fn fail(&self, error: Error) {
         // Runtime mutex serializes completion/error publication.
@@ -329,7 +338,7 @@ pub(crate) struct Completion {
 static CACHE_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 impl Completion {
     pub(crate) fn cache(&mut self) -> Result {
-        if *crate::module_parameters::cpu_cache_pause_grid.value() == u32::from(self.grid)
+        if crate::module_parameters::cpu_cache_pause_grid.value() == u32::from(self.grid)
             && !CACHE_PAUSED.swap(true, Ordering::AcqRel) {
             pr_info!("G17P: CPU_CACHE_PAUSE_BEGIN grid {} owner {:?} outside_runtime_lock\n", self.grid, self.client.owner);
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
@@ -368,10 +377,10 @@ struct Report {
 }
 fn configure_growth_limits(service: &mut super::g17p_growth_runtime::Service) -> Result {
     service.set_source_pool_limits(
-        *crate::module_parameters::tvb_max_blocks.value(),
+        crate::module_parameters::tvb_max_blocks.value(),
         [
-            *crate::module_parameters::tvb_max_blocks_pool0.value(),
-            *crate::module_parameters::tvb_max_blocks_pool1.value(),
+            crate::module_parameters::tvb_max_blocks_pool0.value(),
+            crate::module_parameters::tvb_max_blocks_pool1.value(),
         ],
     )
 }
@@ -381,9 +390,9 @@ fn source_fragment_parameters(
     first: bool,
 ) -> Result<super::g17p_render::Parameters> {
     let selector = if first {
-        *crate::module_parameters::first_render_fragment_sync_grow.value()
+        crate::module_parameters::first_render_fragment_sync_grow.value()
     } else {
-        *crate::module_parameters::repeat_fragment_sync_grow.value()
+        crate::module_parameters::repeat_fragment_sync_grow.value()
     };
     let mut configured = *p;
     configured.fragment_sync_grow = match selector {
@@ -415,7 +424,6 @@ impl Session {
         // Max's context owner and exact publication/CPU leases retain these
         // BOs until its qualified context-close/root-invalidation receipt.
         // Do not add a second permanent reference after that receipt.
-        if self.g16c_transport.is_some() {return Ok(());}
         let identity = &**bo as *const super::g17p_drm::Object as usize;
         if self.retained_buffer_ids.get(&identity).is_some() {
             return Ok(());
@@ -479,9 +487,9 @@ impl Session {
     }
 
     pub(crate) fn prepare(
-        pdev: &platform::Device<Core>,
+        pdev: &platform::Device<Core<'_>>,
         platform: &Platform,
-        sgx: &Devres<IoMem<0x4000000>>,
+        sgx: &DevresIoMem<0x4000000>,
         image: &Image,
     ) -> Result<KBox<Self>> {
         let dev = pdev.as_ref();
@@ -500,12 +508,10 @@ impl Session {
                 c_str!("firmware-secondary"),
             ),
         ] {
-            let asc = KBox::pin_init(
+            let asc =
                 pdev.io_request_by_name(registers)
                     .ok_or(ENODEV)?
-                    .iomap_sized::<0x4000>(),
-                GFP_KERNEL,
-            )?;
+                    .iomap_sized::<0x4000>()?.into_devres()?;
             let regs = asc.try_access().ok_or(ENODEV)?;
             let control = regs.read32(0x44);
             let status = regs.read32(0x48);
@@ -565,11 +571,10 @@ impl Session {
         // Match Python's construction order; it initializes both mailbox
         // transports before starting the primary and then the secondary CPU.
         for peer in &mut session.peers {
-            let mut rtkit = KBox::pin(
+            let rtkit = KBox::pin(
                 rtkit::RtKit::<Operations>::new(dev, Some(peer.data.name), 0, peer.data.clone())?,
                 GFP_KERNEL,
             )?;
-            rtkit.as_mut().set_early_crashlog();
             peer.rtkit = Some(rtkit);
         }
         for peer in &mut session.peers {
@@ -610,10 +615,10 @@ impl Session {
             );
         }
         let vm = Vm::build(dev, memory, platform, image)?;
-        if *crate::module_parameters::compute_queues.value()==1
-            && *crate::module_parameters::native_compute_vms.value()==0
-            && *crate::module_parameters::native_render_vms.value()==0
-            && *crate::module_parameters::native_barriers.value()==0 {
+        if crate::module_parameters::compute_queues.value()==1
+            && crate::module_parameters::native_compute_vms.value()==0
+            && crate::module_parameters::native_render_vms.value()==0
+            && crate::module_parameters::native_barriers.value()==0 {
             let mut dispatch=[0;0x20];
             super::g17p_abi::compute_dispatch(&mut dispatch).map_err(|_|EINVAL)?;
             vm.write(memory,2,0xfffffc20015e8020,&dispatch)?;
@@ -815,7 +820,7 @@ impl Session {
             return Err(EIO);
         }
         self.cleanup.require_idle()?;
-        let replacement = if *crate::module_parameters::native_compute_vms.value() == 1 {
+        let replacement = if crate::module_parameters::native_compute_vms.value() == 1 {
             if self.render.is_some() || self.native.is_some() {
                 return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
             }
@@ -859,7 +864,7 @@ impl Session {
             // No accepted live wave or unvalidated pending report may borrow
             // the old private addresses during a quiescent ownership transfer.
             if pending || self.pending.is_some() || self.compute_pending.is_some() { return Err(EBUSY); }
-            if *crate::module_parameters::native_compute_vms.value() == 1 {
+            if crate::module_parameters::native_compute_vms.value() == 1 {
                 return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
             }
             if let Some(render) = &self.render {
@@ -1067,6 +1072,39 @@ impl Session {
         }
         Ok(self.render.as_ref().map(|work| &work.client))
     }
+    fn render_pool_available(&self,pool:u32)->bool {
+        !self.render_preparing(pool)
+            && !match &self.pending {
+                Some(PendingWork::Render(wave))=>wave.pool_busy(pool),
+                Some(PendingWork::WrappedRender(wave))=>wave.pool_busy(pool),
+                _=>false,
+            }
+            && !self.render_cpu_leases.iter().any(|(owner,fence)|*owner==pool
+                && unsafe {kernel::bindings::dma_fence_get_status(fence.raw())}==0)
+    }
+    fn retained_render_idle(&self) -> bool {
+        self.live_render_count() == 0 && self.render_cpu_leases.iter().all(|(_, fence)|
+            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } != 0)
+    }
+    fn reap_render_cpu_leases(&mut self) {
+        self.render_cpu_leases.retain(|(_, fence)|
+            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0);
+    }
+    fn reserve_wrapped_render(&mut self) -> Result {
+        if self.pending.is_none() {
+            self.pending = Some(PendingWork::WrappedRender(RenderWave {frames:KVec::new(),next:0}));
+        }
+        match self.pending.as_mut().ok_or(EIO)? {
+            PendingWork::WrappedRender(wave) => wave.reserve(),
+            _ => Err(EBUSY),
+        }
+    }
+    fn push_wrapped_render(&mut self, frame:g16c_compute::RenderTicket) -> Result {
+        match self.pending.as_mut().ok_or(EIO)? {
+            PendingWork::WrappedRender(wave) => Ok(wave.frames.push(frame,GFP_KERNEL)?),
+            _ => Err(EIO),
+        }
+    }
     pub(crate) fn render_remaining(&self) -> Result<u32> {
         self.render_client()?;
         // Serialized ordinary submissions reuse retired backing. Admission is
@@ -1092,6 +1130,7 @@ impl Session {
     pub(crate) fn live_render_count(&self) -> usize {
         match &self.pending {
             Some(PendingWork::Render(wave)) => wave.frames.len() - wave.next,
+            Some(PendingWork::WrappedRender(wave)) => wave.frames.len() - wave.next,
             _ => 0,
         }
     }
@@ -1108,10 +1147,24 @@ impl Session {
     pub(crate) fn render_scratch_seed(&self, p: &super::g17p_render::Parameters)
         -> Result<Option<render::ScratchSeed>> {
         if !self.independent_render_roots() || self.phase != Phase::Running { return Ok(None); }
-        self.render.as_ref().map_or(Ok(None), |work| work.scratch_seed(p))
+        self.render.as_ref().or(self.dormant_render.as_ref())
+            .map_or(Ok(None), |work| work.scratch_seed(p))
+    }
+    pub(crate) fn render_scratch_seed_for(&self,incoming:&compute::Client,p:&super::g17p_render::Parameters,
+        key:super::g17p_compute_queues::Key)->Result<Option<render::ScratchSeed>> {
+        if self.phase!=Phase::Running {return Ok(None);}
+        if let Some(state)=self.g16c_compute.as_ref() {
+            let mut parameters=*p;parameters.queue_owner=Some(key);
+            return state.render_scratch_seed(self,incoming,&parameters).map(|seed|seed.map(render::ScratchSeed::G16C));
+        }
+        self.render_scratch_seed(p)
     }
     pub(crate) fn commit_render_scratch(&mut self, prepared: render::PreparedScratch) -> Result<bool> {
-        self.render.as_mut().ok_or(EIO)?.commit_scratch(self.memory.as_mut().ok_or(EIO)?, prepared)
+        match prepared {
+            render::PreparedScratch::G16C(prepared)=>self.commit_g16c_scratch(prepared),
+            render::PreparedScratch::G17P(prepared)=>self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EIO)?
+                .commit_scratch(self.memory.as_mut().ok_or(EIO)?,prepared),
+        }
     }
     pub(crate) fn render_preparation_seed(&self, p: &super::g17p_render::Parameters,
                                          ahead: u32) -> Result<Option<KBox<render::PreparationSeed>>> {
@@ -1132,7 +1185,7 @@ impl Session {
         let context = if self.independent_render_roots() {
             let asid = self.render_pool_asids[pair as usize];
             Some(if asid != 0 { u32::from(asid) } else {
-                (4..64).rev().find(|asid| self.independent_compute.asid_mask() & (1u64 << asid) == 0).ok_or(EBUSY)?
+                u32::from(super::g17p_render_lifecycle::render_asid(pair,self.independent_compute.asid_mask()).ok_or(EBUSY)?)
             })
         } else { None };
         let mut seed = work.preparation_seed(&p, ahead, pair, storage, incoming.or(installed), context)?;
@@ -1143,24 +1196,41 @@ impl Session {
         }
         Ok(seed)
     }
+    fn render_preparation_active(&self,key:render::PreparationKey)->bool {
+        self.render_prepare_leases.iter().any(|(owner,active)|*owner==key&&active.load(Ordering::Acquire))
+    }
     fn render_preparing(&self, pair: u32) -> bool {
-        self.render_prepare_leases.iter().any(|(pool, active)| *pool == pair && active.load(Ordering::Acquire))
+        self.render_preparation_active(render::PreparationKey::Pool(pair))
+    }
+    fn reserve_render_preparation(&mut self,key:render::PreparationKey)->Result<render::PreparationReservation> {
+        let active=if let Some((_,active))=self.render_prepare_leases.iter().find(|(owner,_)|*owner==key) {
+            active.clone()
+        } else {
+            let active=Arc::new(AtomicBool::new(false),GFP_KERNEL)?;
+            self.render_prepare_leases.push((key,active.clone()),GFP_KERNEL)?;
+            active
+        };
+        if active.swap(true,Ordering::AcqRel) {return Err(EBUSY);}
+        Ok(render::PreparationReservation(active))
     }
     pub(crate) fn claim_render_preparation(&mut self, p: &super::g17p_render::Parameters,
         incoming: &compute::Client) -> Result<Option<KBox<render::PreparationSeed>>> {
+        if let Some(state)=self.g16c_compute.as_ref() {
+            let Some(mut seed)=state.render_preparation_seed(self,p,incoming)? else {return Ok(None);};
+            let storage=seed.wrapped_storage().ok_or(EIO)?;
+            let spans=state.render_clearing_seed(self.memory.as_ref().ok_or(EIO)?,&seed)?;
+            let pool_reservation=self.reserve_render_preparation(render::PreparationKey::Pool(seed.pair()))?;
+            let reservation=self.reserve_render_preparation(render::PreparationKey::Storage(storage))?;
+            seed.set_pool_reservation(pool_reservation);
+            seed.set_clearing(spans,reservation);
+            return Ok(Some(seed));
+        }
         let Some(mut seed) = self.render_preparation_seed_for(p, 1, Some(incoming))? else { return Ok(None); };
         let pair = seed.pair();
         if !self.independent_render_roots() { return Ok(Some(seed)); }
         let spans = self.render.as_ref().ok_or(EIO)?.clearing_seed(self.memory.as_ref().ok_or(EIO)?, &seed)?;
-        let active = if let Some((_, active)) = self.render_prepare_leases.iter().find(|(pool,_)| *pool == pair) {
-            active.clone()
-        } else {
-            let active = Arc::new(AtomicBool::new(false), GFP_KERNEL)?;
-            self.render_prepare_leases.push((pair, active.clone()), GFP_KERNEL)?;
-            active
-        };
-        if active.swap(true, Ordering::AcqRel) { return Err(EBUSY); }
-        seed.set_clearing(spans, render::PreparationReservation(active));
+        let reservation=self.reserve_render_preparation(render::PreparationKey::Pool(pair))?;
+        seed.set_clearing(spans,reservation);
         Ok(Some(seed))
     }
     pub(crate) fn render_prepared_matches(&self, plan: &render::PreparedAppend,
@@ -1215,8 +1285,7 @@ impl Session {
             return Ok(self.compute_pending.is_none() || self.render_compute_owner_compatible()?);
         }
         if self.native.is_some() || !self.render_compute_owner_compatible()? || work.layout.native
-            || *crate::module_parameters::partial_independent_owner.value() != 1
-            || *crate::module_parameters::alternate_queue_pairs.value() != 1
+            || !self.render_pipelining_enabled()
             || (!self.independent_render_roots() && !work.same_geometry(p)) { return Ok(false); }
         Ok(self.next_render_pool_for_geometry(incoming, p)?.is_some() && self.next_render_storage()?.is_some())
     }
@@ -1227,33 +1296,25 @@ impl Session {
         let work = self.render.as_ref().ok_or(EINVAL)?;
         let next = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let count = if work.layout.independent && !work.layout.native
-            && *crate::module_parameters::alternate_queue_pairs.value() == 1 {
+            && crate::module_parameters::alternate_queue_pairs.value() == 1 {
             work.pool_count()
         } else { return Ok(Some(work.layout.pair)); };
-        let frames = match &self.pending {
-            Some(PendingWork::Render(wave)) => &wave.frames[wave.next..],
-            _ => &[],
-        };
-        let available = |pair: &u32| !self.render_preparing(*pair) && frames.iter().all(|frame| frame.ticket.item.layout.pair != *pair)
-            && !self.render_cpu_leases.iter().any(|(pool, fence)| pool == pair
-                && unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0)
-            && (!self.independent_render_roots() || *pair == 0
-                || self.render_pool_asids[*pair as usize] != 0
-                || self.independent_compute.asid_mask() != u64::MAX);
-        if self.independent_render_roots() {
-            let desired = incoming.unwrap_or(&work.client);
-            // Reuse an idle exact snapshot before rebuilding caller mappings
-            // in another pool. A live matching pool never blocks a free pool.
-            if let Some(pair) = (0..count).map(|offset| (next + offset) % count).find(|pair| {
-                available(pair) && if *pair == work.layout.pair {
-                    Self::same_client(desired, &work.client)
-                } else {
-                    self.render_pool_clients.iter().any(|(pool, client)|
-                        pool == pair && Self::same_client(desired, client))
-                }
-            }) { return Ok(Some(pair)); }
-        }
-        Ok((0..count).map(|offset| (next + offset) % count).find(available))
+        let desired=incoming.unwrap_or(&work.client);
+        // A retired pool still owns its tiler reservation. A changed caller
+        // can use another pool without overwriting this pool's grown backing.
+        let available=|pair:&u32|self.render_pool_available(*pair)
+            && (!self.independent_render_roots() || work.growth.as_ref().is_none_or(|service|
+                service.caller_compatible(*pair,&desired.bindings)))
+            && (!self.independent_render_roots() || *pair==0
+                || self.render_pool_asids[*pair as usize]!=0
+                || self.independent_compute.asid_mask()!=u64::MAX);
+        Ok(super::g17p_render_lifecycle::select_pool(next,count,available,|pair|
+            self.independent_render_roots() && if *pair==work.layout.pair {
+                Self::same_client(desired,&work.client)
+            } else {
+                self.render_pool_clients.iter().any(|(pool,client)|
+                    pool==pair && Self::same_client(desired,client))
+            }))
     }
 
     fn next_render_pool_for_geometry(&self, incoming: Option<&compute::Client>,
@@ -1322,18 +1383,20 @@ impl Session {
     }
 
     fn next_render_storage(&self) -> Result<Option<u32>> {
-        use super::g17p_render_lifecycle::{storage_conflicts, STORAGE_SUBMISSIONS};
-        let work = self.render.as_ref().ok_or(EINVAL)?;
-        let next = work.ordinal.checked_add(1).ok_or(EOVERFLOW)? % STORAGE_SUBMISSIONS;
-        let frames = match &self.pending {
-            Some(PendingWork::Render(wave)) => &wave.frames[wave.next..],
-            _ => &[],
-        };
-        // Lease a free physical slot independently of the logical ordinal.
-        // A slow owner cannot stall other pools when another slot is free.
-        Ok((0..STORAGE_SUBMISSIONS).map(|offset| (next + offset) % STORAGE_SUBMISSIONS)
-            .find(|slot| frames.iter().all(|frame|
-                !storage_conflicts(*slot, frame.ticket.item.storage_ordinal()))))
+        let work=self.render.as_ref().ok_or(EINVAL)?;
+        let next=work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
+        Ok(match &self.pending {
+            Some(PendingWork::Render(wave))=>wave.next_storage(next,super::g17p_render_lifecycle::storage_conflicts),
+            _=>super::g17p_render_lifecycle::select_storage(next,|_|true),
+        })
+    }
+    fn next_wrapped_render_storage(&self,next:u32)->Option<u32> {
+        let available=|slot|!self.render_preparation_active(render::PreparationKey::Storage(slot));
+        match &self.pending {
+            Some(PendingWork::WrappedRender(wave))=>wave.next_storage_available(next,|a,b|a==b,available),
+            None=>super::g17p_render_lifecycle::select_storage(next,|slot|available(*slot)),
+            _=>None,
+        }
     }
 
     pub(crate) fn submit_next_render(
@@ -1358,7 +1421,7 @@ impl Session {
         replacement: Option<compute::Client>, compute_replacement: Option<compute::Client>,
         p: &super::g17p_render::Parameters, prepared: Option<KBox<render::PreparedAppend>>,
     ) -> Result<Arc<RenderReceipt>> {
-        let profiling = *crate::module_parameters::submission_log.value() >= 3;
+        let profiling = crate::module_parameters::submission_log.value() >= 3;
         let prep_started = profiling.then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         let mut configured = source_fragment_parameters(p, false)?;
         configured.completion_control = u64::from(self.compute.is_some() && !self.independent_compute_enabled());
@@ -1377,7 +1440,7 @@ impl Session {
         let private_pair = if self.independent_render_roots() {
             Some(self.next_render_pool_for_geometry(replacement.as_ref(), p)?.ok_or(EBUSY)?)
         } else { None };
-        if *crate::module_parameters::native_render_vms.value() == 1 {
+        if crate::module_parameters::native_render_vms.value() == 1 {
             self.prepare_native_render_context(dev, replacement, p)?;
         } else if self.native.is_some() {
             self.refresh_native_render(replacement, compute_replacement, p)?;
@@ -1398,8 +1461,8 @@ impl Session {
             .checked_add(1)
             .ok_or(EOVERFLOW)?;
         if self.native.is_none()
-            && *crate::module_parameters::native_render_vms.value() == 0
-            && *crate::module_parameters::partial_independent_owner.value() == 1
+            && crate::module_parameters::native_render_vms.value() == 0
+            && crate::module_parameters::partial_independent_owner.value() == 1
         {
             let pair = match private_pair {
                 Some(pair) => pair,
@@ -1492,7 +1555,7 @@ impl Session {
                 render::DESCRIPTORS[1] + ordinal as u64 * super::g17p_render::FRAGMENT_SIZE as u64,
             )?;
         }
-        let profile_started = (*crate::module_parameters::submission_log.value() >= 3)
+        let profile_started = (crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         let work = self.render.as_mut().ok_or(EINVAL)?;
         render::stage_next_prepared(
@@ -1632,7 +1695,7 @@ impl Session {
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
         let consumer = memory.read_firmware32(vm.physical(memory, 2, channel.states[0])?)?;
         if consumer <= 255 && queue::reached(state.before, consumer as u8, state.target) {
-            if *crate::module_parameters::submission_log.value() != 0 {
+            if crate::module_parameters::submission_log.value() != 0 {
                 dev_info!(
                     dev,
                     "G17P: render {} asynchronous control consumed\n",
@@ -1810,14 +1873,14 @@ impl Session {
         if self.native.is_none()
             && ((self.independent_render_roots() && self.bootstrapped)
                 || self.render_compute_owner_compatible()?)
-            && *crate::module_parameters::partial_independent_owner.value() == 1
-            && *crate::module_parameters::alternate_queue_pairs.value() == 1
+            && crate::module_parameters::partial_independent_owner.value() == 1
+            && crate::module_parameters::alternate_queue_pairs.value() == 1
         {
             self.render.as_mut().ok_or(EINVAL)?.create_render_pools(
                 self.memory.as_mut().ok_or(EINVAL)?, self.vm.as_mut().ok_or(EINVAL)?)?;
         }
         self.inject_owned_render_fault(parameters)?;
-        if self.native.is_none() && *crate::module_parameters::native_limit_reply.value() == 1 {
+        if self.native.is_none() && crate::module_parameters::native_limit_reply.value() == 1 {
             let work = self.render.as_mut().ok_or(EIO)?;
             if work.ordinal == 0 {
                 let fragment = super::g17p_render_lifecycle::DESCRIPTORS[1];
@@ -1859,7 +1922,7 @@ impl Session {
             .as_mut()
             .send_message(0x21, 0x0083000000000008)?;
         let client_root = self.render.as_ref().ok_or(EINVAL)?.client.root.root();
-        if *crate::module_parameters::submission_log.value() != 0 {
+        if crate::module_parameters::submission_log.value() != 0 {
             dev_info!(
                 dev,
                 "G17P: caller render published on TA2/3D2, client root {:#x}\n",
@@ -1869,12 +1932,13 @@ impl Session {
         // Source Item values were validated before publication during staging.
         // Native receipts stay conservative and do not expose ordinary points.
         if !ticket.item.layout.native {
+            receipt.retained_pool.store(ticket.item.layout.pair,Ordering::Relaxed);
             for (stored, grid) in receipt.milestones.iter().zip(ticket.item.layout.grids) {
                 stored.store(((ticket.item.layout.pair as u64) << 40)
                     | ((grid as u64) << 32) | u64::from(ticket.item.index + 1), Ordering::Relaxed);
             }
         }
-        if *crate::module_parameters::submission_log.value() != 0 {
+        if crate::module_parameters::submission_log.value() != 0 {
             let live = match &self.pending { Some(PendingWork::Render(wave)) =>
                 wave.frames[wave.next..].iter().filter(|f| f.ticket.item.layout.pair == ticket.item.layout.pair).count(), _ => 0 };
             let mut unfinished = 0;
@@ -2182,7 +2246,7 @@ impl Session {
                         self.memory.as_mut().ok_or(EINVAL)?,
                         self.vm.as_ref().ok_or(EINVAL)?, ticket,
                     )?;
-                    if quiesced && *crate::module_parameters::submission_log.value() != 0 {
+                    if quiesced && crate::module_parameters::submission_log.value() != 0 {
                         dev_info!(dev,"G17P: failed render pool {} scheduler list quiesced\n",ticket.item.layout.pair);
                     }
                 }
@@ -2217,7 +2281,7 @@ impl Session {
                     self.timestamps.as_ref().ok_or(EINVAL)?.cache([pair[0], pair[1]], true)?;
                 }
             }
-            if *crate::module_parameters::submission_log.value() != 0 {
+            if crate::module_parameters::submission_log.value() != 0 {
                 dev_info!(dev,"G17P: caller render complete: TA {:?}, 3D {:?}, status {:#x}; reports validated, terminals {} cursor {}\n",last[0],last[1],command_status,terminals,service.cursor());
             }
             self.acknowledge_reports(image, &after).inspect_err(|e| dev_err!(dev,"G17P: render fail site report_ack {:?}\n",e))?;
@@ -2240,7 +2304,7 @@ impl Session {
                 self.vm.as_ref().ok_or(EINVAL)?,
                 self.render.as_ref().ok_or(EINVAL)?,
             )? {
-                if *crate::module_parameters::submission_log.value() != 0 {
+                if crate::module_parameters::submission_log.value() != 0 {
                     dev_info!(dev, "G17P: completed render scheduler list quiesced\n");
                 }
             }
@@ -2534,7 +2598,7 @@ impl Session {
                     .as_mut()
                     .send_message(0x21, queue::COMPUTE_DOORBELL)?;
                 let client_root = self.compute.as_ref().ok_or(EINVAL)?.client.root.root();
-                if *crate::module_parameters::submission_log.value() != 0 {
+                if crate::module_parameters::submission_log.value() != 0 {
                     dev_info!(dev,"G17P: asynchronous compute published {} commands, {} hardware leases pending, root {:#x}\n",
                         published,frames.len()-wave.next,client_root);
                 }
@@ -2694,7 +2758,7 @@ impl Session {
                 if copyback { frame.client.cache(true)?; }
                 self.timestamps.as_ref().ok_or(EINVAL)?.cache(timestamps, true)?;
             }
-            if *crate::module_parameters::submission_log.value() != 0 {
+            if crate::module_parameters::submission_log.value() != 0 {
                 dev_info!(
                     dev,
                     "G17P: caller compute complete: queue {:?}, channel {:?}, status {:#x}; reports validated\n",
@@ -2714,7 +2778,7 @@ impl Session {
             };
             if let Some(service) = service {
                 service.finish_compute(frame.ordinal)?;
-                if *crate::module_parameters::submission_log.value() != 0 {
+                if crate::module_parameters::submission_log.value() != 0 {
                     dev_info!(
                         dev,
                         "G17P: mixed reports: render terminals {}, compute terminals {}, cursor {}\n",
@@ -2763,6 +2827,11 @@ impl Session {
         if let Err(e) = self.cleanup.require_idle() { if e == EBUSY { return Ok(false); } return Err(e); }
         if self.phase == Phase::Failed { return Err(self.submission_error.unwrap_or(EIO)); }
         if self.native.as_ref().is_some_and(|n| !n.complete()) { return Ok(false); }
+        if let Some(state)=self.g16c_compute.as_ref() {
+            return Ok(self.phase==Phase::Running
+                && (self.live_render_count()==0 || self.render_pipelining_enabled())
+                && next.is_some_and(|client|state.render_pool(self,client,p).is_some()));
+        }
         if self.phase == Phase::Prepared { return Ok(self.pending.is_none() && self.compute_pending.is_none()); }
         if self.render.is_none() {
             if self.compute_pending.is_some() { return Ok(false); }
@@ -2867,9 +2936,9 @@ impl Session {
     pub(crate) fn can_join_render(&self, next: Option<&compute::Client>,
                                   p: &super::g17p_render::Parameters) -> Result<bool> {
         if self.native.is_some() || !self.render_compute_owner_compatible()?
-            || *crate::module_parameters::native_render_vms.value() != 0
-            || *crate::module_parameters::partial_independent_owner.value() != 1
-            || *crate::module_parameters::alternate_queue_pairs.value() != 1
+            || crate::module_parameters::native_render_vms.value() != 0
+            || crate::module_parameters::partial_independent_owner.value() != 1
+            || crate::module_parameters::alternate_queue_pairs.value() != 1
             || !matches!(self.pending, Some(PendingWork::Render(_)))
             || !self.can_append_render_for(next, p)? { return Ok(false); }
         let (Some(next), Some(work)) = (next, self.render.as_ref()) else { return Ok(false); };
@@ -2930,8 +2999,7 @@ impl Session {
         // lease. These are already-retired GPU tickets or joined consumer
         // completions; keeping a negative fence exhausts all render pools.
         // Physical published backing remains Memory-owned until shutdown.
-        self.render_cpu_leases.retain(|(_, fence)|
-            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0);
+        self.reap_render_cpu_leases();
         self.defer_cache = true;
         let result = self.poll_work(dev, image);
         self.defer_cache = false;
@@ -2972,13 +3040,13 @@ impl Session {
     }
 
     fn fail_owned_receipts(&self, error: Error) {
-        if let Some(state)=self.g16c_compute.as_ref() {state.fail_receipts(error);}
         self.independent_compute.fail(error);
         for pending in &self.independent_pending { pending.receipt.fail(error); }
         if let Some(control) = &self.render_control { control.receipt.fail(error); }
         if let Some(pending) = &self.pending {
             match pending {
-                PendingWork::Render(wave) => for state in &wave.frames[wave.next..] { state.receipt.fail(error); },
+                PendingWork::Render(wave) => wave.fail(error),
+                PendingWork::WrappedRender(wave) => wave.fail(error),
                 PendingWork::Control(state) => state.receipt.fail(error),
                 PendingWork::Native => (),
             }
@@ -3093,46 +3161,8 @@ impl Session {
             match &mut pending {
                 PendingWork::Native => self.poll_native(dev, image),
                 PendingWork::Control(state) => self.poll_control(dev, image, state),
-                PendingWork::Render(wave) => {
-                    if wave.next != 0 {
-                        drop(wave.frames.drain(..wave.next));
-                        wave.next = 0;
-                    }
-                    // A blocked scene does not retain another pool's credit.
-                    // Probe every exact ticket and retire each completed owner
-                    // independently; physical pages remain session-owned.
-                    let mut index = 0;
-                    while index < wave.frames.len() {
-                        let sole = wave.frames.len() == 1;
-                        let state = &mut wave.frames[index];
-                        let control_before = state.control_done;
-                        let mut done = self.poll_render(dev, image, state, sole)?;
-                        if !done && !control_before && state.control_done {
-                            done = self.poll_render(dev, image, state, sole)?;
-                        }
-                        if done {
-                            let stamps = if self.defer_cache {
-                                self.completions.reserve(1, GFP_KERNEL)?;
-                                self.render_cpu_leases.reserve(1, GFP_KERNEL)?;
-                                Some(self.timestamps.as_ref().ok_or(EIO)?.cache_seed(&state.ticket.timestamps)?)
-                            } else { None };
-                            let state = wave.frames.remove(index).map_err(|_| EIO)?;
-                            if let Some(stamps) = stamps {
-                                // GPU retirement permits a private CPU cache
-                                // task, but the published milestone stays live
-                                // until its receipt fence is signaled. Do not
-                                // reset this pool's registration in that gap.
-                                self.render_cpu_leases.push((state.ticket.item.layout.pair,
-                                    state.gate.clone()), GFP_KERNEL)?;
-                                self.completions.push(Completion { client: state.ticket.client,
-                                    stamps, fence: state.gate, grid: state.ticket.item.layout.grids[1] as u8, error: None }, GFP_KERNEL)?;
-                            } else { state.gate.signal(); }
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    Ok(wave.frames.is_empty())
-                },
+                PendingWork::Render(wave) => wave.poll(self, dev, Some(image)),
+                PendingWork::WrappedRender(_) => Err(EIO),
 
             }
         })();
@@ -3149,14 +3179,10 @@ impl Session {
                 self.events.fail(error);
                 self.fail_render_gate(error);
                 if let PendingWork::Control(control) = &pending { control.receipt.fail(error); }
-                if let PendingWork::Render(wave) = &pending {
-                    for state in &wave.frames[wave.next..] {
-                        state.receipt.fail(error);
-                        if unsafe { kernel::bindings::dma_fence_get_status(state.gate.raw()) } == 0 {
-                            state.gate.set_error(error);
-                            state.gate.signal();
-                        }
-                    }
+                match &pending {
+                    PendingWork::Render(wave) => wave.fail(error),
+                    PendingWork::WrappedRender(wave) => wave.fail(error),
+                    _ => (),
                 }
                 if let Some(timestamps) = self.timestamps.as_mut() {
                     timestamps.fail_pending(error);
@@ -3330,6 +3356,9 @@ impl Drop for Session {
             // permanent; keep the runtime owner too as it gains owned tables.
             core::mem::forget(self.g16c_transport.take());
             core::mem::forget(self.g16c_compute.take());
+            // Pending publications now share the wave owner. Preserve their
+            // exact root leases and protocol metadata on uncertain shutdown.
+            core::mem::forget(self.pending.take());
             core::mem::forget(self.memory.take());
             core::mem::forget(self.compute.take());
             core::mem::forget(core::mem::replace(&mut self.independent_compute, super::g17p_compute_queues::Queues::new()));
@@ -3349,10 +3378,10 @@ impl Drop for Session {
 
 impl Session {
     pub(crate) fn independent_compute_enabled(&self) -> bool {
-        *crate::module_parameters::compute_queues.value()==1 && self.native.is_none()
-            && *crate::module_parameters::native_compute_vms.value()==0
-            && *crate::module_parameters::native_render_vms.value()==0
-            && *crate::module_parameters::native_barriers.value()==0
+        crate::module_parameters::compute_queues.value()==1 && self.native.is_none()
+            && crate::module_parameters::native_compute_vms.value()==0
+            && crate::module_parameters::native_render_vms.value()==0
+            && crate::module_parameters::native_barriers.value()==0
     }
     pub(crate) fn independent_compute_client(&self,key:super::g17p_compute_queues::Key,
         client:&compute::Client,p:&compute::Parameters,priority:u32)->Option<&compute::Client> {
@@ -3362,13 +3391,13 @@ impl Session {
         client:&compute::Client,p:&compute::Parameters,priority:u32)->Option<u8> {
         self.independent_compute.selected_grid(key,client,p,priority)
     }
-    pub(crate) fn can_stage_independent_compute(&mut self,image:&Image,key:super::g17p_compute_queues::Key,
+    pub(crate) fn can_stage_independent_compute(&mut self,image:&super::g17p_drm::RuntimeImage,key:super::g17p_compute_queues::Key,
         client:&compute::Client,p:&compute::Parameters,priority:u32)->Result<(bool,bool)> {
         if self.phase==Phase::Failed {return Err(EIO);}
         if !matches!(self.phase,Phase::Prepared|Phase::Running) || !self.independent_compute_enabled() {return Ok((false,false));}
         let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
         let mut values=[0;3];
-        for (v,at) in values.iter_mut().zip(image.graph.channels[0][queue::COMPUTE_CHANNEL].states) {
+        for (v,at) in values.iter_mut().zip(image.compute_channel(priority).states) {
             *v=memory.read_firmware32(vm.physical(memory,2,at)?)?;
         }
         if queue::Counters::new(values).map_err(|_|EIO)?.slot().is_err() {return Ok((false,false));}
@@ -3376,10 +3405,13 @@ impl Session {
             || self.cleanup.require_idle().is_err() { return Ok((false,false)); }
         let (ready, notify) = self.independent_compute.prepare_reconfiguration(
             self.memory.as_mut().ok_or(EIO)?, self.vm.as_ref().ok_or(EIO)?,
-            image.graph.channels[0][12], key, client, p, priority)?;
+            image.control_channel(), key, client, p, priority)?;
         if notify {
             self.peers[0].rtkit.as_mut().ok_or(EIO)?.as_mut()
                 .send_message(0x21, 0x0084000000000011)?;
+            if matches!(image,super::g17p_drm::RuntimeImage::G16C(_)) {
+                self.g16c_send(0x21,0x0083000000000010)?;
+            }
         }
         Ok((ready,!ready))
     }
@@ -3404,9 +3436,9 @@ impl Session {
     pub(crate) fn timestamp_cache_seed(&self, addresses: &[u64]) -> Result<super::g17p_timestamp::Cache> {
         self.timestamps.as_ref().ok_or(EIO)?.cache_seed(addresses)
     }
-    pub(crate) fn retain_dependency(&mut self, point: (u8,u32), fence: &kernel::dma_fence::Fence) -> Result {
+    pub(crate) fn retain_dependency(&mut self, point: (u8,u32), retained_pool:Option<u32>, fence: &kernel::dma_fence::Fence) -> Result {
         let (grid, value) = point;
-        if *crate::module_parameters::submission_log.value() >= 3 {
+        if crate::module_parameters::submission_log.value() >= 3 {
             let mut address = None;
             for producer in &self.independent_pending {
                 if producer.ticket.grid == grid && producer.ticket.value == value {
@@ -3429,6 +3461,13 @@ impl Session {
                 Some(u64::from_le_bytes(word))
             } else { None };
             pr_info!("G17P: FIRMWARE_DEPENDENCY_LEASE point {:?} producer_status {:?}\n", point, status);
+        }
+        if let Some(pool)=retained_pool {
+            if pool>=super::g17p_render_lifecycle::POOL_SLOTS {return Err(EINVAL);}
+            if !self.render_cpu_leases.iter().any(|(held_pool,held)|*held_pool==pool&&held.raw()==fence.raw()) {
+                self.render_cpu_leases.push((pool,fence.clone()),GFP_KERNEL)?;
+            }
+            return Ok(());
         }
         if self.independent_compute.retain_dependency(grid, fence)? { return Ok(()); }
         for pool in 0..super::g17p_render_lifecycle::POOL_SLOTS {
@@ -3476,7 +3515,7 @@ impl Session {
         client: &compute::Client, p: &compute::Parameters, priority: u32) -> bool {
         self.independent_compute.needs_private(key, client, p, priority)
     }
-    pub(crate) fn stage_independent_compute(&mut self,dev:&kernel::device::Device,image:&Image,
+    pub(crate) fn stage_independent_compute(&mut self,dev:&kernel::device::Device,image:&super::g17p_drm::RuntimeImage,
         key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
         storage: Option<Memory>, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
         prepared: KBox<super::g17p_compute_queues::PreparedWork>,
@@ -3490,7 +3529,7 @@ impl Session {
         }
         result
     }
-    fn stage_independent_compute_inner(&mut self,dev:&kernel::device::Device,image:&Image,
+    fn stage_independent_compute_inner(&mut self,dev:&kernel::device::Device,image:&super::g17p_drm::RuntimeImage,
         key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
         private_prepared: bool, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
         prepared: KBox<super::g17p_compute_queues::PreparedWork>, p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
@@ -3499,7 +3538,8 @@ impl Session {
         let receipt=ComputeReceipt::new(ordinal)?;
         // The exact parameters/aliases were made visible by off-lock
         // preparation before this validated descriptor plan was consumed.
-        if self.phase==Phase::Prepared {
+        let neo=match image {super::g17p_drm::RuntimeImage::G17P(image)=>Some(image),_=>None};
+        if let Some(image)=neo { if self.phase==Phase::Prepared {
             self.bootstrap_compute(dev,image,reference.owner,p.preempt)?;
             // The primer is internal permanent backing, never an application
             // VM snapshot. Caller cleanup must visit only its real owners.
@@ -3515,16 +3555,19 @@ impl Session {
             }
         }
         self.service_owned_render_reports(dev,image)?;
+        }
         let ticket=self.independent_compute.stage(self.memory.as_mut().ok_or(EIO)?,
-            self.vm.as_mut().ok_or(EIO)?,self.ttbs,image.graph.channels[0][queue::COMPUTE_CHANNEL],
+            self.vm.as_mut().ok_or(EIO)?,self.ttbs,image.compute_channel(priority),
             key,client,private_prepared,rebind,prepared,reference,p,priority,dependencies,receipt.fence.clone())?;
         for bo in ticket.client.buffers() {self.retain_source_backing(bo)?;}
-        self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EIO)?.growth.as_mut().ok_or(EIO)?
-            .register_independent_compute(self.independent_compute.grid_mask());
+        if neo.is_some() {        self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EIO)?.growth.as_mut().ok_or(EIO)?
+            .register_independent_compute(self.independent_compute.grid_mask()); }
         let publication=ticket.publication;let grid=ticket.grid;let value=ticket.value;let bank=ticket.queue;
+        let binding=ticket.binding;
         // Observe both consumers before every producer store. Once a ticket
         // is consumed, retain that fact across later turns of the outer ring.
         for pending in &mut self.independent_pending {
+            if pending.ticket.channel.states!=ticket.channel.states {continue;}
             for i in 0..2 {
                 pending.outer_done[i] |= queue::reached(pending.ticket.publication.consumers_before[i],
                     publication.consumers_before[i],pending.ticket.publication.producer);
@@ -3533,23 +3576,30 @@ impl Session {
         self.independent_pending.push(IndependentPending {ticket,receipt:receipt.clone(),
             started:kernel::time::Instant::now(),outer_done:[false;2]},GFP_KERNEL)?;
         self.independent_count=ordinal;
+        if let Some((grid,address,resume))=binding {self.bind_g16c_compute(grid,address,resume)?;}
         let memory=self.memory.as_mut().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
         if let Some((address,value))=publication.deferred_inner {vm.write(memory,2,address,&value.to_le_bytes())?;}
         g17p_memory::sync();
         let (address,producer)=publication.deferred_outer.ok_or(EIO)?;
         vm.write(memory,2,address,&producer.to_le_bytes())?;g17p_memory::sync();
-        receipt.point.store((2u64<<40)|(u64::from(grid)<<32)|u64::from(value),Ordering::Relaxed);
+        receipt.point.store((if binding.is_some() {u64::from(grid)} else {2}<<40)|(u64::from(grid)<<32)|u64::from(value),Ordering::Relaxed);
         receipt.publication_ready.store(true,Ordering::Release);
-        self.peers[0].rtkit.as_mut().ok_or(EIO)?.as_mut().send_message(0x21,queue::COMPUTE_DOORBELL)?;
-        if *crate::module_parameters::submission_log.value()!=0 {
+        let doorbell=if binding.is_some() {0x0083000000000000|(u64::from(priority)<<2)|2} else {queue::COMPUTE_DOORBELL};
+        self.peers[0].rtkit.as_mut().ok_or(EIO)?.as_mut().send_message(0x21,doorbell)?;
+        if binding.is_some() {self.g16c_send(0x21,0x0083000000000010)?;}
+        if crate::module_parameters::submission_log.value()!=0 {
             dev_info!(dev,"G17P: independent compute {} queue {:?} bank {} grid {} value {} live {}\n",
                 ordinal,key,bank,grid,value,self.independent_pending.len());
         }
         Ok(receipt)
     }
     fn poll_independent_compute(&mut self,dev:&kernel::device::Device,image:&Image)->Result<bool> {
+        self.poll_scheduled_compute(dev,Some(image))
+    }
+    fn poll_scheduled_compute(&mut self,dev:&kernel::device::Device,image:Option<&Image>)->Result<bool> {
         if self.independent_pending.is_empty() {return Ok(true);}
         if self.peers.iter().any(|p|p.data.crashed.load(Ordering::Acquire)) {return Err(EIO);}
+        let report=if let Some(image)=image {
         self.service_owned_render_reports(dev,image)?;
         let report=self.report_snapshot(image)?;
         if self.render.as_ref().or(self.dormant_render.as_ref()).ok_or(EIO)?.growth.as_ref().ok_or(EIO)?.cursor()!=report[0].firmware {
@@ -3562,6 +3612,8 @@ impl Session {
                 return Err(EIO);
             }
         }}
+        Some(report)
+        } else {None};
         let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
         let mut index=0;
         while index<self.independent_pending.len() {
@@ -3575,10 +3627,16 @@ impl Session {
                     values[i] as u8,ticket.publication.producer);
             }
             let complete=done>=ticket.publication.write_after && pending.outer_done.iter().all(|v|*v);
-            let terminals=self.render.as_ref().or(self.dormant_render.as_ref()).ok_or(EIO)?
-                .growth.as_ref().ok_or(EIO)?.independent_compute_terminals(ticket.grid);
+            let terminals=if ticket.binding.is_some() {ticket.value} else {
+                self.render.as_ref().or(self.dormant_render.as_ref()).ok_or(EIO)?
+                    .growth.as_ref().ok_or(EIO)?.independent_compute_terminals(ticket.grid)
+            };
+            let wire_complete=if let Some((address,value,scheduler))=ticket.driver {
+                memory.read_firmware32(vm.physical(memory,2,address)?)?==value
+                    && memory.read_firmware32(vm.physical(memory,2,scheduler)?)?==1
+            } else {true};
             let status=vm.physical(memory,2,ticket.status[1])?;memory.invalidate(status,8)?;
-            if !complete || memory.read64(status)?==0 || terminals<ticket.value {
+            if !complete || !wire_complete || memory.read64(status)?==0 || terminals<ticket.value {
                 if pending.started.elapsed().as_millis()>10000 {
                     dev_err!(dev,"G17P: independent compute timeout grid {} value {} inner {}/{} outer {:?} status {:#x} terminals {}\n",
                         ticket.grid,ticket.value,done,ticket.publication.write_after,values,memory.read64(status)?,terminals);
@@ -3599,7 +3657,7 @@ impl Session {
                 self.independent_pending.remove(index).map_err(|_|EIO)?;
             }
         }
-        self.acknowledge_reports(image,&report)?;
+        if let (Some(image),Some(report))=(image,report) {self.acknowledge_reports(image,&report)?;}
         Ok(self.independent_pending.is_empty())
     }
 }

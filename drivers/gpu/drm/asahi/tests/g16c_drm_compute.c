@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* One native DRM submission with our Mesa-generated constant32 resources.
  * No firmware objects, Apple shader bytes or reference UAT pages are inputs. */
 #define main memory_test_main

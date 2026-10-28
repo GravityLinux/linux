@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Low-root joins from G17PShimBackend._ensure_dependency_compute_state.
 //! The caller supplies live, owned leaves, not the bootstrap's PA inventory.

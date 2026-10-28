@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Run Max's actual common UAT walker over owned RAM and verify all mappings."""
 import argparse
 import ctypes as C

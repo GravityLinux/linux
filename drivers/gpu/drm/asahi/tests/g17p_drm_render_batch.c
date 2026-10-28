@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Thirty-two two-command batches on one retained physical queue pair. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

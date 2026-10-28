@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Exercise the actual UserVm::grow body with owned table/allocator doubles.
 
 Inject failure at every metadata/page allocation, late collisions, and bad

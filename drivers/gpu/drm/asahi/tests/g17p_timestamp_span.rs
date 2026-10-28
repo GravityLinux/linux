@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
 #[path = "../g17p_timestamp_span.rs"]
 mod span;
 use span::{Mapping, PAGE};

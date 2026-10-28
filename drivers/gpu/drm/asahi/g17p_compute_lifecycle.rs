@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Retained direct-queue profile from stage_next_workload with fresh command
 //! objects, persistent_startup_queue and fast_sequential. Storage admission,

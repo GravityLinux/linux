@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Native sampler transport using output-qualified, wholly source-owned GEMs.
  * Native descriptor tables are normal caller DATA, never kernel shader edits. */
 #define main memory_test_main

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* One mixed ioctl, distinct caller output for every command, both orders. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

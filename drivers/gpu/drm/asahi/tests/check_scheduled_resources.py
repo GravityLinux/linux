@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Exercise m1n1 reserved-memory publication and the real Rust FDT reader."""
 import argparse
 import ctypes as C

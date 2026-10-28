@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* UAPI pipeline measurement: two disjoint render outputs, raw async submits. */
 #include <sys/resource.h>
 #define main memory_test_main

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Live-VM BO generations and accepted old snapshots, with source-owned Mesa DATA. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

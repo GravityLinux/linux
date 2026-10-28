@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Firmware submission bindings. Native queues retain distinct scratch and
 //! identities; the two 64-bit start banks cover the seven-bit grid field.
@@ -29,7 +29,7 @@ impl BindingG16C {
     }
     /// The source protocol binds fragment before tiling.
     pub(crate) fn render(first: u8, tiling: u64, fragment: u64) -> Option<[Self; 2]> {
-        if first > 2 || tiling == fragment {
+        if first >= 127 || tiling == fragment {
             return None;
         }
         Some([

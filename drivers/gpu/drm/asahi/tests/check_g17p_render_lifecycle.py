@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare a retained native append against actual pure Python constructors.
 
 Exercises full descriptors (including embedded partial programs), optionals,

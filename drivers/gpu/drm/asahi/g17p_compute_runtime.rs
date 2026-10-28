@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! First direct-compute graph and its owned caller mappings. Addresses and
 //! field values follow native_add3's direct queue zero, without its workload.
@@ -9,7 +9,7 @@ use super::{
     g17p_queue as q, g17p_user_vm::UserVm, g17p_vm::Vm,
 };
 use kernel::{
-    drm::gem::{shmem, BaseObject},
+    drm::gem::{legacy_shmem as shmem, BaseObject},
     prelude::*,
     rbtree::RBTree,
     sync::{aref::ARef, Arc, Mutex},
@@ -213,7 +213,7 @@ impl Client {
         contexts: &[u16],
         private: &[(u64, u64, u64)],
     ) -> Result<super::g17p_user_vm::RebindPlan<'a>> {
-        let started = (*crate::module_parameters::submission_log.value() >= 3)
+        let started = (crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         if render && self.owner != next.owner {
             return Err(EINVAL);
@@ -704,7 +704,7 @@ impl q::Writer for Writer<'_> {
         self.vm.write(self.memory, 2, address, bytes)
     }
 }
-fn client_storage(
+pub(crate) fn client_storage(
     memory: &mut Memory,
     root: &mut UserVm,
     address: u64,

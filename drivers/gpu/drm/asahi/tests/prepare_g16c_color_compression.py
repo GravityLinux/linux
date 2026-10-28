@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Source-owned compressed PBE store, TFU reload, and exact decoded CPU image.
 
 All shader/launch bytes stay unchanged. Only source VDM groups, caller table

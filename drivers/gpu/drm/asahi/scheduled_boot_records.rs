@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Scheduled-family boot records, initialized from source Default templates.
 //! Large wire images live in static storage; runtime encoders mutate only

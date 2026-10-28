@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Whole scheduled compute pages vs qualified Max source and tagged Neo Rust.
 
 Only descriptor/register DATA is read from native captures. No shader or Apple

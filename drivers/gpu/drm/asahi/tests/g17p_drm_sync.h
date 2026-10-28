@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Optional --sync checks for g17p_drm_compute.c. CONFIG_SW_SYNC is needed
  * only for testing imported, delayed/error fences; GPU work stays native. */
 #include <linux/sync_file.h>

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Own the G16C graph until its RAM mappings can be installed and published.
 //! Allocation failure drops only unpublished CPU buffers, without starting ASC.

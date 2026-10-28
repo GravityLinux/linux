@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Check scheduled initdata layouts, templates and complete source encodings.
 
 Reads RE declarations and owned source builders only; no device access.

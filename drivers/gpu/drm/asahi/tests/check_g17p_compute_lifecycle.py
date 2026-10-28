@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Differential check of retained queue metadata against source-only Python."""
 import host_versions
 import argparse, ast, importlib.util, struct, subprocess, tempfile

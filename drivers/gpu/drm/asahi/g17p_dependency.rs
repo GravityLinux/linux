@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Unpublished native C/R/C objects from G17PShimBackend. This profile is
 //! distinct from retained standalone work: four fresh queues share context

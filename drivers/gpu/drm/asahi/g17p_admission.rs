@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Immutable caller-only admission trees. They never become executable roots:
 //! the backend receives an owned clone only when retained mapping identity

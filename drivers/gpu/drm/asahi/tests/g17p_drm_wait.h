@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 static int g17p_raw_ioctl(int fd, unsigned long request, void *argument)
 {
     return ioctl(fd, request, argument);

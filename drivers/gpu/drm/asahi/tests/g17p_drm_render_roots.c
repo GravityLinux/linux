@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Same DVAs in different live VMs; full outputs, inactive guards, fences, timestamps. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

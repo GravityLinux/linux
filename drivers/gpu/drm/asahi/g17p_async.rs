@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Firmware callbacks wake owned jobs; each pass publishes or retires without
 //! waiting for GPU completion. A delayed pass covers coalesced notifications
@@ -76,7 +76,7 @@ impl Events {
         let jobs = self.jobs.lock();
         for job in jobs.iter() {
             if all || job.firmware_waiting.load(Ordering::SeqCst) {
-                let _ = workqueue::system_unbound().enqueue::<_, 0>(job.clone());
+                let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
             }
         }
     }
@@ -89,7 +89,7 @@ impl Events {
             .iter()
             .find(|job| &***job as *const Job as usize == identity)
         {
-            let _ = workqueue::system_unbound().enqueue::<_, 0>(job.clone());
+            let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
         }
     }
 }
@@ -109,7 +109,6 @@ pub(crate) struct Job {
     events: Arc<Events>,
 }
 struct Execution {
-    dev: ARef<Device>,
     file: Arc<FileState>,
     prepared: Prepared,
     sync: super::super::g17p_sync::Plan,
@@ -123,6 +122,9 @@ struct Execution {
     work_gate: Option<dma_fence::Fence>,
     callbacks: KVec<KBox<FenceWake>>,
     control_timer_handle: Option<ArcHrTimerHandle<Job>>,
+    // Fields drop in declaration order. File/Prepared/receipts retain GEM
+    // objects whose DMA cleanup needs this device, even after driver unbind.
+    dev: ARef<Device>,
 }
 impl Execution {
     fn progress(&mut self) -> Result<Option<Option<Error>>> {
@@ -144,7 +146,7 @@ impl HrTimerCallback for Job {
     fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         // IRQ context only schedules this owner. All receipt reads and mapping
         // edits remain in the existing sleeping worker.
-        let _ = workqueue::system_unbound().enqueue::<Arc<Self>, 0>(this.into());
+        let _ = workqueue::system_dfl().enqueue::<Arc<Self>, 0>(this.into());
         HrTimerRestart::NoRestart
     }
 }
@@ -232,14 +234,10 @@ impl Job {
                 .vm_pending
                 .fetch_add(1, Ordering::Release);
             execution.file.pending.fetch_add(1, Ordering::Release);
-            if matches!(execution.dev.abi, super::super::GpuAbi::G16C) {
-                execution.prepared.history.active_jobs.as_ref().expect("Max queue activity")
-                    .fetch_add(1, Ordering::Release);
-            }
             execution.sync.publish_outputs();
             job.committed.store(true, Ordering::Release);
         }
-        let _ = workqueue::system_unbound().enqueue::<_, 0>(job);
+        let _ = workqueue::system_dfl().enqueue::<_, 0>(job);
     }
 }
 impl Job {
@@ -286,7 +284,7 @@ impl Job {
             Ok(None) => {
                 this.firmware_waiting.store(true, Ordering::SeqCst);
                 if this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
-                    let _ = workqueue::system_unbound().enqueue::<_, 0>(this.clone());
+                    let _ = workqueue::system_dfl().enqueue::<_, 0>(this.clone());
                 }
                 if e.schedule.as_ref().is_some_and(|s| s.control_waiting()) {
                     // These control receipts may have no mailbox notification.
@@ -297,12 +295,12 @@ impl Job {
                 }
                 // Retain the bounded watchdog for genuinely absent/coalesced
                 // notifications, even when the sequence change requeues work.
-                let _ = workqueue::system_unbound()
+                let _ = workqueue::system_dfl()
                     .enqueue_delayed::<_, 1>(this.clone(), kernel::time::msecs_to_jiffies(10));
             }
             result => {
                 let execution = held.take().unwrap();
-                let mut error = match result {
+                let error = match result {
                     Ok(Some(error)) => error,
                     Err(error) => Some(error),
                     _ => unreachable!(),
@@ -330,17 +328,6 @@ impl Job {
                 execution.file.pending.fetch_sub(1, Ordering::Release);
                 // A rejected/unpublished job still releases queue ordering.
                 // Its public fence retains the actual completion/error.
-                if matches!(execution.dev.abi, super::super::GpuAbi::G16C) {
-                    execution.prepared.history.active_jobs.as_ref().expect("Max queue activity")
-                        .fetch_sub(1, Ordering::Release);
-                    let mut runtime = execution.dev.runtime.lock();
-                    if let Some(runtime) = Option::as_mut(&mut *runtime) {
-                        if let Err(cleanup_error) = runtime.session.reap_g16c_contexts() {
-                            runtime.session.fail_cpu_completion(cleanup_error);
-                            error.get_or_insert(cleanup_error);
-                        }
-                    }
-                }
                 execution.publication.signal();
                 execution.sync.complete(error);
                 drop(held);

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(dead_code)]
 
 #[path = "LEGACY_COMPUTE"]
@@ -122,7 +122,7 @@ fn main() {
                 p.queue_control = 0;
                 assert!(matches!(ComputeWrapperG16C::new(&p), Err(Error::Invalid)));
             }
-            3 => emit(ComputeSchedulerG16C::for_compute(w[0]).as_bytes()),
+            3 => emit(ComputeSchedulerG16C::for_compute(w[0],w.get(1).copied().unwrap_or(0) as u32).as_bytes()),
             _ => panic!("bad host protocol"),
         }
     }

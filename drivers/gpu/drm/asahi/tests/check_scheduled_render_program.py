@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Whole ordered Max render programs vs source and independent native DATA."""
 import argparse
 from dataclasses import asdict,replace
@@ -93,7 +93,12 @@ for directory in ('single-user-texture-pixel-20261010','single-user-render32-msa
     for stage,builder in ((0,build_tiling_source),(1,build_fragment_source)):
         folder=a.m1n1/'build/m4max-gpu'/directory;path=folder/f'stage-{stage}-descriptor.bin'
         body=path.read_bytes();built,inputs=builder(body,(folder/f'stage-{stage}-wrapper.bin').read_bytes())
-        assert body==built
+        # Historical reads include bytes after the object. Adjacent-allocation
+        # captures establish exact TA/FR bounds; those trailing bytes belong
+        # to the following allocation and are not part of either program.
+        size = 0x2240 if stage else 0x9c0
+        assert len(built) == size and len(body) >= size
+        assert body[:size] == built
         params=Parameters(**inputs['fields']);at=0xa0 if stage else 0x60
         ref=fragment_registers(params)if stage else tiling_registers(params)
         assert body[at:at+len(ref)*12]==b''.join(struct.pack('<IQ',*r)for r in ref)

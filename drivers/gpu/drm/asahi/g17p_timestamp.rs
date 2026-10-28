@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Caller timestamp BO aliases in the source adapter's firmware aperture.
 //! Bound tokens retain their backing and per-command fences. Only an unbound

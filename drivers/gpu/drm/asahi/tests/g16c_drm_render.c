@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Native Max render output/guard checks using our source-owned Mesa GEMs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

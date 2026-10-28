@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 // Host-side byte oracle adapter: compile the actual kernel serializers.
 #![allow(dead_code)]
 

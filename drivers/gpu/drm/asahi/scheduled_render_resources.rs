@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source-built Max parameter-buffer DATA. These are exclusive CPU staging
 //! images; no mutable firmware mapping is borrowed through a Rust reference.

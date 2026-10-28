@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! CPU access to the validated, permanently reserved GPU boot RAM.
 //! Does not treat firmware physical addresses as kernel direct-map pointers.
@@ -260,11 +260,9 @@ impl Memory {
             let expected = platform.regions[index];
             memory.map(res, expected.base, expected.size)?;
         }
-        let source = node
-            .parse_phandle(c_str!("memory-region"), 6)
-            .ok_or(ENODEV)?;
         for (index, &(base, size)) in g17p_topology::RESERVATIONS.iter().enumerate() {
-            memory.map(source.address_to_resource(index)?, base, size)?;
+            let source = node.parse_phandle(c_str!("memory-region"), 6 + index).ok_or(ENODEV)?;
+            memory.map(source.address_to_resource(0)?, base, size)?;
         }
         dev_info!(
             dev,

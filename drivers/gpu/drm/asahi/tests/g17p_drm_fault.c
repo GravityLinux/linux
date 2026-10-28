@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Run with the source owned command-fetch diagnostic armed at ordinal zero. */
 #define G17P_RENDER_VM_HELPERS
 #include "g17p_drm_render_vm.c"

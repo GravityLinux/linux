@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Max's wrapped-work publication transaction, owned by the common Session.
 //! Memory/VM and client leases are the existing native owners. This layer does
@@ -162,6 +162,7 @@ struct Plan {
     tail: u32,
     head: u32,
     epoch: u32,
+    counters: q::Counters,
 }
 
 /// Prepared host publication plan. The transport already owns its Flight and
@@ -229,6 +230,17 @@ fn poll(
     }
     f.quiescent = idle;
     Ok(idle)
+}
+
+struct Writer<'a> {
+    memory: &'a mut Memory,
+    vm: &'a Vm,
+}
+impl q::Writer for Writer<'_> {
+    type Error = Error;
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result {
+        self.vm.write(self.memory, 2, address, bytes)
+    }
 }
 
 impl StateG16C {
@@ -346,13 +358,8 @@ impl StateG16C {
                 return Err(EBUSY);
             }
             let tail = read(memory, vm, r.producer)?;
-            if !ring_room(
-                tail,
-                read(memory, vm, r.read)?,
-                read(memory, vm, r.done)?,
-                1,
-                256,
-            ) {
+            let consumers = [read(memory, vm, r.read)?, read(memory, vm, r.done)?];
+            if !ring_room(tail, consumers[0], consumers[1], 1, 256) {
                 return Err(EBUSY);
             }
             let head = (l.head + request.works.len() as u32) % l.capacity;
@@ -379,6 +386,7 @@ impl StateG16C {
                     tail,
                     head,
                     epoch,
+                    counters: q::Counters::new([consumers[0],consumers[1],tail]).map_err(|_| EIO)?,
                 },
                 GFP_KERNEL,
             )?;
@@ -393,7 +401,7 @@ impl StateG16C {
             )?;
             channels.push(ChannelTarget { index, head: epoch }, GFP_KERNEL)?;
         }
-        if *crate::module_parameters::g16c_initial_alloc_fail.value() == 9 && !self.allocation_faulted {
+        if crate::module_parameters::g16c_initial_alloc_fail.value() == 9 && !self.allocation_faulted {
             self.allocation_faulted = true;
             kernel::pr_info!("G16C: injected unpublished transport ENOMEM before flight ownership/producers\n");
             return Err(ENOMEM);
@@ -437,30 +445,25 @@ impl StateG16C {
                     if l.stage != stage {
                         continue;
                     }
-                    for (slot, address) in request.works.iter().enumerate() {
-                        let at = l.ring + ((l.head + slot as u32) % l.capacity) as u64 * 8;
-                        vm.write(memory, 2, at, &address.to_le_bytes())?;
-                    }
-                    vm.write(memory, 2, l.pointers + 0x40, &p.head.to_le_bytes())?;
                     let kind = match l.stage {
                         0 => q::Kind::Tiling,
                         1 => q::Kind::Fragment,
                         _ => q::Kind::Compute,
                     };
-                    let body = q::ring_slot_tag(
-                        request.tag,
-                        l.queue,
-                        p.head,
-                        request.event as u32,
-                        l.first,
-                        kind,
-                    );
-                    vm.write(
-                        memory,
-                        2,
-                        self.routes[p.index].ring + p.tail as u64 * 24,
-                        &body,
-                    )?;
+                    let route = self.routes[p.index];
+                    q::Stage {
+                        queue: l.queue, pointers: l.pointers, item_ring: l.ring,
+                        item_capacity: l.capacity, write_index: l.head,
+                        channel_ring: route.ring, channel_producer: route.producer,
+                        counters: p.counters, slot: Some(p.tail as u8), items: request.works,
+                        group: 0, grid: u32::from(request.event), kind, first: l.first,
+                        in_place: false, announce: false, defer_inner: false, defer_outer: true,
+                        event_subtype: None, event_counter: None, event_counter_low: 0,
+                    }.publish_entry(&mut Writer {memory,vm}, p.head, request.tag, None)
+                        .map_err(|error| match error {
+                            q::StageError::Access(error) => error,
+                            q::StageError::Protocol(_) => EIO,
+                        })?;
                 }
             }
             g17p_memory::sync();

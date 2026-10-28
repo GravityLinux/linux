@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Dynamic private arrays: independent C oracle, exact caller BOs and guards. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

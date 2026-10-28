@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Scheduled-family Work15, SKSM and compute scheduler staging records.
 //! These owned byte images neither publish producers nor borrow live firmware.
@@ -468,9 +468,10 @@ impl ComputeScheduler::ver {
     pub(crate) const SIZE: usize = core::mem::size_of::<Self>();
 
     #[ver(G == G16C)]
-    pub(crate) fn for_compute(slot: u64) -> Self {
+    pub(crate) fn for_compute(slot: u64, work_id: u32) -> Self {
         Self {
             slot: slot.to_le_bytes(),
+            work_id: work_id.to_le_bytes(),
             ..Self::default()
         }
     }

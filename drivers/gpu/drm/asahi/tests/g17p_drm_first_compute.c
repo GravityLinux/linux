@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Fresh render-first UAPI session: first compute while a render fence is pending. */
 #include <sys/resource.h>
 #define main memory_test_main

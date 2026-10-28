@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Exact logical timestamp spans, page-rounded aliases and accepted-work leases. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

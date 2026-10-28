@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Real GEM/VM/QUEUE/SUBMIT path, with an authored add3 program and independent
  * expected output. No firmware objects are supplied by this test. */
 #define main memory_test_main

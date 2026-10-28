@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Four synchronous eight-command batches, with independently owned outputs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

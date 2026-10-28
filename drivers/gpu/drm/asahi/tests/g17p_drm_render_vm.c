@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Two files with identical DVAs and independently backed pressure renders. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

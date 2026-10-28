@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* UAPI stress: 320 alternating compute owner/VM handoffs, full outputs and guards. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Independently addressed caller outputs, raw UAPI submissions and own fences. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

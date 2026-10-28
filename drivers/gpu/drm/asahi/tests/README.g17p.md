@@ -1,4 +1,166 @@
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
 # Scheduled G16C/G17P UAPI integration and source checks
+
+Native FList bank correction (2026-10-27, Image271/v81): the output-qualified
+three-client capture and four-phase plain opaque replay establish that request
++0x30 is the operand dispatch bank, acknowledged by RX13 +8 and support +8.
+Native retained render registrations use banks3/4/5 independently of ASID.
+The old code registered all owners in bank0, overwrote its directory on every
+render and incorrectly rejected bank values above2. The corrected path uses
+the existing host Dispatch[context-1] reservation consistently for registration
+and growth, preserves other banks and wakes the work loop for every bank.
+No common scheduling change or artificial resource limit is introduced.
+
+`check_scheduled_flist_banks.py` compiles actual production constructors with
+the versions macro and compares six entire native requests, replies and dispatch
+records. Old source rejects native bank3; corrected source passes all six,
+including wrong-bank and duplicate-reply rejection. Native/plain replay checks
+six changed outputs,3000 guard bytes and18 stage retirements. The resource gate
+also passes288 complete parameter/support objects and64 FList requests.
+
+Image271 passes the Max default16 draws and both two- and nine-generation
+retained large/small Vulkan tests with normal compression and both parallel
+settings enabled. The old second-large-draw firmware timeout is absent.
+Receipts `max-vulkan-retained-normal-v49-owned-flist-banks.json` and
+`max-vulkan-retained-normal-v51-owned-flist-banks-wrap.json` include all16 CPUs,
+66 actual runtime hashes, clean unbind and exact RID0 cold recovery.
+
+Parallel Chromium v52 passes4096 hardware pixels, but subsequent WebGPU cannot
+obtain an adapter after host EIO during resource setup. Diagnostic Image272/v53
+identifies missing_retained_client during queue recycling. Preparation checked
+both logical and selected physical clients, but Max publication checked only
+the logical queue. A changed eligible pool could therefore bypass required
+client preparation and retire its old queue with no incoming replacement.
+
+Publication now revalidates both identities through the existing replacement
+and retry path. The deterministic host gate compiles the actual branch/helper
+and passes six interleavings; the original source fails the stale-pool oracle.
+Checking only the physical client fails the opposite logical-routing case.
+Image274/v84 then passes parallel Chromium4096 pixels, WebGPU16384 cells and
+32768 rendered samples over32 generations, post-browser Vulkan, clean unbind
+and exact cold recovery (max-browser-shared-v54-physical-client-revalidation.json).
+This tests both existing parallel settings1 with all16 CPUs and240 actual runtime
+hashes. Temporary failure-phase diagnostics were removed after qualification;
+final queue-wrap and repeated client teardown checks remain pending. Both targets
+build, but current-turn device access is Max-only under the latest supplied rules.
+The monitor still explicitly disables WFxT as documented below. Image/source
+hashes for182 inputs are in kernel-neo-lifecycle-v81.json. Earlier sections
+below are chronological evidence; their open second-draw issue is superseded
+by this bank correction, not a blanket claim that all lifecycle issues pass.
+
+Current graphics validation (2026-10-27, Image269): the committed queue-local
+stamp implementation now passes real Max Chromium and WebGPU as well as the
+retained Vulkan controls. Receipt `max-browser-shared-v47-local-stamp-no-wfxt.json`
+verifies4096 WebGL pixels,16384 Game of Life cells,32768 pixel samples over32
+generations, post-browser Vulkan, clean unbind and exact cold recovery.
+
+This run uses the Linux monitor's explicit `--disable-wfxt` diagnostic, adding
+the kernel's existing `id_aa64isar2.wfxt=0` override. All16 CPUs and240 actual
+runtime-file hashes are verified, including the actual command line and CPU
+feature list. The prior Image269 browser run (v46) hit the same CPU4 process_srcu
+`__delay` Oops immediately after WFIT, with all general registers reported zero,
+before any graphics workload began. The underlying monitor/platform cause is
+unresolved; the override avoids this instruction without changing GPU code.
+It is not a production kernel restriction or a claim of long-running stability.
+
+The optional15-pool parallel Vulkan control still fails its second large draw
+with that override (v48), separating the firmware timeout from this CPU issue.
+Retesting retained MMIO resume/start handling after all native packet fixes
+also fails (Image270/v45); that candidate was archived and removed. Production
+uses the common Neo policy without artificial pool limits or dependency disabling.
+
+The next native reference is three retained Metal processes, one indirect
+triangle each for warm and repeat, six pixel/count checks and3000 guard bytes.
+`metal_g16c_three_retained_clients.m` is strictly ARM64-compiled but has never
+executed on the host or target. Adapt the capture/console/plain-replay workflow
+to all three groups before using it; no native GPU qualification is claimed.
+The earlier three-pool diagnostic host EIO remains a separate recycling issue.
+The Neo parity goal is still active.
+
+
+Native completion stamp checkpoint (2026-10-27, Image269): captured Max
+completion stamps advance in the physical queue, independently of the global
+render ordinal. The retained pair/A packet has global ordinal3, queue item1
+and stamp0x200; the old constructor emitted0x400. The existing native-data
+regression now rejects that old stamp. Both packet construction and owned host
+completion checks use the queue-local stamp after the correction; all eight
+native descriptor/entry cases and576 ten-image comparisons pass.
+
+Max's default16 draws plus nine retained large and nine retained small draws
+pass on Image269, with all pixels, clean unbind and exact cold recovery (v44).
+Neo's short parallel control also passes (v43). Max's optional15-pool parallel
+control still times out on the second large draw (v42); this correction is not
+claimed to resolve that issue. Chromium/WebGPU qualification above is Image267,
+not a new browser run on269. The three-pool diagnostic268/v41 exposed a different
+unpublished host EIO during old-owner recycling, before the main draw was
+published; it did not produce the15-pool firmware timeout. Keep those failures
+separate and do not infer a hardware pool limit from that diagnostic.
+
+
+Native retained descriptor checkpoint (2026-10-27, Image267): eight
+output-qualified single-user Max descriptors show TA descriptor ordinal zero,
+FR descriptor ordinal equal to its queue-local item, and tail flag1 in both
+stages. The previous multi-owner branch wrote TA ordinal1 and tail3 at native
+pair/A global3/local1. `check_scheduled_render_preparation.py --retained-native`
+now checks these fields in addition to the four entry fields, with descriptor
+hashes in the receipt. The old code fails ordinal1 vs0; fixing only that field
+then fails tail3 vs1; both corrections pass all eight native descriptor/entry
+cases and576 ten-image/address comparisons.
+
+Image267 passes Neo's short Vulkan parallel-admission control and Max's
+normal draw. It also passes Max Chromium4096 pixels, WebGPU16384 cells plus
+32768 pixel samples, post-browser Vulkan, clean unbind and cold recovery
+(`max-browser-shared-v40-native-tail-repeat.json`). The first browser run
+(v38) passed Chromium but stopped during WebGPU at a CPU4 process_srcu worker
+Oops in `__delay` immediately after WFIT, reporting all general registers zero.
+Its log and exact-device recovery are preserved; the cause is unresolved and
+its WebGPU result is not a pass. The cold repeat uses the same Image267.
+
+These descriptor corrections do not fix the optional15-pool Max timeout:
+v36 still fails the second retained large submission, while Neo v37 passes.
+A diagnostic limiting only Max to two pools with both parallel settings still
+on passes (Image266/v35). This narrows the investigation but does not prove a
+hardware pool limit or measure simultaneous GPU execution. The diagnostic cap
+was removed; no such restriction is added to production. An owned-pool append
+candidate (Image265) also failed and was archived without promotion.
+
+
+Current hardware checkpoint (2026-10-27, Image264): Max now follows Neo's
+existing render-pool count and admission policy. Previously Max always selected
+from fifteen pools and admitted overlapping render owners even when Neo's
+`partial_independent_owner` and `alternate_queue_pairs` settings were zero.
+The shared default uses one pool and waits for the previous render admission;
+the existing cleanup and native-owner guards now apply before either backend.
+No firmware dependency is replaced by a CPU wait mode, and no Mesa production
+change is needed for this correction.
+
+On this kernel, with production Vulkan and compression enabled, both Max
+(all16 CPUs) and Neo (all6 CPUs) pass the original16-draw sampler test plus
+nine retained command-buffer submissions at1280x720 and nine at40x20. Every
+pixel is checked after poisoning readback again; the ninth submission crosses
+the eight-slot scratch reuse boundary. Both cleanly unbind and cold-recover.
+Max also passes real Chromium WebGL2 (4096 pixels) and the conditional WebGPU
+Game of Life workload (128x128 cells,32 generations,16384 cell checks and32768
+rendered pixel samples), followed by another Vulkan draw and clean unbind.
+ANGLE/Honeykrisp identifies the actual M4 Max Vulkan device; software fallback
+is disabled. The hardware Vulkan DSO is unchanged from the earlier CDM fix.
+
+Evidence is under the bootloader checkout's `build/dual-gpu-20261026/`:
+`max-browser-shared-v26-common-policy.json`,
+`max-vulkan-retained-normal-v28-common-policy-wrap.json`, and
+`neo-vulkan-retained-normal-v30-common-policy-wrap.json`. Exact181-file source
+and Image/object hashes are in `neo-lifecycle-restoration-20261025/kernel-neo-lifecycle-v74.json`.
+The existing shared render-wave host test also passes23 ownership/failure cases.
+
+This establishes the default production path, not full Neo parity. Enabling
+both existing parallel settings still fails the ordinary second retained draw
+on Max (v29), while Neo passes even nine repeats with these settings (v32).
+Max still selects another idle pool where Neo can append to an already-owned
+pool with disjoint finite slots. Continue comparing that ownership lifecycle;
+do not describe the timeout as a required firmware difference or mark the
+port goal complete. Two-pool admission without pipelining also passes Max's
+short control (v31), separating this from a simple prohibition on multiple pools.
+
 
 Max compute sampler admission now accepts nonzero logical heaps through the
 shared parser and existing generated descriptor. G16C permits representable

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Reserve only the source topology's RAM placements; import no page contents."""
 import argparse
 import importlib.util
@@ -31,7 +31,7 @@ for pa in sorted((leaves | tables) - borrowed):
         ranges.append([pa, page])
 
 header = [
-    "// SPDX-License-Identifier: GPL-2.0-only OR MIT",
+    "// SPDX-License-Identifier: GPL-2.0-only",
     "// Generated from g17p_source_topology.py by tests/import_g17p_topology.py.",
     "// Address-only source topology. No table or firmware page bodies.",
 ]
@@ -56,18 +56,24 @@ for name, runs in (("FIRMWARE_RUNS", src.ROOT_RUNS[1]),
     rust += [f"    ({first:#x}, {count}, {value:#x})," for first, count, value in runs]
     rust += ["];", ""]
 
-dts = header + [
-    "", "/ {", "\treserved-memory {", "\t\t#address-cells = <2>;", "\t\t#size-cells = <2>;", "\t\tranges;", "",
-    f"\t\tneo_source_memory: gpu-source-memory@{ranges[0][0]:x} {{",
-    '\t\t\tcompatible = "apple,neo-gpu-source-memory";',
-    '\t\t\tstatus = "okay";', "\t\t\tno-map;",
-    "\t\t\t/* Excludes MMIO and the existing ADT L2 reservation. */",
-]
+# One reserved-memory child per physical range is required by Linux 7.3.
+# Keep the GPU phandle list and names generated with the same address inventory.
+names = "".join(f"source-graph-{i}\0" for i in range(len(ranges)))
+rust += ["pub(crate) const SOURCE_REGION_NAMES: &[u8] = b\"" + names.replace("\0", "\\0") + "\";", ""]
+dts = header + ["", "#define NEO_GPU_SOURCE_REGIONS \\"]
+for index in range(len(ranges)):
+    dts.append(f"\t&neo_source_memory_{index}" + (" \\" if index + 1 < len(ranges) else ""))
+dts += ["", "#define NEO_GPU_SOURCE_NAMES \\"]
+for index in range(len(ranges)):
+    dts.append(f'\t"source-graph-{index}"' + (", \\" if index + 1 < len(ranges) else ""))
+dts += ["", "/ {", "\treserved-memory {", "\t\t#address-cells = <2>;", "\t\t#size-cells = <2>;", "\t\tranges;", ""]
 for index, (pa, size) in enumerate(ranges):
-    prefix = "\t\t\treg = " if index == 0 else "\t\t\t      "
-    suffix = ";" if index == len(ranges) - 1 else ","
-    dts.append(prefix + f"<{pa >> 32:#x} {pa & 0xffffffff:#x} 0 {size:#x}>" + suffix)
-dts += ["\t\t};", "\t};", "};", ""]
+    dts += [f"\t\tneo_source_memory_{index}: gpu-source-memory@{pa:x} {{",
+            '\t\t\tcompatible = "apple,neo-gpu-source-memory";',
+            '\t\t\tstatus = "okay";', "\t\t\tno-map;",
+            f"\t\t\treg = <{pa >> 32:#x} {pa & 0xffffffff:#x} 0 {size:#x}>;",
+            "\t\t};", ""]
+dts += ["\t};", "};", ""]
 driver = Path(__file__).resolve().parent.parent
 linux = driver.parents[3]
 outputs = {

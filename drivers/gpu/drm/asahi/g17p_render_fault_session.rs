@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source adapter's owned render fault arm/inject/restore lifecycle.
 //! Diagnostics use caller GEMs and retain their original backing and leaves.
@@ -91,10 +91,10 @@ impl Session {
     }
     pub(super) fn inject_owned_render_fault(&mut self, parameters: &Parameters) -> Result {
         let work = self.render.as_ref().ok_or(EINVAL)?;
-        let kind = *crate::module_parameters::owned_render_fault_kind.value();
+        let kind = crate::module_parameters::owned_render_fault_kind.value();
         if !self.faults.used
             && kind != 0
-            && work.ordinal == *crate::module_parameters::owned_render_fault_ordinal.value()
+            && work.ordinal == crate::module_parameters::owned_render_fault_ordinal.value()
         {
             let kind = match kind {
                 1 => Kind::ShaderStore,
@@ -103,7 +103,7 @@ impl Session {
             };
             self.arm_owned_render_fault(
                 work.client.owner,
-                *crate::module_parameters::owned_render_fault_address.value(),
+                crate::module_parameters::owned_render_fault_address.value(),
                 kind,
             )?;
             self.faults.used = true;

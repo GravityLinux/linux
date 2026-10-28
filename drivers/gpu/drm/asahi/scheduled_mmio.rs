@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G16C register configuration and firmware device mappings.
 //! Like Asahi's SoC IOMapping tables, fixed apertures belong to the hardware

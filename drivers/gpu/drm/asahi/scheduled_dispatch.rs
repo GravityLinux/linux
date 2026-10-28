@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Initial device-wide operand cursor DATA for the scheduled firmware family.
 //! These are owned staging bytes. GPU-written live cursors remain behind Memory.
@@ -26,15 +26,19 @@ impl DispatchState::ver {
     #[ver(G == G17P)]
     const INITIAL_PAGES: u32 = 0x1c00;
 
-    /// Current host reservation policy: one pool entry per application ASID.
+    /// Current host reservation policy: one bank per retained physical root.
     /// Native clients can change pools/banks without changing their ASID;
     /// this arithmetic is not an inherent firmware ownership relationship.
     #[ver(G == G16C)]
-    pub(crate) fn slot_offset(context: u16) -> Option<usize> {
+    pub(crate) fn bank_for_context(context: u16) -> Option<u32> {
         if !(1..64).contains(&context) {
             return None;
         }
-        Some(usize::from(context - 1) * 0x20)
+        Some(u32::from(context - 1))
+    }
+    #[ver(G == G16C)]
+    pub(crate) fn slot_offset(context: u16) -> Option<usize> {
+        Self::bank_for_context(context).map(|bank| bank as usize * 0x20)
     }
 
     /// Encode geometry; pool allocation validates its full directory extents.

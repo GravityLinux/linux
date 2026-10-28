@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* UAPI regression: retire B, publish 255 A jobs, then reuse B across wrap. */
 #define G17P_RENDER_VM_HELPERS
 #include "g17p_drm_render_vm.c"

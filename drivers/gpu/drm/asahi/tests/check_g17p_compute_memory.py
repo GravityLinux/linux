@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare generated allocator/control memory against current Python builders."""
 import host_versions
 import argparse,importlib.util,struct,subprocess,tempfile

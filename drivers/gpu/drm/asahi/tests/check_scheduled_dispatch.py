@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare generated dispatch layouts with whole Max DATA pages and tagged Neo.
 
 This gate uses the production versions macro. Captures supply independent

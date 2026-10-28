@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export the shim's source-owned add3 caller workload for the native test.
 
 Only dependency-free workload constructors and the named launch-header AST

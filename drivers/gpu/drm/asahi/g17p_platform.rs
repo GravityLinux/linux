@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! T8140 boot resources and live platform inputs.
 //!
@@ -41,37 +41,24 @@ fn source_memory(node: &of::Node, regions: &[Region; 6]) -> Result {
         return Err(EINVAL);
     }
     let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
-    if names.as_slice()
-        != b"ttbs\0pagetables\0l2\0handoff\0firmware\0firmware-secondary\0source-graph\0"
-    {
+    let prefix = b"ttbs\0pagetables\0l2\0handoff\0firmware\0firmware-secondary\0";
+    if !names.starts_with(prefix) || &names[prefix.len()..] != g17p_topology::SOURCE_REGION_NAMES {
         return Err(EINVAL);
     }
-    let source = node
-        .parse_phandle(c_str!("memory-region"), 6)
-        .ok_or(ENODEV)?;
-    let compatible: KVec<u8> = source.get_property(c_str!("compatible"))?;
-    let status: KVec<u8> = source.get_property(c_str!("status"))?;
-    let nomap: KVec<u8> = source.get_property(c_str!("no-map"))?;
-    let range: KVec<u64> = source.get_property(c_str!("reg"))?;
-    if compatible.as_slice() != b"apple,neo-gpu-source-memory\0"
-        || status.as_slice() != b"okay\0"
-        || !nomap.is_empty()
-        || range.len() != g17p_topology::RESERVATIONS.len() * 2
-    {
-        return Err(EINVAL);
-    }
-    for (pair, (base, size)) in range
-        .chunks_exact(2)
-        .zip(g17p_topology::RESERVATIONS.iter())
-    {
-        if pair != [*base, *size] {
+    for (index, &(base, size)) in g17p_topology::RESERVATIONS.iter().enumerate() {
+        let source = node.parse_phandle(c_str!("memory-region"), 6 + index).ok_or(ENODEV)?;
+        let compatible: KVec<u8> = source.get_property(c_str!("compatible"))?;
+        let status: KVec<u8> = source.get_property(c_str!("status"))?;
+        let nomap: KVec<u8> = source.get_property(c_str!("no-map"))?;
+        let range: KVec<u64> = source.get_property(c_str!("reg"))?;
+        if compatible.as_slice() != b"apple,neo-gpu-source-memory\0"
+            || status.as_slice() != b"okay\0" || !nomap.is_empty()
+            || range.as_slice() != [base, size] {
             return Err(EINVAL);
         }
-        let end = base.checked_add(*size).ok_or(EINVAL)?;
+        let end = base.checked_add(size).ok_or(EINVAL)?;
         for region in regions {
-            if *base < region.base + region.size && region.base < end {
-                return Err(EINVAL);
-            }
+            if base < region.base + region.size && region.base < end { return Err(EINVAL); }
         }
     }
     Ok(())

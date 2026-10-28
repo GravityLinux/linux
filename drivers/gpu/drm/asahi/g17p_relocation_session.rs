@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Owned kernel RAM/table adapters for g17p_lifecycle.py migration diagnostics.
 
@@ -160,7 +160,7 @@ impl RelocationHost for Migration<'_> {
 }
 impl Session {
     pub(super) fn run_cleanup_diagnostics(&mut self, index: usize) -> Result {
-        let mask = *crate::module_parameters::cleanup_diagnostics.value();
+        let mask = crate::module_parameters::cleanup_diagnostics.value();
         if self.phase != Phase::Running || mask & !15 != 0 {
             return Err(EINVAL);
         }

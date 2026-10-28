@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Per-command publication and completion. Queue history names accepted work,
 //! including work blocked on an external fence. Dependencies never reserve an
@@ -20,7 +20,7 @@ struct RuntimeInterval {
 }
 impl RuntimeInterval {
     fn waiting() -> Option<kernel::time::Instant<kernel::time::Monotonic>> {
-        (*crate::module_parameters::submission_log.value() >= 3)
+        (crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::now)
     }
     fn acquired(before: Option<kernel::time::Instant<kernel::time::Monotonic>>,
@@ -201,9 +201,9 @@ pub(super) struct Schedule {
 }
 impl Schedule {
     pub(super) fn enabled() -> bool {
-        *crate::module_parameters::native_render_vms.value() == 0
-            && *crate::module_parameters::native_compute_vms.value() == 0
-            && *crate::module_parameters::native_barriers.value() == 0
+        crate::module_parameters::native_render_vms.value() == 0
+            && crate::module_parameters::native_compute_vms.value() == 0
+            && crate::module_parameters::native_barriers.value() == 0
     }
     pub(super) fn new(commands: &[Command], barriers: &[[u16;2]], seed: History, submission_started: Option<kernel::time::Instant<kernel::time::Monotonic>>) -> Result<Self> {
         let seed = seed.map(Point::accepted_history);
@@ -299,17 +299,17 @@ impl Schedule {
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
                 let runtime = Option::as_ref(&*held).ok_or(ENODEV)?;
                 let (old, private) = match command {
-                    Command::Render(_) if matches!(dev.abi, super::super::GpuAbi::G16C) =>
-                        (runtime.session.g16c_client(prepared.queue_key), false),
+                    Command::Render(p) if matches!(dev.abi, super::super::GpuAbi::G16C) => {
+                        let mut p=*p;p.queue_owner=Some(prepared.queue_key);
+                        (runtime.session.g16c_client(prepared.queue_key),runtime.session.g16c_render_needs_private(snapshot.client(),&p))
+                    },
                     Command::Render(_) => (runtime.session.render_client()?, false),
-                    Command::Compute(_) if matches!(dev.abi, super::super::GpuAbi::G16C) =>
-                        (runtime.session.g16c_client(prepared.queue_key), false),
                     Command::Compute(p) if runtime.session.independent_compute_enabled() =>
                         (runtime.session.independent_compute_client(prepared.queue_key, snapshot.client(), p, prepared.queue_priority),
                          runtime.session.compute_needs_private(prepared.queue_key, snapshot.client(), p, prepared.queue_priority)),
                     Command::Compute(_) => (runtime.session.compute_client()?, false),
                 };
-                let selected = if matches!(dev.abi, super::super::GpuAbi::G16C) {old} else if let Command::Render(p) = command {
+                let selected = if let Command::Render(p) = command {
                     let mut parameters = *p;
                     parameters.queue_owner = Some(prepared.queue_key);
                     runtime.session.render_selected_client(snapshot.client(), &parameters)?
@@ -339,6 +339,33 @@ impl Schedule {
                     client.cache_with(false, cache)?;
                 }
             }
+            if engine==0 && matches!(dev.abi,super::super::GpuAbi::G16C) {
+                let Command::Render(p)=command else {return Err(EIO);};
+                let (queue_needed,work_needed)={
+                    let held=dev.runtime.lock();let runtime=Option::as_ref(&*held).ok_or(ENODEV)?;
+                    runtime.session.g16c_render_storage_needed(snapshot.client(),p,prepared.queue_key,prepared.queue_priority)
+                };
+                if !queue_needed {drop(prepared.render_transport.take());}
+                if !work_needed {drop(prepared.render_work.take());}
+                if queue_needed && prepared.render_transport.is_none() {
+                    prepared.render_transport=Some(super::super::scheduled_queues::QueueBackingG16C::new()?);
+                }
+                if work_needed && prepared.render_work.is_none() {
+                    prepared.render_work=Some(super::super::g17p_boot::WorkBackingG16C::new()?);
+                }
+                if !private && prepared.render_storage.is_some() {
+                    drop(slot.take());drop(prepared.render_storage.take());
+                }
+                if private && prepared.render_storage.is_none() {
+                    let Command::Render(p)=command else {return Err(EIO);};
+                    prepared.render_storage=Some(super::super::g17p_boot::OwnerPrivateG16C::build(
+                        slot.as_mut().ok_or(EIO)?,p.kernel_start,p.kernel_end)?);
+                    if crate::module_parameters::submission_log.value()!=0 {
+                        pr_info!("G16C: fresh render private backing prepared queue={:?} base={:#x} limit={:#x}\n",
+                            prepared.queue_key,p.kernel_start,p.kernel_end);
+                    }
+                }
+            }
             if engine == 1 && !private && prepared.compute_storage.is_some() {
                 // A competing worker may have installed/released an owner
                 // while this job built speculative private backing. Neither
@@ -348,11 +375,11 @@ impl Schedule {
                 drop(slot.take());
                 drop(prepared.compute_storage.take());
             }
-            if private && prepared.compute_storage.is_none() {
+            if engine==1 && private && prepared.compute_storage.is_none() {
                 let Command::Compute(parameters) = command else { return Err(EIO); };
                 let mut memory = super::super::g17p_memory::Memory::detached();
-                super::super::g17p_compute_runtime::build_independent_client(&mut memory,
-                    slot.as_mut().ok_or(EIO)?, parameters)?;
+                super::super::g17p_compute_queues::build_private(&mut memory,
+                    slot.as_mut().ok_or(EIO)?, parameters,matches!(dev.abi,super::super::GpuAbi::G16C))?;
                 prepared.compute_storage = Some(memory);
             }
         }
@@ -375,7 +402,7 @@ impl Schedule {
                 // Keep such chains queued instead of round-tripping through
                 // CPU completion for every short compute command.
                 let queued_compute = matches!(command,Command::Compute(_)) && engine == 1;
-                let queued_firmware = *crate::module_parameters::firmware_dependencies.value() == 1;
+                let queued_firmware = crate::module_parameters::firmware_dependencies.value() == 1;
                 let Some(value) = point.dependency(1,true,!(early_fragment || queued_compute || queued_firmware))? else { return Ok(None); };
                 dependencies[engine] = value;
             }
@@ -383,8 +410,7 @@ impl Schedule {
         Ok(Some((previous,dependencies)))
     }
     fn prepare_render(&self, dev: &Device, prepared: &Prepared)
-        -> Option<(usize,KBox<super::super::g17p_render_runtime::PreparedAppend>, Option<super::super::g17p_boot::PreparedPoolRebind>)> {
-        if matches!(dev.abi, super::super::GpuAbi::G16C) {return None;}
+        -> Option<(usize,Option<KBox<super::super::g17p_render_runtime::PreparedAppend>>, Option<super::super::g17p_boot::PreparedPoolRebind>)> {
         for (index,node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
@@ -413,12 +439,16 @@ impl Schedule {
                 let snapshot = prepared.render_snapshot.as_ref()?;
                 if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
                 let Some(rebind) = runtime.session.capture_render_rebind(snapshot.client(),&parameters,storage).ok()? else { continue; };
-                let Some(seed) = runtime.session.claim_render_preparation(&parameters,snapshot.client()).ok()? else { continue; };
+                let seed = runtime.session.claim_render_preparation(&parameters,snapshot.client()).ok()?;
+                // A cold retained pool can need a caller/root rebind before
+                // its geometry exists. Preserve that independently prepared
+                // root plan even while descriptor preparation must wait.
+                if seed.is_none() && rebind.is_none() { continue; }
                 (seed,rebind)
             };
             let rebind = if let Some(rebind) = rebind {
                 let Some(desired) = prepared.render_client.as_ref() else { continue; };
-                if *crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
+                if crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
                     && !PREPARATION_PAUSED.swap(true, core::sync::atomic::Ordering::AcqRel) {
                     pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} render_root_plan outside_runtime_lock\n",prepared.queue_key);
                     kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
@@ -432,12 +462,38 @@ impl Schedule {
             // CPU allocation/serialization holds neither the device mutex nor
             // a hardware reservation. Commit revalidates the full seed and
             // rebuilds it if another job changed the next item in the meantime.
-            match super::super::g17p_render_runtime::PreparationSeed::prepare(seed) {
+            match seed.map(super::super::g17p_render_runtime::PreparationSeed::prepare).transpose() {
                 Ok(objects) => return Some((index, objects, rebind)),
                 Err(error) => { node.point.finish(Some(error)); continue; },
             }
         }
         None
+    }
+    /// The receipt retains physical identity even after a completed GPU
+    /// ticket leaves the wave for deferred CPU visibility. Never infer a Max
+    /// pool from its shared engine grid or discard skipped queue history.
+    fn retain_dependencies(session:&mut super::super::g17p_boot::Session,node:&Node,
+        previous:Option<(u8,u32)>,dependencies:[Option<(u8,u32)>;2])->Result {
+        let points=[previous,dependencies[0],dependencies[1]];
+        let sources=[node.previous.as_ref(),node.dependencies[0].as_ref(),node.dependencies[1].as_ref()];
+        for (index,wanted)in points.iter().enumerate() {
+            let Some(wanted)=*wanted else {continue;};
+            if points[..index].contains(&Some(wanted)) {continue;}
+            let mut source=sources[index].cloned();let mut pool=None;
+            while let Some(point)=source {
+                {
+                    let held=point.receipt.lock();
+                    if let Some(Receipt::Render(receipt))=held.as_ref() {
+                        if (0..2).any(|stage|receipt.milestone(stage).is_some_and(|p|(p.grid,p.value)==wanted)) {
+                            pool=Some(receipt.retained_pool().ok_or(EIO)?);break;
+                        }
+                    }
+                }
+                source=point.previous.lock().clone();
+            }
+            session.retain_dependency(wanted,pool,&node.point.completion)?;
+        }
+        Ok(())
     }
     fn preferred(runtime: &mut Runtime, engine: usize, node: &Node) -> bool {
         let preference = &mut runtime.engine_handoff[engine];
@@ -454,7 +510,6 @@ impl Schedule {
     }
     fn prepare_compute(&self, dev: &Device, prepared: &Prepared)
         -> Result<Option<(usize, KBox<super::super::g17p_compute_queues::PreparedWork>, Option<super::super::g17p_compute_queues::PreparedComputeRebind>)>> {
-        if matches!(dev.abi, super::super::GpuAbi::G16C) { return Ok(None); }
         for (index, node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Compute(parameters) = &prepared.parameters[index] else { continue; };
@@ -488,7 +543,7 @@ impl Schedule {
             let Some(rebind)=rebind else {continue;};
             let rebind=if let Some(seed)=rebind {
                 let Some(client)=prepared.compute_client.as_ref() else {continue;};
-                if *crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
+                if crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
                     && !PREPARATION_PAUSED.swap(true,core::sync::atomic::Ordering::AcqRel) {
                     pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} compute_root_plan outside_runtime_lock\n",prepared.queue_key);
                     kernel::time::delay::fsleep(kernel::time::Delta::from_millis(2000));
@@ -513,7 +568,6 @@ impl Schedule {
         Ok(None)
     }
     fn prepare_render_scratch(&self, dev: &Device, prepared: &Prepared) -> Result {
-        if matches!(dev.abi, super::super::GpuAbi::G16C) {return Ok(());}
         for (index, node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Render(parameters) = &prepared.parameters[index] else { continue; };
@@ -522,7 +576,8 @@ impl Schedule {
                 let preparation_wait = RuntimeInterval::waiting();
                 let held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
-                Option::as_ref(&*held).ok_or(ENODEV)?.session.render_scratch_seed(parameters)?
+                Option::as_ref(&*held).ok_or(ENODEV)?.session.render_scratch_seed_for(
+                    prepared.render_snapshot.as_ref().ok_or(EIO)?.client(),parameters,prepared.queue_key)?
             };
             if let Some(seed) = seed {
                 let scratch = match seed.prepare() {
@@ -538,7 +593,6 @@ impl Schedule {
         Ok(())
     }
     fn prepare_render_templates(&self, dev: &Device, prepared: &Prepared) -> Result {
-        if matches!(dev.abi, super::super::GpuAbi::G16C) {return Ok(());}
         for (index, node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
@@ -612,7 +666,7 @@ impl Schedule {
         sync: &g17p_sync::Plan, initialized: &mut bool, cursor: &mut usize,
         publication: &Fence) -> Result<Option<Option<Error>>> {
         self.control_waiting = false;
-        let profile_started = (*crate::module_parameters::submission_log.value() >= 3)
+        let profile_started = (crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
         self.prepare_shared_backing(dev)?;
         self.prepare_clients(dev, prepared)?;
@@ -624,7 +678,7 @@ impl Schedule {
             None=>(None,None),
         };
         let (mut prepared_append, mut prepared_rebind) = match self.prepare_render(dev, prepared) {
-            Some((index,objects,rebind)) => (Some((index,objects)),rebind.map(|plan|(index,plan))),
+            Some((index,objects,rebind)) => (objects.map(|objects|(index,objects)),rebind.map(|plan|(index,plan))),
             None => (None,None),
         };
         let seed_us = profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
@@ -645,8 +699,8 @@ impl Schedule {
         }
         let poll_started = profile_started.as_ref().map(|_| kernel::time::Instant::<kernel::time::Monotonic>::now());
         let (poll_result, mut completions) = match &runtime.image {
-            super::RuntimeImage::G16C(_) => runtime.session.poll_g16c_work(),
-            super::RuntimeImage::G17P(image) => runtime.session.poll_work_deferred(dev.as_ref(), image),
+            super::RuntimeImage::G16C(_) => runtime.session.poll_scheduled_g16c_work(dev.as_ref().as_ref()),
+            super::RuntimeImage::G17P(image) => runtime.session.poll_work_deferred(dev.as_ref().as_ref(), image),
         };
         self.control_waiting |= runtime.session.backing_waiting();
         if let Err(error) = poll_result {
@@ -685,23 +739,53 @@ impl Schedule {
             let result = (|| -> Result<Option<Receipt>> {
                 let render = matches!(prepared.parameters[index],Command::Render(_));
                 let Some((previous,dependencies)) = Self::dependencies(node,&prepared.parameters[index])? else { return Ok(None); };
-                if matches!(dev.abi, super::super::GpuAbi::G16C) {
-                    let snapshot = if render { prepared.render_snapshot.as_ref() } else { prepared.compute_snapshot.as_ref() }.ok_or(EIO)?;
-                    let slot = if render { &mut prepared.render_client } else { &mut prepared.compute_client };
-                    let (ready, replacement) = Self::replacement(snapshot,
-                        runtime.session.g16c_client(prepared.queue_key), slot)?;
-                    if !ready { return Ok(None); }
+                if matches!(dev.abi, super::super::GpuAbi::G16C) && render {
+                    // Render owns its pool/root and VDM preference. Ordinary
+                    // compute generations retain their independent bindings.
+                    if !Self::preferred(runtime,0,node) {
+                        return Ok(None);
+                    }
+                    let Command::Render(mut parameters)=prepared.parameters[index] else {unreachable!()};
+                    parameters.queue_owner=Some(prepared.queue_key);
+                    let snapshot=prepared.render_snapshot.as_ref().ok_or(EIO)?;
+                    let slot=&mut prepared.render_client;
+                    // Revalidate the physical pool chosen now, just as in
+                    // off-lock preparation. A matching logical queue may
+                    // still retain its caller in a different physical pool.
+                    let selected=runtime.session.render_selected_client(snapshot.client(),&parameters)?;
+                    let current=runtime.session.g16c_client(prepared.queue_key);
+                    let installed=if snapshot.same_client(current) {selected} else {current};
+                    let (ready, replacement) = Self::replacement(snapshot,installed,slot)?;
+                    if !ready {
+                        Self::handoff(runtime,0,node,true);
+                        return Ok(None);
+                    }
                     if let Some(client) = replacement { *slot = Some(client); }
-                    return match &prepared.parameters[index] {
-                        Command::Compute(parameters)=>runtime.session.stage_g16c_compute(prepared.queue_key,
-                            &mut prepared.compute_client, parameters, prepared.queue_priority,
-                            [previous,dependencies[0],dependencies[1]])
-                            .map(|receipt| receipt.map(Receipt::Compute)),
-                        Command::Render(parameters)=>runtime.session.stage_g16c_render(prepared.queue_key,
-                            &mut prepared.render_client, parameters, prepared.queue_priority,
-                            prepared.g16c_kernel_start, prepared.g16c_kernel_end)
-                            .map(|receipt| receipt.map(Receipt::Render)),
-                    };
+                    parameters.prior_queue_ta=previous;parameters.vdm_dependency=dependencies[0];parameters.cdm_dependency=dependencies[1];
+                    // Establish admission before pinning producer pools. A
+                    // deferred consumer must not reserve the pool it needs.
+                    if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters)? {
+                        Self::handoff(runtime,0,node,true);return Ok(None);
+                    }
+                    if crate::module_parameters::firmware_dependencies.value()!=1 {
+                        for point in node.dependencies.iter().flatten() {
+                            if point.dependency(1,true,true)?.is_none() {return Ok(None);}
+                        }
+                    } else {
+                        Self::retain_dependencies(&mut runtime.session,node,previous,dependencies)?;
+                    }
+                    let objects=if prepared_append.as_ref().is_some_and(|(i,_)|*i==index) {
+                        prepared_append.take().map(|(_,objects)|objects)
+                    } else {None};
+                    let receipt=runtime.session.stage_g16c_render(prepared.queue_key,
+                        &mut prepared.render_client,&parameters,prepared.queue_priority,
+                        prepared.g16c_kernel_start,prepared.g16c_kernel_end,&mut prepared.render_storage,
+                        &mut prepared.render_transport,&mut prepared.render_work,objects,
+                        prepared_rebind.as_mut().filter(|(i,_)|*i==index).map(|(_,plan)|plan))?.map(Receipt::Render);
+                    if receipt.is_none() {
+                        Self::handoff(runtime,0,node,true);
+                    }
+                    return Ok(receipt);
                 }
                 if render {
                     let Command::Render(mut parameters) = prepared.parameters[index] else { unreachable!() };
@@ -741,17 +825,15 @@ impl Schedule {
                     // identity when another VM is currently selected. Omitting
                     // it would route the command back to the current caller.
                     let (ready, mut client) = Self::replacement(snapshot,runtime.session.render_client()?, &mut prepared.render_client)
-                        .inspect_err(|e| kernel::dev_err!(dev.as_ref(),"G17P: render fail site replacement {:?}\n",e))?;
+                        .inspect_err(|e| kernel::dev_err!(dev.as_ref().as_ref(),"G17P: render fail site replacement {:?}\n",e))?;
                     if !ready { self.control_waiting = true; return Ok(None); }
                     let objects = if prepared_append.as_ref().is_some_and(|(i,_)| *i==index) {
                         prepared_append.take().map(|(_,objects)| objects)
                     } else { None };
-                    if *crate::module_parameters::firmware_dependencies.value() == 1 {
-                        for point in [previous, dependencies[0], dependencies[1]].into_iter().flatten() {
-                            runtime.session.retain_dependency(point, &node.point.completion)?;
-                        }
+                    if crate::module_parameters::firmware_dependencies.value() == 1 {
+                        Self::retain_dependencies(&mut runtime.session,node,previous,dependencies)?;
                     }
-                    Ok(runtime.session.stage_render_ticket(dev.as_ref(),runtime.image.g17p()?,&mut client,&parameters,objects)?
+                    Ok(runtime.session.stage_render_ticket(dev.as_ref().as_ref(),runtime.image.g17p()?,&mut client,&parameters,objects)?
                         .map(Receipt::Render))
                 } else {
                     let Command::Compute(parameters) = &prepared.parameters[index] else { unreachable!() };
@@ -766,12 +848,12 @@ impl Schedule {
                         // can occupy CS before the old owner's final dispatch.
                         // Await only those genuine dependencies; independent
                         // nodes/owners continue through the normal scan.
-                        if *crate::module_parameters::firmware_dependencies.value() != 1 && previous.is_some_and(|p| p.0 != grid) {
+                        if crate::module_parameters::firmware_dependencies.value() != 1 && previous.is_some_and(|p| p.0 != grid) {
                             if let Some(point) = &node.previous {
                                 if Point::ordered(point,true)?.is_none() { return Ok(None); }
                             }
                         }
-                        if *crate::module_parameters::firmware_dependencies.value() != 1 && dependencies[1].is_some_and(|p| p.0 != grid) {
+                        if crate::module_parameters::firmware_dependencies.value() != 1 && dependencies[1].is_some_and(|p| p.0 != grid) {
                             if let Some(point) = &node.dependencies[1] {
                                 if point.dependency(1,true,true)?.is_none() { return Ok(None); }
                             }
@@ -784,8 +866,8 @@ impl Schedule {
                         for point in [previous,dependencies[0],dependencies[1]].into_iter().flatten() {
                             if !waits.contains(&point) { waits.push(point,GFP_KERNEL)?; }
                         }
-                        let (ready,control_waiting) = runtime.session.can_stage_independent_compute(runtime.image.g17p()?,key,snapshot.client(),parameters,priority)
-                            .inspect_err(|e| kernel::dev_err!(dev.as_ref(),"G17P: compute admission key {:?} failed {:?}\n",key,e))?;
+                        let (ready,control_waiting) = runtime.session.can_stage_independent_compute(&runtime.image,key,snapshot.client(),parameters,priority)
+                            .inspect_err(|e| kernel::dev_err!(dev.as_ref().as_ref(),"G17P: compute admission key {:?} failed {:?}\n",key,e))?;
                         if !ready {
                             self.control_waiting |= control_waiting;
                             return Ok(None);
@@ -810,10 +892,10 @@ impl Schedule {
                         let old=runtime.session.independent_compute_client(key,snapshot.client(),parameters,priority);
                         let (ready, client)=Self::replacement(snapshot,old, &mut prepared.compute_client)?;
                         if !ready { self.control_waiting = true; return Ok(None); }
-                        if *crate::module_parameters::firmware_dependencies.value() == 1 {
-                            for point in &waits { runtime.session.retain_dependency(*point, &node.point.completion)?; }
+                        if crate::module_parameters::firmware_dependencies.value() == 1 {
+                            Self::retain_dependencies(&mut runtime.session,node,previous,dependencies)?;
                         }
-                        return runtime.session.stage_independent_compute(dev.as_ref(),runtime.image.g17p()?,
+                        return runtime.session.stage_independent_compute(dev.as_ref().as_ref(),&runtime.image,
                             key,snapshot.client(),client,prepared.compute_storage.take(),rebind,objects,parameters,priority,&waits)
                             .map(|r|Some(Receipt::Compute(r)));
                     }
@@ -829,7 +911,7 @@ impl Schedule {
                     }
                     let (ready, mut client) = Self::replacement(snapshot,runtime.session.compute_client()?, &mut prepared.compute_client)?;
                     if !ready { self.control_waiting = true; return Ok(None); }
-                    Ok(runtime.session.stage_compute_ticket(dev.as_ref(),runtime.image.g17p()?,&mut client,parameters,&waits)?
+                    Ok(runtime.session.stage_compute_ticket(dev.as_ref().as_ref(),runtime.image.g17p()?,&mut client,parameters,&waits)?
                         .map(Receipt::Compute))
                 }
             })();
@@ -837,7 +919,7 @@ impl Schedule {
                 Ok(Some(receipt)) => {
                     if let (Some(start), Receipt::Render(render)) = (profile_started.as_ref(), &receipt) {
                         if render.ordinal % 16 == 0 {
-                            kernel::dev_info!(dev.as_ref(),"G17P: render schedule timing ordinal {} seed_us {} poll_us {} total_us {}\n",
+                            kernel::dev_info!(dev.as_ref().as_ref(),"G17P: render schedule timing ordinal {} seed_us {} poll_us {} total_us {}\n",
                                 render.ordinal,seed_us,poll_us,start.elapsed().as_nanos()/1000);
                         }
                     }

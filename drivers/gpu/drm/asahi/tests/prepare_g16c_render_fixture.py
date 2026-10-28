@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export unchanged source-owned render and mixed-batch GEMs; no Apple client pages."""
 import argparse,json,hashlib,struct
 from pathlib import Path

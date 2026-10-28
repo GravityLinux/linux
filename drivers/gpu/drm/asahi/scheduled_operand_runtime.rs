@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Quiescent source-owned compute FList extension. Never rewrite the live
 //! directory, dispatch cursors or firmware support counters from the CPU.
@@ -54,16 +54,16 @@ impl State {
         Ok(())
     }
     pub(super) fn seed_operand_probe(&mut self,session:&Session,index:usize)->Result {
-        if *crate::module_parameters::g16c_operand_probe.value()==0
+        if crate::module_parameters::g16c_operand_probe.value()==0
             || self.owners[index].operand_probe_seeded
             || self.owners[index].operand_buffers.len()<=operands::INITIAL_BUFFERS as usize {return Ok(());}
-        if !self.pending.is_empty() {return Err(EBUSY);}
+        if session.live_render_count()!=0 {return Err(EBUSY);}
         self.sample_operands(session,index,true)?;
         self.owners[index].operand_probe_seeded=true;
         Ok(())
     }
     pub(super) fn retire_operand_probe(&mut self,session:&Session)->Result {
-        if *crate::module_parameters::g16c_operand_probe.value()==0 {return Ok(());}
+        if crate::module_parameters::g16c_operand_probe.value()==0 {return Ok(());}
         // Several immutable owners can retire in this idle interval. Sample
         // every seeded pending pool, not just the last submitted ASID.
         for index in 0..self.owners.len() {
@@ -75,7 +75,7 @@ impl State {
         Ok(())
     }
     pub(super) fn grow_operands(&mut self,session:&mut Session,index:usize,total:u32)->StageResult<()> {
-        if !self.idle() || self.selected!=Some(index) {return Err(EBUSY.into());}
+        if !session.retained_render_idle() || self.selected!=Some(index) {return Err(EBUSY.into());}
         self.growth_roots(session.memory.as_ref().ok_or(EIO)?,session.ttbs,index)?;
         let o=&mut self.owners[index];
         let previous=u32::try_from(o.operand_buffers.len())?;
@@ -87,8 +87,9 @@ impl State {
         if end>o.private_limit {return Err(StageError::Rejected(ENOSPC));}
         // Construct the receipt before publication. The support/table/context
         // tuple and previous end own the reply; a generic kind13 is not enough.
+        let bank=DispatchStateG16C::bank_for_context(o.context).ok_or(EINVAL)?;
         let registration=RegistrationG16C {context:u32::from(o.context),support:o.support,
-            table,added,previous,mode:0,tag:1,reply_value:0};
+            table,added,previous,bank,tag:1};
         registration.prepare().map_err(|_|EINVAL)?;
         let memory=session.memory.as_mut().ok_or(EIO)?;
         let vm=session.vm.as_ref().ok_or(EIO)?;
@@ -120,7 +121,7 @@ impl State {
         let mut detached=Memory::detached();
         let mut blocks=KVec::new();
         for i in 0..added {
-            let fail_after=*crate::module_parameters::g16c_operand_alloc_fail_after.value();
+            let fail_after=crate::module_parameters::g16c_operand_alloc_fail_after.value();
             if !self.operand_allocation_faulted && fail_after==i {
                 self.operand_allocation_faulted=true;
                 let (count,bytes)=detached.allocation_stats();

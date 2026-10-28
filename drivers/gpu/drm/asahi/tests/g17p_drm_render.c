@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Real caller GEMs and authored constant-eight shader; independent full image. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

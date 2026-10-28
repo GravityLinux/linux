@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare all owned Max boot RAM and aliases against actual source startup.
 
 Executes qualified Bootstrap.build_graph in bounded host RAM, actual m1n1 C FDT

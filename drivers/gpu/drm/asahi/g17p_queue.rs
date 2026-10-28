@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Queue serializers and synchronous publication ordering from g17p.py and
 //! G17PSubmitter.stage. Caller owns storage, cache maintenance and notification.
@@ -252,11 +252,6 @@ impl Stage<'_> {
         if new_write > self.item_capacity {
             return Err(Error::Full.into());
         }
-        let slot = match self.slot {
-            Some(slot) => slot,
-            None => self.counters.slot()?,
-        };
-        let producer = slot.wrapping_add(1);
         let event = event(
             self.group,
             self.grid,
@@ -265,16 +260,44 @@ impl Stage<'_> {
             self.event_counter,
             self.event_counter_low,
         )?;
-        let slot_body = ring_slot(self.queue, new_write, self.grid, self.first, self.kind);
+        self.publish_entry(writer, new_write, 0, Some(&event))
+    }
+
+    /// Emit an already serialized submission entry. Both firmware families
+    /// share the item/producer/channel store ordering; the caller supplies the
+    /// wire-specific terminal item. Direct entries use the generated event,
+    /// wrapped entries already contain their opcode-16 marker in `items`.
+    pub(crate) fn publish_entry<W: Writer>(
+        &self,
+        writer: &mut W,
+        new_write: u32,
+        tag: u64,
+        event: Option<&[u8; 0x40]>,
+    ) -> core::result::Result<Publication, StageError<W::Error>> {
+        let count = u32::try_from(self.items.len()).map_err(|_| Error::Overflow)?;
+        if count == 0 || self.item_capacity == 0 { return Err(Error::Invalid.into()); }
+        let first = if self.in_place {
+            self.write_index.checked_sub(count).ok_or(Error::Invalid)?
+        } else { self.write_index };
+        let end = first.checked_add(count).ok_or(Error::Overflow)?;
+        if new_write != end && new_write != end % self.item_capacity {
+            return Err(Error::Invalid.into());
+        }
+        if first >= self.item_capacity || new_write > self.item_capacity {
+            return Err(Error::Full.into());
+        }
+        let slot = match self.slot { Some(slot) => slot, None => self.counters.slot()? };
+        let producer = slot.wrapping_add(1);
+        let slot_body = ring_slot_tag(tag, self.queue, new_write, self.grid, self.first, self.kind);
         // Validate every range before the first store. Runtime Writer applies
         // allocation/VA ownership checks and cache maintenance on each write.
         self.item_ring
-            .checked_add(new_write as u64 * 8)
+            .checked_add(self.item_capacity as u64 * 8)
             .ok_or(Error::Overflow)?;
         let event_at = *self.items.last().ok_or(Error::Invalid)?;
-        event_at
-            .checked_add(event.len() as u64)
-            .ok_or(Error::Overflow)?;
+        if let Some(event) = event {
+            event_at.checked_add(event.len() as u64).ok_or(Error::Overflow)?;
+        }
         let inner_at = self.pointers.checked_add(0x40).ok_or(Error::Overflow)?;
         inner_at.checked_add(4).ok_or(Error::Overflow)?;
         let slot_at = self
@@ -290,12 +313,14 @@ impl Stage<'_> {
         for (index, address) in self.items.iter().enumerate() {
             writer
                 .write(
-                    self.item_ring + (first as u64 + index as u64) * 8,
+                    self.item_ring + ((first as u64 + index as u64) % u64::from(self.item_capacity)) * 8,
                     &address.to_le_bytes(),
                 )
                 .map_err(StageError::Access)?;
         }
-        writer.write(event_at, &event).map_err(StageError::Access)?;
+        if let Some(event) = event {
+            writer.write(event_at, event).map_err(StageError::Access)?;
+        }
         if !self.defer_inner {
             writer
                 .write(inner_at, &new_write.to_le_bytes())

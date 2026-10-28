@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G16C/G17P scheduled-work wire layouts for macOS 26.6.2.
 //!

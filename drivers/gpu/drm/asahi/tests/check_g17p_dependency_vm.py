@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Execute the shim's live dependency-root join against owned synthetic leaves.
 
 Compare complete resulting PTEs with the same Rust join used by the kernel.

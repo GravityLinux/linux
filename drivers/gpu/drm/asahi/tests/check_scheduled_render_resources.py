@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Whole Max parameter/FList DATA against qualified source constructors."""
 import argparse,hashlib,json,struct,subprocess,sys,tempfile
 from pathlib import Path
@@ -38,13 +38,13 @@ for i in range(32):
 for i in range(64):
     context=i%63+1;support=0xfffffc20c3000000+i*0x200000;table=0x7001000000+i*0x2000000
     added=(1,5,6,23,255,1024,(1<<29)-1)[i%7];previous=(0,19,23,25,0xffffffff)[i%5]
-    mode=i%3;tag=i*17;reply_value=(0,2,17,0xffffffff)[i%4]
-    want=register_flist(context,support,table,added,previous=previous,mode=mode,tag=tag)
-    fields=f'context:{context},support:{support},table:{table},added:{added},previous:{previous},mode:{mode},tag:{tag},reply_value:{reply_value}'
+    bank=i%3;tag=i*17
+    want=register_flist(context,support,table,added,previous=previous,mode=bank,tag=tag)
+    fields=f'context:{context},support:{support},table:{table},added:{added},previous:{previous},bank:{bank},tag:{tag}'
     lines.append('let r=admission::RegistrationG16C{'+fields+'};let(request,mut receipt)=r.prepare().unwrap();emit(request.bytes());')
     cases.append((f'flist-request-{i}',want))
-    reply=struct.pack('<IIIQQQI',13,context,reply_value,support,table,table+previous*64,added*8)+bytes([0xa5])*32
-    assert FListReceipt(context,support,table,added,previous,reply_value).matches(reply)
+    reply=struct.pack('<IIIQQQI',13,context,bank,support,table,table+previous*64,added*8)+bytes([0xa5])*32
+    assert FListReceipt(context,support,table,added,previous,bank).matches(reply)
     lines.append('let reply=['+','.join(str(x)for x in reply)+'];')
     lines.append('for at in 0..40usize{let(_,mut fresh)=r.prepare().unwrap();let mut bad=reply;bad[at]^=1;assert!(!fresh.consume(&bad));assert!(!fresh.received);}'
                  'assert!(receipt.consume(&reply));assert!(receipt.received);assert!(!receipt.consume(&reply));')
@@ -55,10 +55,10 @@ with tempfile.TemporaryDirectory()as directory:
     for name,file in [('resources','scheduled_render_resources.rs'),('admission','scheduled_render_admission.rs'),('operands','scheduled_operands.rs')]:
         code+=f'#[path={json.dumps(str(tests.parent/file))}]mod {name};\n'
     code+='fn emit(bytes:&[u8]){std::io::stdout().write_all(bytes).unwrap();}\nfn main(){\n'+'\n'.join(lines)+'''
-    let mut r=admission::RegistrationG16C{context:1,support:0xfffffc20c3000000,table:0x7001000000,added:5,previous:23,mode:0,tag:19,reply_value:0};
+    let mut r=admission::RegistrationG16C{context:1,support:0xfffffc20c3000000,table:0x7001000000,added:5,previous:23,bank:0,tag:19};
     r.context=0;assert!(r.prepare().is_err());r.context=64;assert!(r.prepare().is_err());r.context=1;
     r.added=0;assert!(r.prepare().is_err());r.added=1<<29;assert!(r.prepare().is_err());r.added=5;
-    r.mode=3;assert!(r.prepare().is_err());r.mode=0;r.table=u64::MAX;assert!(r.prepare().is_err());
+    r.bank=512;assert!(r.prepare().is_err());r.bank=0;r.table=u64::MAX;assert!(r.prepare().is_err());
     for(list,pages)in[(0,1),(0x1000438001,1),(0x2000000000,1),(0x1000438000,0),(0x1000438000,1<<22)]{assert!(resources::ParameterDescriptorG16C::new(list,pages).is_err());}
     assert!(operands::OperandSupportG16C::for_render(0x7000000000,0x7001000000,0xfffffc20c3004000,28,29,29).is_none());
     assert!(operands::OperandSupportG16C::for_render(0x7000000000,0x7001000000,0xfffffc20c3004000,28,23,22).is_none());

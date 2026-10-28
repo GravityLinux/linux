@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare the Rust serializers with the current Python shim, without hardware.
 
 Usage: check_g17p_abi.py /path/to/m1n1 [--rustc /path/to/rustc]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export own Mesa private-array inputs verbatim, with an independent CPU oracle."""
 import argparse
 import hashlib

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
 // Native Linux mixed render/resolve: source-owned Mesa GEMs, no Apple pages.
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>

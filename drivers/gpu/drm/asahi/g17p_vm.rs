@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Cold source-built firmware address space. This is not a userspace VM yet.
 //! Fixed placements are confined to the validated DT reservations; all other

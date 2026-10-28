@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Owned RAM/control/report adapter for the native synchronous release.
 //! The Session supplies its primary RTKit transport and bounded event wait.

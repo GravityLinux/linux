@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
-//! Owned Max active parameter-buffer handshake. Unknown request bytes stay
-//! opaque; RX context_word is echoed, without assigning it wider semantics.
+//! Owned Max active parameter-buffer handshake. The first five reply words
+//! retain Neo's success/pool/VM/counter order. The extra RX word stays opaque.
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -16,9 +16,9 @@ pub(crate) struct GrowthRequestG16C {
 #[repr(C)]
 pub(crate) struct GrowthReplyG16C {
     kind: [u8; 4],
-    context: [u8; 4],
+    success: [u8; 4],
     slot: [u8; 4],
-    generation: [u8; 4],
+    context: [u8; 4],
     token: [u8; 4],
     context_word: [u8; 4],
     pad: [u8; 40],
@@ -35,17 +35,17 @@ const _: () = {
     assert!(core::mem::size_of::<GrowthReplyG16C>() == 64);
     assert!(core::mem::align_of::<GrowthReplyG16C>() == 1);
     assert!(core::mem::offset_of!(GrowthReplyG16C, kind) == 0);
-    assert!(core::mem::offset_of!(GrowthReplyG16C, context) == 4);
+    assert!(core::mem::offset_of!(GrowthReplyG16C, success) == 4);
     assert!(core::mem::offset_of!(GrowthReplyG16C, slot) == 8);
-    assert!(core::mem::offset_of!(GrowthReplyG16C, generation) == 12);
+    assert!(core::mem::offset_of!(GrowthReplyG16C, context) == 12);
     assert!(core::mem::offset_of!(GrowthReplyG16C, token) == 16);
     assert!(core::mem::offset_of!(GrowthReplyG16C, context_word) == 20);
     assert!(core::mem::offset_of!(GrowthReplyG16C, pad) == 24);
 };
 impl Default for GrowthReplyG16C {
     fn default() -> Self {
-        Self { kind: 8u32.to_le_bytes(), context: [0;4], slot: [0;4],
-            generation: [0;4], token: [0;4], context_word: [0;4], pad: [0;40] }
+        Self { kind: 8u32.to_le_bytes(), success: 1u32.to_le_bytes(), slot: [0;4],
+            context: [0;4], token: [0;4], context_word: [0;4], pad: [0;40] }
     }
 }
 impl GrowthRequestG16C {
@@ -60,8 +60,10 @@ impl GrowthRequestG16C {
     pub(crate) fn token(&self) -> u32 { u32::from_le_bytes(self.token) }
     pub(crate) fn reply(&self, generation: u32) -> Option<GrowthReplyG16C> {
         if generation == 0 { return None; }
+        // Generation validates retained ownership; it is not the VM word.
+        // Context1/generation1 captures cannot distinguish these fields.
         Some(GrowthReplyG16C { context: self.context, slot: self.slot,
-            generation: generation.to_le_bytes(), token: self.token,
+            token: self.token,
             context_word: self.context_word, ..Default::default() })
     }
 }

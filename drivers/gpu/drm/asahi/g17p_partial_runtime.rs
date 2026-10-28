@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Direct g17p_partial_runtime.py second-owner resource graph. Transport
 //! admission remains separate from constructing this independent inventory.

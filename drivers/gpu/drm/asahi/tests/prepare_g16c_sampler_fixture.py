@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export qualified source-owned sampler GEMs for the native DRM test.
 
 No instruction decoding or rewriting; the shader image stays byte-identical.

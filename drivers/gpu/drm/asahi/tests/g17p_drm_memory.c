@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Native Asahi memory-UAPI integration test; no GPU work is submitted.
  * Build: aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -static
  *        -I <headers_install>/include/drm -I <headers_install>/include

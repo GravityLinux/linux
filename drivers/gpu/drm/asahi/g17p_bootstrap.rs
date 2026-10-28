@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source-owned direct compute bootstrap from DRMAsahiShim.g17p_cold_boot.
 //! This is the authored add3 workload used by the Python bootstrap, never a

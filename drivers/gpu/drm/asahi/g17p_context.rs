@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! g17p_context.py: two retained native CL roots, slot publication, owned
 //! fences and slot-three cleanup. Table clones never read code/data leaves.

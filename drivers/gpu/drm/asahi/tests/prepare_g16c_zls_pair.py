@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Own-Mesa ZLS store/load pair, with CPU byte oracles and no shader changes."""
 import argparse,ctypes,hashlib,json,struct,subprocess,sys
 from pathlib import Path

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source-presented partial opening, shared by the Python shim's render and
 //! compute paths. These are protocol objects, with no workload or shader data.

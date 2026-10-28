@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Preparation of the first retained native C/R/C owner. No work doorbell,
 //! control notification or execution-root switch is issued by this module.

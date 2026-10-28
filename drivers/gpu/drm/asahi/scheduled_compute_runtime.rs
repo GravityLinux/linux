@@ -1,22 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
-//! Max command lowering within the common Session. CPU jobs, dependencies,
-//! immutable snapshots, GEMs, fences and completions use the shared owners.
+//! G16C render protocol state during migration to common retained render pools.
+//! Compute uses the common Queues, root rebinding and receipt implementation.
 
 use super::super::{
-    g17p_compute::{self as protocol, wire, work},
+    g17p_compute::work,
     g17p_compute_queues::Key,
     g17p_render::parameter_error,
     g17p_user_vm::UserVm,
     scheduled_bootstrap as boot,
     scheduled_dispatch::DispatchStateG16C,
+    scheduled_generation::Generation,
     scheduled_lifetime::{ContextCloseG16C, LifetimeTickG16C, MaintenanceG16C},
     scheduled_operands as operands,
-    scheduled_queues::{self, EngineScratchG16C, QueueSetG16C},
+    scheduled_queues::{self, QueueSetG16C},
     scheduled_transport::{Request, Requirements, Stamp},
 };
-use super::{compute, Completion, ComputeReceipt, RenderReceipt, Memory, Phase, Session, Vm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use super::{compute, Completion, RenderReceipt, Memory, Phase, Session, Vm, PendingWork, RenderWave, RetainedFrame};
+use core::sync::atomic::Ordering;
 use kernel::{bindings, dma_fence::RawDmaFence, io::Io, prelude::*, sync::Arc};
 
 const PAGE: u64 = 0x4000;
@@ -25,8 +26,6 @@ const SHARED: u64 = 0x00c000000000044b;
 const PRIVATE: u64 = 0x00c0000000000443;
 const GPU_READ: u64 = 0x0080000000000c8b;
 const DISPATCH: u64 = 0xfffffc2001550000;
-const WORK_BASE: u64 = 0xfffffc20d1000000;
-const WORK_FLAGS: [u64; 5] = [PRIVATE, PRIVATE, PRIVATE, SHARED, 0x008000000000044b];
 
 #[path = "scheduled_render_runtime.rs"]
 #[allow(dead_code)]
@@ -68,7 +67,104 @@ impl StageError {
     }
 }
 
+/// Max wire backing carried by the common render template preparation phase.
+/// Root/table ownership and exact revalidation follow the Neo template contract.
+pub(crate) struct RenderTemplateSeedG16C {
+    owner: usize,
+    pool: u32,
+    context: u16,
+    directory: u64,
+    limit: u64,
+    snapshot: super::super::g17p_user_vm::TableSnapshot,
+    _root: super::super::g17p_user_vm::RootLease,
+}
+pub(crate) struct PreparedRenderTemplateG16C {
+    seed: RenderTemplateSeedG16C,
+    memory: Memory,
+    resource: render::ResourcesG16C,
+}
+
+/// Speculative private backing owned by the common client-preparation worker.
+/// It is tied to one unpublished client root and contains no firmware identity.
+pub(crate) struct OwnerPrivateG16C {
+    root: u64,
+    base: u64,
+    limit: u64,
+    memory: Memory,
+    support_pages: [u64;2],
+    high_root: u64,
+    private: KVec<PrivateBlock>,
+    operand_buffers: KVec<u64>,
+}
+impl OwnerPrivateG16C {
+    pub(crate) fn matches(&self,client:&compute::Client,base:u64,limit:u64)->bool {
+        self.root==client.root.root() && self.base==base && self.limit==limit
+    }
+    pub(crate) fn build(client:&mut compute::Client,base:u64,limit:u64)->Result<Self> {
+        let [table,state,buffers,end,_]=owner_layout(base,limit)?;
+        let mut memory=Memory::detached();
+        let support_pages=[memory.allocate(PAGE as usize)?,memory.allocate(PAGE as usize)?];
+        let high_root=memory.allocate(PAGE as usize)?;
+        let mut private=KVec::new();
+        private_span(&mut memory,&mut private,0,operands::DIRECTORY_SIZE)?;
+        private_span(&mut memory,&mut private,table-base,operands::TABLE_SIZE)?;
+        private_span(&mut memory,&mut private,state-base,0x7c000)?;
+        private_span(&mut memory,&mut private,end-base,0x7c000)?;
+        let mut operand_buffers=KVec::with_capacity(operands::INITIAL_BUFFERS as usize,GFP_KERNEL)?;
+        for i in 0..operands::INITIAL_BUFFERS as u64 {
+            let offset=buffers-base+i*operands::BUFFER_STRIDE;
+            private_span(&mut memory,&mut private,offset,operands::BUFFER_SIZE)?;
+            operand_buffers.push(offset,GFP_KERNEL)?;
+        }
+        let mut directory=bytes(PAGE as usize)?;let mut entries=bytes(operands::TABLE_SIZE as usize)?;
+        encode_operand_directory(base,&operand_buffers,&mut directory,&mut entries,
+            |offset,data|write_blocks(&mut memory,&private,offset,data))?;
+        for block in &private {
+            client.root.prepare(base+block.offset,block.size)?;
+            memory.clean(block.physical,block.size as usize)?;
+        }
+        for physical in [support_pages[0],support_pages[1],high_root] {memory.clean(physical,PAGE as usize)?;}
+        Ok(Self {root:client.root.root(),base,limit,memory,support_pages,high_root,private,operand_buffers})
+    }
+}
+
+/// The seven fixed wrapped-work pages have no DVA until admission commits.
+pub(crate) struct WorkBackingG16C {
+    memory: Memory,
+    pages: [u64;7],
+}
+impl WorkBackingG16C {
+    pub(crate) fn new()->Result<Self> {
+        let mut memory=Memory::detached();let mut pages=[0;7];
+        for page in &mut pages {*page=memory.allocate(PAGE as usize)?;memory.clean(*page,PAGE as usize)?;}
+        Ok(Self {memory,pages})
+    }
+}
+
+pub(crate) struct GeometrySeedG16C {
+    owner: usize,
+    pool: u32,
+    context: u16,
+    plan: render::GeometryPlanG16C,
+    root: super::super::g17p_user_vm::RootLease,
+}
+pub(crate) struct PreparedScratchG16C {
+    owner: usize,
+    pool: u32,
+    context: u16,
+    plan: render::GeometryPlanG16C,
+    memory: Memory,
+    geometry: render::PreparedGeometryG16C,
+}
+impl GeometrySeedG16C {
+    pub(crate) fn prepare(self)->Result<PreparedScratchG16C> {
+        let (memory,geometry)=self.plan.prepare(self.root)?;
+        Ok(PreparedScratchG16C {owner:self.owner,pool:self.pool,context:self.context,plan:self.plan,memory,geometry})
+    }
+}
+
 struct Owner {
+    pool: u32,
     client: Option<compute::Client>,
     context: u16,
     high_root: u64,
@@ -79,7 +175,6 @@ struct Owner {
     support_pages: [u64; 2],
     private_next: u64,
     dispatch_initial: [u8; 32],
-    compute_ordinal: u32,
     published: bool,
     close_requested: bool,
     invalid_roots: [u64; 2],
@@ -102,281 +197,284 @@ struct Queue {
     key: Key,
     owner: usize,
     storage: QueueSetG16C,
-    save: u64,
-    robustness: u64,
-    ordinal: u32,
-    save_pages: [u64; 2],
     render_count: u32,
-    compute_binding: Option<usize>,
+    generation: Generation,
 }
-enum ReceiptG16C { Compute(Arc<ComputeReceipt>), Render(Arc<RenderReceipt>) }
-impl ReceiptG16C {
-    fn fence(&self)->&kernel::dma_fence::Fence{match self{Self::Compute(r)=>&r.fence,Self::Render(r)=>&r.fence}}
-    fn fail(&self,error:Error){match self{Self::Compute(r)=>r.fail(error),Self::Render(r)=>r.fail(error)}}
-}
-struct Pending {
+pub(super) struct RenderTicket {
     id: u64,
-    receipt: ReceiptG16C,
+    receipt: Arc<RenderReceipt>,
     completion: Completion,
     started: kernel::time::Instant<kernel::time::Monotonic>,
-    render_owner: Option<usize>,
+    render_owner: usize,
+    storage:u32,
     growth_tokens: KVec<u32>,
-    render_work: Option<parameter_error::RenderOwnerG16C>,
+    render_work: parameter_error::RenderOwnerG16C,
     parameter_error: Option<parameter_oom::RepliedError>,
-    compute_slot: Option<usize>,
 }
 enum WorkEvent {Growth(parameter_growth::AcceptedGrowth),ParameterError(parameter_oom::AcceptedError)}
-struct QueueClose {
-    key: Key,
-    active_jobs: Arc<AtomicU64>,
-}
+
 pub(super) struct State {
     owners: KVec<Owner>,
     queues: KVec<Queue>,
-    pending: KVec<Pending>,
-    cpu_leases: KVec<kernel::dma_fence::Fence>,
     selected: Option<usize>,
     queue_next: u64,
     metadata_next: u64,
-    work_pages: [Option<[u64; 5]>;2],
-    work_leases: [Option<(usize,kernel::dma_fence::Fence)>;2],
     compute_mode: bool,
-    compute_sequences: [u32;2],
-    compute_bound: [bool;2],
-    engine_scratch: Option<EngineScratchG16C>,
-    queue_closes: KVec<QueueClose>,
-    ordinal: u32,
     operand_allocation_faulted: bool,
     initial_allocation_faulted: bool,
     render_ordinal: u32,
-    render_work_pages: Option<[u64;7]>,
+    render_work_pages: KVec<(u32,[u64;7])>,
     render_status: bool,
     render_close: u32,
-    compute_first: Option<bool>,
 }
 impl State {
-    fn idle(&mut self) -> bool {
-        self.cpu_leases
-            .retain(|f| unsafe { bindings::dma_fence_get_status(f.raw()) } == 0);
-        self.pending.is_empty() && self.cpu_leases.is_empty()
+    /// Bounded, opt-in DATA from retained owners after a submission failure.
+    /// Do not follow firmware pointers or change owners while diagnosing it.
+    fn dump_render_failure(&self,session:&Session,pending:&[RenderTicket])->Result {
+        // Diagnose only after a terminal error, without hot-path logging.
+        let memory=session.memory.as_ref().ok_or(EIO)?;
+        let vm=session.vm.as_ref().ok_or(EIO)?;
+        for pending in session.independent_pending.iter().take(4) {
+            let ticket=&pending.ticket;
+            kernel::pr_err!("G16C: FAILED_COMPUTE_DATA grid={} value={} queue={} driver={:?} outer_done={:?} age_ms={}\n",
+                ticket.grid,ticket.value,ticket.queue,ticket.driver,pending.outer_done,pending.started.elapsed().as_millis());
+            let layout=super::super::scheduled_generation::Layout::new(ticket.queue,4)?;
+            let mut data=[0u8;0x200];
+            for (name,address,size) in [
+                ("record",layout.context()+u64::from(ticket.value&255)*0x200,0x200),
+                ("pointers",ticket.pointers,0x80),
+                ("timestamps",ticket.status[0],16),
+                ("driver",ticket.driver.ok_or(EIO)?.0,8),
+            ] {
+                boot::read_words(memory,vm,address,&mut data[..size])?;
+                for (chunk,bytes) in data[..size].chunks(0x80).enumerate() {
+                    kernel::pr_err!("G16C: FAILED_COMPUTE_OBJECT grid={} value={} name={} address={:#x} offset={:#x} DATA={:02x?}\n",
+                        ticket.grid,ticket.value,name,address,chunk*0x80,bytes);
+                }
+            }
+        }
+        for ticket in pending.iter().take(4) {
+            let owner=self.owners.get(ticket.render_owner).ok_or(EIO)?;
+            let render=owner.render.as_ref().ok_or(EIO)?;
+            let queue=self.queues.iter().find(|q|q.owner==ticket.render_owner
+                && q.storage.lanes[1].queue==ticket.render_work.queue).ok_or(EIO)?;
+            kernel::pr_err!("G16C: FAILED_RENDER_DATA context={} pool={} storage={} growth_tokens={:?}\n",
+                owner.context,owner.pool,ticket.storage,ticket.growth_tokens);
+            let mut data=[0u8;0x200];
+            for (name,address,size) in [
+                ("manager",render.manager,0x88),
+                ("control",render.parameter.block_control,0x80),
+                ("region",super::super::scheduled_initgraph::BASE+0x1548000+u64::from(owner.pool)*16,16),
+                ("dispatch",DISPATCH,0x20),
+                ("dispatch-owner",DISPATCH+DispatchStateG16C::slot_offset(owner.context).ok_or(EIO)? as u64,0x20),
+                ("dispatch-second",DISPATCH+0x20,0x20),
+                ("operand-support",owner.support,0x80),
+                ("render-support",render.support,0x80),
+            ] {
+                boot::read_words(memory,vm,address,&mut data[..size])?;
+                kernel::pr_err!("G16C: FAILED_RENDER_OBJECT name={} address={:#x} DATA={:02x?}\n",name,address,&data[..size]);
+            }
+            let base=super::super::g17p_render_runtime::wrapped_storage_base(ticket.storage)?;
+            boot::read_words(memory,vm,base+0x18100,&mut data[..32])?;
+            kernel::pr_err!("G16C: FAILED_RENDER_TIMESTAMPS pool={} storage={} DATA={:02x?}\n",owner.pool,ticket.storage,&data[..32]);
+            for (stage,lane) in queue.storage.lanes[..2].iter().enumerate() {
+                let milestone=ticket.receipt.milestones[stage].load(Ordering::Relaxed)as u32;
+                for (name,address,size) in [
+                    ("record",lane.scratch_high+u64::from(milestone&255)*0x200,0x200),
+                    ("wrapper",base+if stage==0 {0x4000}else{0xc000},0xc0),
+                    ("pointers",lane.pointers,0x80),
+                    ("driver",ticket.render_work.driver_stamps[stage],8),
+                ] {
+                    boot::read_words(memory,vm,address,&mut data[..size])?;
+                    for (chunk,bytes) in data[..size].chunks(0x80).enumerate() {
+                        kernel::pr_err!("G16C: FAILED_RENDER_STAGE stage={} name={} address={:#x} offset={:#x} DATA={:02x?}\n",
+                            stage,name,address,chunk*0x80,bytes);
+                    }
+                }
+            }
+        }
+        // A dependency producer may have retired out of `pending` already.
+        // Its retained queue and allocator state still distinguish a bad wait
+        // from a consumer that started with another owner's cursor backing.
+        for (index,owner) in self.owners.iter().enumerate().rev().take(4) {
+            let Some(render)=owner.render.as_ref() else {continue;};
+            let Some(queue)=self.queues.iter().find(|q|q.owner==index && q.render_count!=0) else {continue;};
+            let milestone=render.sequence_base.checked_add(render.sequence).ok_or(EOVERFLOW)?;
+            kernel::pr_err!("G16C: RETAINED_RENDER_DATA context={} pool={} milestone={} queue_count={} published={} client={} directory={:#x}\n",
+                owner.context,owner.pool,milestone,queue.render_count,owner.published,owner.client.is_some(),owner.directory);
+            let mut data=[0u8;0x80];
+            for (name,address,size) in [
+                ("dispatch-pool",DISPATCH+u64::from(owner.pool)*0x20,0x20),
+                ("dispatch-context",DISPATCH+DispatchStateG16C::slot_offset(owner.context).ok_or(EIO)? as u64,0x20),
+                ("operand-support",owner.support,0x68),
+            ] {
+                boot::read_words(memory,vm,address,&mut data[..size])?;
+                kernel::pr_err!("G16C: RETAINED_RENDER_OBJECT context={} pool={} name={} address={:#x} DATA={:02x?}\n",
+                    owner.context,owner.pool,name,address,&data[..size]);
+            }
+            for (stage,lane) in queue.storage.lanes[..2].iter().enumerate() {
+                for (name,address,size) in [
+                    ("record-head",lane.scratch_high+u64::from(milestone&255)*0x200,0x48),
+                    ("record-status",lane.scratch_high+u64::from(milestone&255)*0x200+0x130,0x20),
+                    ("firmware-stamp",lane.queue+0x1040,8),
+                ] {
+                    boot::read_words(memory,vm,address,&mut data[..size])?;
+                    kernel::pr_err!("G16C: RETAINED_RENDER_STAGE context={} pool={} stage={} name={} address={:#x} DATA={:02x?}\n",
+                        owner.context,owner.pool,stage,name,address,&data[..size]);
+                }
+            }
+        }
+        if let Err(error)=session.independent_compute.dump_failure(memory,vm) {
+            kernel::pr_err!("G16C: retained compute DATA unavailable {:?}\n",error);
+        }
+        Ok(())
     }
     fn release_requested(&mut self, session: &mut Session) -> Result {
-        if !self.idle() {
-            return Err(EBUSY);
-        }
-        self.release_queues(session)?;
         for index in 0..self.owners.len() {
-            let o = &self.owners[index];
-            if !o.close_requested || o.client.is_none() {
-                continue;
+            let o=&self.owners[index];
+            if o.close_requested && o.client.is_some() && session.render_pool_available(o.pool)
+                && !self.queues.iter().any(|q|q.owner==index && !q.generation.idle()) {
+                self.retire_owner(session,index,false)?;
             }
-            if !o.published {
-                if let Some(r) = &mut self.owners[index].render { r.detach()?; }
-                // A rejected admission may have mapped queue save pages in
-                // this CPU-only root. Root drop invalidates those aliases just
-                // as the published close below does; a later owner must map
-                // the retained pages again, never validate stale addresses.
-                for q in &mut self.queues {
-                    if q.owner == index {
-                        q.live = false;
-                        q.save = 0;
-                        q.robustness = 0;
-                    }
-                }
-                self.owners[index].client = None;
-                continue;
-            }
-            let memory = session.memory.as_ref().ok_or(EIO)?;
-            let vm = session.vm.as_ref().ok_or(EIO)?;
-            let at = session.ttbs + o.context as u64 * 16;
-            memory.invalidate(at, 16)?;
-            let before = [memory.read64(at)?, memory.read64(at + 8)?];
-            let expected = [o.client.as_ref().ok_or(EIO)?.root.root(), o.high_root]
-                .map(|root| root | ((o.context as u64) << 48) | 1);
-            if before != expected {
-                return Err(EIO);
-            }
-            let cursors = boot::control_cursors(memory, vm)?;
-            if cursors != [cursors[0]; 3] {
-                return Err(EBUSY);
-            }
-            let mut closes = KVec::new();
-            // Validate every live prefix before publishing the first control.
-            for q in self
-                .queues
-                .iter()
-                .rev()
-                .filter(|q| q.live && q.owner == index && (q.ordinal != 0 || q.render_count != 0))
-            {
-                let prefix = memory
-                    .read_firmware32(vm.physical(memory, 2, q.storage.context)?)?
-                    .to_le_bytes();
-                closes.push(
-                    ContextCloseG16C::new(q.storage.context, prefix).ok_or(EIO)?,
-                    GFP_KERNEL,
-                )?;
-            }
-            let detached = closes.is_empty();
-            if detached && !o.retired_queues {
-                return Err(EIO);
-            }
-            let mut count = 0;
-            if !detached {
-                if o.render.as_ref().is_some_and(|r| r.attached()) {
-                    let tick=LifetimeTickG16C::for_render(self.render_close);
-                    session.g16c_control(tick.bytes())?;
-                    self.render_close=self.render_close.wrapping_add(1);
-                    count=closes.len()+1;
-                } else {
-                    session.g16c_close_prelude()?;
-                    count = closes.len() + 7;
-                }
-                for close in &closes {
-                    session.g16c_control(close.bytes())?;
-                }
-            }
-            let memory = session.memory.as_mut().ok_or(EIO)?;
-            // Recheck exact roots after firmware retirement, before detaching.
-            memory.invalidate(at, 16)?;
-            if [memory.read64(at)?, memory.read64(at + 8)?] != before {
-                return Err(EIO);
-            }
-            for i in 0..2 {
-                memory.write64(at + i as u64 * 8, before[i] & !1)?;
-            }
-            memory.clean(at, 16)?;
-            UserVm::invalidate(o.context);
-            memory.invalidate(at, 16)?;
-            if [memory.read64(at)?, memory.read64(at + 8)?] != before.map(|v| v & !1) {
-                return Err(EIO);
-            }
-            // Qualified detached release: after the last live roots break,
-            // retire all six maintenance phases before reusing their backing.
-            if (detached || o.render.as_ref().is_some_and(|r| r.attached())) && !self.owners.iter().enumerate()
-                .any(|(i, owner)| i != index && owner.published) {
-                for engine in 0..3 {
-                    for phase in 1..=2 {
-                        session.g16c_control(MaintenanceG16C::new(engine, phase).ok_or(EIO)?.bytes())?;
-                    }
-                }
-                count += 6;
-            }
-            let context = o.context;
-            if self.selected == Some(index) {
-                self.selected = None;
-            }
-            self.owners[index].published = false;
-            self.owners[index].invalid_roots = before.map(|v| v & !1);
+        }
+        Ok(())
+    }
+
+    /// G16C control/SGX retirement, independent of the common root's lifetime.
+    /// A private-window move retains its physical root and client for the
+    /// prepared PTE commit; final release drops the same owner after receipt.
+    fn retire_owner(&mut self,session:&mut Session,index:usize,keep_root:bool)->Result {
+        if !session.render_pool_available(self.owners[index].pool)
+            || self.queues.iter().any(|q|q.owner==index && !q.generation.idle()) {return Err(EBUSY);}
+        let o=&self.owners[index];
+        if !o.published {
+            if let Some(r) = &mut self.owners[index].render { r.detach()?; }
             for q in &mut self.queues {
                 if q.owner == index {
                     q.live = false;
-                    q.save = 0;
-                    q.robustness = 0;
                 }
             }
-            // No client root or BO reference may drop before this receipt.
-            if let Some(r) = &mut self.owners[index].render { r.detach()?; }
-            drop(self.owners[index].client.take());
-            // Context retirement invalidates any engine's retained binding.
-            self.compute_bound = [false; 2];
-            kernel::dev_info!(
-                session.peers[0].data.dev.as_ref(),
-                "G16C: context {} released after {} retired controls and owned TTBR invalidation\n",
-                context,
-                count
-            );
-            let (allocations, bytes) = session.memory.as_ref().ok_or(EIO)?.allocation_stats();
-            kernel::dev_info!(session.peers[0].data.dev.as_ref(),
-                "G16C: retained backing allocations={} bytes={} pool_slots={} queue_slots={}\n",
-                allocations, bytes, self.owners.len(), self.queues.len());
+            if !keep_root {self.owners[index].client=None;}
+            return Ok(());
         }
-        Ok(())
-    }
-    fn release_queues(&mut self, session: &mut Session) -> Result {
-        let mut request = 0;
-        while request < self.queue_closes.len() {
-            if self.queue_closes[request].active_jobs.load(Ordering::Acquire) != 0 {
-                request += 1;
-                continue;
+        let memory = session.memory.as_ref().ok_or(EIO)?;
+        let vm = session.vm.as_ref().ok_or(EIO)?;
+        let at = session.ttbs + o.context as u64 * 16;
+        memory.invalidate(at, 16)?;
+        let before = [memory.read64(at)?, memory.read64(at + 8)?];
+        let expected = [o.client.as_ref().ok_or(EIO)?.root.root(), o.high_root]
+            .map(|root| root | ((o.context as u64) << 48) | 1);
+        if before != expected {
+            kernel::pr_err!("G16C: RETIRE_REJECT context={} pool={} phase=initial_root actual={:x?} expected={:x?}\n",o.context,o.pool,before,expected);
+            return Err(EIO);
+        }
+        let cursors = boot::control_cursors(memory, vm)?;
+        if cursors != [cursors[0]; 3] {
+            return Err(EBUSY);
+        }
+        let mut closes = KVec::new();
+        // Validate every live prefix before publishing the first control.
+        for q in self
+            .queues
+            .iter()
+            .rev()
+            .filter(|q| q.live && q.owner == index && (q.render_count != 0))
+        {
+            let prefix = memory
+                .read_firmware32(vm.physical(memory, 2, q.storage.context)?)?
+                .to_le_bytes();
+            closes.push(
+                ContextCloseG16C::new(q.storage.context, prefix).ok_or(EIO)?,
+                GFP_KERNEL,
+            )?;
+        }
+        let detached = closes.is_empty();
+        if detached && !o.retired_queues {
+            kernel::pr_err!("G16C: RETIRE_REJECT context={} pool={} phase=missing_queue_receipt\n",o.context,o.pool);
+            return Err(EIO);
+        }
+        let mut count = 0;
+        if !detached {
+            if o.render.as_ref().is_some_and(|r| r.attached()) {
+                let tick=LifetimeTickG16C::for_render(self.render_close);
+                session.g16c_control(tick.bytes())?;
+                self.render_close=self.render_close.wrapping_add(1);
+                count=closes.len()+1;
+            } else {
+                session.g16c_close_prelude()?;
+                count = closes.len() + 7;
             }
-            let key = self.queue_closes[request].key;
-            // Snapshot and validate every installed owner, including a VM
-            // whose last logical queue has already retired. No root changes.
-            let mut roots = KVec::new();
-            let memory = session.memory.as_ref().ok_or(EIO)?;
-            for o in self.owners.iter().filter(|o| o.published) {
-                let at = session.ttbs + o.context as u64 * 16;
-                memory.invalidate(at, 16)?;
-                let words = [memory.read64(at)?, memory.read64(at + 8)?];
-                let expected = [o.client.as_ref().ok_or(EIO)?.root.root(), o.high_root]
-                    .map(|root| root | ((o.context as u64) << 48) | 1);
-                if words != expected { return Err(EIO); }
-                roots.push((at, words), GFP_KERNEL)?;
+            for close in &closes {
+                session.g16c_control(close.bytes())?;
             }
-            let vm = session.vm.as_ref().ok_or(EIO)?;
-            let cursors = boot::control_cursors(memory, vm)?;
-            if cursors != [cursors[0]; 3] { return Err(EBUSY); }
-            // A single accepted logical queue can own more than one frozen
-            // binding generation. Preflight every prefix before first send.
-            let mut closes = KVec::new();
-            for (i, q) in self.queues.iter().enumerate().filter(|(_, q)| q.live && q.key == key) {
-                let close = if q.ordinal == 0 && q.render_count == 0 { None } else {
-                    let prefix = memory.read_firmware32(vm.physical(memory, 2, q.storage.context)?)?.to_le_bytes();
-                    Some(ContextCloseG16C::new(q.storage.context, prefix).ok_or(EIO)?)
-                };
-                closes.push((i, close), GFP_KERNEL)?;
-            }
-            for (i, close) in closes {
-                let controls = if let Some(close) = close {
-                    let count=if self.owners[self.queues[i].owner].render.as_ref().is_some_and(|r| r.attached()) {
-                        session.g16c_control(LifetimeTickG16C::for_render(self.render_close).bytes())?;
-                        self.render_close=self.render_close.wrapping_add(1);2
-                    } else {session.g16c_close_prelude()?;8};
-                    session.g16c_control(close.bytes())?;
-                    count
-                } else { 0 };
-                let memory = session.memory.as_ref().ok_or(EIO)?;
-                for &(at, words) in &roots {
-                    memory.invalidate(at, 16)?;
-                    if [memory.read64(at)?, memory.read64(at + 8)?] != words { return Err(EIO); }
+        }
+        let memory = session.memory.as_mut().ok_or(EIO)?;
+        // Recheck exact roots after firmware retirement, before detaching.
+        memory.invalidate(at, 16)?;
+        if [memory.read64(at)?, memory.read64(at + 8)?] != before {
+            kernel::pr_err!("G16C: RETIRE_REJECT context={} pool={} phase=changed_root\n",o.context,o.pool);
+            return Err(EIO);
+        }
+        for i in 0..2 {
+            memory.write64(at + i as u64 * 8, before[i] & !1)?;
+        }
+        memory.clean(at, 16)?;
+        UserVm::invalidate(o.context);
+        memory.invalidate(at, 16)?;
+        if [memory.read64(at)?, memory.read64(at + 8)?] != before.map(|v| v & !1) {
+            return Err(EIO);
+        }
+        // Qualified detached release: after the last live roots break,
+        // retire all six maintenance phases before reusing their backing.
+        if (detached || o.render.as_ref().is_some_and(|r| r.attached())) && !self.owners.iter().enumerate()
+            .any(|(i, owner)| i != index && owner.published) {
+            for engine in 0..3 {
+                for phase in 1..=2 {
+                    session.g16c_control(MaintenanceG16C::new(engine, phase).ok_or(EIO)?.bytes())?;
                 }
-                let q = &mut self.queues[i];
+            }
+            count += 6;
+        }
+        let context = o.context;
+        if self.selected == Some(index) {
+            self.selected = None;
+        }
+        self.owners[index].published = false;
+        self.owners[index].invalid_roots = before.map(|v| v & !1);
+        for q in &mut self.queues {
+            if q.owner == index {
                 q.live = false;
-                if controls != 0 {
-                    self.owners[q.owner].retired_queues = true;
-                    self.compute_bound = [false; 2];
-                }
-                let (allocations, bytes) = memory.allocation_stats();
-                kernel::dev_info!(session.peers[0].data.dev.as_ref(),
-                    "G16C: queue {} retired controls={} roots_preserved={} allocations={} bytes={} pool_slots={} queue_slots={}\n",
-                    key.1, controls, roots.len(), allocations, bytes, self.owners.len(), self.queues.len());
             }
-            // This may be an entirely unpublished queue. Its zero accepted
-            // count still proves no future worker can construct this key.
-            self.queue_closes.remove(request).map_err(|_| EIO)?;
         }
+        // No client root or BO reference may drop before this receipt.
+        if let Some(r) = &mut self.owners[index].render { r.detach()?; }
+        if !keep_root {drop(self.owners[index].client.take());}
+        // Context retirement invalidates any engine's retained binding.
+        self.leave_compute_mode();
+        kernel::dev_info!(
+            session.peers[0].data.dev.as_ref(),
+            "G16C: context {} released after {} retired controls and owned TTBR invalidation\n",
+            context,
+            count
+        );
+        let (allocations, bytes) = session.memory.as_ref().ok_or(EIO)?.allocation_stats();
+        kernel::dev_info!(session.peers[0].data.dev.as_ref(),
+            "G16C: retained backing allocations={} bytes={} pool_slots={} queue_slots={}\n",
+            allocations, bytes, self.owners.len(), self.queues.len());
         Ok(())
     }
+
     pub(super) fn new() -> Self {
         Self {
             owners: KVec::new(),
             queues: KVec::new(),
-            pending: KVec::new(),
-            cpu_leases: KVec::new(),
             selected: None,
             queue_next: scheduled_queues::START,
             metadata_next: 0xfffffc2207000000,
-            work_pages: [None;2],
-            work_leases: core::array::from_fn(|_|None),
             compute_mode: false,
-            compute_sequences: [0;2],
-            compute_bound: [false;2],
-            engine_scratch: None,
-            queue_closes: KVec::new(),
-            ordinal: 0,
             operand_allocation_faulted: false,
             initial_allocation_faulted: false,
-            render_ordinal: 0, render_work_pages: None, render_status: false, render_close: 0, compute_first: None,
+            render_ordinal: 0, render_work_pages: KVec::new(), render_status: false, render_close: 0,
         }
     }
     fn client(&self, key: Key) -> Option<&compute::Client> {
@@ -386,11 +484,7 @@ impl State {
             .find(|q| q.live && q.key == key)
             .and_then(|q| self.owners[q.owner].client.as_ref())
     }
-    pub(super) fn fail_receipts(&self, error: Error) {
-        for pending in &self.pending {
-            pending.receipt.fail(error);
-        }
-    }
+
 }
 
 fn bytes(size: usize) -> Result<KVVec<u8>> {
@@ -425,6 +519,55 @@ fn map_private(memory: &mut Memory, root: &mut UserVm, base: u64, blocks: &[Priv
     }
     Ok(())
 }
+fn validate_mapped_private(root:&UserVm,base:u64,blocks:&[PrivateBlock])->Result {
+    for block in blocks {
+        for page in (0..block.size).step_by(PAGE as usize) {
+            if root.pte(base+block.offset+page)?!=(block.physical+page)|GPU_READ|(1<<54) {return Err(EIO);}
+        }
+    }
+    Ok(())
+}
+fn reset_mapped_private(memory:&mut Memory,root:&UserVm,base:u64,blocks:&[PrivateBlock])->Result {
+    validate_mapped_private(root,base,blocks)?;
+    for block in blocks {
+        memory.zero(block.physical,block.size as usize)?;
+        memory.clean(block.physical,block.size as usize)?;
+    }
+    Ok(())
+}
+
+/// Same source-built operand directory/table for cold construction and a
+/// retired physical owner's new private window. Callers allocate scratch first.
+fn encode_operand_directory(base:u64,offsets:&[u64],directory:&mut[u8],entries:&mut[u8],
+    mut write:impl FnMut(u64,&[u8])->Result)->Result {
+    directory.fill(0);entries.fill(0);
+    for (i,offset) in offsets.iter().enumerate() {
+        let buffer=base+offset;
+        for j in 0..2048 {
+            directory[j*8..j*8+8].copy_from_slice(&(buffer+j as u64*0x1000).to_le_bytes());
+        }
+        write(i as u64*PAGE,directory)?;
+        entries[i*64..i*64+8].copy_from_slice(&(buffer|1<<63).to_le_bytes());
+    }
+    let table=base+operands::DIRECTORY_SIZE+2*PAGE;
+    write(table-base,entries)?;
+    Ok(())
+}
+fn initialize_operand_data(memory:&mut Memory,vm:&Vm,root:&UserVm,base:u64,support:u64,
+    offsets:&[u64],directory:&mut [u8],entries:&mut [u8])->Result<[u8;32]> {
+    encode_operand_directory(base,offsets,directory,entries,
+        |offset,data|write_low(memory,root,base+offset,data))?;
+    initialize_operand_support(memory,vm,base,support,offsets.len())
+}
+fn initialize_operand_support(memory:&mut Memory,vm:&Vm,base:u64,support:u64,count:usize)->Result<[u8;32]> {
+    let table=base+operands::DIRECTORY_SIZE+2*PAGE;
+    let count=u32::try_from(count)?;
+    let record=operands::ComputeSupportG16C::new(base,table,support+PAGE,count).ok_or(EINVAL)?;
+    vm.write(memory,2,support,record.as_bytes())?;
+    vm.write(memory,2,support+PAGE,&1u32.to_le_bytes())?;
+    Ok(*DispatchStateG16C::initial(base,count*2048).ok_or(EINVAL)?.as_bytes())
+}
+
 fn map_prepared_private(root: &mut UserVm, base: u64, blocks: &[PrivateBlock]) -> Result {
     // Paths and cleaned DATA already exist; preserve the prepared contents.
     for block in blocks {
@@ -454,7 +597,7 @@ fn fw_span(memory: &mut Memory, vm: &mut Vm, va: u64, size: u64, flags: u64) -> 
 /// Fault injection is limited to detached backing, before any adoption or
 /// mapping. Production defaults disable it. A single Session rejects once.
 fn initial_allocation_checkpoint(stage: u32, fired: &mut bool, memory: &Memory) -> StageResult<()> {
-    if *crate::module_parameters::g16c_initial_alloc_fail.value() == stage && !*fired {
+    if crate::module_parameters::g16c_initial_alloc_fail.value() == stage && !*fired {
         *fired = true;
         let (allocations, bytes) = memory.allocation_stats();
         kernel::pr_info!("G16C: injected initial allocation ENOMEM stage={} detached_allocations={} detached_bytes={}\n",
@@ -481,19 +624,15 @@ fn write_blocks(memory: &mut Memory, blocks: &[PrivateBlock], offset: u64, data:
 
 /// Shared host preparation for fixed Max work-storage DATA. This changes no
 /// graph topology or wire layout: all leaves remain absent until adoption.
-fn stage_work_pages<const N: usize>(memory: &mut Memory, vm: &mut Vm, base: u64,
-    flags: [u64; N], aliases: &[usize]) -> Result<(Memory, [u64; N])> {
-    let alias = 0x7000000000 + base - work::DESCRIPTOR_BASE_G16C;
-    for (i, _) in flags.into_iter().enumerate() { vm.prepare_g16c_empty(memory, 2, base + i as u64 * PAGE, PAGE as usize)?; }
+fn prepare_work_mappings<const N:usize>(memory:&mut Memory,vm:&mut Vm,base:u64,
+    flags:[u64;N],aliases:&[usize])->Result {
+    let alias=0x7000000000+base-work::DESCRIPTOR_BASE_G16C;
+    for (i,_)in flags.into_iter().enumerate() {vm.prepare_g16c_empty(memory,2,base+i as u64*PAGE,PAGE as usize)?;}
     for &i in aliases {
-        if i >= N { return Err(EINVAL); }
-        vm.prepare_g16c_empty(memory, 0, alias + i as u64 * PAGE, PAGE as usize)?;
+        if i>=N {return Err(EINVAL);}
+        vm.prepare_g16c_empty(memory,0,alias+i as u64*PAGE,PAGE as usize)?;
     }
-    let mut staged = Memory::detached();
-    let mut pages = [0; N];
-    for page in &mut pages { *page = staged.allocate(PAGE as usize)?; staged.clean(*page, PAGE as usize)?; }
-    // Keep attributes at the installation call site alongside the wire graph.
-    Ok((staged, pages))
+    Ok(())
 }
 fn install_work_pages<const N: usize>(memory: &mut Memory, vm: &mut Vm, base: u64,
     flags: [u64; N], aliases: &[usize], pages: [u64; N]) -> Result {
@@ -503,7 +642,7 @@ fn install_work_pages<const N: usize>(memory: &mut Memory, vm: &mut Vm, base: u6
     Ok(())
 }
 fn flight_allocation_checkpoint(fired: &mut bool) -> StageResult<()> {
-    if *crate::module_parameters::g16c_initial_alloc_fail.value() == 8 && !*fired {
+    if crate::module_parameters::g16c_initial_alloc_fail.value() == 8 && !*fired {
         *fired = true;
         kernel::pr_info!("G16C: injected unpublished flight metadata ENOMEM before graph/control publication\n");
         return Err(StageError::Rejected(ENOMEM));
@@ -521,31 +660,8 @@ fn same(a: &compute::Client, b: &compute::Client) -> bool {
             .all(|(x, y)| core::ptr::eq(&**x, &**y))
 }
 
-impl State {
-    fn build_owner(
-        &mut self,
-        memory: &mut Memory,
-        vm: &mut Vm,
-        ttbs: u64,
-        mut client: compute::Client,
-        base: u64,
-        limit: u64,
-    ) -> StageResult<usize> {
-        let capacity = limit.checked_sub(base).ok_or(EINVAL)?;
-        if capacity == 0 || (base | limit) & (PAGE - 1) != 0 || limit > 1 << 42 {
-            return Err(EINVAL.into());
-        }
-        // A grown dormant pool may not fit a later caller's smaller window.
-        // Check all retained extents before moving ownership or clearing RAM.
-        let reusable = self.owners.iter().position(|o| o.client.is_none()
-            && o.private.iter().all(|b| b.offset.checked_add(b.size).is_some_and(|end| end <= capacity))
-            && o.operand_buffers.iter().all(|offset| offset.checked_add(operands::BUFFER_STRIDE)
-                .is_some_and(|end| end <= capacity)));
-        if reusable.is_none() && self.owners.len() >= 63 {
-            return Err(StageError::Rejected(ENOSPC));
-        }
-        let context = reusable.map_or(self.owners.len() as u16 + 1, |i| self.owners[i].context);
-        let invalid_roots = reusable.map_or([0; 2], |i| self.owners[i].invalid_roots);
+fn owner_layout(base:u64,limit:u64)->Result<[u64;5]> {
+    if limit.checked_sub(base).is_none_or(|span|span==0) || (base|limit)&(PAGE-1)!=0 || limit>1<<42 {return Err(EINVAL);}
         let table = base
             .checked_add(operands::DIRECTORY_SIZE + 2 * PAGE)
             .ok_or(EINVAL)?;
@@ -556,10 +672,53 @@ impl State {
         let end = buffers
             .checked_add(operands::INITIAL_BUFFERS as u64 * operands::BUFFER_STRIDE)
             .ok_or(EINVAL)?;
-        let mut private_end=end.checked_add(0x80000).ok_or(EINVAL)?;
+        let private_end=end.checked_add(0x80000).ok_or(EINVAL)?;
         if private_end > limit {
+            return Err(EINVAL);
+        }
+    Ok([table,state,buffers,end,private_end])
+}
+
+impl State {
+    fn reusable_owner(&self,pool:u32,base:u64,limit:u64)->Option<usize> {
+        let capacity=limit.checked_sub(base)?;
+        self.owners.iter().position(|o| o.pool==pool && o.client.is_none()
+            && o.private.iter().all(|b| b.offset.checked_add(b.size).is_some_and(|end| end <= capacity))
+            && o.operand_buffers.iter().all(|offset| offset.checked_add(operands::BUFFER_STRIDE)
+                .is_some_and(|end| end <= capacity)))
+    }
+    fn owner_private_required(&self,pool:u32,incoming:&compute::Client,base:u64,limit:u64)->bool {
+        !self.owners.iter().any(|o|o.pool==pool&&o.client.as_ref().is_some_and(|c|same(c,incoming)))
+            && self.reusable_owner(pool,base,limit).is_none()
+    }
+    fn build_owner(
+        &mut self,
+        memory: &mut Memory,
+        vm: &mut Vm,
+        ttbs: u64,
+        asid_mask:u64,
+        pool:u32,
+        mut client: compute::Client,
+        base: u64,
+        limit: u64,
+        prepared:&mut Option<OwnerPrivateG16C>,
+    ) -> StageResult<usize> {
+        let capacity = limit.checked_sub(base).ok_or(EINVAL)?;
+        if capacity == 0 || (base | limit) & (PAGE - 1) != 0 || limit > 1 << 42 {
             return Err(EINVAL.into());
         }
+        // A grown dormant pool may not fit a later caller's smaller window.
+        // Check all retained extents before moving ownership or clearing RAM.
+        let reusable=self.reusable_owner(pool,base,limit);
+        if reusable.is_none() && self.owners.len() >= 63 {
+            return Err(StageError::Rejected(ENOSPC));
+        }
+        let context=if let Some(i)=reusable {self.owners[i].context} else {
+            let mask=self.owners.iter().fold(asid_mask,|mask,o|mask|(1u64<<o.context));
+            super::super::g17p_render_lifecycle::render_asid(pool,mask).ok_or(ENOSPC)?
+        };
+        let invalid_roots = reusable.map_or([0; 2], |i| self.owners[i].invalid_roots);
+        let [_table,state,_buffers,_end,mut private_end]=owner_layout(base,limit)?;
         // Only a context with the qualified release receipt has client=None.
         // Revalidate its exact invalid TTBR words before touching cached RAM.
         let at = ttbs + context as u64 * 16;
@@ -569,7 +728,7 @@ impl State {
         }
         let mut detached = Memory::detached();
         if reusable.is_none() { self.owners.reserve(1, GFP_KERNEL).map_err(StageError::allocation)?; }
-        let (support, support_pages, high_root, private) = if let Some(i) = reusable {
+        let (support, support_pages, high_root, private,prepared_offsets) = if let Some(i) = reusable {
             let o = &self.owners[i];
             for (j, flags) in [PRIVATE, SHARED].into_iter().enumerate() {
                 if vm.pte(memory, 2, o.support + j as u64 * PAGE)? != o.support_pages[j] | flags {
@@ -579,36 +738,22 @@ impl State {
             let mut blocks = KVec::new();
             blocks.reserve(o.private.len(), GFP_KERNEL).map_err(StageError::allocation)?;
             for block in &o.private { blocks.push(*block, GFP_KERNEL).expect("reserved retained private blocks"); }
-            (o.support, o.support_pages, o.high_root, blocks)
+            (o.support, o.support_pages, o.high_root, blocks,None)
         } else {
             let support = self.metadata_next;
             if support + 2 * PAGE > 0xfffffc2208000000 { return Err(StageError::Rejected(ENOSPC)); }
-            let pages = [detached.allocate(PAGE as usize).map_err(StageError::allocation)?,
-                detached.allocate(PAGE as usize).map_err(StageError::allocation)?];
-            let high_root = detached.allocate(PAGE as usize).map_err(StageError::allocation)?;
-            let mut private = KVec::new();
-            private_span(&mut detached, &mut private, 0, operands::DIRECTORY_SIZE).map_err(StageError::allocation)?;
-            private_span(&mut detached, &mut private, table - base, operands::TABLE_SIZE).map_err(StageError::allocation)?;
-            private_span(&mut detached, &mut private, state - base, 0x7c000).map_err(StageError::allocation)?;
-            // Independently leased CDM engines require different GPU-written
-            // state and work tags even when they share one VM operand pool.
-            private_span(&mut detached, &mut private, end - base, 0x7c000).map_err(StageError::allocation)?;
-            for i in 0..operands::INITIAL_BUFFERS as u64 {
-                private_span(&mut detached, &mut private,
-                    buffers - base + i * operands::BUFFER_STRIDE, operands::BUFFER_SIZE).map_err(StageError::allocation)?;
-            }
-            (support, pages, high_root, private)
+            let storage=prepared.take().ok_or(EIO)?;
+            if !storage.matches(&client,base,limit) {return Err(EIO.into());}
+            detached=storage.memory;
+            let pages=storage.support_pages;let high_root=storage.high_root;
+            let private=storage.private;
+            (support, pages, high_root, private,Some(storage.operand_buffers))
         };
-        let mut operand_buffers = KVec::new();
+        let mut operand_buffers = prepared_offsets.unwrap_or_else(KVec::new);
         if let Some(i) = reusable {
             operand_buffers.reserve(self.owners[i].operand_buffers.len(), GFP_KERNEL).map_err(StageError::allocation)?;
             for &offset in &self.owners[i].operand_buffers {
                 operand_buffers.push(offset, GFP_KERNEL).expect("reserved retained operand offsets");
-            }
-        } else {
-            operand_buffers.reserve(operands::INITIAL_BUFFERS as usize, GFP_KERNEL).map_err(StageError::allocation)?;
-            for i in 0..operands::INITIAL_BUFFERS as u64 {
-                operand_buffers.push(buffers-base+i*operands::BUFFER_STRIDE,GFP_KERNEL).expect("reserved initial operand offsets");
             }
         }
         // A recycled owner retains every successfully grown buffer. Save
@@ -617,11 +762,15 @@ impl State {
             private_end=private_end.max(base.checked_add(*offset)
                 .and_then(|p|p.checked_add(operands::BUFFER_STRIDE)).ok_or(EOVERFLOW)?);
         }
-        if private_end>limit {return Err(StageError::Rejected(ENOSPC));}
-        let mut directory = bytes(PAGE as usize).map_err(StageError::allocation)?;
-        let mut entries = bytes(operands::TABLE_SIZE as usize).map_err(StageError::allocation)?;
+        // Include retained private allocations as well as grown operands;
+        // detached-root recycling must never allocate a queue over this pool.
         for block in &private {
-            client.root.prepare(base + block.offset, block.size).map_err(StageError::allocation)?;
+            private_end = private_end.max(base.checked_add(block.offset)
+                .and_then(|p|p.checked_add(block.size)).ok_or(EOVERFLOW)?);
+        }
+        if private_end>limit {return Err(StageError::Rejected(ENOSPC));}
+        if reusable.is_some() {
+            for block in &private {client.root.prepare(base+block.offset,block.size).map_err(StageError::allocation)?;}
         }
         if reusable.is_none() {
             vm.prepare_g16c_empty(memory, 2, support, 2 * PAGE as usize).map_err(StageError::allocation)?;
@@ -636,46 +785,31 @@ impl State {
             }
             self.metadata_next += 2 * PAGE;
         }
-        map_private(memory, &mut client.root, base, &private)?;
+        if reusable.is_some() {map_private(memory,&mut client.root,base,&private)?;}
+        else {map_prepared_private(&mut client.root,base,&private)?;}
         for physical in [support_pages[0], support_pages[1], high_root] {
             memory.zero(physical, PAGE as usize)?;
             memory.clean(physical, PAGE as usize)?;
         }
-        for (i,offset) in operand_buffers.iter().enumerate() {
-            let buffer = base + offset;
-            for j in 0..2048 {
-                directory[j * 8..j * 8 + 8]
-                    .copy_from_slice(&(buffer + j as u64 * 0x1000).to_le_bytes());
-            }
-            write_low(memory, &client.root, base + i as u64 * PAGE, &directory)?;
-            entries[i * 64..i * 64 + 8].copy_from_slice(&(buffer | 1 << 63).to_le_bytes());
-        }
-        write_low(memory, &client.root, table, &entries)?;
-        let record = operands::ComputeSupportG16C::new(
-            base,
-            table,
-            support + PAGE,
-            operand_buffers.len().try_into()?,
-        )
-        .ok_or(EINVAL)?;
-        vm.write(memory, 2, support, record.as_bytes())?;
-        vm.write(memory, 2, support + PAGE, &1u32.to_le_bytes())?;
-        let pages = u32::try_from(operand_buffers.len())? * 2048;
-        let dispatch_initial = *DispatchStateG16C::initial(base, pages).ok_or(EINVAL)?.as_bytes();
+        let dispatch_initial=if reusable.is_some() {
+            let mut directory=bytes(PAGE as usize).map_err(StageError::allocation)?;
+            let mut entries=bytes(operands::TABLE_SIZE as usize).map_err(StageError::allocation)?;
+            initialize_operand_data(memory,vm,&client.root,base,support,&operand_buffers,&mut directory,&mut entries)?
+        } else {initialize_operand_support(memory,vm,base,support,operand_buffers.len())?};
         let index = reusable.unwrap_or(self.owners.len());
         let render = reusable.and_then(|i| self.owners[i].render.take());
         let value = Owner {
+            pool,
             client: Some(client),
             context,
             high_root,
             directory: base,
             private_limit: limit,
-            operand_state: [state,end],
+            operand_state: [state,_end],
             support,
             support_pages,
             private_next: private_end,
             dispatch_initial,
-            compute_ordinal: 0,
             published: false,
             close_requested: false,
             invalid_roots,
@@ -693,6 +827,21 @@ impl State {
         }
         Ok(index)
     }
+    fn choose_queue(&self,key:Key,client:Option<&compute::Client>,base:u64,limit:u64,
+        priority:u32,pool:u32)->Option<usize> {
+        super::super::scheduled_generation::select(
+            self.queues.iter().enumerate().map(|(index,q)| {
+                let owner=&self.owners[q.owner];
+                let matching=q.live && q.key==key && q.storage.lanes[2].priority as u32==priority && owner.directory==base && owner.private_limit==limit
+                    && owner.client.is_some()
+                    && client.is_none_or(|next|owner.client.as_ref().is_some_and(|old|same(old,next)));
+                super::super::scheduled_generation::Candidate {
+                    index, reserved:false, eligible:owner.pool==pool && q.generation.idle(),
+                    matches:matching, same_queue:q.key==key, idle:q.generation.idle(),
+                    room:q.generation.window<super::super::g17p_compute_lifecycle::TRANSPORT_INTERVAL,
+                }
+            }), (self.queues.len()<Generation::G16C_COUNT).then_some(self.queues.len()))
+    }
     fn prepare_queue(
         &mut self,
         session: &mut Session,
@@ -701,43 +850,36 @@ impl State {
         base: u64,
         limit: u64,
         priority: u32,
-        compute_binding: Option<usize>,
-    ) -> StageResult<usize> {
-        // A caller-only immutable snapshot can be accepted while another
-        // worker changes bindings. At this serialized admission boundary all
-        // previously published GPU work and CPU cache leases have retired.
-        // Unstaged jobs still own their exact snapshots/BOs and can reconstruct
-        // that generation later; they do not own these firmware roots/queues.
-        if let Some(next) = client.as_ref() {
-            let mut obsolete = false;
-            for o in &mut self.owners {
-                if o.client.as_ref().is_some_and(|old| old.owner == next.owner && !same(old, next)) {
-                    o.close_requested = true;
-                    obsolete = true;
+        pool: u32,
+        private:&mut Option<OwnerPrivateG16C>,
+        transport:&mut Option<scheduled_queues::QueueBackingG16C>,
+    ) -> StageResult<Option<usize>> {
+        // Only the selected physical pool may change roots or transports.
+        // Another pool retains its exact older caller snapshot until its own
+        // GPU work, CPU visibility and producer leases have retired.
+        let Some(selected)=self.choose_queue(key,client.as_ref(),base,limit,priority,pool) else {
+            return Ok(None);
+        };
+        if selected==self.queues.len() && transport.is_none() {return Ok(None);}
+        if selected<self.queues.len() {
+            let index=selected;
+            let q=&self.queues[index];let o=&self.owners[q.owner];
+            if q.live && q.key==key && q.storage.lanes[2].priority as u32==priority && o.directory==base && o.private_limit==limit
+                && o.client.is_some() && client.as_ref().is_none_or(|next|
+                    o.client.as_ref().is_some_and(|old|same(old,next))) {
+                if self.queues[index].generation.window==super::super::g17p_compute_lifecycle::TRANSPORT_INTERVAL {
+                    if !self.queues[index].generation.idle() {return Err(EBUSY.into());}
+                    self.queues[index].generation.window=0;
                 }
+                return Ok(Some(index));
             }
-            if obsolete {
-                self.release_requested(session)?;
-            }
-        }
-        if let Some(i) = self
-            .queues
-            .iter().enumerate()
-            .rfind(|(index,q)| q.live && q.key == key && self.owners[q.owner].client.is_some()
-                && compute_binding.is_none_or(|binding|q.compute_binding.is_none_or(|old|old==binding))
-                && !self.work_leases.iter().flatten().any(|(qi,_)|qi==index))
-            .map(|(index,_)|index)
-        {
-            if client.as_ref().is_none_or(|c| {
-                self.owners[self.queues[i].owner]
-                    .client
-                    .as_ref()
-                    .is_some_and(|old| same(c, old))
-            }) {
-                let o = &self.owners[self.queues[i].owner];
-                if o.directory != base || o.private_limit != limit { return Err(EIO.into()); }
-                if compute_binding.is_some() { self.queues[i].compute_binding=compute_binding; }
-                return Ok(i);
+            if q.live {
+                let owner=q.owner;
+                self.recycle_generation(session,index)?;
+                if !self.queues.iter().any(|q|q.live && q.owner==owner) {
+                    self.owners[owner].close_requested=true;
+                    self.release_requested(session)?;
+                }
             }
         }
         let next = client.take();
@@ -745,97 +887,104 @@ impl State {
         let vm = session.vm.as_mut().ok_or(EIO)?;
         let owner = if let Some(next) = next {
             if let Some(i) = self.owners.iter()
-                .position(|o| o.client.as_ref().is_some_and(|c| same(c, &next))) { i }
-            else { self.build_owner(memory, vm, session.ttbs, next, base, limit)? }
+                .position(|o| o.pool==pool && o.client.as_ref().is_some_and(|c| same(c, &next))) { i }
+            else { self.build_owner(memory, vm, session.ttbs,session.independent_compute.asid_mask(), pool, next, base, limit,private)? }
         } else {
             // Another native binding may already hold this logical queue's
             // immutable client. Keep it pinned while adding a disjoint binding.
-            self.queues.iter().rfind(|q|q.live && q.key==key && self.owners[q.owner].client.is_some())
+            self.queues.iter().rfind(|q|q.live && q.key==key && self.owners[q.owner].pool==pool && self.owners[q.owner].client.is_some())
                 .map(|q|q.owner).ok_or(EIO)?
         };
         if self.owners[owner].directory != base || self.owners[owner].private_limit != limit {
             return Err(EIO.into());
         }
-        if self.engine_scratch.is_none() {
-            let (staged, prepared) = EngineScratchG16C::prepare(memory, vm).map_err(StageError::allocation)?;
-            initial_allocation_checkpoint(2, &mut self.initial_allocation_faulted, &staged)?;
-            memory.absorb(staged).map_err(StageError::allocation)?;
-            self.engine_scratch = Some(prepared.install(memory, vm)?);
+        let context=self.owners[owner].context;
+        if context>=4 && session.independent_compute.asid_mask()&(1u64<<context)==0 {
+            session.independent_compute.reserve_render_asid(context)?;
         }
-        // Preserve aliases in another still-live root. Prefer this owner's
-        // already-mapped save slot; otherwise use backing detached by VM close.
-        let reusable = self.queues.iter().position(|q| !q.live && q.owner == owner && q.save != 0)
-            .or_else(|| self.queues.iter().position(|q| !q.live && q.save == 0));
-        let i = if let Some(i) = reusable {
-            let q = &self.queues[i];
-            if q.save != 0 {
-                let root = &self.owners[owner].client.as_ref().ok_or(EIO)?.root;
-                for (j, physical) in q.save_pages.into_iter().enumerate() {
-                    if root.pte(q.save + j as u64 * PAGE)? != physical | GPU_READ | (1 << 54) {
-                        return Err(EIO.into());
-                    }
-                }
-            }
-            self.queues[i].storage.reset(memory, vm, priority.try_into()?)?;
+        // Render transports have no compute save/robustness/operand state.
+        // Their only root-private resources belong to the retained render pool.
+        // Commit the exact physical transport chosen by the shared Neo
+        // selector. Do not run a second Max-specific free-queue search after
+        // owner construction or retirement changed the old association.
+        let i = if selected<self.queues.len() {
+            let i=selected;
+            if self.queues[i].live || !self.queues[i].generation.idle() { return Err(EIO.into()); }
+            self.queues[i].storage.reset_retained(memory, vm, priority.try_into()?)?;
             i
         } else {
             self.queues.reserve(1, GFP_KERNEL).map_err(StageError::allocation)?;
             let uuid: u16 = (self.queues.len() + 1).try_into()?;
-            let (mut staged, prepared) = QueueSetG16C::prepare(memory, vm, self.queue_next,
-                priority.try_into()?, uuid, None).map_err(StageError::allocation)?;
-            let save_pages = [staged.allocate(PAGE as usize).map_err(StageError::allocation)?,
-                staged.allocate(PAGE as usize).map_err(StageError::allocation)?];
-            let o = &mut self.owners[owner];
-            if o.private_next.checked_add(2 * PAGE).ok_or(EOVERFLOW)? > o.private_limit {
-                return Err(StageError::Rejected(ENOSPC));
-            }
-            o.client.as_mut().ok_or(EIO)?.root.prepare(o.private_next, 2 * PAGE)
-                .map_err(StageError::allocation)?;
+            let (staged, prepared) = QueueSetG16C::prepare_backed(memory, vm, self.queue_next,
+                priority.try_into()?, uuid, None,transport).map_err(StageError::allocation)?;
+            initial_allocation_checkpoint(2, &mut self.initial_allocation_faulted, &staged)?;
             initial_allocation_checkpoint(3, &mut self.initial_allocation_faulted, &staged)?;
             memory.absorb(staged).map_err(StageError::allocation)?;
             let storage = prepared.install(memory, vm, priority.try_into()?)?;
             let i = self.queues.len();
             self.queues.push(Queue { live: false, key, owner, storage,
-                save: 0, robustness: 0, ordinal: 0, save_pages, render_count: 0, compute_binding }, GFP_KERNEL)?;
+                render_count: 0,
+                generation: Generation::g16c(i)? }, GFP_KERNEL)?;
             self.queue_next += scheduled_queues::SIZE;
             i
         };
         let q = &mut self.queues[i];
-        let scratch = self.engine_scratch.as_ref().ok_or(EIO)?;
-        for i in 0..3 {
-            q.storage.lanes[i].scratch_high = scratch.high[i];
-            q.storage.lanes[i].scratch_low = scratch.low[i];
-        }
-        let o = &mut self.owners[owner];
-        let mapped = q.owner == owner && q.save != 0;
-        let save = if mapped { q.save } else { o.private_next };
-        if save.checked_add(2 * PAGE).ok_or(EINVAL)? > o.private_limit {
-            return Err(ENOSPC.into());
-        }
-        let root = &mut o.client.as_mut().ok_or(EIO)?.root;
-        if !mapped { root.prepare(save, 2 * PAGE).map_err(StageError::allocation)?; }
-        for (j, physical) in q.save_pages.into_iter().enumerate() {
-            memory.zero(physical, PAGE as usize)?;
-            memory.clean(physical, PAGE as usize)?;
-            if !mapped { root.map_page(save + j as u64 * PAGE, physical, true)?; }
-        }
-        if !mapped { o.private_next += 2 * PAGE; }
         q.live = true;
         q.key = key;
         q.owner = owner;
-        q.save = save;
-        q.robustness = save + PAGE;
-        q.ordinal = 0;
+        q.generation.window = 0;
         q.render_count = 0;
-        q.compute_binding = compute_binding;
-        Ok(i)
+        Ok(Some(i))
+    }
+    /// Reassign an idle physical generation without destroying its logical
+    /// API queue. The same prefix/close/TTBR receipt used by queue destruction
+    /// precedes reinitializing its transport. Accepted immutable snapshots can
+    /// reconstruct that logical owner later, as in Neo generation rollover.
+    fn recycle_generation(&mut self,session:&mut Session,index:usize)->Result {
+        if !self.queues[index].generation.idle() {return Err(EBUSY);}
+        let mut roots=KVec::new();
+        let memory=session.memory.as_ref().ok_or(EIO)?;
+        let vm=session.vm.as_ref().ok_or(EIO)?;
+        for owner in self.owners.iter().filter(|o|o.published) {
+            let at=session.ttbs+u64::from(owner.context)*16;
+            memory.invalidate(at,16)?;
+            let words=[memory.read64(at)?,memory.read64(at+8)?];
+            let expected=[owner.client.as_ref().ok_or(EIO)?.root.root(),owner.high_root]
+                .map(|root|root|(u64::from(owner.context)<<48)|1);
+            if words!=expected {
+                kernel::pr_err!("G16C: RECYCLE_REJECT context={} pool={} actual={:x?} expected={:x?}\n",owner.context,owner.pool,words,expected);
+                return Err(EIO);
+            }
+            roots.push((at,words),GFP_KERNEL)?;
+        }
+        let oi=self.queues[index].owner;
+        let q=&self.queues[index];
+        if q.live && (q.render_count!=0) {
+            let cursors=boot::control_cursors(memory,vm)?;
+            if cursors!=[cursors[0];3] {return Err(EBUSY);}
+            let prefix=memory.read_firmware32(vm.physical(memory,2,q.storage.context)?)?.to_le_bytes();
+            let close=ContextCloseG16C::new(q.storage.context,prefix).ok_or(EIO)?;
+            if self.owners[oi].render.as_ref().is_some_and(|r|r.attached()) {
+                session.g16c_control(LifetimeTickG16C::for_render(self.render_close).bytes())?;
+                self.render_close=self.render_close.wrapping_add(1);
+            } else {session.g16c_close_prelude()?;}
+            session.g16c_control(close.bytes())?;
+            self.owners[oi].retired_queues=true;
+        }
+        let memory=session.memory.as_ref().ok_or(EIO)?;
+        for (at,words) in roots {
+            memory.invalidate(at,16)?;
+            if [memory.read64(at)?,memory.read64(at+8)?]!=words {return Err(EIO);}
+        }
+        self.queues[index].live=false;
+        self.leave_compute_mode();
+        Ok(())
     }
     fn activate(&mut self, session: &mut Session, index: usize) -> Result {
-        // Different ASIDs own distinct 32-byte entries. Initializing one can
-        // touch a cache line containing its neighbor's GPU-written cursors.
-        // New entries therefore require quiescence; existing entries are
-        // never copied or rewritten when switching between live contexts.
-        if !self.owners[index].published && !self.idle() { return Err(EBUSY); }
+        // Host policy reserves one dispatch bank per retained physical root.
+        // Initialize only a newly published bank, preserving neighboring
+        // firmware-owned bytes. Render FList registration selects this bank;
+        // native bank identities are independent of application ASIDs.
         let memory = session.memory.as_mut().ok_or(EIO)?;
         let vm = session.vm.as_ref().ok_or(EIO)?;
         let o = &mut self.owners[index];
@@ -865,6 +1014,8 @@ impl State {
             memory.write64(at + 8, o.high_root | ((o.context as u64) << 48) | 1)?;
             memory.clean(at, 16)?;
         }
+        // FList registration binds the render support to its owned bank.
+        // Other banks retain their directory and firmware-written cursors.
         self.selected=Some(index);
         vm.flush_tables(memory)?;
         Vm::invalidate_gpu();
@@ -873,357 +1024,37 @@ impl State {
         self.seed_operand_probe(session,index)?;
         Ok(())
     }
-    fn compute_slots()->Result<usize> {
-        let slots=*crate::module_parameters::g16c_compute_slots.value() as usize;
-        if !(1..=2).contains(&slots) {return Err(EINVAL);}
-        Ok(slots)
-    }
-    fn work_base(slot:usize)->Result<u64> {
-        // Slot zero preserves its qualified address. The render graph owns
-        // +0x40000..+0x5c000; other compute graphs must not overlap it.
-        Ok(WORK_BASE+match slot {0=>0,1=>0x80000,_=>return Err(EINVAL)})
-    }
-    fn work_event(&self,slot:usize)->u8 {
-        (slot+if self.compute_first==Some(false){2}else{0})as u8
-    }
-    fn prepare_work(&mut self,memory:&mut Memory,vm:&mut Vm,slot:usize)->StageResult<()> {
-        let base=Self::work_base(slot)?;
-        let alias=0x7000000000+base-work::DESCRIPTOR_BASE_G16C;
-        if self.work_leases[slot].is_some() {return Err(EBUSY.into());}
-        if self.work_pages[slot].is_none() {
-            let (staged, pages) = stage_work_pages(memory, vm, base, WORK_FLAGS, &[0])
-                .map_err(StageError::allocation)?;
-            initial_allocation_checkpoint(5, &mut self.initial_allocation_faulted, &staged)?;
-            memory.absorb(staged).map_err(StageError::allocation)?;
-            install_work_pages(memory, vm, base, WORK_FLAGS, &[0], pages)?;
-            self.work_pages[slot]=Some(pages);
-        }
-        let pages=self.work_pages[slot].ok_or(EIO)?;
-        for(i,flags)in WORK_FLAGS.into_iter().enumerate() {
-            if vm.pte(memory,2,base+i as u64*PAGE)?!=pages[i]|flags {return Err(EIO.into());}
-        }
-        if vm.pte(memory,0,alias)?!=pages[0]|GPU_READ {return Err(EIO.into());}
-        for pa in pages {memory.zero(pa,PAGE as usize)?;memory.clean(pa,PAGE as usize)?;}
-        Ok(())
-    }
-    fn reap_work_slots(&mut self) {
-        for lease in &mut self.work_leases {
-            if lease.as_ref().is_some_and(|(_,f)|unsafe {bindings::dma_fence_get_status(f.raw())}!=0) {
-                *lease=None;
-            }
-        }
-    }
-    fn configure_compute(&mut self,session:&mut Session,slot:usize)->Result {
-        if self.work_leases[slot].is_some() {return Err(EBUSY);}
-        let scratch=self.engine_scratch.as_ref().ok_or(EIO)?;
-        // Initial binding requires the established global start. Resuming a
-        // bound engine preserves its scratch and in-flight sibling state.
-        session.configure_g16c_engines(
-            &[BindingG16C::compute(self.work_event(slot),scratch.low[slot+2]).ok_or(EIO)?],
-            self.compute_bound[slot], !self.compute_bound[slot])?;
-        self.compute_bound[slot] = true;
-        self.compute_mode=true;
-        Ok(())
-    }
-    fn stage(
-        &mut self,
-        session: &mut Session,
-        key: Key,
-        client: &mut Option<compute::Client>,
-        p: &compute::Parameters,
-        priority: u32,
-        dependencies: [Option<(u8,u32)>;3],
-    ) -> StageResult<Option<Arc<ComputeReceipt>>> {
-        self.cpu_leases.retain(|f|unsafe {bindings::dma_fence_get_status(f.raw())}==0);
-        self.reap_work_slots();
-        let busy=!self.pending.is_empty() || !self.cpu_leases.is_empty();
-        if busy {
-            // A closed queue with no unfinished accepted jobs is reclaimable.
-            // Stop refilling the engines until its qualified close transaction
-            // can run at global quiescence. Unfinished closing queues must
-            // still be allowed to publish all of their accepted work.
-            if self.queue_closes.iter().any(|q|q.active_jobs.load(Ordering::Acquire)==0) {
-                return Ok(None);
-            }
-            // A live ASID retains its own GPU-written dispatch entry. Admit
-            // another immutable owner only after its root/entry was published
-            // at quiescence; never initialize a neighboring cursor while busy.
-            let requested=client.as_ref().or_else(||self.client(key));
-            let resident=requested.and_then(|next|self.owners.iter().find(|o|
-                o.published && o.client.as_ref().is_some_and(|old|same(old,next))));
-            if !self.compute_mode || resident.is_none()
-                || self.pending.iter().any(|p|p.render_owner.is_some()) {return Ok(None);}
-        } else {self.release_requested(session)?;}
-        let slots=Self::compute_slots()?;
-        // A cold binding runs the full engine setup and global start. Do not
-        // perform that transaction while a sibling is executing. Once idle,
-        // initialize an unused slot before reusing an already-bound one, so
-        // the next pair can use both engines with the qualified resume tail.
-        let free=|index: &usize|self.work_leases[*index].is_none();
-        let slot=if busy {
-            (0..slots).find(|index|free(index) && self.compute_bound[*index])
-        } else {
-            (0..slots).find(|index|free(index) && !self.compute_bound[*index])
-                .or_else(||(0..slots).find(free))
-        };
-        let Some(slot)=slot else {return Ok(None);};
-        let qi=self.prepare_queue(session,key,client,p.preempt,p.kernel_end,priority,Some(slot))?;
-        let oi=self.queues[qi].owner;
-        // Engine scratch is device-wide; work packets carry their own ASID.
-        // Retain initialized bindings across live owners. Queue/context close
-        // and render transitions still invalidate them at global quiescence.
-        let target=*crate::module_parameters::g16c_operand_buffers.value();
-        if !(operands::INITIAL_BUFFERS..=1024).contains(&target) {return Err(EINVAL.into());}
-        if !busy && self.queues[qi].ordinal!=0 && target as usize>self.owners[oi].operand_buffers.len() {
-            self.activate(session,oi)?;
-            self.grow_operands(session,oi,target)?;
-        }
-        if !self.compute_mode {
-            for slot in 0..Self::compute_slots()? {self.prepare_work(session.memory.as_mut().ok_or(EIO)?,session.vm.as_mut().ok_or(EIO)?,slot)?;}
-        }
-        let receipt_ordinal=self.ordinal;
-        // The record waits on this ENGINE's previous item. A global ordinal
-        // would make its first job wait for nonexistent work on a new engine.
-        let sequence=self.compute_sequences[slot];
-        let event=self.work_event(slot);
-        let stamp=sequence.wrapping_add(1).wrapping_shl(8);
-        let base=Self::work_base(slot)?;
-        self.pending.reserve(1,GFP_KERNEL).map_err(StageError::allocation)?;
-        self.prepare_work(session.memory.as_mut().ok_or(EIO)?,session.vm.as_mut().ok_or(EIO)?,slot)?;
-        let scratch=self.engine_scratch.as_ref().ok_or(EIO)?;
-        self.queues[qi].storage.lanes[2].scratch_high=scratch.high[slot+2];
-        self.queues[qi].storage.lanes[2].scratch_low=scratch.low[slot+2];
-        let receipt = ComputeReceipt::new(receipt_ordinal).map_err(StageError::allocation)?;
-        let o = &self.owners[oi];
-        let q = &self.queues[qi];
-        // One backend submission namespace per owned context. Its numeric
-        // ID is our allocation policy, independent of physical engine IDs.
-        let namespace=o.context.checked_sub(1).ok_or(EIO)?;
-        // All these bindings use the owner's one compute support domain.
-        // Its submission identity is independent of queue and engine counters.
-        let support_ordinal=o.compute_ordinal;
-        let completion = Completion {
-            client: o.client.as_ref().ok_or(EIO)?.lease().map_err(StageError::allocation)?,
-            stamps: session
-                .timestamps
-                .as_ref()
-                .ok_or(EIO)?
-                .cache_seed(&p.timestamps).map_err(StageError::allocation)?,
-            fence: receipt.fence.clone(),
-            grid: event,
-            error: None,
-        };
-        let mut leases = KVec::new();
-        leases.push(o.client.as_ref().ok_or(EIO)?.lease().map_err(StageError::allocation)?, GFP_KERNEL).map_err(StageError::allocation)?;
-        o.client.as_ref().ok_or(EIO)?.cache(false).map_err(StageError::allocation)?;
-        completion.stamps.run(false).map_err(StageError::allocation)?;
-        let mut drivers = KVec::new();
-        drivers.push(
-            Stamp {
-                address: base + 0xc100,
-                value: stamp,
-            },
-            GFP_KERNEL,
-        ).map_err(StageError::allocation)?;
-        let mut counters = KVec::new();
-        counters.push(
-            Stamp {
-                address: base + 0x800c,
-                value: 1,
-            },
-            GFP_KERNEL,
-        ).map_err(StageError::allocation)?;
-        let next_queue_ordinal = self.queues[qi].ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        let next_sequence = sequence.checked_add(1).ok_or(EOVERFLOW)?;
-        let next_ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        flight_allocation_checkpoint(&mut self.initial_allocation_faulted)?;
-        let memory = session.memory.as_mut().ok_or(EIO)?;
-        let vm = session.vm.as_mut().ok_or(EIO)?;
-        let alias = 0x7000000000 + base - work::DESCRIPTOR_BASE_G16C;
-        let identity = ((q.storage.uuid as u64) << 32) | 0xc0 | o.context as u64;
-        let program = protocol::ProgramG16C {
-            preempt: q.save,
-            cdm: p.cdm,
-            identity,
-            context: o.context as u32,
-            ordinal: slot as u32,
-            robustness: q.robustness,
-            operand_state: o.operand_state[slot],
-            usc_exec_base: Some(1 << 40),
-            helper_binary: 0,
-            helper_data: 0,
-            helper_cfg: 0,
-            // Our live-pool reservation uses context-1. This is a host policy,
-            // not an inherent firmware association between bank and ASID.
-            execution_gate: u64::from(o.context - 1),
-            register_a599: 0x13200400020,
-        }.build()
-        .map_err(|_| EINVAL)?;
-        let mut descriptor = bytes(PAGE as usize).map_err(StageError::allocation)?;
-        protocol::DescriptorG16C {
-                save_area: q.save,
-                cdm: p.cdm,
-                identity,
-                sequence: u64::from(support_ordinal),
-                context: o.context as u32,
-                scheduler: base + 0x8000,
-                low_alias: alias,
-                cdm_terminator: p.end.checked_sub(4).ok_or(EINVAL)?,
-                sampler_array: p.sampler,
-                sampler_count: p.sampler_count,
-                // Shared Neo names: dispatch = completion stamps; status = internal timestamps.
-                dispatch: [base + 0xc100, q.storage.lanes[2].queue + 0x1040],
-                grid: u32::from(event),
-                queue_submission: stamp >> 8,
-                queue_ordinal: 0,
-                submission_index: sequence.checked_add(1).ok_or(EOVERFLOW)?,
-                ordinal: support_ordinal,
-                status: [base + 0xc120, base + 0xc128],
-                timestamps: p.timestamps,
-                shared_control: o.support,
-                support_control: 0x6c000001,
-                support_flags: 6,
-                support_kind: 0x45f,
-                support_phase: 1,
-                zero_page: base + 0x10000,
-            }.build(&mut descriptor,program.registers())
-        .map_err(|_| EINVAL)?;
-        vm.write(memory, 2, base, &descriptor)?;
-        let wrapper = work::ComputeWrapperG16C::new(&work::WrapperParameters {
-            scratch_low: q.storage.lanes[2].scratch_low,
-            scratch_high: q.storage.lanes[2].scratch_high,
-            support: o.support,
-            queue_control: q.storage.context,
-            grid: u16::from(event),
-            item: q.ordinal as u16 & 255,
-            ordinal: q.ordinal as u16,
-            context: o.context,
-            support_id: namespace,
-            uuid: q.storage.uuid,
-            scheduler: priority as u16,
-            scheduler_hint: 0,
-            first: sequence == 0,
-            field_52: u16::from(q.ordinal == 0),
-            field_5e: 2,
-            field_62: u16::from(q.ordinal == 0),
-        })
-        .map_err(|_| EINVAL)?;
-        vm.write(memory, 2, base + 0x4000, wrapper.as_bytes())?;
-        let mut end = [0u8; 0x40];
-        end[..4].copy_from_slice(&16u32.to_le_bytes());
-        end[4..8].copy_from_slice(&(((sequence.wrapping_add(1) & 0xffff) << 16) | u32::from(event)).to_le_bytes());
-        end[8..16].copy_from_slice(
-            &(0x00fe000000000000u64 | ((sequence as u64 + 1) >> 16)).to_le_bytes(),
-        );
-        vm.write(memory, 2, base + 0x40c0, &end)?;
-        // The common scheduler supplies exact backend target counters. Keep
-        // cold binding conservative, but never add unrelated hot-engine waits.
-        let mut required=[None;4];required[event as usize]=Some(sequence);
-        for (grid,value) in dependencies.into_iter().flatten() {
-            if grid>=4 || value>=1<<30 || (grid==event && value>sequence) {return Err(EIO.into());}
-            let cell=&mut required[grid as usize];
-            *cell=Some(cell.unwrap_or(0).max(value));
-        }
-        if !self.compute_bound.iter().all(|bound|*bound) {
-            for index in 0..Self::compute_slots()? {
-                if index==slot || self.compute_sequences[index]!=0 {
-                    let cell=&mut required[self.work_event(index)as usize];
-                    *cell=Some(cell.unwrap_or(0).max(self.compute_sequences[index]));
-                }
-            }
-        }
-        let mut points=[(0,0);4];let mut point_count=0;
-        for (grid,value)in required.into_iter().enumerate() {
-            if let Some(value)=value {points[point_count]=(grid as u8,value);point_count+=1;}
-        }
-        let record = work::ComputeRecordG16C::for_compute_control_dependencies(&work::RecordParametersG16C {
-            descriptor: base,
-            queue: q.storage.lanes[2].queue,
-            grid: event,
-            item: sequence,
-            primary_count: (program.registers().len() - 2) as u16,
-            control: 0x0800 | namespace,
-            retire_control: 2,
-            ..Default::default()
-        }, 0x0800 | namespace, &points[..point_count])
-        .map_err(|_| EINVAL)?;
-        vm.write(
-            memory,
-            2,
-            q.storage.lanes[2].scratch_high + ((sequence as u64 + 1) & 255) * 0x200,
-            record.as_bytes(),
-        )?;
-        vm.write(
-            memory,
-            2,
-            base + 0x8000,
-            work::ComputeSchedulerG16C::for_compute(base + 0xc140).as_bytes(),
-        )?;
-        vm.write(memory, 2, base + 0xc140, &1u32.to_le_bytes())?;
-        vm.write(
-            memory,
-            2,
-            base + 0xc100,
-            &stamp.wrapping_sub(0x100).to_le_bytes(),
-        )?;
-        let works = [base + 0x4000, base + 0x40c0];
-        let lane = &mut self.queues[qi].storage.lanes[2];
-        let prepared = session.prepare_g16c_admission(
-            &mut [Request {
-                lane,
-                works: &works,
-                event,
-                tag: 0,
-            }],
-            Requirements {
-                firmware: KVec::new(),
-                driver: drivers,
-                notifiers: KVec::new(),
-                drains: KVec::new(),
-                counters,
-            },
-            leases,
-        )?;
-        self.activate(session, oi)?;
-        // All host allocations and retirement ownership precede engine arm.
-        // Activation publishes scratch/graph tables before alias fetches.
-        self.configure_compute(session,slot)?;
-        let id = session.publish_g16c_submission(&mut [Request {
-            lane: &mut self.queues[qi].storage.lanes[2], works: &works, event, tag: 0,
-        }], prepared)?;
-        self.compute_first.get_or_insert(true);
-        receipt.point.store((u64::from(event)<<40)|(u64::from(event)<<32)|u64::from(next_sequence), Ordering::Relaxed);
-        receipt.publication_ready.store(true, Ordering::Release);
-        self.work_leases[slot]=Some((qi,receipt.fence.clone()));
-        if *crate::module_parameters::g16c_operand_probe.value()!=0 {
-            self.owners[oi].operand_probe_pending=true;
-        }
-        if *crate::module_parameters::submission_log.value()>=3 {
-            kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: compute published queue={} context={} slot={} stamp={} in_flight={}\n",key.1,self.owners[oi].context,slot,stamp,self.pending.len()+1);
-        }
-        self.pending.push(
-            Pending {
-                id,
-                receipt: ReceiptG16C::Compute(receipt.clone()),
-                render_owner: None,
-                growth_tokens: KVec::new(),
-                render_work: None,
-                parameter_error: None,
-                compute_slot: Some(slot),
-                completion,
-                started: kernel::time::Instant::now(),
-            },
-            GFP_KERNEL,
-        )?;
-        self.queues[qi].ordinal = next_queue_ordinal;
-        self.owners[oi].compute_ordinal = support_ordinal.wrapping_add(1);
-        self.compute_sequences[slot]=next_sequence;
-        self.ordinal = next_ordinal;
-        Ok(Some(receipt))
+    fn leave_compute_mode(&mut self) {
+        // Native client recycling closes the logical context but retains its
+        // SKSM binding/count. The next publication resumes it after new DATA
+        // is ready; only the first use performs the full binding transaction.
+        self.compute_mode=false;
     }
 }
 
 impl Session {
+    pub(super) fn require_g16c_render_owner_idle(&self,owner:(u64,u32))->Result {
+        let state=self.g16c_compute.as_ref().ok_or(EIO)?;
+        if state.owners.iter().any(|o|o.client.as_ref().is_some_and(|c|c.owner==owner)
+            && !self.render_pool_available(o.pool)) {return Err(EBUSY);}
+        Ok(())
+    }
+
+    pub(super) fn bind_g16c_compute(&mut self,grid:u8,address:u64,resume:bool)->Result {
+        let mode=self.g16c_compute.as_ref().ok_or(EIO)?.compute_mode;
+        self.configure_g16c_engines(&[BindingG16C::compute(grid,address).ok_or(EINVAL)?],resume,!resume||!mode)?;
+        self.g16c_compute.as_mut().ok_or(EIO)?.compute_mode=true;Ok(())
+    }
+    pub(crate) fn poll_scheduled_g16c_work(&mut self,dev:&kernel::device::Device)->(Result<bool>,KVec<Completion>) {
+        let (result,completions)=self.poll_g16c_work(dev);
+        self.completions=completions;
+        self.defer_cache=true;
+        let result=result.and_then(|render|self.poll_scheduled_compute(dev,None).map(|compute|render&&compute));
+        self.defer_cache=false;
+        if let Err(error)=result {self.fail_cpu_completion(error);}
+        (result,core::mem::take(&mut self.completions))
+    }
+
     fn prepare_g16c_admission(&mut self, requests: &mut [Request<'_>], requirements: Requirements,
         owners: KVec<compute::ClientLease>) -> StageResult<super::super::scheduled_transport::PreparedG16C> {
         match self.prepare_g16c_submission(requests, requirements, owners) {
@@ -1260,12 +1091,7 @@ impl Session {
         }
         Ok(())
     }
-    pub(crate) fn close_g16c_queue(&mut self, key: Key, active_jobs: Arc<AtomicU64>) -> Result {
-        if self.phase != Phase::Running { return Err(EIO); }
-        self.g16c_compute.as_mut().ok_or(EIO)?.queue_closes
-            .push(QueueClose { key, active_jobs }, GFP_KERNEL)?;
-        self.reap_g16c_contexts()
-    }
+
     pub(super) fn g16c_control(&mut self, record: &[u8; 64]) -> Result {
         let target = boot::publish_control(
             self.memory.as_mut().ok_or(EIO)?,
@@ -1312,25 +1138,29 @@ impl Session {
     pub(crate) fn g16c_client(&self, key: Key) -> Option<&compute::Client> {
         self.g16c_compute.as_ref().and_then(|s| s.client(key))
     }
-    pub(crate) fn stage_g16c_compute(
-        &mut self,
-        key: Key,
-        client: &mut Option<compute::Client>,
-        p: &compute::Parameters,
-        priority: u32,
-        dependencies: [Option<(u8,u32)>;3],
-    ) -> Result<Option<Arc<ComputeReceipt>>> {
-        if self.phase != Phase::Running
-            || self
-                .peers
-                .iter()
-                .any(|p| p.data.crashed.load(Ordering::Acquire))
-        {
-            return Err(EIO);
-        }
-        let mut state = self.g16c_compute.take().ok_or(EIO)?;
-        let result = state.stage(self, key, client, p, priority, dependencies);
-        self.g16c_compute = Some(state);
+    pub(super) fn commit_g16c_scratch(&mut self,prepared:PreparedScratchG16C)->Result<bool> {
+        let mut state=self.g16c_compute.take().ok_or(EIO)?;
+        let result=state.commit_render_scratch(self,prepared);
+        self.g16c_compute=Some(state);self.finish_g16c_admission(result)
+    }
+    pub(crate) fn g16c_render_storage_needed(&self,incoming:&compute::Client,p:&super::super::g17p_render::Parameters,
+        key:Key,priority:u32)->(bool,bool) {
+        let Some(state)=self.g16c_compute.as_ref() else {return (true,true);};
+        let queue=state.render_pool(self,incoming,p).is_some_and(|pool|
+            state.choose_queue(key,Some(incoming),p.kernel_start,p.kernel_end,priority,pool)==Some(state.queues.len()));
+        let work=self.next_wrapped_render_storage(state.render_ordinal).is_some_and(|slot|
+            !state.render_work_pages.iter().any(|(old,_)|*old==slot));
+        (queue,work)
+    }
+    pub(crate) fn g16c_render_needs_private(&self,incoming:&compute::Client,p:&super::super::g17p_render::Parameters)->bool {
+        let Some(state)=self.g16c_compute.as_ref() else {return true;};
+        state.render_needs_private(self,incoming,p)
+    }
+    pub(super) fn commit_g16c_render_template(&mut self,incoming:&compute::Client,
+        p:&super::super::g17p_render::Parameters,prepared:PreparedRenderTemplateG16C)->Result<bool> {
+        let mut state=self.g16c_compute.take().ok_or(EIO)?;
+        let result=state.commit_render_template(self,incoming,p,prepared);
+        self.g16c_compute=Some(state);
         self.finish_g16c_admission(result)
     }
     fn finish_g16c_admission<T>(&mut self, result: StageResult<T>) -> Result<T> {
@@ -1346,26 +1176,27 @@ impl Session {
             }
         })
     }
-    pub(crate) fn poll_g16c_work(&mut self) -> (Result<bool>, KVec<Completion>) {
-        let mut completions = KVec::new();
+    pub(crate) fn poll_g16c_work(&mut self,dev:&kernel::device::Device) -> (Result<bool>, KVec<Completion>) {
+        self.reap_render_cpu_leases();
+        self.defer_cache=true;
         let result = (|| -> Result<bool> {
-            if self.phase != Phase::Running
-                || self
-                    .peers
-                    .iter()
-                    .any(|p| p.data.crashed.load(Ordering::Acquire))
-            {
+            if self.phase != Phase::Running || self.peers.iter().any(|p|p.data.crashed.load(Ordering::Acquire)) {
                 return Err(EIO);
             }
-            let mut state = self.g16c_compute.take().ok_or(EIO)?;
-            let result = (|| -> Result<bool> {
+            let mut state=self.g16c_compute.take().ok_or(EIO)?;
+            let mut wave=match self.pending.take() {
+                Some(PendingWork::WrappedRender(wave))=>wave,
+                None=>RenderWave {frames:KVec::new(),next:0},
+                Some(other)=>{self.pending=Some(other);self.g16c_compute=Some(state);return Err(EIO);},
+            };
+            let result=(|| -> Result<bool> {
                 let mut accepted=None;
                 let ttbs=self.ttbs;
                 boot::drain_with_work_event(self.memory.as_mut().ok_or(EIO)?,
                     self.vm.as_ref().ok_or(EIO)?, &mut |memory,vm,raw| {
                         let result=match u32::from_le_bytes(raw[..4].try_into().unwrap()) {
-                            6=>state.accept_growth(memory,vm,ttbs,raw).map(WorkEvent::Growth),
-                            7=>state.accept_parameter_error(memory,vm,ttbs,raw).map(WorkEvent::ParameterError),
+                            6=>state.accept_growth(memory,vm,ttbs,&mut wave.frames,raw).map(WorkEvent::Growth),
+                            7=>state.accept_parameter_error(memory,vm,ttbs,&wave.frames,raw).map(WorkEvent::ParameterError),
                             _=>Err(EIO),
                         };
                         accepted=Some(result.map_err(|error|{
@@ -1376,51 +1207,54 @@ impl Session {
                 if let Some(request)=accepted {
                     match request {
                         WorkEvent::Growth(request)=>state.service_growth(self,request),
-                        WorkEvent::ParameterError(request)=>state.service_parameter_error(self,request),
+                        WorkEvent::ParameterError(request)=>state.service_parameter_error(self,&mut wave.frames,request),
                     }.map_err(|error|{kernel::pr_err!("G16C: work event service failed {:?}\n",error);error})?;
                 }
-                let mut index=0;
-                while index<state.pending.len() {
-                    let p=&state.pending[index];
-                    if !self.poll_g16c(p.id).map_err(|error|{kernel::pr_err!("G16C: flight poll {} failed {:?}\n",p.id,error);error})? {
-                        if p.started.elapsed().as_nanos() > 10_000_000_000 {
-                            return Err(ETIMEDOUT);
-                        }
-                        index+=1;continue;
-                    }
-                    let id = p.id;
-                    completions.reserve(1, GFP_KERNEL)?;
-                    state.cpu_leases.reserve(1, GFP_KERNEL)?;
-                    self.release_g16c(id).map_err(|error|{kernel::pr_err!("G16C: flight release {} failed {:?}\n",id,error);error})?;
-                    let mut p = state.pending.remove(index).map_err(|_| EIO)?;
-                    if let Some(error)=p.parameter_error.take() {
-                        // Release above independently proved every required
-                        // stamp, event counter and queue/channel cursor.
-                        p.completion.error=Some(ENOMEM);
-                        kernel::dev_info!(self.peers[0].data.dev.as_ref(),
-                            "G16C: retired parameter ENOMEM context={} slot={} stamp={} driver_before={:?} work_quiescent=1 error9_retired=1\n",
-                            error.owner.context,error.owner.slot,error.owner.stamp,error.before_driver);
-                    }
-                    if let Some(slot)=p.compute_slot.filter(|_|*crate::module_parameters::submission_log.value()>=3) {
-                        kernel::dev_info!(self.peers[0].data.dev.as_ref(),"G16C: compute retired slot={} flight={} remaining={}\n",slot,id,state.pending.len());
-                    }
-                    state.cpu_leases.push(p.receipt.fence().clone(), GFP_KERNEL)?;
-                    completions.push(p.completion, GFP_KERNEL)?;
-                }
-                if state.pending.is_empty() {state.retire_operand_probe(self)?;}
-                Ok(state.pending.is_empty())
+                let done=wave.poll(self,dev,None)?;
+                if done {state.retire_operand_probe(self)?;}
+                Ok(done)
             })();
-            if let Err(error) = result {
-                for p in &state.pending {
-                    p.receipt.fail(error);
+            if let Err(error)=result {
+                if let Err(dump_error)=state.dump_render_failure(self,&wave.frames) {
+                    kernel::pr_err!("G16C: retained render DATA unavailable {:?}\n",dump_error);
                 }
+                wave.fail(error);
             }
-            self.g16c_compute = Some(state);
+            if !wave.frames.is_empty() {self.pending=Some(PendingWork::WrappedRender(wave));}
+            self.g16c_compute=Some(state);
             result
         })();
-        if let Err(error) = result {
-            self.fail_cpu_completion(error);
-        }
-        (result, completions)
+        self.defer_cache=false;
+        if let Err(error)=result {self.fail_cpu_completion(error);}
+        (result,core::mem::take(&mut self.completions))
     }
+}
+
+impl RetainedFrame for RenderTicket {
+    type Cache=();
+    fn receipt(&self)->&Arc<RenderReceipt> {&self.receipt}
+    fn fence(&self)->&kernel::dma_fence::Fence {&self.receipt.fence}
+    fn pool(&self)->u32 {self.render_work.slot}
+    fn storage(&self)->u32 {self.storage}
+    fn poll(&mut self,session:&mut Session,_dev:&kernel::device::Device,image:Option<&super::Image>,_sole:bool)->Result<bool> {
+        if image.is_some() {return Err(EIO);}
+        if self.started.elapsed().as_millis()>=5000 {return Err(ETIMEDOUT);}
+        session.poll_g16c(self.id).map_err(|error|{
+            kernel::pr_err!("G16C: flight poll {} failed {:?}\n",self.id,error);error
+        })
+    }
+    fn cache_seed(&self,_session:&Session)->Result {Ok(())}
+    fn release(&mut self,session:&mut Session)->Result {
+        session.release_g16c(self.id).map_err(|error|{
+            kernel::pr_err!("G16C: flight release {} failed {:?}\n",self.id,error);error
+        })?;
+        if let Some(error)=self.parameter_error.take() {
+            self.completion.error=Some(ENOMEM);
+            kernel::dev_info!(session.peers[0].data.dev.as_ref(),
+                "G16C: retired parameter ENOMEM context={} slot={} stamp={} driver_before={:?} work_quiescent=1 error9_retired=1\n",
+                error.owner.context,error.owner.slot,error.owner.stamp,error.before_driver);
+        }
+        Ok(())
+    }
+    fn completion(self,_cache:())->Completion {self.completion}
 }

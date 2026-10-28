@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Single-ASC G16C startup inside the common scheduler/session owner.
 //! No caller producer is exposed here. Full command emission remains separate.
@@ -13,8 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
     c_str,
     device::Core,
-    devres::Devres,
-    io::{mem::IoMem, Io},
+    io::{mem::DevresIoMem, Io},
     platform,
     prelude::*,
     soc::apple::rtkit,
@@ -23,7 +22,8 @@ use kernel::{
 
 impl Session {
     pub(crate) fn destroy_g16c_vm(&mut self, owner: (u64, u32)) -> Result {
-        self.release_g16c_vm(owner)
+        self.independent_compute.require_owner_idle(owner)?;
+        self.require_g16c_render_owner_idle(owner)
     }
 
     pub(crate) fn create_g16c_queues(
@@ -106,19 +106,17 @@ impl Session {
     }
 
     pub(crate) fn prepare_g16c(
-        pdev: &platform::Device<Core>,
+        pdev: &platform::Device<Core<'_>>,
         resources: &ResourcesG16C,
-        sgx: Pin<KBox<Devres<IoMem<0x3758000>>>>,
+        sgx: DevresIoMem<0x3758000>,
         image: &ImageG16C,
     ) -> Result<KBox<Self>> {
         let dev = pdev.as_ref();
         // Validate cold state before allocating or changing any UAT backing.
-        let asc = KBox::pin_init(
+        let asc =
             pdev.io_request_by_name(c_str!("asc"))
                 .ok_or(ENODEV)?
-                .iomap_sized::<0x4000>(),
-            GFP_KERNEL,
-        )?;
+                .iomap_sized::<0x4000>()?.into_devres()?;
         let control = {
             let regs = asc.try_access().ok_or(ENODEV)?;
             let control = regs.read32(0x44);
@@ -178,7 +176,7 @@ impl Session {
             vm.as_ref().ok_or(EINVAL)?.flush_tables(memory)?;
             Vm::invalidate_gpu();
         }
-        let mut rtkit = KBox::pin(
+        let rtkit = KBox::pin(
             rtkit::RtKit::<Operations>::new(
                 dev,
                 Some(c_str!("primary")),
@@ -187,7 +185,6 @@ impl Session {
             )?,
             GFP_KERNEL,
         )?;
-        rtkit.as_mut().set_early_crashlog();
         session.peers[0].rtkit = Some(rtkit);
         session.phase = Phase::Starting;
         {
@@ -260,7 +257,8 @@ impl Session {
         )?);
         session.phase = Phase::Running;
         session.g16c_compute = Some(KBox::new(super::g16c_compute::State::new(), GFP_KERNEL)?);
-        dev_info!(dev,"G16C: single-ASC initdata accepted and opening controls retired; native command emission pending\n");
+        session.independent_compute=super::super::g17p_compute_queues::Queues::wrapped();
+        dev_info!(dev,"G16C: single-ASC initdata accepted; opening controls retired\n");
         Ok(session)
     }
 
@@ -287,9 +285,9 @@ impl Session {
             let target = boot::publish_control(self.memory.as_mut().ok_or(EIO)?,
                 self.vm.as_ref().ok_or(EIO)?, request.bytes())?;
             self.g16c_send(0x21, boot::CONTROL_MESSAGE)?;
-            // Live compute operand extension follows the source shim's
-            // retirement transaction: notify control, then wake the work loop.
-            if registration.mode==0 {self.g16c_send(0x21,0x0083000000000010)?;}
+            // Bank selection does not change the registration transaction:
+            // notify control, then wake the work loop for every owned bank.
+            self.g16c_send(0x21,0x0083000000000010)?;
             self.g16c_wait_receipt(|memory, vm| boot::control_retired(memory, vm, target),
                 Some(&mut receipt), false)
         })();

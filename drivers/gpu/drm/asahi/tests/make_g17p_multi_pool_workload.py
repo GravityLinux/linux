@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export independently addressed eight-target callers for the DRM pool test.
 
 Execute selected pure constructors, never the experiment's proxy setup. The

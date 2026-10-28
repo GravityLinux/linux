@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Max FList registration DATA and its owned reply. A matching RX receipt is
 //! independent of TX consumption; callers must establish both before reuse.
@@ -16,7 +16,7 @@ pub(crate) struct FListRequestG16C {
     table: [u8; 8],
     previous_end: [u8; 8],
     added_bytes: [u8; 4],
-    mode: [u8; 4],
+    bank: [u8; 4],
     enabled: [u8; 4],
     pad_38: [u8; 8],
 }
@@ -32,7 +32,7 @@ impl Default for FListRequestG16C {
             table: [0; 8],
             previous_end: [0; 8],
             added_bytes: [0; 4],
-            mode: [0; 4],
+            bank: [0; 4],
             enabled: 1u32.to_le_bytes(),
             pad_38: [0; 8],
         }
@@ -45,10 +45,9 @@ pub(crate) struct RegistrationG16C {
     pub(crate) table: u64,
     pub(crate) added: u32,
     pub(crate) previous: u32,
-    pub(crate) mode: u32,
+    // Request +0x30 selects the dispatch bank, not an operation enum.
+    pub(crate) bank: u32,
     pub(crate) tag: u32,
-    // RX +8 is an independent observed value, not the request tag at +0xc.
-    pub(crate) reply_value: u32,
 }
 
 pub(crate) struct FListReceiptG16C {
@@ -57,7 +56,7 @@ pub(crate) struct FListReceiptG16C {
     table: u64,
     previous_end: u64,
     added_bytes: u32,
-    reply_value: u32,
+    bank: u32,
     pub(crate) received: bool,
 }
 impl RegistrationG16C {
@@ -67,7 +66,8 @@ impl RegistrationG16C {
         if !(1..64).contains(&self.context)
             || self.added == 0
             || self.added >= 1 << 29
-            || self.mode > 2
+            // The owned 16-KiB dispatch page contains 32-byte bank records.
+            || self.bank >= 0x4000 / 0x20
         {
             return Err(Error::Invalid);
         }
@@ -82,7 +82,7 @@ impl RegistrationG16C {
             table: self.table.to_le_bytes(),
             previous_end: previous_end.to_le_bytes(),
             added_bytes: bytes.to_le_bytes(),
-            mode: self.mode.to_le_bytes(),
+            bank: self.bank.to_le_bytes(),
             tag: self.tag.to_le_bytes(),
             ..Default::default()
         };
@@ -92,7 +92,7 @@ impl RegistrationG16C {
             table: self.table,
             previous_end,
             added_bytes: bytes,
-            reply_value: self.reply_value,
+            bank: self.bank,
             received: false,
         };
         Ok((request, receipt))
@@ -111,7 +111,7 @@ impl FListReceiptG16C {
         if self.received
             || word(0) != 13
             || word(4) != self.context
-            || word(8) != self.reply_value
+            || word(8) != self.bank
             || pointer(0xc) != self.support
             || pointer(0x14) != self.table
             || pointer(0x1c) != self.previous_end
@@ -140,7 +140,7 @@ const _: () = {
     at!(table, 0x1c);
     at!(previous_end, 0x24);
     at!(added_bytes, 0x2c);
-    at!(mode, 0x30);
+    at!(bank, 0x30);
     at!(enabled, 0x34);
     at!(pad_38, 0x38);
 };

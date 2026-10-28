@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G16C source startup DATA transactions, before accepting caller work.
 //! Wire objects remain owned by the common Memory/Vm. RTKit transport and

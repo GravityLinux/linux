@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
 // Native Linux compute->indirect render/PB growth: source-owned inputs, no Apple pages.
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
@@ -62,9 +62,37 @@ static void set_timestamps(void *commands,size_t size,uint32_t object_handle) {
     }
     assert(cursor==size && render==1 && compute==1 && index==6);
 }
+static void prepare_timestamp_bank(int fd,uint32_t vm_id,unsigned bank,uint32_t *handle,uint8_t **mapping) {
+    assert(bank<2);
+    struct drm_asahi_gem_create stamp_create={.size=0x4000};
+    checked_ioctl(fd,DRM_IOCTL_ASAHI_GEM_CREATE,&stamp_create);
+    *handle=stamp_create.handle;
+    struct drm_asahi_gem_mmap_offset stamp_offset={.handle=stamp_create.handle};
+    checked_ioctl(fd,DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET,&stamp_offset);
+    uint8_t *stamp_map=mmap(NULL,0x4000,PROT_READ|PROT_WRITE,MAP_SHARED,fd,stamp_offset.offset);
+    assert(stamp_map!=MAP_FAILED); *mapping=stamp_map;
+    memset(stamp_map,0xa5,0x4000);
+    /* Keep a user alias so subsequent submits upload/read back old bank
+     * guards. Late firmware DMA becomes visible to this C client. */
+    struct drm_asahi_gem_bind_op stamp_alias={.flags=DRM_ASAHI_BIND_READ|DRM_ASAHI_BIND_WRITE,
+        .handle=stamp_create.handle,.range=0x4000,
+        .addr=UINT64_C(0x6fe0000000)+bank*0x4000};
+    struct drm_asahi_vm_bind stamp_vm_bind={.vm_id=vm_id,.num_binds=1,
+        .stride=sizeof(stamp_alias),.userptr=(uintptr_t)&stamp_alias};
+    checked_ioctl(fd,DRM_IOCTL_ASAHI_VM_BIND,&stamp_vm_bind);
+}
+
 int main(int argc,char **argv) {
     assert(argc>=2 && argc<=4);
     int file_close=0;uint64_t origin=UINT64_C(0x7000000000);
+    const char *evidence_tag=getenv("G16C_EVIDENCE_TAG");
+    char artifact_prefix[40]="";
+    if(evidence_tag) {
+        size_t length=strlen(evidence_tag);
+        assert(length && length<32 && strspn(evidence_tag,
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")==length);
+        assert(snprintf(artifact_prefix,sizeof(artifact_prefix),"%s-",evidence_tag)>0);
+    }
     for(int i=2;i<argc;i++) {
         if(!strcmp(argv[i],"--file-close"))file_close=1;
         else {char *end=NULL;assert(!strncmp(argv[i],"--origin=",9));
@@ -112,25 +140,28 @@ int main(int argc,char **argv) {
     struct drm_syncobj_create sync_create={0}; checked_ioctl(fd,DRM_IOCTL_SYNCOBJ_CREATE,&sync_create);
     uint8_t *timestamp_maps[2]={0};
     uint32_t timestamp_handles[2]={0};
+    const char *stable=getenv("G16C_STABLE_TIMESTAMP_BINDINGS");
+    assert(!stable || !strcmp(stable,"1"));
+    int stable_bindings=stable!=NULL;
+    if(stable_bindings) {
+        for(unsigned bank=0;bank<2;bank++) prepare_timestamp_bank(fd,vm.vm_id,bank,
+            &timestamp_handles[bank],&timestamp_maps[bank]);
+        printf("G16C_PRESSURE_BINDINGS_STABLE banks=2; same VM/queue and user bindings across generations\n");
+        fflush(stdout);
+    }
     for(unsigned generation=1;generation<=2;generation++) {
-        struct drm_asahi_gem_create stamp_create={.size=0x4000};
-        checked_ioctl(fd,DRM_IOCTL_ASAHI_GEM_CREATE,&stamp_create);
-        timestamp_handles[generation-1]=stamp_create.handle;
-        struct drm_asahi_gem_mmap_offset stamp_offset={.handle=stamp_create.handle};
-        checked_ioctl(fd,DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET,&stamp_offset);
-        uint8_t *stamp_map=mmap(NULL,0x4000,PROT_READ|PROT_WRITE,MAP_SHARED,fd,stamp_offset.offset);
-        assert(stamp_map!=MAP_FAILED); timestamp_maps[generation-1]=stamp_map;
-        memset(stamp_map,0xa5,0x4000);
-        /* Keep a user alias so subsequent submits upload/read back old bank
-         * guards. Late firmware DMA becomes visible to this C client. */
-        struct drm_asahi_gem_bind_op stamp_alias={.flags=DRM_ASAHI_BIND_READ|DRM_ASAHI_BIND_WRITE,
-            .handle=stamp_create.handle,.range=0x4000,
-            .addr=UINT64_C(0x6fe0000000)+(generation-1)*0x4000};
-        struct drm_asahi_vm_bind stamp_vm_bind={.vm_id=vm.vm_id,.num_binds=1,
-            .stride=sizeof(stamp_alias),.userptr=(uintptr_t)&stamp_alias};
-        checked_ioctl(fd,DRM_IOCTL_ASAHI_VM_BIND,&stamp_vm_bind);
+        const char *gate=getenv("G16C_SECOND_GENERATION_FIFO");
+        if(generation==2 && gate) {
+            printf("G16C_PRESSURE_READY tag=%s generation=2\n",evidence_tag?evidence_tag:"single");
+            fflush(stdout);
+            FILE *release=fopen(gate,"rb");assert(release);
+            assert(fgetc(release)=='1');assert(fclose(release)==0);
+        }
+        if(!stable_bindings) prepare_timestamp_bank(fd,vm.vm_id,generation-1,
+            &timestamp_handles[generation-1],&timestamp_maps[generation-1]);
+        uint8_t *stamp_map=timestamp_maps[generation-1];
         struct drm_asahi_gem_bind_object stamp_bind={.op=DRM_ASAHI_BIND_OBJECT_OP_BIND,
-            .flags=DRM_ASAHI_BIND_OBJECT_USAGE_TIMESTAMPS,.handle=stamp_create.handle,
+            .flags=DRM_ASAHI_BIND_OBJECT_USAGE_TIMESTAMPS,.handle=timestamp_handles[generation-1],
             .offset=0,.range=0x4000};
         checked_ioctl(fd,DRM_IOCTL_ASAHI_GEM_BIND_OBJECT,&stamp_bind);
         assert(stamp_bind.object_handle);
@@ -141,10 +172,29 @@ int main(int argc,char **argv) {
         struct drm_asahi_sync sync={.sync_type=DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,.handle=sync_create.handle,.timeline_value=generation};
         struct drm_asahi_submit submit={.queue_id=queue.queue_id,.cmdbuf=(uintptr_t)commands,
             .cmdbuf_size=h[4],.syncs=(uintptr_t)&sync,.out_sync_count=1};
-        checked_ioctl(fd,DRM_IOCTL_ASAHI_SUBMIT,&submit);
+        /* Stable mode measures the asynchronous UAPI, bypassing the legacy
+         * test wrapper's hidden completion wait. The public timeline below
+         * still owns retirement and all original output/poison checks. */
+        if(stable_bindings) {
+            if(g17p_raw_ioctl(fd,DRM_IOCTL_ASAHI_SUBMIT,&submit)<0) {
+                perror("raw asynchronous submit"); exit(1);
+            }
+        } else checked_ioctl(fd,DRM_IOCTL_ASAHI_SUBMIT,&submit);
+        struct drm_asahi_get_time submitted={0};
+        if(stable_bindings) {
+            checked_ioctl(fd,DRM_IOCTL_ASAHI_GET_TIME,&submitted);
+            printf("G16C_PRESSURE_RAW_SUBMIT tag=%s generation=%u before=%"PRIu64" returned=%"PRIu64"\n",
+                evidence_tag?evidence_tag:"single",generation,(uint64_t)before.gpu_timestamp,
+                (uint64_t)submitted.gpu_timestamp);
+            fflush(stdout);
+        }
         uint64_t point=generation;
         struct drm_syncobj_timeline_wait wait={.handles=(uintptr_t)&sync_create.handle,.points=(uintptr_t)&point,
             .count_handles=1,.timeout_nsec=0};
+        if(stable_bindings) {
+            struct timespec now;assert(clock_gettime(CLOCK_MONOTONIC,&now)==0);
+            wait.timeout_nsec=(int64_t)now.tv_sec*1000000000+now.tv_nsec+15000000000LL;
+        }
         checked_ioctl(fd,DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,&wait);
         unsigned checked=0;
         for(unsigned i=0;i<h[2];i++) if(seeds[i]) {
@@ -159,7 +209,7 @@ int main(int argc,char **argv) {
             }
             assert(memcmp(maps[i],seeds[i],objects[i].size));
             char actual_name[128];
-            snprintf(actual_name,sizeof(actual_name),"/pressure-%u-epoch%u-gem%u.bin",h[5],generation,objects[i].id);
+            snprintf(actual_name,sizeof(actual_name),"/pressure-%s%u-epoch%u-gem%u.bin",artifact_prefix,h[5],generation,objects[i].id);
             FILE *actual=fopen(actual_name,"wb");assert(actual);
             assert(fwrite(maps[i],1,objects[i].size,actual)==objects[i].size);assert(fclose(actual)==0);
             free(expected);
@@ -180,7 +230,13 @@ int main(int argc,char **argv) {
             int written=byte>=24 && byte<192 && (byte-24)%32<8;
             if(!written) assert(stamp_map[byte]==0xa5);
         }
-        char actual_stamp[128];snprintf(actual_stamp,sizeof(actual_stamp),"/pressure-%u-epoch%u-timestamps.bin",h[5],generation);
+        printf("G16C_PRESSURE_TIMESTAMPS tag=%s origin=%#"PRIx64" generation=%u CS=%"PRIu64",%"PRIu64" TA=%"PRIu64",%"PRIu64" FR=%"PRIu64",%"PRIu64"\n",
+            evidence_tag?evidence_tag:"single",origin,generation,
+            values[0],values[1],values[2],values[3],values[4],values[5]);
+        if(stable_bindings) printf("G16C_PRESSURE_SUBMIT_WINDOW tag=%s generation=%u before=%"PRIu64" submitted=%"PRIu64" observed=%"PRIu64"\n",
+            evidence_tag?evidence_tag:"single",generation,(uint64_t)before.gpu_timestamp,
+            (uint64_t)submitted.gpu_timestamp,(uint64_t)after.gpu_timestamp);
+        char actual_stamp[128];snprintf(actual_stamp,sizeof(actual_stamp),"/pressure-%s%u-epoch%u-timestamps.bin",artifact_prefix,h[5],generation);
         FILE *actual=fopen(actual_stamp,"wb");assert(actual);
         assert(fwrite(stamp_map,1,0x4000,actual)==0x4000);assert(fclose(actual)==0);
         for(unsigned old=0;old+1<generation;old++)

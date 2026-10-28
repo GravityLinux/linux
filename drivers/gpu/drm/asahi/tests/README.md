@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
 Native Max compressed-color producer and consumer:
 
 ```sh
@@ -767,3 +768,40 @@ rejection with no stores/sends, dropped unpublished leases, unchanged heads
 and a successful retry of id1 in the same transport. Geometry CPU checks fail
 each of its three initial backing allocations without altering prior leaves,
 addresses or retained backing, then preserve the full source image comparison.
+
+`g16c_drm_compute_overlap /fixture-compute-overlap-v1 --dependency` warms
+two distinct queues in one VM, then submits a consumer with the producer's
+still-pending binary syncobj as an input. Both ioctls precede either completion
+wait. Three short pairs check every BO, output, timestamp guard and actual GPU
+ordering. `--dependency-close` destroys the producer queue while both commands
+are accepted and the producer fence remains pending; stale queue destruction
+must return ENOENT, VM destruction EBUSY, and both exported fences must succeed.
+The surviving mappings permit full output readback after closing the DRM fd.
+
+These external syncobj inputs follow the common asynchronous Job's CPU input
+gate. They do not qualify a firmware cross-generation consumer lease or final
+DriverFile release: the output mappings still retain the file for readback.
+
+For a bounded new-VM handoff probe, make a version3 fixture from the existing
+own-Mesa balanced compute fixture:
+
+```sh
+python3 prepare_g16c_handoff_fixture.py /fixture-compute-balanced-v1 /fixture-handoff
+/g16c_drm_compute_cross_vm /fixture-handoff --separate-files --relocate --drain-arrival --return-after-arrival --jobs=12 --arrival-after=4
+```
+
+The generator changes only iteration uniforms, expected CPU outputs and the
+fixture version. Shader, launch, binding and command bytes stay unchanged.
+The native client independently checks both arithmetic results. Arrival after4
+accepted old jobs leaves subsequent work on the original queue. Version3
+requires actual GPU interval overlap, incoming work before the final old job,
+and continued old work after incoming completion, followed by an explicit
+old-queue return. Complete BO images and timestamp guards remain mandatory.
+
+`--jobs=4 --arrival-after=1` is a shorter fault probe. With the preceding
+render/queue-lifetime sequence it reproduces a firmware event4 and negative
+old fence on the current Max driver. A clean compute-only boot can complete
+all GPU outputs and the return yet reject the stricter temporal guard when
+incoming work covers the final old command. Such a coverage rejection is
+different evidence from a firmware timeout or negative fence. Neither closes
+the full early-handoff requirement.

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Bounded pool-zero growth refusal and independently backed pool-one work. */
 #define G17P_RENDER_VM_HELPERS
 #include "g17p_drm_render_vm.c"

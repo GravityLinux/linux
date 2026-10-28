@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 // Included after the bounded DATA fixture and production modules.
 use prelude::*;
 use scheduled_transport::{StateG16C,Request,Requirements,Stamp,Route};

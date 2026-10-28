@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Typed, reserved-memory contract for the single G16C firmware instance.
 //! All original ADT interpretation belongs to m1n1. Addresses here come from

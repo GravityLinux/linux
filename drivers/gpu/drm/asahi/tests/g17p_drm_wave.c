@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* 258 commands in bounded waves, distinct outputs and changing inputs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

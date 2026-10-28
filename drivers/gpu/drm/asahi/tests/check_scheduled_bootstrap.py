@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare real Max startup DATA transactions with actual Python methods.
 
 Uses the common production UAT walker; ASID invalidation is recorded by a host
@@ -144,7 +144,7 @@ fn main()->Result {
     boot::drain(&mut m,&v)?;dump(&m,&v,&out,"drained")?;
     let state=BASE+0x3f1c0;let data=BASE+0x3f440;
     let registration=g17p_render::admission::RegistrationG16C{context:7,support:0xfffffc20c3000000,
-        table:0x7001000000,added:5,previous:23,mode:0,tag:19,reply_value:0};
+        table:0x7001000000,added:5,previous:23,bank:0,tag:19};
     let (_,mut receipt)=registration.prepare().unwrap();
     let mut reply=[0u8;0x48];
     for(at,value)in[(0,13u32),(4,7),(8,0),(36,40)]{reply[at..at+4].copy_from_slice(&value.to_le_bytes());}

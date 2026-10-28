@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-2.0-only
 // Native owned OOM7/error9, failed dependency and same-queue recovery.
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>

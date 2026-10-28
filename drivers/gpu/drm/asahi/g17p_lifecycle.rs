@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! g17p_lifecycle.py cleanup encodings and bounded publication/receipt gates.
 //! Consumption retains every resource and does not qualify physical reclaim.

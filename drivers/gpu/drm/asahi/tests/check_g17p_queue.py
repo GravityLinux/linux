@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare ordered Rust publication writes with actual G17PSubmitter.stage."""
 import host_versions
 import argparse,ast,importlib.util,struct,subprocess,tempfile,sys

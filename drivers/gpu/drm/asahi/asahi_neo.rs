@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Scheduled-family G16C/G17P GPU driver.
 //!
@@ -6,7 +6,7 @@
 //! owners. G16C command admission remains under construction.
 
 use kernel::{
-    c_str, device::Core, devres::Devres, io::mem::IoMem, io::Io, of, platform, prelude::*,
+    c_str, device::Core, io::mem::DevresIoMem, io::Io, of, platform, prelude::*,
 };
 
 #[allow(dead_code)]
@@ -37,6 +37,7 @@ mod scheduled_operands;
 #[allow(dead_code)]
 mod scheduled_dispatch;
 mod scheduled_lifetime;
+mod scheduled_generation;
 #[allow(dead_code)]
 mod scheduled_transport;
 #[allow(dead_code)]
@@ -110,26 +111,34 @@ enum GpuAbi {
 }
 
 // Profile-specific MMIO/resources surround the same runtime and DRM owners.
-enum ScheduledGpu {
+struct ScheduledDriver;
+
+enum ScheduledGpu<'bound> {
     G17P {
-        _sgx: Pin<KBox<Devres<IoMem<SGX_SIZE>>>>,
+        _sgx: DevresIoMem<SGX_SIZE>,
         _platform: g17p_platform::Platform,
         runtime: g17p_drm::RuntimeRef,
-        _drm: kernel::sync::aref::ARef<kernel::drm::Device<g17p_drm::Driver>>,
+        _drm: kernel::drm::Registration<'bound, g17p_drm::Driver>,
     },
     G16C {
         _resources: scheduled_resources::ResourcesG16C,
         runtime: g17p_drm::RuntimeRef,
-        _drm: kernel::sync::aref::ARef<kernel::drm::Device<g17p_drm::Driver>>,
+        _drm: kernel::drm::Registration<'bound, g17p_drm::Driver>,
     },
 }
 
-impl Drop for ScheduledGpu {
+impl Drop for ScheduledGpu<'_> {
     fn drop(&mut self) {
         // Stop firmware while devres still owns all mailbox/MMIO mappings.
         match self {
             Self::G17P { runtime, .. } | Self::G16C { runtime, .. } => {
-                drop(runtime.lock().take());
+                let mut held=runtime.lock();
+                if let Some(owner)=Option::as_mut(&mut *held) {
+                    // Also wake accepted jobs blocked on caller fences: no
+                    // firmware event or watchdog is pending for those jobs.
+                    owner.session.fail_cpu_completion(ENODEV);
+                }
+                drop(held.take());
             }
         }
     }
@@ -137,8 +146,7 @@ impl Drop for ScheduledGpu {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
-    <ScheduledGpu as platform::Driver>::IdInfo,
+    <ScheduledDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c_str!("apple,agx-t8140")), GpuAbi::G17P),
         (of::DeviceId::new(c_str!("apple,agx-g16c")), GpuAbi::G16C),
@@ -146,30 +154,30 @@ kernel::of_device_table!(
     ]
 );
 
-impl platform::Driver for ScheduledGpu {
+impl platform::Driver for ScheduledDriver {
     type IdInfo = GpuAbi;
+    type Data<'bound> = ScheduledGpu<'bound>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
-
-    fn probe(
-        pdev: &platform::Device<Core>,
-        _info: Option<&Self::IdInfo>,
-    ) -> impl PinInit<Self, Error> {
-        match _info {
-            Some(GpuAbi::G16C) => Self::probe_g16c(pdev),
-            _ => Self::probe_g17p(pdev),
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        match info {
+            Some(GpuAbi::G16C) => ScheduledGpu::probe_g16c(pdev),
+            _ => ScheduledGpu::probe_g17p(pdev),
         }
     }
 }
 
-impl ScheduledGpu {
+impl<'bound> ScheduledGpu<'bound> {
     // Isolate per-profile construction frames from each other and from the
     // platform adapter. The common entry must not reserve both probe stacks.
     #[inline(never)]
-    fn probe_g16c(pdev: &platform::Device<Core>) -> Result<Self> {
+    fn probe_g16c(pdev: &'bound platform::Device<Core<'_>>) -> Result<Self> {
         let node = pdev.as_ref().of_node().ok_or(ENODEV)?;
         let resources = scheduled_resources::ResourcesG16C::from_fdt(&node)?;
         let request = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx = KBox::pin_init(request.iomap_sized::<0x3758000>(), GFP_KERNEL)?;
+        let sgx = request.iomap_sized::<0x3758000>()?.into_devres()?;
         let version = sgx.try_access().ok_or(ENODEV)?.read32(ID_VERSION);
         let board = scheduled_board::BoardG16C::from_fdt(&node)?;
         let max_mhz = *board.freq_a.iter().max().ok_or(EINVAL)?;
@@ -192,7 +200,7 @@ impl ScheduledGpu {
             })),
             GFP_KERNEL,
         )?;
-        let drm = g17p_drm::register_g16c(pdev.as_ref(), version, max_mhz, runtime.clone())?;
+        let drm = g17p_drm::register_g16c(pdev, version, max_mhz, runtime.clone())?;
         Ok(Self::G16C {
             _resources: resources,
             runtime,
@@ -201,9 +209,9 @@ impl ScheduledGpu {
     }
 
     #[inline(never)]
-    fn probe_g17p(pdev: &platform::Device<Core>) -> Result<Self> {
+    fn probe_g17p(pdev: &'bound platform::Device<Core<'_>>) -> Result<Self> {
         let request = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx = KBox::pin_init(request.iomap_sized::<SGX_SIZE>(), GFP_KERNEL)?;
+        let sgx = request.iomap_sized::<SGX_SIZE>()?.into_devres()?;
         let (version, counts, mask) = {
             let regs = sgx.try_access().ok_or(ENODEV)?;
             let version = regs.read32(ID_VERSION);
@@ -247,7 +255,7 @@ impl ScheduledGpu {
             GFP_KERNEL,
         )?;
         let drm = g17p_drm::register(
-            pdev.as_ref(),
+            pdev,
             version,
             counts,
             mask,
@@ -264,11 +272,11 @@ impl ScheduledGpu {
 }
 
 kernel::module_platform_driver! {
-    type: ScheduledGpu,
+    type: ScheduledDriver,
     name: "asahi_neo",
     authors: ["Asahi Linux Contributors"],
     description: "Apple A18 Pro GPU driver",
-    license: "Dual MIT/GPL",
+    license: "GPL",
     params: {
         submission_log: u32 {
             default: 1,
@@ -310,10 +318,7 @@ kernel::module_platform_driver! {
             default: 0xffffffff,
             description: "Source pool-one TVB bound: inherit by default, zero unbounded, otherwise 8..2048",
         },
-        g16c_compute_slots: u32 {
-            default: 2,
-            description: "G16C dedicated compute engine slots, 1..2; preserves two render engines",
-        },
+
         g16c_operand_buffers: u32 {
             default: 20,
             description: "G16C quiescent operand-pool target after initial compute use; 20 retains the initial pool",

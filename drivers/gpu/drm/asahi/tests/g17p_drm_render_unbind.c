@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Unbind/rebind live render outputs and timestamps in one VM/file. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

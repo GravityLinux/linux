@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Whole Rust engine-handoff records vs single-user native protocol DATA."""
 import argparse
 import hashlib

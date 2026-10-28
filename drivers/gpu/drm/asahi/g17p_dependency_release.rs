@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Native first-wave release from _submit_dependency_wave and the two source
 //! target-side release primitives. Every object is owned and resident first.

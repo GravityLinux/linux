@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare all G16C close/maintenance bytes with the qualified source encoders."""
 import argparse,hashlib,json,subprocess,sys,tempfile
 from pathlib import Path

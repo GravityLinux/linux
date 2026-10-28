@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source port of g17p_render.py and G17PWorkBuilder descriptor bodies.
 //! Ordered register writes (including duplicates) are firmware programs.
@@ -25,6 +25,9 @@ pub(crate) const SUPPORT_SIZE: usize = 0x70;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Parameters {
+    // Immutable VM reservation metadata; not firmware wire fields.
+    pub(crate) kernel_start:u64,
+    pub(crate) kernel_end:u64,
     pub(crate) firmware_priority: Option<u32>,
     pub(crate) queue_owner: Option<(u64, u32)>,
     // UAPI bit 3 moves only the selected FR dependency to this command's FR.
@@ -128,6 +131,7 @@ pub(crate) struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
+            kernel_start:0,kernel_end:0,
             firmware_priority: None,
             queue_owner: None,
             vdm_barrier_fragment: false,

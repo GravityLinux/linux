@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare Rust opening objects with the actual Python partial-opening builders.
 
 Compile only selected AST definitions/constants: no experiment module setup,

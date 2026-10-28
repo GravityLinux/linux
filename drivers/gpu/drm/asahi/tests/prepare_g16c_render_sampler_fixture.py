@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export qualified own-source vertex sampling with caller-built native tables.
 
 Only resource DATA and UAPI fields change. No shader/launch decoding or rewriting

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Differential Max publication/retirement gate against actual Python Publisher.
 
 Compiles the production Rust transaction with bounded DATA memory, an identity
@@ -157,7 +157,7 @@ for cap in [4,256,1280,65536]:
 with tempfile.TemporaryDirectory(prefix='scheduled-transport-')as directory:
     tmp=Path(directory);flags=host_versions.build(tmp)
     code=host_vm.prelude().replace('pub fn sync(){}','pub fn sync(){crate::trace::fence();}')
-    code+='\nmod module_parameters {\n    pub static FAIL:std::sync::atomic::AtomicU32=std::sync::atomic::AtomicU32::new(0);\n    pub struct Parameter;\n    impl Parameter {pub fn value(&self)->&u32{if FAIL.load(std::sync::atomic::Ordering::Relaxed)==9{&9}else{&0}}}\n    #[allow(non_upper_case_globals)]pub static g16c_initial_alloc_fail:Parameter=Parameter;\n}\n'
+    code+='\nmod module_parameters {\n    pub static FAIL:std::sync::atomic::AtomicU32=std::sync::atomic::AtomicU32::new(0);\n    pub struct Parameter;\n    impl Parameter {pub fn value(&self)->u32{if FAIL.load(std::sync::atomic::Ordering::Relaxed)==9{9}else{0}}}\n    #[allow(non_upper_case_globals)]pub static g16c_initial_alloc_fail:Parameter=Parameter;\n}\n'
     code=code.replace('pub fn write(&mut self,base:u64,b:&[u8])->Result{self.write_inner(base,b)}',
         'pub fn write(&mut self,base:u64,b:&[u8])->Result{self.write_inner(base,b)?;crate::trace::write(base,b)}')
     code+='''

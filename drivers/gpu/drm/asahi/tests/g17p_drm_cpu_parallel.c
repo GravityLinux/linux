@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Independent UAPI work completes during an off-lock CPU preparation/cache pause. */
 #define G17P_UNBIND_LIBRARY
 #include "g17p_drm_unbind_pending.c"

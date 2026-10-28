@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Direct port of g17p_resource_record.py. These functions encode supplied
 //! owner state; they do not choose slots, publish work or reclaim resources.

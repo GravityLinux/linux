@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 // Generated from g17p_source_topology.py by tests/import_g17p_topology.py.
 // Address-only source topology. No table or firmware page bodies.
 
@@ -309,3 +309,5 @@ pub(crate) const CONTEXT0_PEERS: &[(u64, usize, u64)] = &[
     (0x7001848000, 8, 0xfffffc20c07d0000),
     (0x7001870000, 8, 0xfffffc20c07f8000),
 ];
+
+pub(crate) const SOURCE_REGION_NAMES: &[u8] = b"source-graph-0\0source-graph-1\0source-graph-2\0source-graph-3\0source-graph-4\0source-graph-5\0source-graph-6\0source-graph-7\0source-graph-8\0source-graph-9\0source-graph-10\0source-graph-11\0source-graph-12\0source-graph-13\0source-graph-14\0source-graph-15\0source-graph-16\0source-graph-17\0source-graph-18\0source-graph-19\0source-graph-20\0source-graph-21\0source-graph-22\0source-graph-23\0";

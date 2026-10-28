@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """CPU RGBA8 oracle for the source fixtures' POT Morton surface layout.
 
 Addressing follows Mesa src/asahi/layout/layout.c::ail_initialize_twiddled and

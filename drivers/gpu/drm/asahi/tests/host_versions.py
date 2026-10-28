@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Build the production versions macro without the kernel's other macros."""
 
 import json

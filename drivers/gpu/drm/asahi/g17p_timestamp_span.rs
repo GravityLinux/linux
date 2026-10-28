@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Page coverage of a caller's logical timestamp object. This is host mapping
 //! bookkeeping, not a firmware ABI structure.

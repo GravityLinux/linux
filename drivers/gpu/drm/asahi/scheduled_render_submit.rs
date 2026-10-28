@@ -1,10 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source-owned Max render pair lowering in the common scheduler/runtime.
 
-use super::super::super::g17p_render::{self as command, program, wire as body};
+use super::super::super::g17p_render as command;
 use super::*;
-const BASE: u64 = WORK_BASE + 0x40000;
 const FLAGS: [u64; 7] = [
     PRIVATE,
     PRIVATE,
@@ -15,20 +14,316 @@ const FLAGS: [u64; 7] = [
     SHARED,
 ];
 
+impl RenderTemplateSeedG16C {
+    pub(crate) fn prepare(self)->Result<PreparedRenderTemplateG16C> {
+        let (memory,resource)=render::ResourcesG16C::build(self.pool,self.pool,self.directory,self.limit)?;
+        if crate::module_parameters::submission_log.value()>=3 {
+            kernel::pr_info!("G16C: RENDER_TEMPLATE_PREPARED pool={} context={} outside_runtime_lock\n",self.pool,self.context);
+        }
+        Ok(PreparedRenderTemplateG16C {seed:self,memory,resource})
+    }
+}
+fn geometry_sizes(p:&command::Parameters)->Result<[u64;3]> {
+    let (_,stride,tpc)=p.scratch_layout().map_err(|_|EINVAL)?;
+    Ok([stride.checked_mul(u64::from(super::super::super::g17p_render_lifecycle::SCRATCH_SLOTS)).ok_or(EOVERFLOW)?,
+        tpc.checked_mul(4).ok_or(EOVERFLOW)?,0x200+if p.layers>1 {0x100}else{0}])
+}
 impl State {
-    fn render_storage(&mut self, memory: &mut Memory, vm: &mut Vm) -> StageResult<()> {
-        let alias = 0x7000000000 + BASE - work::DESCRIPTOR_BASE_G16C;
-        if self.render_work_pages.is_none() {
-            let (staged, pages) = stage_work_pages(memory, vm, BASE, FLAGS, &[0, 2])
-                .map_err(StageError::allocation)?;
+    pub(in super::super) fn render_scratch_seed(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)
+        ->Result<Option<GeometrySeedG16C>> {
+        let Some(qi)=self.retained_render_index(session,incoming,p) else {return Ok(None);};
+        let owner=self.queues[qi].owner;let o=&self.owners[owner];
+        let client=o.client.as_ref().ok_or(EIO)?;
+        // Geometry addresses must see the admitted caller's mappings. The
+        // common rebind transaction runs before normal geometry staging;
+        // defer this seed until that exact caller/window has been installed.
+        if !same(client,incoming) || o.directory!=p.kernel_start || o.private_limit!=p.kernel_end {return Ok(None);}
+        let r=o.render.as_ref().ok_or(EIO)?;let root=&client.root;
+        let Some(plan)=r.geometry_plan(root,geometry_sizes(p)?)? else {return Ok(None);};
+        Ok(Some(GeometrySeedG16C {owner,pool:o.pool,context:o.context,plan,root:root.lease()?}))
+    }
+    pub(super) fn commit_render_scratch(&mut self,session:&mut Session,mut prepared:PreparedScratchG16C)->StageResult<bool> {
+        if !session.render_pool_available(prepared.pool) {return Ok(false);}
+        let Some(o)=self.owners.get_mut(prepared.owner) else {return Ok(false);};
+        if o.pool!=prepared.pool || o.context!=prepared.context {return Ok(false);}
+        let Some(client)=o.client.as_mut() else {return Ok(false);};
+        let Some(r)=o.render.as_mut() else {return Ok(false);};
+        if !r.preflight_geometry(&mut client.root,&prepared.plan,&mut prepared.geometry).map_err(StageError::allocation)? {return Ok(false);}
+        initial_allocation_checkpoint(7,&mut self.initial_allocation_faulted,&prepared.memory)?;
+        session.memory.as_mut().ok_or(EIO)?.absorb(prepared.memory).map_err(StageError::allocation)?;
+        r.install_geometry(&mut client.root,prepared.geometry)?;
+        Ok(true)
+    }
+}
+
+impl State {
+    fn cold_render_owner(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<usize> {
+        let pool=self.render_pool(session,incoming,p)?;
+        let oi=self.owners.iter().position(|o|o.pool==pool && o.render.is_none()
+            && o.client.as_ref().is_some_and(|c|same(c,incoming)))?;
+        let o=&self.owners[oi];
+        // Preserve Neo-style retained reuse: an existing dormant graph is
+        // rebound by normal admission and needs no speculative replacement.
+        if self.owners.iter().any(|old|old.pool==pool && old.render.as_ref().is_some_and(|r|r.dormant()
+            && r.private_end.checked_sub(r.directory).and_then(|span|o.private_next.checked_add(span))
+                .is_some_and(|end|end<=o.private_limit))) {return None;}
+        Some(oi)
+    }
+    pub(in super::super) fn render_template_size(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)
+        ->Result<Option<usize>> {
+        Ok(self.cold_render_owner(session,incoming,p).map(|i|self.owners[i].client.as_ref().unwrap().root.table_count()))
+    }
+    pub(in super::super) fn capture_render_template(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters,
+        storage:super::super::super::g17p_user_vm::TableStorage)->Result<Option<RenderTemplateSeedG16C>> {
+        let Some(owner)=self.cold_render_owner(session,incoming,p) else {return Ok(None);};
+        let o=&self.owners[owner];let root=&o.client.as_ref().ok_or(EIO)?.root;
+        let Some(snapshot)=root.capture_tables(storage)? else {return Ok(None);};
+        Ok(Some(RenderTemplateSeedG16C {owner,pool:o.pool,context:o.context,directory:o.private_next,
+            limit:o.private_limit,snapshot,_root:root.lease()?}))
+    }
+    pub(super) fn commit_render_template(&mut self,session:&mut Session,incoming:&compute::Client,p:&command::Parameters,
+        mut prepared:PreparedRenderTemplateG16C)->StageResult<bool> {
+        let seed=&prepared.seed;
+        if self.cold_render_owner(session,incoming,p)!=Some(seed.owner) {return Ok(false);}
+        let o=&mut self.owners[seed.owner];let root=&mut o.client.as_mut().ok_or(EIO)?.root;
+        if o.pool!=seed.pool || o.context!=seed.context || o.private_next!=seed.directory
+            || o.private_limit!=seed.limit || !seed.snapshot.matches(root) {return Ok(false);}
+        if prepared.resource.private_end>o.private_limit {return Err(StageError::Rejected(ENOSPC));}
+        let memory=session.memory.as_mut().ok_or(EIO)?;let vm=session.vm.as_mut().ok_or(EIO)?;
+        prepared.resource.preflight(memory,vm,root).map_err(StageError::allocation)?;
+        initial_allocation_checkpoint(4,&mut self.initial_allocation_faulted,&prepared.memory)?;
+        memory.absorb(prepared.memory).map_err(StageError::allocation)?;
+        prepared.resource.install(memory,vm,root)?;
+        o.private_next=prepared.resource.private_end;o.render=Some(prepared.resource);
+        kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: PB {} allocated for context {} common off-lock template commit\n",o.pool,o.context);
+        Ok(true)
+    }
+}
+
+impl State {
+    pub(in super::super) fn render_needs_private(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->bool {
+        // A retained physical root already owns its private backing. The
+        // common PTE rebind plan changes callers/windows without replacing it.
+        self.retained_render_index(session,incoming,p).is_none()
+            && self.render_pool(session,incoming,p).is_some_and(|pool|
+                self.owner_private_required(pool,incoming,p.kernel_start,p.kernel_end))
+    }
+    pub(crate) fn render_pool(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<u32> {
+        super::super::super::g17p_render_lifecycle::select_pool(
+            self.render_ordinal,super::super::super::g17p_render_runtime::pool_count() as u32,
+            |pool| {
+                if !session.render_pool_available(*pool) {return false;}
+                let Some(o)=self.owners.iter().find(|o|o.pool==*pool) else {
+                    return super::super::super::g17p_render_lifecycle::render_asid(*pool,session.independent_compute.asid_mask()).is_some();
+                };
+                o.private_next.checked_sub(o.directory).and_then(|span|p.kernel_start.checked_add(span))
+                    .is_some_and(|end|end<=p.kernel_end)
+                    && self.queues.iter().filter(|q|q.owner<self.owners.len() && self.owners[q.owner].pool==*pool)
+                        .all(|q|q.generation.idle())
+            },
+            |pool|self.owners.iter().any(|o|o.pool==*pool&&o.client.as_ref().is_some_and(|c|same(c,incoming))))
+    }
+    fn retained_render_index(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<usize> {
+        let key=p.queue_owner?;p.firmware_priority?;
+        let pool=self.render_pool(session,incoming,p)?;
+        let owns_pool=|q:&&Queue|q.live&&q.generation.idle()&&self.owners[q.owner].pool==pool
+            && self.owners[q.owner].client.is_some()
+            && self.owners[q.owner].render.as_ref().is_some_and(|r|r.attached());
+        self.queues.iter().enumerate().find(|(_,q)|owns_pool(q)&&q.key==key)
+            .or_else(||self.queues.iter().enumerate().find(|(_,q)|owns_pool(q))).map(|(index,_)|index)
+    }
+    pub(crate) fn selected_render_client(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<&compute::Client> {
+        let qi=self.retained_render_index(session,incoming,p)?;
+        self.owners[self.queues[qi].owner].client.as_ref()
+    }
+    pub(crate) fn render_rebind_size(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)
+        ->Result<Option<usize>> {
+        let Some(qi)=self.retained_render_index(session,incoming,p) else {return Ok(None);};
+        let o=&self.owners[self.queues[qi].owner];let installed=o.client.as_ref().ok_or(EIO)?;
+        Ok((!same(installed,incoming)||o.directory!=p.kernel_start||o.private_limit!=p.kernel_end)
+            .then(||installed.root.table_count()))
+    }
+    pub(crate) fn capture_render_rebind(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters,
+        storage:Option<super::super::super::g17p_user_vm::TableStorage>)
+        ->Result<Option<Option<super::super::super::g17p_boot::PoolRebindSeed>>> {
+        let Some(qi)=self.retained_render_index(session,incoming,p) else {return Ok(Some(None));};
+        let o=&self.owners[self.queues[qi].owner];let client=o.client.as_ref().ok_or(EIO)?;
+        let moving=o.directory!=p.kernel_start||o.private_limit!=p.kernel_end;
+        if same(client,incoming)&&!moving {return Ok(Some(None));}
+        let Some(storage)=storage else {return Ok(None);};
+        let seed=super::super::super::g17p_boot::PoolRebindSeed::capture(
+            o.render.as_ref().ok_or(EIO)?.parameter.slot,o.context,client,storage,
+            Arc::new(KVec::new(),GFP_KERNEL)?,KVec::new(),KVec::new())?;
+        let Some(seed)=seed else {return Ok(None);};
+        let seed=if moving {
+            let mut blocks=KVec::with_capacity(o.private.len(),GFP_KERNEL)?;
+            for b in &o.private {blocks.push((b.offset,b.physical,b.size),GFP_KERNEL)?;}
+            o.render.as_ref().ok_or(EIO)?.append_private_blocks(o.directory,&mut blocks)?;
+            seed.relocate_private([o.directory,o.private_next],[p.kernel_start,p.kernel_end],blocks)
+        } else {seed};
+        Ok(Some(Some(seed)))
+    }
+    fn rebind_render_owner(&mut self,session:&mut Session,client:&mut Option<compute::Client>,p:&command::Parameters,
+        plan:Option<&mut super::super::super::g17p_boot::PreparedPoolRebind>)->Result<bool> {
+        let Some(incoming)=client.as_ref() else {return Ok(true);};
+        let Some(qi)=self.retained_render_index(session,incoming,p) else {return Ok(true);};
+        let oi=self.queues[qi].owner;
+        let o=&self.owners[oi];let installed=o.client.as_ref().ok_or(EIO)?;
+        let moving=o.directory!=p.kernel_start||o.private_limit!=p.kernel_end;
+        let private=moving.then_some(([o.directory,o.private_next],[p.kernel_start,p.kernel_end]));
+        if !same(installed,incoming)||moving {
+            let Some(plan)=plan else {return Ok(false);};
+            if !plan.matches_pool(o.render.as_ref().ok_or(EIO)?.parameter.slot,o.context)
+                || !plan.matches(installed,incoming)||!plan.matches_private(private) {return Ok(false);}
+            let memory=session.memory.as_ref().ok_or(EIO)?;
+            let at=session.ttbs+u64::from(o.context)*16;
+            memory.invalidate(at,16)?;
+            let expected=if o.published {
+                [installed.root.root(),o.high_root].map(|root|root|(u64::from(o.context)<<48)|1)
+            } else {o.invalid_roots};
+            if [memory.read64(at)?,memory.read64(at+8)?]!=expected {return Err(EIO);}
+            if moving {
+                let old=o.directory;let root=installed.root.root();let context=o.context;
+                let end=p.kernel_start+(o.private_next-old);
+                let render_directory=p.kernel_start+(o.render.as_ref().ok_or(EIO)?.directory-old);
+                // Every allocation for host directory serialization precedes
+                // the existing firmware retirement/TTBR transaction.
+                let mut directory=bytes(PAGE as usize)?;
+                let mut entries=bytes(operands::TABLE_SIZE as usize)?;
+                self.retire_owner(session,oi,true)?;
+                let o=&mut self.owners[oi];let installed=o.client.as_mut().ok_or(EIO)?;
+                plan.commit(installed)?;
+                if installed.root.root()!=root {return Err(EIO);}
+                let memory=session.memory.as_mut().ok_or(EIO)?;
+                let vm=session.vm.as_mut().ok_or(EIO)?;
+                reset_mapped_private(memory,&installed.root,p.kernel_start,&o.private)?;
+                for physical in [o.support_pages[0],o.support_pages[1],o.high_root] {
+                    memory.zero(physical,PAGE as usize)?;memory.clean(physical,PAGE as usize)?;
+                }
+                o.dispatch_initial=initialize_operand_data(memory,vm,&installed.root,p.kernel_start,o.support,
+                    &o.operand_buffers,&mut directory,&mut entries)?;
+                o.render.as_mut().ok_or(EIO)?.rebind_mapped(memory,vm,&mut installed.root,render_directory,p.kernel_end)?;
+                o.operand_state=o.operand_state.map(|address|p.kernel_start+(address-old));
+                o.directory=p.kernel_start;o.private_limit=p.kernel_end;o.private_next=end;
+                o.operand_probe_seeded=false;o.operand_probe_pending=false;
+                let q=&mut self.queues[qi];q.storage.reset_retained(memory,vm,p.firmware_priority.ok_or(EINVAL)?.try_into()?)?;
+                q.live=true;q.render_count=0;q.generation.window=0;
+                kernel::dev_info!(session.peers[0].data.dev.as_ref(),
+                    "G16C: retained render private window moved context={} root={:#x} pool={} old={:#x} new={:#x} common prepared PTE commit; physical root and ASID unchanged\n",
+                    context,root,o.render.as_ref().ok_or(EIO)?.parameter.slot,old,p.kernel_start);
+            } else {
+                let o=&mut self.owners[oi];let installed=o.client.as_mut().ok_or(EIO)?;
+                plan.commit(installed)?;
+                o.render.as_mut().ok_or(EIO)?.refresh_root(&installed.root)?;
+                kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: retained render root rebound context={} root={:#x} pool={} through common prepared PTE commit\n",
+                    o.context,installed.root.root(),o.render.as_ref().ok_or(EIO)?.parameter.slot);
+            }
+        }
+        let priority=p.firmware_priority.ok_or(EINVAL)?;
+        let q=&mut self.queues[qi];let words=super::super::super::g17p_queue::priority_profile(priority).map_err(|_|EINVAL)?;
+        if u32::from(q.storage.lanes[0].priority)!=priority {
+            for lane in &mut q.storage.lanes {
+                session.vm.as_ref().ok_or(EIO)?.write(session.memory.as_mut().ok_or(EIO)?,2,lane.queue+0x28,&words)?;
+                lane.priority=priority.try_into()?;
+            }
+        }
+        q.key=p.queue_owner.ok_or(EINVAL)?;self.owners[oi].close_requested=false;
+        drop(client.take());Ok(true)
+    }
+    fn configured_render(input:&command::Parameters,n:u32,sequence:u32,geo:[u64;3])->Result<command::Parameters> {
+        let mut p=*input;
+        p.context_base=0x1000000000;p.deflake_1=0x1000068da0;p.deflake_2=0x1000068120;p.deflake_3=0x1000068000;
+        p.ta_status=0x1000078000;p.fragment_status=0x1000490000;p.aux_fb=0x10004d0000;
+        p.reactive_tvb_growth=true;
+        if crate::module_parameters::g16c_parameter_oom_test.value()==n {
+            p.reactive_tvb_growth=false;p.fragment_sync_grow=Some(true);
+        }
+        p.aux_fb_flags=0xc000|(p.aux_fb_flags&(1<<18));
+        // Same eight-block tilemap/heap ring as the Neo retained lifecycle.
+        let (heap,stride,_)=p.scratch_layout().map_err(|_|EINVAL)?;
+        p.tilemap=geo[0].checked_add(super::super::super::g17p_render_lifecycle::scratch_offset(sequence,stride)).ok_or(EOVERFLOW)?;
+        p.tpc=geo[1];p.heapmeta=p.tilemap.checked_add(heap).ok_or(EOVERFLOW)?
+            + if p.layers>1 {0x100}else{0};Ok(p)
+    }
+    fn render_seed(&self,qi:usize,storage:u32,input:&command::Parameters)
+        ->Result<(command::Parameters,super::super::super::g17p_render_runtime::WrappedSeed)> {
+        use super::super::super::g17p_render_runtime::{WrappedSeed,WrappedLane};
+        let q=&self.queues[qi];let o=&self.owners[q.owner];let r=o.render.as_ref().ok_or(EIO)?;
+        let geo=r.geometry_addresses();let p=Self::configured_render(input,self.render_ordinal,r.sequence,geo)?;
+        Ok((p,WrappedSeed {base:super::super::super::g17p_render_runtime::wrapped_storage_base(storage)?,storage,ordinal:self.render_ordinal,local:q.render_count,
+            sequence:r.sequence,milestone:r.sequence_base.checked_add(r.sequence).ok_or(EOVERFLOW)?,grids:super::super::super::g17p_render_lifecycle::pool_grids(o.pool).map_err(|_|EINVAL)?.map(|grid|grid as u8),context:o.context,slot:r.parameter.slot,support:r.support,
+            manager:r.manager,scene:r.scene+u64::from(r.sequence%79)*0x80,empty:r.empty_scene,
+            layermeta:p.heapmeta-if p.layers>1 {0x100}else{0},queue_control:q.storage.context,uuid:q.storage.uuid,
+            lanes:core::array::from_fn(|i| {let l=&q.storage.lanes[i];
+                WrappedLane{queue:l.queue,scratch_low:l.scratch_low,scratch_high:l.scratch_high,priority:input.firmware_priority.unwrap_or(u32::from(l.priority)) as u8}})}))
+    }
+    pub(crate) fn render_preparation_seed(&self,session:&Session,input:&command::Parameters,incoming:&compute::Client)
+        ->Result<Option<KBox<super::super::super::g17p_render_runtime::PreparationSeed>>> {
+        let Some(qi)=self.retained_render_index(session,incoming,input) else {return Ok(None);};
+        let o=&self.owners[self.queues[qi].owner];
+        let installed=o.client.as_ref().ok_or(EIO)?;
+        // Rebind the retained root/window before selecting or clearing its
+        // scratch. An incoming larger geometry cannot use the old pool's
+        // tilemap span while that root transaction is still pending.
+        if !same(installed,incoming) || o.directory!=input.kernel_start
+            || o.private_limit!=input.kernel_end {return Ok(None);}
+        if o.render.as_ref().ok_or(EIO)?.geometry_plan(&installed.root,geometry_sizes(input)?)?.is_some() {
+            return Ok(None);
+        }
+        let Some(storage)=session.next_wrapped_render_storage(self.render_ordinal) else {return Ok(None);};
+        let (p,wire)=self.render_seed(qi,storage,input)?;
+        // A cold template installs backing before admission fits geometry.
+        // Let normal staging perform that step before serializing descriptors.
+        if [p.tilemap,p.tpc,p.heapmeta].contains(&0) {return Ok(None);}
+        let stamps=session.timestamp_cache_seed(&[p.ta_user_timestamp_start,p.ta_user_timestamp_end,p.fragment_user_timestamp_start,p.fragment_user_timestamp_end])?;
+        super::super::super::g17p_render_runtime::PreparationSeed::wrapped(wire,p,incoming,stamps).map(Some)
+    }
+
+    /// The selected slot is retired and held by the common preparation lease.
+    /// Each span pins its physical allocation while CPU clearing runs off-lock.
+    pub(in super::super) fn render_clearing_seed(&self,memory:&Memory,seed:&super::super::super::g17p_render_runtime::PreparationSeed)
+        ->Result<KVec<super::super::super::g17p_memory::ZeroSpan>> {
+        let storage=seed.wrapped_storage().ok_or(EIO)?;
+        let mut spans=KVec::new();
+        let o=self.owners.iter().find(|o|o.pool==seed.pair() && o.client.is_some()).ok_or(EIO)?;
+        let r=o.render.as_ref().ok_or(EIO)?;let root=&o.client.as_ref().ok_or(EIO)?.root;
+        let (address,size)=seed.wrapped_tilemap_span()?;
+        let (base,capacity)=r.tilemap_span();
+        if address<base || address.checked_add(size).ok_or(EOVERFLOW)?
+            >base.checked_add(capacity).ok_or(EOVERFLOW)? {return Err(EIO);}
+        // The pool and work-slot leases pin all retired backing during this
+        // common off-lock clear. Fresh slots remain zero; wrapped slots lose
+        // only their old tilemap/heap contents, preserving the persistent TPC.
+        let mut offset=0;
+        while offset<size {
+            let at=address+offset;let pa=(root.pte(at&!(PAGE-1))?&ADDRESS)+(at&(PAGE-1));
+            let count=(size-offset).min(PAGE-(at&(PAGE-1)))as usize;
+            spans.push(memory.zero_span(pa,count)?,GFP_KERNEL)?;offset+=count as u64;
+        }
+        if let Some((_,pages))=self.render_work_pages.iter().find(|(slot,_)|*slot==storage) {
+            spans.reserve(pages.len(),GFP_KERNEL)?;
+            for pa in pages {spans.push(memory.zero_span(*pa,PAGE as usize)?,GFP_KERNEL)?;}
+        }
+        // Fresh WorkBackingG16C pages are already zeroed/cleaned off-lock.
+        Ok(spans)
+    }
+    fn render_storage(&mut self, memory: &mut Memory, vm: &mut Vm, storage:u32,backing:&mut Option<WorkBackingG16C>,cleared:bool) -> StageResult<()> {
+        if !cleared {return Err(EIO.into());}
+
+        let base=super::super::super::g17p_render_runtime::wrapped_storage_base(storage)?;
+        let alias = 0x7000000000 + base - work::DESCRIPTOR_BASE_G16C;
+        if !self.render_work_pages.iter().any(|(slot,_)|*slot==storage) {
+            self.render_work_pages.reserve(1,GFP_KERNEL).map_err(StageError::allocation)?;
+            prepare_work_mappings(memory,vm,base,FLAGS,&[0,2]).map_err(StageError::allocation)?;
+            let WorkBackingG16C {memory:staged,pages}=backing.take().ok_or(EIO)?;
             initial_allocation_checkpoint(6, &mut self.initial_allocation_faulted, &staged)?;
             memory.absorb(staged).map_err(StageError::allocation)?;
-            install_work_pages(memory, vm, BASE, FLAGS, &[0, 2], pages)?;
-            self.render_work_pages = Some(pages);
+            install_work_pages(memory, vm, base, FLAGS, &[0, 2], pages)?;
+            self.render_work_pages.push((storage,pages),GFP_KERNEL).expect("reserved render storage");
         }
-        let pages = self.render_work_pages.ok_or(EIO)?;
+        let pages = self.render_work_pages.iter().find(|(slot,_)|*slot==storage).ok_or(EIO)?.1;
         for (i, flags) in FLAGS.into_iter().enumerate() {
-            if vm.pte(memory, 2, BASE + i as u64 * PAGE)? != pages[i] | flags {
+            if vm.pte(memory, 2, base + i as u64 * PAGE)? != pages[i] | flags {
                 return Err(EIO.into());
             }
         }
@@ -36,10 +331,6 @@ impl State {
             if vm.pte(memory, 0, alias + i as u64 * PAGE)? != pages[i] | GPU_READ {
                 return Err(EIO.into());
             }
-        }
-        for pa in pages {
-            memory.zero(pa, PAGE as usize)?;
-            memory.clean(pa, PAGE as usize)?;
         }
         Ok(())
     }
@@ -52,18 +343,30 @@ impl State {
         priority: u32,
         kernel_start: u64,
         kernel_end: u64,
+        private:&mut Option<OwnerPrivateG16C>,
+        transport:&mut Option<scheduled_queues::QueueBackingG16C>,
+        work_backing:&mut Option<WorkBackingG16C>,
+        prepared:Option<KBox<super::super::super::g17p_render_runtime::PreparedAppend>>,
+        rebind:Option<&mut super::super::super::g17p_boot::PreparedPoolRebind>,
     ) -> StageResult<Option<Arc<RenderReceipt>>> {
-        if !self.idle() {
-            return Ok(None);
+        let caller=client.as_ref().or_else(||self.client(key)).ok_or(EIO)?;
+        let Some(pool)=self.render_pool(session,caller,input) else {return Ok(None);};
+        if self.render_needs_private(session,caller,input)
+            && !private.as_ref().is_some_and(|plan|plan.matches(caller,kernel_start,kernel_end)) {return Ok(None);}
+
+        if let Some(caller)=client.as_ref().or_else(||self.client(key)) {
+            for bo in &caller.buffers {session.retain_source_backing(bo)?;}
         }
+        if !self.rebind_render_owner(session,client,input,rebind)? {return Ok(None);}
         self.compute_mode=false;
-        self.compute_bound=[false;2];
+        self.leave_compute_mode();
         self.release_requested(session)?;
-        let qi = self.prepare_queue(session, key, client, kernel_start, kernel_end, priority, None)?;
+        let Some(qi) = self.prepare_queue(session, key, client, kernel_start, kernel_end, priority, pool,private,transport)? else {return Ok(None);};
+        self.queues[qi].generation.leases.prepare().map_err(StageError::allocation)?;
         let oi = self.queues[qi].owner;
         // Vertex scratch uses the owned queue operand directory at the VM's
-        // requested origin. Idle above includes every GPU and CPU root lease;
-        // build_owner maps all 28 backing tranches before this admission.
+        // requested origin. Admission protects this pool's GPU/CPU leases;
+        // the render resource constructor owns all 28 backing tranches.
         if self.owners[oi].directory != kernel_start {
             return Err(EIO.into());
         }
@@ -74,7 +377,7 @@ impl State {
             if let Some(from) = self
                 .owners
                 .iter()
-                .position(|o| o.render.as_ref().is_some_and(|r| r.dormant()
+                .position(|o| o.pool==pool && o.render.as_ref().is_some_and(|r| r.dormant()
                     && r.private_end.checked_sub(r.directory)
                         .and_then(|span| self.owners[oi].private_next.checked_add(span))
                         .is_some_and(|end| end <= self.owners[oi].private_limit)))
@@ -86,45 +389,10 @@ impl State {
                     slot, self.owners[from].context, self.owners[oi].context);
             }
         }
-        if self.owners[oi].render.is_none() {
-            let slot = (0..15u32)
-                .find(|slot| {
-                    !self
-                        .owners
-                        .iter()
-                        .any(|o| o.render.as_ref().is_some_and(|r| r.parameter.slot == *slot))
-                })
-                .ok_or(ENOSPC)?;
-            let o = &mut self.owners[oi];
-            let memory = session.memory.as_mut().ok_or(EIO)?;
-            let vm = session.vm.as_mut().ok_or(EIO)?;
-            if render::ResourcesG16C::private_end(o.private_next)? > o.private_limit {
-                return Err(StageError::Rejected(ENOSPC));
-            }
-            let (staged, resource) = render::ResourcesG16C::prepare(
-                memory,
-                vm,
-                &mut o.client.as_mut().ok_or(EIO)?.root,
-                slot,
-                slot,
-                o.private_next,
-                o.private_limit,
-            ).map_err(StageError::allocation)?;
-            initial_allocation_checkpoint(4, &mut self.initial_allocation_faulted, &staged)?;
-            memory.absorb(staged).map_err(StageError::allocation)?;
-            resource.install(memory, vm, &mut o.client.as_mut().ok_or(EIO)?.root)?;
-            if resource.private_end > o.private_limit {
-                return Err(ENOSPC.into());
-            }
-            o.private_next = resource.private_end;
-            o.render = Some(resource);
-            kernel::dev_info!(
-                session.peers[0].data.dev.as_ref(),
-                "G16C: PB {} allocated for context {}\n",
-                slot,
-                o.context
-            );
-        }
+        // The existing common template phase builds unpublished PB backing
+        // off-lock. Retry this node once its owner exists; never allocate a
+        // second bulk resource graph while holding the publication mutex.
+        if self.owners[oi].render.is_none() {return Ok(None);}
         if !self.owners[oi].render.as_ref().ok_or(EIO)?.attached() {
             let o = &mut self.owners[oi];
             let r = o.render.as_mut().ok_or(EIO)?;
@@ -142,11 +410,10 @@ impl State {
             o.private_next = r.private_end;
         }
         let n = self.render_ordinal;
-        let first_event = if self.compute_first == Some(true) && Self::compute_slots()?==2 {2} else {u8::from(self.compute_first == Some(true))};
+        let first_event = super::super::super::g17p_render_lifecycle::pool_grids(pool).map_err(|_|EINVAL)?[0] as u8;
         if n >= 0x3fffffff {
             return Err(EOVERFLOW.into());
         }
-        let local = self.queues[qi].render_count;
         let mut p = *input;
         p.context_base = 0x1000000000;
         p.deflake_1 = 0x1000068da0;
@@ -157,50 +424,27 @@ impl State {
         p.aux_fb = 0x10004d0000;
         // Owned kind-6 requests are serviced by the common runtime before polling retirement.
         p.reactive_tvb_growth = true;
-        if *crate::module_parameters::g16c_parameter_oom_test.value()==n {
+        if crate::module_parameters::g16c_parameter_oom_test.value()==n {
             // Explicit one-shot qualification matches the source OOM7 gate.
             p.reactive_tvb_growth=false;
             p.fragment_sync_grow=Some(true);
             kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: test-only parameter OOM policy at render ordinal={} TA892=0 FG2100=1\n",n);
         }
         p.aux_fb_flags = 0xc000 | (p.aux_fb_flags & (1 << 18));
-        let (_, _, tpc) = p.scratch_layout().map_err(|_| EINVAL)?;
-        let tile = p.scratch_layout().map_err(|_| EINVAL)?.0;
-        let tpc_size = tpc.checked_mul(4).ok_or(EOVERFLOW)?;
         let o = &mut self.owners[oi];
         let r = o.render.as_mut().ok_or(EIO)?;
-        let geometry = r.prepare_geometry(
-            &mut o.client.as_mut().ok_or(EIO)?.root,
-            [tile, tpc_size, 0x200 + if p.layers > 1 { 0x100 } else { 0 }],
-        ).map_err(StageError::allocation)?;
-        let geo = if let Some((staged, prepared)) = geometry {
-            initial_allocation_checkpoint(7, &mut self.initial_allocation_faulted, &staged)?;
-            session.memory.as_mut().ok_or(EIO)?.absorb(staged).map_err(StageError::allocation)?;
-            r.install_geometry(&mut o.client.as_mut().ok_or(EIO)?.root, prepared)?
-        } else { r.geometry_addresses() };
-        p.tilemap = geo[0];
-        p.tpc = geo[1];
-        p.heapmeta = geo[2] + if p.layers > 1 { 0x100 } else { 0 };
-        let scene_slot = r.sequence % 79 + 1;
-        let context = u64::from(o.context);
-        let ps = program::ProgramStateG16C {
-            layermeta: geo[2],
-            cycle: 0x420000 + u64::from(scene_slot % 36) * 0x70,
-            scene_slot: u64::from(scene_slot),
-            tiling_admission: u64::from(r.parameter.slot),
-            fragment_admission: u64::from(r.parameter.slot),
-            tiling_gate: 0x7f00400020,
-            fragment_gate: 0xa000400020,
-            tiling_lifecycle: 0xbc010000e1 + u64::from(r.sequence) * 2,
-            fragment_lifecycle: 0xbc010000e0 + u64::from(r.sequence) * 2,
-            tiling_work_stamp: context << 8 | u64::from(r.sequence & 255),
-            fragment_work_stamp: context << 8 | u64::from(r.sequence & 255),
-            stencil_clear_flags: 0x100,
-            partial_load_depth_flags: Some(p.depth_flags | ((p.depth_flags & (3 << 18)) >> 4)),
-            partial_resume_depth_flags: Some(p.depth_flags | ((p.depth_flags & (3 << 18)) >> 4)),
-            ..Default::default()
-        };
-        let parameters = program::descriptor_parameters(&p, &ps, tpc_size).map_err(|_| EINVAL)?;
+        let root=&mut o.client.as_mut().ok_or(EIO)?.root;
+        if r.geometry_plan(root,geometry_sizes(&p)?)?.is_some() {return Ok(None);}
+        r.refresh_root(root)?;
+        let geo=r.geometry_addresses();
+        p=Self::configured_render(input,n,r.sequence,geo)?;
+        let Some(storage)=session.next_wrapped_render_storage(n) else {return Ok(None);};
+        if !self.render_work_pages.iter().any(|(old,_)|*old==storage) && work_backing.is_none() {return Ok(None);}
+        let (configured,wire)=self.render_seed(qi,storage,input)?;
+        let base=wire.base;
+        let Some(prepared)=prepared.filter(|plan|plan.matches_wrapped(wire,&configured,
+            self.owners[oi].client.as_ref().unwrap())) else {return Ok(None);};
+        let o=&mut self.owners[oi];let r=o.render.as_mut().ok_or(EIO)?;
         let receipt = RenderReceipt::new(n).map_err(StageError::allocation)?;
         let addresses = [
             p.ta_user_timestamp_start,
@@ -221,28 +465,23 @@ impl State {
         };
         let mut leases = KVec::new();
         leases.push(o.client.as_ref().ok_or(EIO)?.lease().map_err(StageError::allocation)?, GFP_KERNEL).map_err(StageError::allocation)?;
-        o.client.as_ref().ok_or(EIO)?.cache(false).map_err(StageError::allocation)?;
-        completion.stamps.run(false).map_err(StageError::allocation)?;
         let slot = r.parameter.slot;
-        let support = r.support;
         let manager = r.manager;
-        let scene = r.scene + u64::from(r.sequence % 79) * 0x80;
-        let empty = r.empty_scene;
         let auxiliary = r.auxiliary;
         let resource_count = (r.sequence_base.checked_add(r.sequence).ok_or(EOVERFLOW)? + 1)
             .checked_mul(2)
             .ok_or(EOVERFLOW)?;
-        self.pending.reserve(1, GFP_KERNEL).map_err(StageError::allocation)?;
+        session.reserve_wrapped_render().map_err(StageError::allocation)?;
         self.render_storage(
             session.memory.as_mut().ok_or(EIO)?,
-            session.vm.as_mut().ok_or(EIO)?,
+            session.vm.as_mut().ok_or(EIO)?,storage,work_backing,prepared.wrapped_storage_cleared(),
         )?;
-        let stamp = n.wrapping_add(1).wrapping_shl(8);
+        let stamp = wire.local.wrapping_add(1).wrapping_shl(8);
         let mut drivers = KVec::new();
         for stage in 0..2 {
             drivers.push(
                 Stamp {
-                    address: BASE + 0x18000 + stage * 0x40,
+                    address: base + 0x18000 + stage * 0x40,
                     value: stamp,
                 },
                 GFP_KERNEL,
@@ -251,216 +490,34 @@ impl State {
         let mut counters = KVec::new();
         counters.push(
             Stamp {
-                address: BASE + 0x20c,
+                address: base + 0x20c,
                 value: 2,
             },
             GFP_KERNEL,
         ).map_err(StageError::allocation)?;
         let next_local = self.queues[qi].render_count.checked_add(1).ok_or(EOVERFLOW)?;
-        let mut descriptor = bytes(body::FragmentDescriptorG16C::SIZE).map_err(StageError::allocation)?;
         flight_allocation_checkpoint(&mut self.initial_allocation_faulted)?;
         let memory = session.memory.as_mut().ok_or(EIO)?;
         let vm = session.vm.as_mut().ok_or(EIO)?;
-        for stage in 0..2usize {
-            let fragment = stage == 1;
-            let lane = &self.queues[qi].storage.lanes[stage];
-            let address = BASE + if fragment { 0x8000 + 0x1b40 } else { 0x2940 };
-            let prelude = BASE + if fragment { 0xc000 } else { 0x4000 };
-            let state = body::State {
-                context: context as u32,
-                pool: slot,
-                event_control: BASE + 0x200,
-                manager,
-                scene,
-                empty_scene: empty,
-                alias: 0x7000000000 + address - work::DESCRIPTOR_BASE_G16C,
-                shared_tail: BASE + 0x10000 + stage as u64 * PAGE - u64::from(n) * 0x40,
-                driver_stamp: BASE + 0x18000 + stage as u64 * 0x40,
-                firmware_stamp: lane.queue + 0x1040,
-                support,
-                counter: if n != local {
-                    u64::from(local) * 2 + 1 - stage as u64
-                } else {
-                    u64::from(n) * 2 + 1 - stage as u64
-                },
-                stamp,
-                event: u32::from(first_event) + stage as u32,
-                uuid: 0x010000e1 + n * 2 - stage as u32,
-                timestamp: BASE + 0x18100,
-                timestamp_end: if fragment { None } else { Some(0) },
-                user_timestamp_start: addresses[stage * 2],
-                user_timestamp_end: addresses[stage * 2 + 1],
-                fragment_event: u32::from(first_event) + 1,
-                fragment_stamp: stamp,
-                stage_flag: 0,
-                field_93c: 0x305800001,
-                field_2128: 0,
-                field_21d8: 0x3be00,
-                field_222c: 0,
-                secondary_stamp: Some(if n != local {
-                    (local + 1).wrapping_shl(8)
-                } else {
-                    stamp & 65535
-                }),
-                descriptor_ordinal: Some(if n != local {
-                    local
-                } else if fragment {
-                    n
-                } else {
-                    0
-                }),
-                work_index: Some(if n != local {
-                    if fragment {
-                        local + 1
-                    } else {
-                        local + local / 2
-                    }
-                } else if fragment {
-                    (n + 1) & 255
-                } else {
-                    n
-                }),
-                tail_flags: if n != local { 3 } else { 1 },
-                tiling_submission_tag: ((n + 1) & 255) * 0x101,
-                tiling_queue_ordinal: n,
-            };
-            let primary_count;
-            if fragment {
-                let primary = program::FragmentProgramG16C::new(&p, &ps).map_err(|_| EINVAL)?;
-                let store = program::partial_store(&p, &ps).map_err(|_| EINVAL)?;
-                let resume = program::partial_resume(&p, &ps).map_err(|_| EINVAL)?;
-                let load = program::partial_load(&p, &ps).map_err(|_| EINVAL)?;
-                body::FragmentDescriptorG16C::write(
-                    &mut descriptor,
-                    &parameters,
-                    &state,
-                    &body::Programs {
-                        primary: primary.registers(),
-                        partial_store: &store,
-                        partial_resume: &resume,
-                        partial_load: &load,
-                    },
-                    n,
-                    u32::from(first_event) + 1,
-                )
-                .map_err(|_| EINVAL)?;
-                primary_count = primary.registers().len() as u16 - 4;
-                vm.write(memory, 2, address, &descriptor)?;
-            } else {
-                let primary = program::TilingProgramG16C::new(&p, &ps).map_err(|_| EINVAL)?;
-                body::TilingDescriptorG16C::write(
-                    &mut descriptor[..body::TilingDescriptorG16C::SIZE],
-                    &parameters,
-                    &state,
-                    primary.registers(),
-                    n,
-                    u32::from(first_event),
-                )
-                .map_err(|_| EINVAL)?;
-                primary_count = primary.registers().len() as u16 - 2;
-                vm.write(
-                    memory,
-                    2,
-                    address,
-                    &descriptor[..body::TilingDescriptorG16C::SIZE],
-                )?;
-            }
-            let arrays = if fragment {
-                [
-                    (0xa0, primary_count),
-                    (0x7c0, 16),
-                    (0xee0, 23),
-                    (0x1600, 10),
-                ]
-            } else {
-                [(0x60, primary_count), (0, 0), (0, 0), (0, 0)]
-            };
-            let record = work::WorkRecordG16C::for_render(&work::RenderRecordParametersG16C {
-                descriptor: address,
-                queue: lane.queue,
-                grid: first_event + stage as u8,
-                item: n,
-                fragment,
-                timeout: 0xfa0,
-                ready: true,
-                arrays: if fragment { &arrays } else { &arrays[..1] },
-                control: Some(if fragment { 0x1800 } else { 0xc00 }),
-                control_low: None,
-                field_30: None,
-                field_38: 0,
-            })
-            .map_err(|_| EINVAL)?;
-            vm.write(
-                memory,
-                2,
-                lane.scratch_high + u64::from((n + 1) & 255) * 0x200,
-                record.as_bytes(),
-            )?;
-            let wrapper = work::WorkWrapperG16C::for_render(&work::RenderWrapperParameters {
-                common: work::WrapperParameters {
-                    scratch_low: lane.scratch_low,
-                    scratch_high: lane.scratch_high,
-                    support,
-                    queue_control: self.queues[qi].storage.context,
-                    grid: u16::from(first_event) + stage as u16,
-                    item: 0,
-                    ordinal: n as u16,
-                    context: context as u16,
-                    support_id: slot as u16,
-                    uuid: self.queues[qi].storage.uuid,
-                    scheduler: lane.priority as u16,
-                    scheduler_hint: 2,
-                    first: n == 0,
-                    field_52: if n == local { u16::from(n == 0) } else { 1 },
-                    field_5e: lane.priority as u16,
-                    field_62: if n == local { u16::from(n == 0) } else { 1 },
-                },
-                fragment,
-                buffer_manager: manager,
-                lifecycle: n as u16,
-                namespace: slot as u16,
-                item: n,
-                item_control: if n == local {
-                    ((n & 255) << 8) as u16
-                } else {
-                    0
-                },
-            })
-            .map_err(|_| EINVAL)?;
-            vm.write(memory, 2, prelude, wrapper.as_bytes())?;
-            let mut end = [0u8; 0x40];
-            end[..4].copy_from_slice(&16u32.to_le_bytes());
-            end[4..8].copy_from_slice(
-                &(((n + 1) & 65535) << 16 | (u32::from(first_event) + stage as u32)).to_le_bytes(),
-            );
-            end[8..16]
-                .copy_from_slice(&(0x00fe000000000000u64 | (u64::from(n + 1) >> 16)).to_le_bytes());
-            vm.write(memory, 2, prelude + 0xc0, &end)?;
-            vm.write(
-                memory,
-                2,
-                state.driver_stamp,
-                &stamp.wrapping_sub(0x100).to_le_bytes(),
-            )?;
-        }
+        prepared.write_wrapped(memory,vm)?;
         let mut event = [0u8; 0x28];
-        event[..8].copy_from_slice(&(BASE + 0x18200).to_le_bytes());
+        event[..8].copy_from_slice(&(base + 0x18200).to_le_bytes());
         event[0x10..0x14].copy_from_slice(&0x50u32.to_le_bytes());
-        vm.write(memory, 2, BASE + 0x200, &event)?;
-        vm.write(memory, 2, BASE + 0x18200, &2u32.to_le_bytes())?;
+        vm.write(memory, 2, base + 0x200, &event)?;
+        vm.write(memory, 2, base + 0x18200, &2u32.to_le_bytes())?;
         vm.write(memory, 2, auxiliary, &resource_count.to_le_bytes())?;
         let [ta, fr, _] = &mut self.queues[qi].storage.lanes;
         let prepared = session.prepare_g16c_admission(
             &mut [
                 Request {
                     lane: ta,
-                    works: &[BASE + 0x4000, BASE + 0x40c0],
+                    works: &[base + 0x4000, base + 0x40c0],
                     event: first_event,
                     tag: 0,
                 },
                 Request {
                     lane: fr,
-                    works: &[BASE + 0xc000, BASE + 0xc0c0],
+                    works: &[base + 0xc000, base + 0xc0c0],
                     event: first_event + 1,
                     tag: 0,
                 },
@@ -500,28 +557,36 @@ impl State {
         )?;
         let [ta, fr, _] = &mut self.queues[qi].storage.lanes;
         let id = session.publish_g16c_submission(&mut [
-            Request { lane: ta, works: &[BASE + 0x4000, BASE + 0x40c0], event: first_event, tag: 0 },
-            Request { lane: fr, works: &[BASE + 0xc000, BASE + 0xc0c0], event: first_event + 1, tag: 0 },
+            Request { lane: ta, works: &[base + 0x4000, base + 0x40c0], event: first_event, tag: 0 },
+            Request { lane: fr, works: &[base + 0xc000, base + 0xc0c0], event: first_event + 1, tag: 0 },
         ], prepared)?;
-        self.compute_first.get_or_insert(false);
+        if crate::module_parameters::submission_log.value()!=0 {
+            kernel::dev_info!(session.peers[0].data.dev.as_ref(),
+                "G16C: RENDER_PUBLISHED pool={} context={} root={:#x} grids={},{} milestone={} ordinal={} scratch={:#x},{:#x}\n",
+                pool,self.owners[oi].context,self.owners[oi].client.as_ref().ok_or(EIO)?.root.root(),
+                first_event,first_event+1,wire.milestone+1,n,wire.lanes[0].scratch_high,wire.lanes[1].scratch_high);
+        }
+        self.queues[qi].generation.leases.published(receipt.fence.clone())?;
+        receipt.retained_pool.store(slot,Ordering::Relaxed);
+        for (stored,grid)in receipt.milestones.iter().zip([first_event,first_event+1]) {
+            stored.store((u64::from(grid)<<32)|u64::from(wire.milestone+1),Ordering::Relaxed);
+        }
         receipt.publication_ready.store(true, Ordering::Release);
-        self.pending.push(
-            Pending {
+        session.push_wrapped_render(
+            RenderTicket {
                 id,
-                receipt: ReceiptG16C::Render(receipt.clone()),
-                render_owner: Some(oi),
+                receipt: receipt.clone(),
+                render_owner: oi,storage,
                 growth_tokens: KVec::new(),
-                render_work: Some(parameter_error::RenderOwnerG16C {
+                render_work: parameter_error::RenderOwnerG16C {
                     context:u32::from(self.owners[oi].context),slot,event:u32::from(first_event)+1,stamp,
-                    descriptor:BASE+0x9b40,manager,queue:self.queues[qi].storage.lanes[1].queue,
-                    driver_stamps:[BASE+0x18000,BASE+0x18040],
-                }),
+                    descriptor:base+0x9b40,manager,queue:self.queues[qi].storage.lanes[1].queue,
+                    driver_stamps:[base+0x18000,base+0x18040],
+                },
                 parameter_error: None,
-                compute_slot: None,
                 completion,
                 started: kernel::time::Instant::now(),
             },
-            GFP_KERNEL,
         )?;
         self.queues[qi].render_count = next_local;
         self.owners[oi].render.as_mut().ok_or(EIO)?.sequence += 1;
@@ -538,6 +603,11 @@ impl Session {
         priority: u32,
         kernel_start: u64,
         kernel_end: u64,
+        private:&mut Option<OwnerPrivateG16C>,
+        transport:&mut Option<scheduled_queues::QueueBackingG16C>,
+        work_backing:&mut Option<WorkBackingG16C>,
+        prepared:Option<KBox<super::super::super::g17p_render_runtime::PreparedAppend>>,
+        rebind:Option<&mut super::super::super::g17p_boot::PreparedPoolRebind>,
     ) -> Result<Option<Arc<RenderReceipt>>> {
         if self.phase != Phase::Running
             || self
@@ -548,7 +618,7 @@ impl Session {
             return Err(EIO);
         }
         let mut state = self.g16c_compute.take().ok_or(EIO)?;
-        let result = state.stage_render(self, key, client, p, priority, kernel_start, kernel_end);
+        let result = state.stage_render(self, key, client, p, priority, kernel_start, kernel_end,private,transport,work_backing,prepared,rebind);
         self.g16c_compute = Some(state);
         self.finish_g16c_admission(result)
     }

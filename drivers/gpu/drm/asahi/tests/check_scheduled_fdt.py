@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Populate Max FDT in m1n1 and consume typed OPP/config nodes in Rust.
 
 Compare all derived fields and whole hardware images with the qualified source

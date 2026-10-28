@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export only the authored eight-target graphics caller for the native DRM test.
 
 Execute selected pure constructors, never the experiment's proxy setup. The

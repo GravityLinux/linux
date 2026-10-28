@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare native dependency objects with executed source-only shim builders.
 
 No target, firmware binaries or captured objects. The topology method runs

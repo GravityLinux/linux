@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Field-built compute protocol objects for the scheduled firmware family.
 //! The caller supplies CDM and resource addresses; no shader or workload data
@@ -277,29 +277,70 @@ pub(crate) fn points(out: &mut [u8], engine: u8, event_slot: u8, points: &[(u8, 
 }
 /// Extend the existing Source same-queue point without changing its
 /// completion, receiver event slot, or firmware-owned context tail.
-pub(crate) fn context_dependencies(out: &mut [u8], dependencies: &[(u8, u32)]) -> Result {
-    if dependencies.is_empty() { return Ok(()); }
-    if out.len() != 0x200 || dependencies.len() > 3 { return Err(Error::Invalid); }
-    let header = qword(out, 0x20);
-    let previous = qword(out, 0x28);
-    let mut merged = [(0u8, 0u32); 4];
-    let mut own = ((previous >> 40) as u8, previous as u32);
-    let mut count = 0;
-    for &(grid, value) in dependencies {
-        if grid >= 128 || value == 0 || value >= 1 << 30 { return Err(Error::Invalid); }
-        if grid == own.0 { own.1 = own.1.max(value); continue; }
-        if let Some(existing) = merged[..count].iter_mut().find(|point| point.0 == grid) {
-            existing.1 = existing.1.max(value);
-        } else {
-            merged[count] = (grid, value);
-            count += 1;
+#[versions(AGX_SCHEDULED)]
+impl work::ComputeRecord::ver {
+    /// Write a complete ordered dependency vector without altering the
+    /// captured timeout/engine prefix or any register/retirement fields.
+    pub(crate) fn set_dependencies(&mut self,points:&[(u8,u32)])->Result {
+        if points.is_empty() || points.len()>4
+            || points.iter().any(|&(grid,value)|grid>=128 || value>=1<<30) {
+            return Err(Error::Invalid);
         }
+        self.write_dependencies(points);Ok(())
     }
-    // Native consumer-first captures place the receiver's previous-value
-    // point last, after every foreign grid dependency.
-    merged[count] = own;
-    count += 1;
-    points(&mut out[0x20..0x130], 8, (header >> 32) as u8, &merged[..count])
+    fn write_dependencies(&mut self,points:&[(u8,u32)]) {
+        let header=u64::from_le_bytes(self.dependency_header);
+        self.dependency_header=((header&!0xffffffff)|((1u64<<points.len())-1)).to_le_bytes();
+        let mut words=[[0u8;8];4];
+        for (out,&(grid,value))in words.iter_mut().zip(points) {
+            *out=((u64::from(grid)<<40)|u64::from(value)).to_le_bytes();
+        }
+        [self.previous,self.field_30,self.field_38,self.field_40]=words;
+        self.dependency_tail.fill(0);
+    }
+    /// Preserve the ordinary queue rule: foreign waits precede our own point.
+    pub(crate) fn append_dependencies(&mut self, dependencies: &[(u8, u32)]) -> Result {
+        if dependencies.is_empty() { return Ok(()); }
+        #[ver(G == G17P)]
+        if dependencies.len()>3 {return Err(Error::Invalid);}
+        #[ver(G == G16C)]
+        if dependencies.len()>4 {return Err(Error::Invalid);}
+        let header=u64::from_le_bytes(self.dependency_header);
+        let previous=u64::from_le_bytes(self.previous);
+        let mut merged=[(0u8,0u32);4];
+        let mut own=((previous>>40)as u8,previous as u32);
+        if own.0>=128 {return Err(Error::Invalid);}
+        let mut count=0;
+        for &(grid,value) in dependencies {
+            if grid>=128 || value>=1<<30 {return Err(Error::Invalid);}
+            #[ver(G == G17P)]
+            if value==0 {return Err(Error::Invalid);}
+            if grid==own.0 {own.1=own.1.max(value);continue;}
+            if let Some(existing)=merged[..count].iter_mut().find(|p|p.0==grid) {
+                existing.1=existing.1.max(value);
+            } else {
+                #[ver(G == G16C)]
+                if count==3 {return Err(Error::Invalid);}
+                merged[count]=(grid,value);count+=1;
+            }
+        }
+        merged[count]=own;count+=1;
+        #[ver(G == G17P)]
+        let prefix=0xffff080000000000u64 | (((header>>32)&255)<<32);
+        #[ver(G == G16C)]
+        let prefix=header & !0xffffffff;
+        self.dependency_header=prefix.to_le_bytes();
+        self.write_dependencies(&merged[..count]);Ok(())
+    }
+}
+
+pub(crate) fn context_dependencies(out:&mut[u8],dependencies:&[(u8,u32)])->Result {
+    if dependencies.is_empty() {return Ok(());}
+    if out.len()!=work::ComputeRecordG17P::SIZE {return Err(Error::Invalid);}
+    // SAFETY: This is owned staging, the exact record size was checked, and
+    // the asserted repr(C) layout contains only alignment-one byte arrays.
+    let record=unsafe {&mut *out.as_mut_ptr().cast::<work::ComputeRecordG17P>()};
+    record.append_dependencies(dependencies)
 }
 
 pub(crate) fn completion_header(header: u64, value: u32) -> Result<u64> {

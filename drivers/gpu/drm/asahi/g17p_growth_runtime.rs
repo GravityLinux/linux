@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Retained synchronous growth service. Report pointers never select storage.
 
@@ -115,6 +115,10 @@ fn verify_root(memory: &Memory, ttbs: u64, root: u64) -> Result {
     Ok(())
 }
 impl Service {
+    pub(crate) fn caller_compatible(&self, pool: u32, bindings: &[(u64, u64, u64, u32)]) -> bool {
+        self.pools.iter().find(|p| p.identity.pool == pool).is_none_or(|p|
+            g::caller_fits_growth(p.growth_base, p.request_limit, bindings))
+    }
     pub(crate) fn set_source_pool_limits(&mut self, global: u32, overrides: [u32; 2]) -> Result {
         let limits = g::source_pool_limits(global, overrides).ok_or(EINVAL)?;
         if self.pools.iter().any(|pool| pool.counter != 0) { return Err(EBUSY); }
@@ -468,7 +472,7 @@ impl Service {
     pub(crate) fn token_reply_retired(&self, token: WorkToken, memory: &Memory, vm: &Vm) -> Result<bool> {
         self.token_index(token)?;
         let Some(reply) = self.error_replies.iter().find(|r| r.token == token) else {
-            return Ok(*crate::module_parameters::native_limit_reply.value() != 1
+            return Ok(crate::module_parameters::native_limit_reply.value() != 1
                 || !self.token_limited(token)?);
         };
         let counters = super::g17p_queue::Counters::new([
@@ -479,7 +483,7 @@ impl Service {
         let retired = (0..2).all(|i| super::g17p_queue::reached(
             reply.consumers_before[i], counters.0[i], reply.producer,
         ));
-        if retired && *crate::module_parameters::submission_log.value() != 0 {
+        if retired && crate::module_parameters::submission_log.value() != 0 {
             pr_info!("G17P: render error reply retired pool {} generation {} consumers {:?} before {:?} target {}\n",
                 token.pool, token.generation, [counters.0[0], counters.0[1]], reply.consumers_before, reply.producer);
         }
@@ -893,7 +897,7 @@ impl Service {
             }
             let index = matched.ok_or(EIO)?;
             let pool = &self.pools[index];
-            let reply = if *crate::module_parameters::native_limit_reply.value() == 1 {
+            let reply = if crate::module_parameters::native_limit_reply.value() == 1 {
                 let mut identity = None;
                 let mut token = None;
                 for owner in &self.work_owners {

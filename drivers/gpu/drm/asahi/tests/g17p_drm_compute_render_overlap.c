@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Real UAPI: three independently owned compute queues during repeated long renders. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

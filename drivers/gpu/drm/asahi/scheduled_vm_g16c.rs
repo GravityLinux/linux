@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Max construction using the common UAT walker and Memory ownership.
 //! Establish the cold boot contract before starting RTKit. Its management

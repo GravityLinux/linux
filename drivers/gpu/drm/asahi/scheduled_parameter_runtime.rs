@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Owned active Max PB growth. The receive dispatcher validates ownership,
 //! ACKs once, then returns here; control waits never recursively service RX.
@@ -25,16 +25,17 @@ impl State {
     }
 
     pub(super) fn accept_growth(&mut self,memory:&Memory,vm:&Vm,ttbs:u64,
-        raw:&[u8;0x48])->Result<AcceptedGrowth> {
+        pending:&mut [RenderTicket],raw:&[u8;0x48])->Result<AcceptedGrowth> {
         let request=GrowthRequestG16C::parse(raw).ok_or(EIO)?;
-        // Actual firmware publication is currently serialized. Input-blocked
-        // CPU jobs are not executable firmware flights and own no shared PB.
-        if self.pending.len()!=1 {return Err(EBUSY);}
-        let p=&self.pending[0];
-        if !matches!(p.receipt,ReceiptG16C::Render(_)) || p.parameter_error.is_some() || p.growth_tokens.contains(&request.token()) {
+        // The growth protocol names a retained context/pool. Never choose
+        // another flight merely because it is first in the retirement wave.
+        let index=RenderWave::<RenderTicket>::find_owner(pending,|p|
+            p.render_work.context==request.context() && p.render_work.slot==request.slot())?;
+        let p=&pending[index];
+        if p.parameter_error.is_some() || p.growth_tokens.contains(&request.token()) {
             return Err(EIO);
         }
-        let owner=p.render_owner.ok_or(EIO)?;
+        let owner=p.render_owner;
         let o=self.owners.get(owner).ok_or(EIO)?;
         let r=o.render.as_ref().ok_or(EIO)?;
         if request.context()!=u32::from(o.context) || request.slot()!=r.parameter.slot {
@@ -49,7 +50,7 @@ impl State {
         }
         let first=p.growth_tokens.is_empty();
         // Reserve/retain before ACK. Tokens cannot be replayed in this flight.
-        self.pending[0].growth_tokens.push(request.token(),GFP_KERNEL)?;
+        pending[index].growth_tokens.push(request.token(),GFP_KERNEL)?;
         Ok(AcceptedGrowth {request,owner,generation,first})
     }
 

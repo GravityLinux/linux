@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare every ordered Max engine-register transaction with qualified source."""
 import argparse,hashlib,json,struct,subprocess,sys,tempfile
 from pathlib import Path

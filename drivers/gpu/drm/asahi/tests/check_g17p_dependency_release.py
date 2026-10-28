@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Compare release with the executed shim tail and source-authored host ASM.
 
 No target, firmware binary or captured RAM. The bounded interpreter executes

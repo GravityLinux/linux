@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Render allocator, support and queue-context objects from g17p_submission.py.
 //! These serializers do not publish queues or infer resource retirement.
@@ -311,6 +311,27 @@ pub(crate) fn paired_grid_dependencies(kind: Kind, grids: [u32; 2], item: u32)
     let [ta, fr] = grids.map(|grid| grid as u8);
     Ok(if kind == Kind::Tiling { ([(ta, item), (0, 0)], 1) }
        else { ([(ta, item + 1), (fr, item)], 2) })
+}
+
+/// Ordinary render dependency topology shared by both scheduled ABIs.
+/// Foreign waits precede the receiver's own previous-value point.
+pub(crate) fn render_dependencies(kind:Kind,grids:[u32;2],item:u32,
+    external:[Option<(u8,u32)>;3])->Result<([(u8,u32);4],usize)> {
+    let (internal,count)=paired_grid_dependencies(kind,grids,item)?;
+    let mut points=[(0u8,0u32);4];points[..count].copy_from_slice(&internal[..count]);
+    let mut count=count;
+    for point in external.into_iter().flatten() {
+        if point.0>=128 || point.1>=1<<30 {return Err(Error::Invalid);}
+        if let Some(existing)=points[..count].iter_mut().find(|p|p.0==point.0) {
+            existing.1=existing.1.max(point.1);
+        } else {
+            if count==points.len() {return Err(Error::Invalid);}
+            points[count]=point;count+=1;
+        }
+    }
+    let own=points[..count].iter().position(|p|p.0==grids[kind.index()as usize]as u8).ok_or(Error::Invalid)?;
+    let own_point=points[own];points[own..count].rotate_left(1);points[count-1]=own_point;
+    Ok((points,count))
 }
 
 pub(crate) struct Context<'a> {

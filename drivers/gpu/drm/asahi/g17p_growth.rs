@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Source-only Neo TVB request/reply and limit-report identities.
 //! These decoders never dereference addresses supplied by firmware.
@@ -11,6 +11,26 @@ pub(crate) const GROWTH_BASE: u64 = 0x1002000000;
 pub(crate) const INCREMENT: usize = 10;
 pub(crate) const REQUEST_LIMIT: u32 = 32;
 pub(crate) const GROWTH_END: u64 = GROWTH_BASE + REQUEST_LIMIT as u64 * INCREMENT as u64 * 0x28000;
+
+/// A retained pool cannot move its tiler block IDs when another caller is
+/// admitted. Keep its whole growth reservation free, including later requests.
+pub(crate) fn caller_fits_growth(base: u64, requests: u32, bindings: &[(u64, u64, u64, u32)]) -> bool {
+    let Some(end) = u64::from(requests)
+        .checked_mul(INCREMENT as u64)
+        .and_then(|n| n.checked_mul(0x28000))
+        .and_then(|length| base.checked_add(length))
+    else {
+        return false;
+    };
+    if base < CONTEXT_BASE || end > 1 << 42 {
+        return false;
+    }
+    bindings.iter().all(|&(address, size, _, _)| {
+        let address = if address < CONTEXT_BASE { address + CONTEXT_BASE } else { address };
+        size != 0 && address.checked_add(size).is_some_and(|last|
+            last <= 1 << 42 && (requests == 0 || last <= base || address >= end))
+    })
+}
 
 /// Source G17PFirstRender's global and independently overridable pool bounds.
 pub(crate) fn source_pool_limits(global: u32, overrides: [u32; 2]) -> Option<[u32; 2]> {

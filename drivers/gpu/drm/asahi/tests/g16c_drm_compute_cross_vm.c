@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Two live immutable VM roots, identical virtual mappings, independent BOs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"
@@ -54,7 +54,7 @@ static void drain_mark(const char *event,unsigned index)
 }
 int main(int argc,char **argv)
 {
-    setbuf(stdout,NULL);CHECK(argc>=2);int serial=0,overlap=0,relocate=0,separate_files=0,drain_close=0,drain_arrival=0,return_after=0;unsigned rounds=3,jobs=8;
+    setbuf(stdout,NULL);CHECK(argc>=2);int serial=0,overlap=0,relocate=0,separate_files=0,drain_close=0,drain_arrival=0,return_after=0;unsigned rounds=3,jobs=8,arrival_after=0;
     for(int i=2;i<argc;i++){
         if(!strcmp(argv[i],"--serial"))serial=1;
         else if(!strcmp(argv[i],"--require-overlap"))overlap=1;
@@ -64,14 +64,16 @@ int main(int argc,char **argv)
         else if(!strcmp(argv[i],"--drain-arrival"))drain_arrival=1;
         else if(!strcmp(argv[i],"--return-after-arrival"))return_after=1;
         else if(!strncmp(argv[i],"--jobs=",7)){jobs=(unsigned)strtoul(argv[i]+7,NULL,10);CHECK(jobs>=4 && jobs<=32);}
+        else if(!strncmp(argv[i],"--arrival-after=",16)){arrival_after=(unsigned)strtoul(argv[i]+16,NULL,10);CHECK(arrival_after>0);}
         else if(!strncmp(argv[i],"--rounds=",9)){rounds=(unsigned)strtoul(argv[i]+9,NULL,10);CHECK(rounds>0);}
         else CHECK(0);
     }
     if(return_after)CHECK(drain_arrival);
+    if(arrival_after)CHECK(drain_arrival && arrival_after<jobs);
     CHECK(!(serial && overlap));if(drain_close || drain_arrival){CHECK(separate_files && !overlap && !serial && !(drain_close && drain_arrival));rounds=0;}
     size_t n;unsigned char *input=input_file(argv[1],"inputs.bin",&n);CHECK(n>=32);
     uint32_t h[8];memcpy(h,input,32);int pair=h[0]==0x384f4347;
-    CHECK((pair && (h[1]==1 || h[1]==2) && h[4]==144) ||
+    CHECK((pair && (h[1]==1 || h[1]==2 || h[1]==3) && h[4]==144) ||
           (h[0]==0x39504347 && (h[1]==1 || h[1]==2) && h[4]==72));
     CHECK(h[2]<128 && h[3]<4096 && n==32+h[2]*16+h[3]*sizeof(struct drm_asahi_gem_bind_op)+h[4]);
     unsigned char *seed[128]={0},*expected[128]={0};size_t sizes[128]={0};uint32_t flags[128]={0};
@@ -87,6 +89,18 @@ int main(int argc,char **argv)
         unsigned id=outputs[j];CHECK(id<128 && sizes[id]==PAGE);
         if(!expected[id]){char name[64];snprintf(name,sizeof(name),"expected-gem-%u.bin",id);expected[id]=input_file(argv[1],name,&n);CHECK(n==PAGE);}
         CHECK(memcmp(seed[id],expected[id],PAGE)!=0);
+        if(pair && h[1]==3){
+            /* Version3 keeps the shader/launch bytes and varies only the
+             * two iteration uniforms. Verify both outputs independently. */
+            unsigned uniform=j?101:11;CHECK(seed[uniform] && sizes[uniform]>=4);
+            uint32_t steps;memcpy(&steps,seed[uniform],4);CHECK(steps>0 && steps<=16000000);
+            for(unsigned lane=0;lane<16;lane++){
+                uint32_t value=0x5a110000u^lane;
+                for(uint32_t i=0;i<steps;i++)value=rotate(value,7)+0x9e3779b9u+i;
+                uint32_t want;memcpy(&want,expected[id]+lane*4,4);CHECK(value==want);
+            }
+            for(unsigned i=64;i<PAGE;i++)CHECK(expected[id][i]==seed[id][i]);
+        }
         if(!pair && h[1]==1){
             CHECK(h[6]==256 || h[6]==4096);
             for(unsigned i=0;i<16;i++){uint32_t value;memcpy(&value,expected[id]+i*4,4);CHECK(value==private_hash(i,h[6],h[7]));}
@@ -162,6 +176,10 @@ int main(int argc,char **argv)
             c->ts.end=(struct drm_asahi_timestamp){.handle=roots[1].timestamp_object.object_handle,.offset=0x108+i*32};
             struct drm_asahi_submit submit={.queue_id=roots[1].queue.queue_id,.cmdbuf=(uintptr_t)queued[i],.cmdbuf_size=72,.syncs=(uintptr_t)&sync[i],.out_sync_count=1};
             OK(roots[1].fd,DRM_IOCTL_ASAHI_SUBMIT,&submit);printf("DRAIN_STREAM_ACCEPTED job=%u keeper_queue=%u\n",i,roots[1].queue.queue_id);
+            if(arrival_after && i+1==arrival_after){
+                drain_mark("ARRIVAL_REQUEST",i+1);
+                OK(roots[0].fd,DRM_IOCTL_ASAHI_SUBMIT,&roots[0].submit);
+            }
         }
         CHECK(!usleep(30000));
         struct drm_syncobj_handle export={.handle=done[jobs-1].handle,.flags=DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE};
@@ -174,7 +192,7 @@ int main(int argc,char **argv)
             OK(roots[0].fd,DRM_IOCTL_ASAHI_QUEUE_DESTROY,&close_queue);BAD(roots[0].fd,DRM_IOCTL_ASAHI_QUEUE_DESTROY,&close_queue,ENOENT);
             drain_mark("CLOSE_RETURNED",jobs);puts("DRAIN_CLOSE_ACCEPTED stale_queue=ENOENT");
         } else {
-            drain_mark("ARRIVAL_REQUEST",jobs);OK(roots[0].fd,DRM_IOCTL_ASAHI_SUBMIT,&roots[0].submit);
+            if(!arrival_after){drain_mark("ARRIVAL_REQUEST",jobs);OK(roots[0].fd,DRM_IOCTL_ASAHI_SUBMIT,&roots[0].submit);}
             wait_root(roots[0].fd,&roots[0],0);drain_mark("ARRIVAL_FENCE",jobs);
         }
         uint64_t previous=0;
@@ -203,6 +221,16 @@ int main(int argc,char **argv)
             uint64_t incoming[2],last[2];memcpy(incoming,roots[0].timestamps+PAGE+64,16);memcpy(last,roots[1].timestamps+PAGE+0x100+(jobs-1)*32,16);
             CHECK(incoming[0] && incoming[1]>incoming[0]);
             printf("DRAIN_ARRIVAL_ORDER early=%u incoming_start=%"PRIu64" incoming_end=%"PRIu64" keeper_last_start=%"PRIu64"\n",incoming[1]<last[0],incoming[0],incoming[1],last[0]);
+            if(h[1]==3){
+                unsigned overlapping=0;
+                for(unsigned i=0;i<jobs;i++){
+                    uint64_t old[2];memcpy(old,roots[1].timestamps+PAGE+0x100+i*32,16);
+                    overlapping+=old[0]<incoming[1] && incoming[0]<old[1];
+                }
+                CHECK(incoming[0]<last[0] && overlapping>0);
+                if(arrival_after)CHECK(incoming[1]<last[0]);
+                printf("DRAIN_ARRIVAL_OVERLAP_PASS old_commands_overlapping_incoming=%u full_outputs_and_timestamps=1\n",overlapping);
+            }
         }
         drain_mark("OUTPUT_VERIFIED",jobs);
         printf("G16C_DRAIN_OUTPUT_PASS jobs=%u arrival=%d closed_queue=%d all_BO_timestamp_guards=1 checks=%u\n",jobs,drain_arrival,drain_close,checks);

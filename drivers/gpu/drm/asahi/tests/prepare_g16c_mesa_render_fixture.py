@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Export one own-Mesa render directly from its hash-verified offline producer.
 
 Shader/launch bytes are unchanged. Only an entirely zero generic shader-aperture

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Synchronous native retirement gates from G17PQueueFence and shim finishers.
 //! Queue retirement, command status and owned report closure are distinct.

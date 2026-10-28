@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Independently retained ordinary compute queue generations. A generation
 //! owns its ASID, private operand/preemption state, firmware queue and storage.
@@ -12,9 +12,10 @@ use super::{
     g17p_queue as q,
     g17p_user_vm::UserVm,
     g17p_vm::Vm,
+    scheduled_generation::{self as generation, Generation, Layout},
 };
 use kernel::{
-    dma_fence::{Fence, RawDmaFence},
+    dma_fence::Fence,
     prelude::*,
 };
 
@@ -25,92 +26,18 @@ const CONTEXTS: usize = 64 - FIRST_ASID as usize;
 const FIRST_GRID: u8 = 32;
 const WINDOW: u32 = super::g17p_compute_lifecycle::TRANSPORT_INTERVAL;
 const RECORDS: u32 = 256;
-const FW_BASE: u64 = 0xfffffc20e0000000;
-const LOW_BASE: u64 = 0x7200000000;
-const STRIDE: u64 = 0x200000;
 
 pub(crate) type Key = (u64, u32);
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Layout {
-    high: u64,
-    low: u64,
-    grid: u8,
-    asid: u16,
+#[path = "scheduled_compute_preparation.rs"]
+mod wrapped;
+pub(crate) use wrapped::WrappedSeed;
+#[path="scheduled_compute_queue.rs"]
+mod wrapped_queue;
+use wrapped_queue::WrappedQueue;
+pub(crate) fn build_private(memory:&mut Memory,client:&mut Client,p:&Parameters,wrapped:bool)->Result {
+    if wrapped {wrapped_queue::PrivateLayout::new(p)?.build(memory,client)}
+    else {runtime::build_independent_client(memory,client,p)}
 }
-impl Layout {
-    fn new(index: usize, asid: u16) -> Result<Self> {
-        if index >= CONTEXTS {
-            return Err(EBUSY);
-        }
-        Ok(Self {
-            high: FW_BASE + index as u64 * STRIDE,
-            low: LOW_BASE + index as u64 * STRIDE,
-            grid: FIRST_GRID + index as u8,
-            asid,
-        })
-    }
-    fn queue(self) -> u64 {
-        self.high + 0x100000
-    }
-    fn pointers(self) -> u64 {
-        self.high + 0x104000
-    }
-    fn ring(self) -> u64 {
-        self.high + 0x108000
-    }
-    fn context(self) -> u64 {
-        self.high + 0x110000
-    }
-    fn context_low(self) -> u64 {
-        self.low + 0x110000
-    }
-    fn support(self) -> u64 {
-        self.high + 0x140000
-    }
-    fn support_state(self) -> u64 {
-        self.high + 0x144000
-    }
-    fn zero(self) -> u64 {
-        self.high + 0x148000
-    }
-    fn completion_scratch(self, slot: u32) -> u64 {
-        self.zero() + slot as u64 * 0x40
-    }
-    fn control(self) -> u64 {
-        self.high + 0x14c000
-    }
-    fn job_list(self) -> u64 {
-        self.high + 0x150000
-    }
-    fn optional(self) -> u64 {
-        self.high + 0x154000
-    }
-    fn scheduler(self, slot: u32) -> u64 {
-        self.high + 0x160000 + slot as u64 * 0x100
-    }
-    fn scheduler_slot(self, slot: u32) -> u64 {
-        self.high + 0x170000 + slot as u64 * 64
-    }
-    fn event(self, slot: u32) -> u64 {
-        self.high + 0x1a0000 + slot as u64 * 0x400
-    }
-    fn status(self, slot: u32) -> u64 {
-        self.high + 0x178000 + slot as u64 * 64
-    }
-    fn dispatch(self, slot: u32) -> [u64; 2] {
-        [
-            self.high + 0x17c000 + slot as u64 * 64,
-            self.high + 0x180000 + slot as u64 * 64,
-        ]
-    }
-    fn descriptor(self, slot: u32) -> u64 {
-        self.high + slot as u64 * 0x1040
-    }
-    fn descriptor_low(self, slot: u32) -> u64 {
-        self.low + slot as u64 * 0x1040
-    }
-}
-
 /// Immutable physical-owner/ordinal seed. Descriptor serialization takes
 /// no firmware or caller memory borrow, and runs outside the runtime mutex.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,15 +51,18 @@ pub(crate) struct PreparationSeed {
     dependency_count: usize,
     optional: bool,
     first: bool,
+    wrapped: Option<WrappedSeed>,
 }
 pub(crate) struct PreparedWork {
     seed: PreparationSeed,
     descriptor: KVVec<u8>,
     context: KVVec<u8>,
     optional: Option<[u8; 0xc0]>,
+    wrapped: Option<wrapped::WrappedWork>,
 }
 impl PreparationSeed {
     pub(crate) fn prepare(self) -> Result<KBox<PreparedWork>> {
+        if let Some(wrapped) = self.wrapped { return wrapped.prepare(self); }
         let l = self.layout;
         let ordinal = self.ordinal;
         let slot = ordinal % RECORDS;
@@ -232,7 +162,29 @@ impl PreparationSeed {
             .build())
         } else { None };
         Ok(KBox::new(PreparedWork { seed: self, descriptor: descriptor_body,
-            context: context_body, optional: optional_body }, GFP_KERNEL)?)
+            context: context_body, optional: optional_body, wrapped: None }, GFP_KERNEL)?)
+    }
+}
+
+impl PreparationSeed {
+    pub(crate) fn wrapped(layout: Layout, key: Key, ordinal: u32, parameters: Parameters,
+        priority: u32, dependencies: &[(u8,u32)], wrapped: WrappedSeed) -> Result<Self> {
+        if dependencies.len()>3 { return Err(EINVAL); }
+        let mut points=[(0,0);3]; points[..dependencies.len()].copy_from_slice(dependencies);
+        Ok(Self {layout,key,ordinal,parameters,priority,dependencies:points,
+            dependency_count:dependencies.len(),optional:false,first:ordinal==0,wrapped:Some(wrapped)})
+    }
+}
+impl PreparedWork {
+    pub(crate) fn matches_seed(&self, seed: PreparationSeed) -> bool { self.seed==seed }
+    pub(crate) fn write_wrapped(&self, memory:&mut Memory, vm:&Vm) -> Result {
+        let work=self.wrapped.as_ref().ok_or(EINVAL)?;
+        let l=self.seed.layout; let sequence=self.seed.ordinal; let command=sequence%256;
+        vm.write(memory,2,l.descriptor(sequence%240),&self.descriptor[..0x1000])?;
+        vm.write(memory,2,l.event(command),&work.wrapper)?;
+        vm.write(memory,2,l.event(command)+0xc0,&work.marker)?;
+        vm.write(memory,2,l.context()+((u64::from(sequence)+1)&255)*0x200,&self.context)?;
+        vm.write(memory,2,l.scheduler(command),&work.scheduler)
     }
 }
 
@@ -246,24 +198,24 @@ pub(crate) struct Ticket {
     pub(crate) grid: u8,
     pub(crate) value: u32,
     pub(crate) queue: usize,
+    pub(crate) binding: Option<(u8,u64,bool)>,
+    pub(crate) driver: Option<(u64,u32,u64)>,
 }
 pub(crate) struct Queue {
-    layout: Layout,
+    generation: Generation,
     key: Key,
     pub(crate) client: Client,
     preempt: u64,
     priority: u32,
-    count: u32,
-    window: u32,
     publication: Option<q::Publication>,
     pointers: u64,
     ring: u64,
     transport: TransportPool,
-    fences: KVec<Fence>,
     upper: u64,
     needs_optional: bool,
     needs_first: bool,
     reconfiguration: Option<Maintenance>,
+    wrapped: Option<WrappedQueue>,
 }
 struct Maintenance {
     target: Key,
@@ -275,16 +227,25 @@ struct Maintenance {
 pub(crate) struct Queues {
     owners: KVec<Queue>,
     reserved_asids: u64,
+    wrapped: bool,
 }
 impl Queues {
     pub(crate) fn new() -> Self {
         Self {
             owners: KVec::new(),
             reserved_asids: 0xf,
+            wrapped: false,
         }
     }
+    pub(crate) fn wrapped()->Self {Self {wrapped:true,..Self::new()}}
+    fn layout(&self,index:usize,asid:u16)->Result<Layout> {
+        let mut l=Layout::new(index,asid)?;
+        if self.wrapped {l.low=0x7000000000+l.high-0xfffffc20c0018000;}
+        Ok(l)
+    }
+
     pub(crate) fn asid_mask(&self) -> u64 {
-        self.owners.iter().fold(self.reserved_asids, |mask, q| mask | (1u64 << q.layout.asid))
+        self.owners.iter().fold(self.reserved_asids, |mask, q| mask | (1u64 << q.generation.layout.asid))
     }
     pub(crate) fn reserve_render_asid(&mut self, asid: u16) -> Result {
         if asid >= 64 || self.asid_mask() & (1u64 << asid) != 0 { return Err(EBUSY); }
@@ -294,22 +255,40 @@ impl Queues {
     fn free_asid(&self) -> Option<u16> {
         (FIRST_ASID..64).find(|asid| self.asid_mask() & (1u64 << asid) == 0)
     }
+    pub(crate) fn dump_failure(&self,memory:&Memory,vm:&Vm)->Result {
+        for q in self.owners.iter().take(4) {
+            let l=q.generation.layout;let n=q.generation.count;
+            pr_err!("G16C: RETAINED_COMPUTE_DATA key={:?} grid={} asid={} count={} idle={} maintenance={:?}\n",
+                q.key,l.grid,l.asid,n,q.idle(),q.reconfiguration.as_ref().map(|m|(m.target,m.next)));
+            if n==0 {continue;}
+            let slot=(n-1)%256;let mut data=[0u8;0x200];
+            for (name,address,size) in [
+                ("record",l.context()+u64::from(n&255)*0x200,0x200),
+                ("timestamps",l.status(slot),16),
+                ("driver",l.dispatch(slot)[0],8),
+            ] {
+                runtime::read_owned(memory,vm,address,&mut data[..size])?;
+                for (chunk,bytes) in data[..size].chunks(0x80).enumerate() {
+                    pr_err!("G16C: RETAINED_COMPUTE_OBJECT grid={} name={} address={:#x} offset={:#x} DATA={:02x?}\n",l.grid,name,address,chunk*0x80,bytes);
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn any(&self) -> bool {
         !self.owners.is_empty()
     }
     pub(crate) fn grid_mask(&self) -> u128 {
         self.owners
             .iter()
-            .fold(0, |mask, q| mask | (1u128 << q.layout.grid))
+            .fold(0, |mask, q| mask | (1u128 << q.generation.layout.grid))
     }
     pub(crate) fn pending(&self) -> bool {
         self.owners.iter().any(|q| !q.idle())
     }
     pub(crate) fn retain_dependency(&mut self, grid: u8, fence: &Fence) -> Result<bool> {
-        let Some(queue) = self.owners.iter_mut().find(|queue| queue.layout.grid == grid) else { return Ok(false); };
-        if !queue.fences.iter().any(|held| held.raw() == fence.raw()) {
-            queue.fences.push(fence.clone(), GFP_KERNEL)?;
-        }
+        let Some(queue) = self.owners.iter_mut().find(|queue| queue.generation.layout.grid == grid) else { return Ok(false); };
+        queue.generation.leases.retain_dependency(fence)?;
         Ok(true)
     }
     pub(crate) fn require_owner_idle(&self, owner: (u64, u32)) -> Result {
@@ -337,32 +316,25 @@ impl Queues {
             }
             queue
                 .client
-                .unbind(start, size, &expected, false, &[queue.layout.asid])?;
+                .unbind(start, size, &expected, false, &[queue.generation.layout.asid])?;
         }
         Ok(())
     }
     pub(crate) fn fail(&self, error: Error) {
         for queue in &self.owners {
-            for fence in &queue.fences {
-                if unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0 {
-                    fence.set_error(error);
-                    fence.signal();
-                }
-            }
+            queue.generation.leases.fail(error);
         }
     }
     fn choose(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<usize> {
-        let eligible = |q: &Queue| q.reconfiguration.as_ref().is_none_or(|m| m.target == key);
-        self.owners.iter().position(|q| q.reconfiguration.as_ref().is_some_and(|m| m.target == key))
-            .or_else(|| self.owners
-            .iter()
-            .position(|q| eligible(q) && q.matches(key, client, p, priority) && q.window < WINDOW))
-            .or_else(|| self.owners.iter().position(|q| eligible(q) && q.key == key && q.idle()))
-            // Rebind a fully retired owner before growing the permanent
-            // backing pool. Live owners never block another queue: allocate
-            // another owner when none can be reused safely.
-            .or_else(|| self.owners.iter().position(|q| eligible(q) && q.idle()))
-            .or_else(|| (self.owners.len() < CONTEXTS && self.free_asid().is_some()).then_some(self.owners.len()))
+        generation::select(self.owners.iter().enumerate().map(|(index, q)| generation::Candidate {
+            index,
+            reserved: q.reconfiguration.as_ref().is_some_and(|m| m.target == key),
+            eligible: q.reconfiguration.as_ref().is_none_or(|m| m.target == key),
+            matches: q.matches(key, client, p, priority),
+            same_queue: q.key == key,
+            idle: q.idle(),
+            room: q.generation.window < WINDOW,
+        }), (self.owners.len() < CONTEXTS && self.free_asid().is_some()).then_some(self.owners.len()))
     }
     pub(crate) fn selected_grid(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<u8> {
         self.choose(key, client, p, priority).map(|index| FIRST_GRID + index as u8)
@@ -372,15 +344,21 @@ impl Queues {
         if dependencies.len() > 3 { return Err(EINVAL); }
         let Some(index) = self.choose(key, client, p, priority) else { return Ok(None); };
         let (layout, ordinal, optional, first) = if let Some(q) = self.owners.get(index) {
-            (q.layout, q.count, q.needs_optional || !q.matches(key, client, p, priority),
-                q.count == 0 || q.needs_first || q.reconfiguration.is_some())
+            (q.generation.layout, q.generation.count, q.needs_optional || !q.matches(key, client, p, priority),
+                q.generation.count == 0 || q.needs_first || q.reconfiguration.is_some())
         } else {
-            (Layout::new(index, self.free_asid().ok_or(EBUSY)?)?, 0, true, true)
+            (self.layout(index, self.free_asid().ok_or(EBUSY)?)?, 0, true, true)
         };
+        if self.wrapped {
+            let registration=self.owners.get(index).filter(|q|q.matches(key,client,p,priority))
+                .and_then(|q|q.wrapped.as_ref()).map_or(0,|w|w.registration);
+            return Ok(Some(PreparationSeed::wrapped(layout,key,ordinal,*p,priority,dependencies,
+                WrappedQueue::seed(layout,p,ordinal,registration)?)?));
+        }
         let mut points = [(0, 0); 3];
         points[..dependencies.len()].copy_from_slice(dependencies);
         Ok(Some(PreparationSeed { layout, key, ordinal, parameters: *p, priority,
-            dependencies: points, dependency_count: dependencies.len(), optional, first }))
+            dependencies: points, dependency_count: dependencies.len(), optional, first, wrapped: None }))
     }
     pub(crate) fn prepared_matches(&self, plan: &PreparedWork, key: Key, client: &Client,
         p: &Parameters, priority: u32, dependencies: &[(u8,u32)]) -> Result<bool> {
@@ -426,7 +404,7 @@ impl Queues {
         if queue.matches(key, client, p, priority) && queue.reconfiguration.is_none() {
             return Ok((true, false));
         }
-        if !queue.idle() { pr_err!("G17P: compute admission nonidle grid {} key {:?} target {:?}\n",queue.layout.grid,queue.key,key); return Err(EIO); }
+        if !queue.idle() { pr_err!("G17P: compute admission nonidle grid {} key {:?} target {:?}\n",queue.generation.layout.grid,queue.key,key); return Err(EIO); }
         let maintenance = queue.reconfiguration.get_or_insert_with(|| Maintenance {
             target: key, next: 0, published: None, acknowledged: [false; 2],
             started: kernel::time::Instant::now(),
@@ -445,11 +423,12 @@ impl Queues {
             maintenance.next += 1;
             maintenance.published = None;
         }
-        if maintenance.next == 1 { return Ok((true, false)); }
+        if maintenance.next == if self.wrapped {8} else {1} { return Ok((true, false)); }
         if counters.available() == 0 { return Ok((false, false)); }
         let mut live = [0; 0x40];
-        runtime::read_owned(memory,vm,queue.layout.control(),&mut live)?;
-        let body = super::g17p_lifecycle::build_live_context_cleanup(queue.layout.control(),&live)?;
+        runtime::read_owned(memory,vm,queue.generation.layout.control(),&mut live)?;
+        let body=if self.wrapped {wrapped_queue::cleanup_message(maintenance.next,queue.generation.layout.control(),&live)?}
+            else {super::g17p_lifecycle::build_live_context_cleanup(queue.generation.layout.control(),&live)?};
         let target = ((values[2] + 1) & 255) as u8;
         vm.write(memory, 2, channel.ring + u64::from(values[2]) * 0x40, &body)?;
         g17p_memory::sync();
@@ -482,25 +461,26 @@ impl Queues {
             let queue = Queue::new(
                 memory,
                 vm,
-                Layout::new(index, self.free_asid().ok_or(EBUSY)?)?,
+                self.layout(index, self.free_asid().ok_or(EBUSY)?)?,
                 key,
                 client.take().ok_or(EINVAL)?,
                 p,
                 priority,
                 private_prepared,
+                self.wrapped,
             )?;
             self.owners.push(queue, GFP_KERNEL)?;
-            self.owners[index].install(memory, ttbs)?;
+            self.owners[index].install(memory, vm, ttbs, p)?;
         } else {
             let queue = &mut self.owners[index];
             if let Some(receipt) = &queue.reconfiguration {
-                if receipt.target != key || receipt.next != 1 || !queue.idle() { return Err(EBUSY); }
+                if receipt.target != key || receipt.next != if self.wrapped {8} else {1} || !queue.idle() { return Err(EBUSY); }
                 // A first registration starts with an empty inner transport.
                 // Switch while the old source header still mirrors its retired
                 // read index; resetting that header first loses rollover proof.
                 // Both finite backing slots and logical counters stay retained.
-                queue.rotate(memory,vm).inspect_err(|e| pr_err!("G17P: compute cleanup rotate grid {} error {:?}\n",queue.layout.grid,e))?;
-                queue.reset_registration(memory,vm).inspect_err(|e| pr_err!("G17P: compute reset registration grid {} error {:?}\n",queue.layout.grid,e))?;
+                queue.rotate(memory,vm).inspect_err(|e| pr_err!("G17P: compute cleanup rotate grid {} error {:?}\n",queue.generation.layout.grid,e))?;
+                queue.reset_registration(memory,vm).inspect_err(|e| pr_err!("G17P: compute reset registration grid {} error {:?}\n",queue.generation.layout.grid,e))?;
                 queue.reconfiguration = None;
             }
             if !queue.matches(key, reference, p, priority) {
@@ -516,14 +496,14 @@ impl Queues {
                     rebind,
                     p,
                     priority,
-                ).inspect_err(|e| pr_err!("G17P: compute replace client grid {} error {:?}\n",queue.layout.grid,e))?;
+                ).inspect_err(|e| pr_err!("G17P: compute replace client grid {} error {:?}\n",queue.generation.layout.grid,e))?;
             }
-            if queue.window == WINDOW {
-                queue.rotate(memory, vm).inspect_err(|e| pr_err!("G17P: compute rotate grid {} error {:?}\n",queue.layout.grid,e))?;
+            if queue.generation.window == WINDOW {
+                queue.rotate(memory, vm).inspect_err(|e| pr_err!("G17P: compute rotate grid {} error {:?}\n",queue.generation.layout.grid,e))?;
             }
         }
         self.owners[index].stage(memory, vm, channel, index, p, dependencies, prepared, fence)
-            .inspect_err(|e| pr_err!("G17P: compute build grid {} error {:?}\n",self.owners[index].layout.grid,e))
+            .inspect_err(|e| pr_err!("G17P: compute build grid {} error {:?}\n",self.owners[index].generation.layout.grid,e))
     }
 }
 impl Queue {
@@ -533,9 +513,7 @@ impl Queue {
         // joined producer errors), or after rejection before publication.
         // Session-wide failure prevents further publication separately.
         // Match stage() reaping: a terminal negative lease is not pending.
-        self.fences
-            .iter()
-            .all(|f| unsafe { kernel::bindings::dma_fence_get_status(f.raw()) } != 0)
+        self.generation.leases.idle()
     }
     fn matches(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> bool {
         self.key == key
@@ -560,6 +538,7 @@ impl Queue {
         p: &Parameters,
         priority: u32,
         private_prepared: bool,
+        wrapped: bool,
     ) -> Result<Self> {
         // The ordinary worker constructs the large operand/save allocations
         // outside publication locking, then transfers their retained ownership.
@@ -581,6 +560,9 @@ impl Queue {
             vm.ensure_firmware(memory, address, size)?;
         }
         vm.alias_firmware(memory, layout.context(), layout.context_low(), 8 * PAGE)?;
+        let wrapped=if wrapped {
+            Some(WrappedQueue::initialize(memory,vm,layout,p,priority)?)
+        } else {
         let mut page = KVVec::with_capacity(PAGE, GFP_KERNEL)?;
         page.resize(PAGE, 0, GFP_KERNEL)?;
         cm::Support {
@@ -639,41 +621,42 @@ impl Queue {
         .map_err(|_| EINVAL)?;
         record[0x28..0x48].copy_from_slice(&q::priority_profile(priority).map_err(|_| EINVAL)?);
         vm.write(memory, 2, layout.queue(), &record)?;
+            None
+        };
         let upper = memory.allocate(PAGE)?;
         memory.clean(upper, PAGE)?;
         vm.flush_tables(memory)?;
         Ok(Self {
-            layout,
+            generation: Generation::new(layout),
             key,
             client,
             preempt: p.preempt,
             priority,
-            count: 0,
-            window: 0,
             publication: None,
             pointers: layout.pointers(),
             ring: layout.ring(),
             transport: TransportPool::new(layout.high + 0x190000),
-            fences: KVec::new(),
             upper,
             needs_optional: true,
             needs_first: false,
             reconfiguration: None,
+            wrapped,
         })
     }
     // Session owns the complete root before either TTB becomes visible.
-    fn install(&self, memory: &mut Memory, ttbs: u64) -> Result {
-        let at = ttbs + u64::from(self.layout.asid) * 16;
+    fn install(&self, memory: &mut Memory, vm:&Vm, ttbs: u64,p:&Parameters) -> Result {
+        if self.wrapped.is_some() {WrappedQueue::dispatch(memory,vm,self.generation.layout,p,true)?;}
+        let at = ttbs + u64::from(self.generation.layout.asid) * 16;
         if memory.read64(at)? & 1 != 0 {
             return Err(EBUSY);
         }
-        memory.write64(at + 8, (u64::from(self.layout.asid) << 48) | self.upper | 1)?;
+        memory.write64(at + 8, (u64::from(self.generation.layout.asid) << 48) | self.upper | 1)?;
         memory.write64(
             at,
-            (u64::from(self.layout.asid) << 48) | self.client.root.root() | 1,
+            (u64::from(self.generation.layout.asid) << 48) | self.client.root.root() | 1,
         )?;
         memory.clean(at, 16)?;
-        UserVm::invalidate(self.layout.asid);
+        UserVm::invalidate(self.generation.layout.asid);
         Ok(())
     }
     fn reset_registration(&mut self, memory: &mut Memory, vm: &Vm) -> Result {
@@ -681,20 +664,25 @@ impl Queue {
         // fences completed. Rebuild source-authored registration metadata;
         // never return, repurpose or zero any caller/GPU executable pages.
         for offset in (0..8 * PAGE).step_by(PAGE) {
-            let pa = vm.physical(memory,2,self.layout.context() + offset as u64)?;
+            let pa = vm.physical(memory,2,self.generation.layout.context() + offset as u64)?;
             memory.zero(pa,PAGE)?;
             memory.clean(pa,PAGE)?;
         }
-        vm.write(memory,2,self.layout.control(),&super::g17p_dependency::channel_control())?;
-        vm.write(memory,2,self.layout.job_list(),&q::job_list(self.layout.job_list()))?;
+        if let Some(wrapped)=self.wrapped.as_mut() {
+            WrappedQueue::registration(memory,vm,self.generation.layout,self.pointers,self.ring,self.priority)?;
+            wrapped.registration=0;self.needs_optional=true;self.needs_first=true;
+            return Ok(());
+        }
+        vm.write(memory,2,self.generation.layout.control(),&super::g17p_dependency::channel_control())?;
+        vm.write(memory,2,self.generation.layout.job_list(),&q::job_list(self.generation.layout.job_list()))?;
         let mut record = q::Record {
-            pointers:self.pointers,ring:self.ring,job_list:self.layout.job_list(),
-            context:self.layout.control(),uuid:0x200+u32::from(self.layout.grid),
+            pointers:self.pointers,ring:self.ring,job_list:self.generation.layout.job_list(),
+            context:self.generation.layout.control(),uuid:0x200+u32::from(self.generation.layout.grid),
             priority:self.priority,prio5:self.priority,unk_2c:self.priority,
             unk_38:0,unk_30:None,unk_94:0,sentinel_size:2,
         }.build().map_err(|_|EINVAL)?;
         record[0x28..0x48].copy_from_slice(&q::priority_profile(self.priority).map_err(|_|EINVAL)?);
-        vm.write(memory,2,self.layout.queue(),&record)?;
+        vm.write(memory,2,self.generation.layout.queue(),&record)?;
         self.needs_optional = true;
         self.needs_first = true;
         Ok(())
@@ -714,14 +702,14 @@ impl Queue {
             return Err(EBUSY);
         }
         let profile = q::priority_profile(priority).map_err(|_| EINVAL)?;
-        let at = ttbs + u64::from(self.layout.asid) * 16;
-        if memory.read64(at)? != ((u64::from(self.layout.asid) << 48) | self.client.root.root() | 1)
-            || memory.read64(at + 8)? != ((u64::from(self.layout.asid) << 48) | self.upper | 1)
+        let at = ttbs + u64::from(self.generation.layout.asid) * 16;
+        if memory.read64(at)? != ((u64::from(self.generation.layout.asid) << 48) | self.client.root.root() | 1)
+            || memory.read64(at + 8)? != ((u64::from(self.generation.layout.asid) << 48) | self.upper | 1)
         {
             pr_err!("G17P: compute rebind TTB grid {} actual [{:#x},{:#x}] expected [{:#x},{:#x}]\n",
-                self.layout.grid,memory.read64(at)?,memory.read64(at+8)?,
-                (u64::from(self.layout.asid)<<48)|self.client.root.root()|1,
-                (u64::from(self.layout.asid)<<48)|self.upper|1);
+                self.generation.layout.grid,memory.read64(at)?,memory.read64(at+8)?,
+                (u64::from(self.generation.layout.asid)<<48)|self.client.root.root()|1,
+                (u64::from(self.generation.layout.asid)<<48)|self.upper|1);
             return Err(EIO);
         }
         // Reuse this owner's allocator and private backing. A changed reserved
@@ -730,11 +718,14 @@ impl Queue {
         if !plan.matches(self, key, &client, p, priority) { return Err(EBUSY); }
         plan.root.commit(&mut self.client.root)?;
         self.client.adopt_rebound(client);
+        if let Some(wrapped)=self.wrapped.as_mut() {
+            wrapped.update_private(memory,vm,self.generation.layout,p)?;
+        }
         self.needs_optional = true;
         // Retained firmware queues keep their established scheduling state
         // when another caller requests the same priority family.
         if self.priority != priority {
-            vm.write(memory, 2, self.layout.queue() + 0x28, &profile)?;
+            vm.write(memory, 2, self.generation.layout.queue() + 0x28, &profile)?;
         }
         self.key = key;
         self.preempt = p.preempt;
@@ -749,14 +740,14 @@ impl Queue {
         let next = self.transport.switch(
             memory,
             vm,
-            self.layout.queue(),
+            self.generation.layout.queue(),
             self.pointers,
             self.ring,
             previous.write_after,
         )?;
         self.pointers = next[0];
         self.ring = next[1];
-        self.window = 0;
+        self.generation.window = 0;
         Ok(())
     }
     fn stage(
@@ -770,15 +761,13 @@ impl Queue {
         prepared: KBox<PreparedWork>,
         fence: Fence,
     ) -> Result<Ticket> {
-        self.fences
-            .retain(|f| unsafe { kernel::bindings::dma_fence_get_status(f.raw()) } == 0);
-        self.fences.reserve(1, GFP_KERNEL)?;
-        let ordinal = self.count;
+        self.generation.leases.prepare()?;
+        let ordinal = self.generation.count;
         if ordinal >= 0xfffffe {
             return Err(EOVERFLOW);
         }
         let slot = ordinal % RECORDS;
-        let l = self.layout;
+        let l = self.generation.layout;
         let descriptor = l.descriptor(ordinal % 240);
         let low = l.descriptor_low(ordinal % 240);
         // The firmware accesses the entire 0x1040-byte record, including
@@ -791,7 +780,7 @@ impl Queue {
         }
         let counters = q::Counters::new(counters).map_err(|_| EIO)?;
         counters.slot().map_err(|_| EBUSY)?;
-        let write_index = if self.window == 0 {
+        let write_index = if self.generation.window == 0 {
             0
         } else {
             self.publication.ok_or(EIO)?.write_after
@@ -804,6 +793,16 @@ impl Queue {
         vm.write(memory, 2, l.completion_scratch(slot), &[0; 0x40])?;
         let dispatch = l.dispatch(slot);
         let status = [l.status(slot), l.status(slot) + 8];
+        if let Some(wrapped)=self.wrapped.as_ref() {
+            let seed=PreparationSeed::wrapped(l,self.key,ordinal,*p,self.priority,dependencies,
+                WrappedQueue::seed(l,p,ordinal,wrapped.registration)?)?;
+            if !prepared.matches_seed(seed) {return Err(EBUSY);}
+            wrapped.clear_command(memory,&self.client.root,ordinal)?;
+            prepared.write_wrapped(memory,vm)?;
+            vm.write(memory,2,l.scheduler_slot(slot),&1u32.to_le_bytes())?;
+            vm.write(memory,2,dispatch[0],&ordinal.wrapping_shl(8).to_le_bytes())?;
+            vm.write(memory,2,status[0],&[0;16])?;
+        } else {
         let scheduler = c::Scheduler {
             slot: l.scheduler_slot(slot),
             work_id: ordinal,
@@ -831,6 +830,7 @@ impl Queue {
         if let Some(optional) = &prepared.optional {
             vm.write(memory, 2, l.optional(), optional)?;
         }
+        }
         vm.flush_tables(memory)?;
         // New firmware aliases are global mappings in context zero.
         // SAFETY: The runtime lock serializes host page-table publication.
@@ -847,7 +847,8 @@ impl Queue {
         let client = self.client.lease()?;
         let initial = [descriptor, l.optional(), l.event(slot)];
         let retained = [descriptor, l.event(slot)];
-        let publication = q::Stage {
+        let wrapped_items=[l.event(slot),l.event(slot)+0xc0];
+        let stage = q::Stage {
             queue: l.queue(),
             pointers: self.pointers,
             item_ring: self.ring,
@@ -857,7 +858,7 @@ impl Queue {
             channel_producer: channel.states[2],
             counters,
             slot: None,
-            items: if self.needs_optional { &initial } else { &retained },
+            items: if self.wrapped.is_some() {&wrapped_items} else if self.needs_optional { &initial } else { &retained },
             group: ordinal + 1,
             grid: u32::from(l.grid),
             kind: q::Kind::Compute,
@@ -869,18 +870,24 @@ impl Queue {
             event_subtype: None,
             event_counter: None,
             event_counter_low: 2,
-        }
-        .publish(&mut Writer { memory, vm })
+        };
+        let publication=if self.wrapped.is_some() {
+            stage.publish_entry(&mut Writer {memory,vm},write_index+2,0,None)
+        } else {stage.publish(&mut Writer {memory,vm})}
         .map_err(|e| match e {
             q::StageError::Access(e) => e,
             _ => EINVAL,
         })?;
-        self.fences.push(fence, GFP_KERNEL)?;
+        let binding=self.wrapped.as_mut().map(|wrapped| {
+            let resume=wrapped.bound;wrapped.bound=true;wrapped.registration+=1;
+            (l.grid,l.context_low(),resume)
+        });
+        self.generation.leases.published(fence)?;
         self.publication = Some(publication);
         self.needs_optional = false;
         self.needs_first = false;
-        self.count += 1;
-        self.window += 1;
+        self.generation.count += 1;
+        self.generation.window += 1;
         Ok(Ticket {
             client,
             publication,
@@ -889,8 +896,10 @@ impl Queue {
             status,
             timestamps: p.timestamps,
             grid: l.grid,
-            value: self.count,
+            value: self.generation.count,
             queue: index,
+            binding,
+            driver:self.wrapped.as_ref().map(|_|(dispatch[0],(ordinal+1)<<8,l.scheduler(slot)+0xc)),
         })
     }
 }
@@ -920,6 +929,7 @@ pub(crate) struct ComputeRebindSeed {
     primer_aliases: Option<[(u64,u64);2]>,
     new_key: Key,
     new_priority: u32,
+    private: Option<wrapped_queue::PrivateLayout>,
 }
 pub(crate) struct PreparedComputeRebind {
     layout: Layout,
@@ -942,6 +952,7 @@ impl ComputeRebindSeed {
             cpu_maps:self.cpu_maps,primer_aliases:self.primer_aliases };
         let mut private: KVec<(u64, u64, u64)> = KVec::new();
         if self.old_preempt != self.new_preempt {
+            let offsets=if let Some(private)=self.private {private.offsets()?} else {
             let mut offsets = KVec::with_capacity(256 * 3 + 2, GFP_KERNEL)?;
             for slot in 0..256u64 {
                 for page in [0, 0x4000, 0x8000] {
@@ -949,6 +960,8 @@ impl ComputeRebindSeed {
                 }
             }
             for offset in [0x100000, 0x108000] {offsets.push(offset, GFP_KERNEL)?;}
+                offsets
+            };
             let mut leaves = KVec::with_capacity(offsets.len(), GFP_KERNEL)?;
             for &offset in &offsets {
                 let old = self.old_preempt + offset;
@@ -984,7 +997,7 @@ impl ComputeRebindSeed {
         let mut buffers=KVec::with_capacity(client.buffers.len(),GFP_KERNEL)?;
         for bo in &client.buffers { buffers.push(bo.clone(),GFP_KERNEL)?; }
         let root=relocation.prepare(&shadow.root,&[self.layout.asid])?;
-        if *crate::module_parameters::submission_log.value() >= 3 {
+        if crate::module_parameters::submission_log.value() >= 3 {
             pr_info!("G17P: COMPUTE_ROOT_PREPARED grid {} bindings {} elapsed_us {} outside_runtime_lock\n",
                 self.layout.grid,bindings.len(),started.elapsed().as_nanos()/1000);
         }
@@ -995,7 +1008,7 @@ impl ComputeRebindSeed {
 }
 impl PreparedComputeRebind {
     fn matches(&self,queue:&Queue,key:Key,client:&Client,p:&Parameters,priority:u32) -> bool {
-        self.layout==queue.layout && self.old_key==queue.key && self.old_preempt==queue.preempt
+        self.layout==queue.generation.layout && self.old_key==queue.key && self.old_preempt==queue.preempt
             && self.old_priority==queue.priority && self.root.matches(&queue.client.root) && queue.idle()
             && self.new_preempt==p.preempt && self.new_key==key && self.new_priority==priority
             && self.owner==client.owner && self.bindings==client.bindings
@@ -1017,10 +1030,10 @@ impl Queues {
         let mut buffers=KVec::with_capacity(queue.client.buffers.len(),GFP_KERNEL)?;
         for bo in &queue.client.buffers {buffers.push(bo.clone(),GFP_KERNEL)?;}
         let mut bindings=KVec::new();bindings.extend_from_slice(&queue.client.bindings,GFP_KERNEL)?;
-        Ok(Some(Some(ComputeRebindSeed {layout:queue.layout,old_key:queue.key,old_preempt:queue.preempt,
+        Ok(Some(Some(ComputeRebindSeed {layout:queue.generation.layout,old_key:queue.key,old_preempt:queue.preempt,
             new_preempt:p.preempt,old_priority:queue.priority,snapshot,buffers,bindings,owner:queue.client.owner,
             cpu_maps:queue.client.cpu_maps.clone(),primer_aliases:queue.client.primer_aliases,
-            new_key:key,new_priority:priority})))
+            new_key:key,new_priority:priority,private:queue.wrapped.as_ref().map(|w|w.private)})))
     }
     pub(crate) fn rebind_matches(&self,plan:Option<&PreparedComputeRebind>,key:Key,client:&Client,
         p:&Parameters,priority:u32) -> bool {

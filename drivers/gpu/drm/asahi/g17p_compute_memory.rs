@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Compute allocator/control memory constructors. Every output is generated
 //! from explicit addresses and source ABI fields, before firmware publication.

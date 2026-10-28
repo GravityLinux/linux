@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Firmware writes into an offset GEM object range, with live object rebind. */
 #ifndef G17P_TIMESTAMP_CAPACITY
 #define G17P_TIMESTAMP_CAPACITY 258

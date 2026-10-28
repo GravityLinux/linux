@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G16C queue storage built through the common Memory/UAT owners.
 //! No producers or context roots are published here. Detached preparation
@@ -77,6 +77,21 @@ pub(crate) struct LaneG16C {
     pub(crate) stage: u8,
 }
 
+/// Unpublished transport RAM, independent of queue identity or UAT placement.
+pub(crate) struct QueueBackingG16C {
+    memory: Memory,
+    pages: [[u64;4];3],
+}
+impl QueueBackingG16C {
+    pub(crate) fn new()->Result<Self> {
+        let mut memory=Memory::detached();let mut pages=[[0;4];3];
+        for lane in &mut pages {for (page,size)in lane.iter_mut().zip([PAGE,PAGE,PAGE,0x20000]) {
+            *page=memory.allocate(size as usize)?;memory.clean(*page,size as usize)?;
+        }}
+        Ok(Self {memory,pages})
+    }
+}
+
 pub(crate) struct QueueSetG16C {
     pub(crate) base: u64,
     pub(crate) lanes: [LaneG16C; 3],
@@ -97,13 +112,23 @@ fn empty(memory: &Memory, vm: &Vm, group: usize, start: u64, size: u64) -> Resul
 }
 
 impl QueueSetG16C {
-    pub(crate) fn prepare(
+    pub(crate) fn prepare(memory:&mut Memory,vm:&mut Vm,base:u64,priority:u8,
+        uuid:u16,scratch_aliases:Option<[u64;3]>)->Result<(Memory,Self)> {
+        Self::prepare_inner(memory,vm,base,priority,uuid,scratch_aliases,&mut None)
+    }
+    pub(crate) fn prepare_backed(memory:&mut Memory,vm:&mut Vm,base:u64,priority:u8,
+        uuid:u16,scratch_aliases:Option<[u64;3]>,backing:&mut Option<QueueBackingG16C>)->Result<(Memory,Self)> {
+        if backing.is_none() {return Err(EINVAL);}
+        Self::prepare_inner(memory,vm,base,priority,uuid,scratch_aliases,backing)
+    }
+    fn prepare_inner(
         memory: &mut Memory,
         vm: &mut Vm,
         base: u64,
         priority: u8,
         uuid: u16,
         scratch_aliases: Option<[u64; 3]>,
+        backing: &mut Option<QueueBackingG16C>,
     ) -> Result<(Memory, Self)> {
         vm.require_g16c_graph()?;
         if priority >= 4 || base < START || base > END - SIZE || base & (PAGE - 1) != 0 {
@@ -148,20 +173,9 @@ impl QueueSetG16C {
         });
         vm.prepare_g16c_empty(memory, 2, base, SIZE as usize)?;
         for low in lows { vm.prepare_g16c_empty(memory, 0, low, 0x20000)?; }
-        let mut staged = Memory::detached();
-        let mut backing = [[0; 4]; 3];
-        for (i, _) in lanes.iter().enumerate() {
-            for (j, (_, size, _)) in [
-                (0, PAGE, PRIVATE),
-                (0x4000, PAGE, SHARED),
-                (0x8000, PAGE, PRIVATE),
-                (0xc000, 0x20000, SHARED),
-            ].into_iter().enumerate() {
-                let physical = staged.allocate(size as usize)?;
-                backing[i][j] = physical;
-                staged.clean(physical, size as usize)?;
-            }
-        }
+        let QueueBackingG16C {memory:staged,pages:backing}=match backing.take() {
+            Some(backing)=>backing,None=>QueueBackingG16C::new()?,
+        };
         Ok((staged, Self { base, lanes, jobs, context, uuid, backing, aliases: lows }))
     }
 
@@ -194,6 +208,15 @@ impl QueueSetG16C {
     /// Check every retained mapping before zeroing any allocation. Canonical
     /// engine arrays are separate; these are only the queue's own allocations.
     pub(crate) fn reset(&mut self, memory: &mut Memory, vm: &Vm, priority: u8) -> Result {
+        self.reset_inner(memory,vm,priority,false)
+    }
+    /// Neo retains firmware-owned context arrays across idle root rebinding.
+    /// Queue records/rings restart after the owned close receipt; scratch and
+    /// its engine milestone identity remain at the same physical address.
+    pub(crate) fn reset_retained(&mut self,memory:&mut Memory,vm:&Vm,priority:u8)->Result {
+        self.reset_inner(memory,vm,priority,true)
+    }
+    fn reset_inner(&mut self,memory:&mut Memory,vm:&Vm,priority:u8,retain_scratch:bool)->Result {
         if priority >= 4 { return Err(EINVAL); }
         for i in 0..3 {
             for (j, (offset, size, flags)) in [(0, PAGE, PRIVATE),
@@ -212,6 +235,7 @@ impl QueueSetG16C {
         }
         for i in 0..3 {
             for (j, size) in [PAGE, PAGE, PAGE, 0x20000].into_iter().enumerate() {
+                if retain_scratch && j==3 {continue;}
                 memory.zero(self.backing[i][j], size as usize)?;
                 memory.clean(self.backing[i][j], size as usize)?;
             }

@@ -1,5 +1,5 @@
 /* Candidate pressure variant: 48 independent ready queues, exact full outputs/guards. */
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Render, 258 retained computes in five buffers, then render again. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

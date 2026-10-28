@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Retained pair-zero append lifecycle from G17PShimBackend's source path.
 //! Each later generation owns a sequenced control tick, new records and
@@ -14,6 +14,36 @@ use super::{
 // The optional item's ordinal is u16; native dependency waves retain their
 // previously qualified bounded storage profile.
 pub(crate) const STORAGE_SUBMISSIONS: u32 = 256;
+/// Retained tilemap and heap metadata rotate together. TPC backing persists
+/// across this ring; only a retired slot may be cleared for another use.
+pub(crate) const SCRATCH_SLOTS: u32 = 8;
+pub(crate) fn scratch_offset(index: u32, stride: u64) -> u64 {
+    u64::from(index % SCRATCH_SLOTS) * stride
+}
+/// Original ordinary render ordering. Logical counters do not own backing;
+/// a slow publication pins only the physical intervals it still references.
+pub(crate) fn select_storage(next:u32,available:impl Fn(&u32)->bool)->Option<u32> {
+    let next=next%STORAGE_SUBMISSIONS;
+    (0..STORAGE_SUBMISSIONS).map(|offset|(next+offset)%STORAGE_SUBMISSIONS).find(available)
+}
+
+/// Original independent render policy: prefer a free exact caller snapshot,
+/// then another free pool in the same round-robin order.
+pub(crate) fn select_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
+    matches:impl Fn(&u32)->bool)->Option<u32> {
+    if count==0 {return None;}
+    let next=next%count;
+    (0..count).map(|offset|(next+offset)%count).find(|pool|available(pool)&&matches(pool))
+        .or_else(||(0..count).map(|offset|(next+offset)%count).find(available))
+}
+
+/// Physical render roots use the bootstrap slot for pool zero and grow
+/// downwards against compute's existing shared ASID reservation mask.
+pub(crate) fn render_asid(pool:u32,mask:u64)->Option<u16> {
+    if pool>=POOL_SLOTS {return None;}
+    if pool==0 {Some(1)} else {(4..64u16).rev().find(|asid|mask&(1u64<<asid)==0)}
+}
+
 pub(crate) const NATIVE_SUBMISSIONS: u32 = 255;
 // The terminal report is a u32 grid bitmap. Compute reserves grids 4/5;
 // each render owner consumes an adjacent TA/FR pair from the remaining bits.
@@ -300,8 +330,8 @@ impl Item {
         (self.layout.pair != 0 && self.index == 0).then_some(self.layout.leaves[4] + 0x40)
     }
     pub(crate) fn tilemap_reset(self, p: &Parameters) -> Option<u64> {
-        (self.index >= 8).then_some(
-            p.tilemap + (self.index % 8) as u64 * p.scratch_layout().unwrap().1
+        (self.index >= SCRATCH_SLOTS).then_some(
+            p.tilemap + scratch_offset(self.index, p.scratch_layout().unwrap().1)
                 + if self.layout.independent { self.layout.pair as u64 * p.scratch_pair_stride } else { 0 },
         )
     }
@@ -426,7 +456,7 @@ impl Item {
         } else {
             0
         };
-        let step = (self.index % 8) as u64 * p.scratch_layout()?.1 + pair_step;
+        let step = scratch_offset(self.index, p.scratch_layout()?.1) + pair_step;
         let offsets: &[usize] = if kind == Kind::Tiling {
             &[0x7c, 0x88, 0xa0, 0xac, 0x148, 0x154]
         } else {
@@ -484,35 +514,12 @@ impl Item {
         .build(out)
     }
     pub(crate) fn context(self, kind: Kind, p: &r::Parameters, out: &mut [u8]) -> Result {
-        let (internal, count) = graph::paired_grid_dependencies(kind, self.layout.grids, self.index)?;
-        let mut points = [(0u8, 0u32); 4];
-        points[..count].copy_from_slice(&internal[..count]);
-        let mut count = count;
-        // Keep receiver event-slot and paired internal dependencies unchanged.
-        // A referenced Source milestone names its target grid and counter.
-        let external = [
-            if kind == Kind::Tiling { p.prior_queue_ta } else { None },
-            if kind == Kind::Tiling { p.cdm_dependency } else { None },
-            if (kind == Kind::Fragment) == p.vdm_barrier_fragment {
-                p.vdm_dependency
-            } else { None },
+        let external=[
+            if kind==Kind::Tiling {p.prior_queue_ta}else{None},
+            if kind==Kind::Tiling {p.cdm_dependency}else{None},
+            if (kind==Kind::Fragment)==p.vdm_barrier_fragment {p.vdm_dependency}else{None},
         ];
-        for point in external.into_iter().flatten() {
-            if point.0 >= 128 || point.1 >= (1 << 30) { return Err(c::Error::Invalid); }
-            if let Some(existing) = points[..count].iter_mut().find(|existing| existing.0 == point.0) {
-                existing.1 = existing.1.max(point.1);
-            } else {
-                points[count] = point;
-                count += 1;
-            }
-        }
-        // Keep the native queue/value-list order: foreign waits precede
-        // the receiving grid's own previous-value point.
-        let own_grid = self.layout.grids[kind.index() as usize] as u8;
-        let own = points[..count].iter().position(|point| point.0 == own_grid).ok_or(c::Error::Invalid)?;
-        let own_point = points[own];
-        points[own..count].rotate_left(1);
-        points[count - 1] = own_point;
+        let (points,count)=graph::render_dependencies(kind,self.layout.grids,self.index,external)?;
         graph::Context {
             kind,
             descriptor: self.descriptor_address(kind),

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Two DRM files, colliding DVAs, and source-default synchronous VM handoff. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

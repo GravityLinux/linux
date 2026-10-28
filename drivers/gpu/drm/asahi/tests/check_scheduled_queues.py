@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Whole Max queue storage and common UAT mappings vs actual QueueSet.create.
 
 Uses populated typed FDT nodes and bounded owned RAM. No target access or
@@ -96,7 +96,10 @@ fn main()->Result {
 '''
     for i, (base, lows) in enumerate(layouts):
         aliases = 'None' if lows is None else 'Some([' + ','.join(str(v) for v in lows) + '])'
-        code += f'let mut q=QueueSetG16C::new(&mut m,&mut vm,{base},{i},{0xff00+i},{aliases})?;\n'
+        code += 'let caller_maps=context1;let caller_ttbs=ttbs.clone();let before_calls=m.calls;\n'
+        code += 'let mut backing=Some(scheduled_queues::QueueBackingG16C::new()?);assert_eq!(m.calls,before_calls);\n'
+        code += f'let (staged,prepared)=QueueSetG16C::prepare_backed(&mut m,&mut vm,{base},{i},{0xff00+i},{aliases},&mut backing)?;assert!(backing.is_none());assert_eq!(staged.calls,12);m.absorb(staged)?;let mut q=prepared.install(&mut m,&mut vm,{i})?;\n'
+        code += 'assert_eq!(vm.boot_context_roots(1)?,caller_maps);assert_eq!(m.read(r.regions[0].base,0x4000)?,caller_ttbs);\n'
         code += f'let case={i};\n'
         code += '''
     assert_eq!((q.base,q.jobs,q.context,q.uuid),(q.base,q.base+0x4100,q.base+0x140,0xff00+case as u16));
@@ -134,6 +137,18 @@ fn main()->Result {
         assert_eq!((lane.head,lane.first,lane.priority),(0,true,case as u8));
         assert_eq!(bytes(&m,&vm,0,lane.scratch_low,0x20000)?,vec![0;0x20000]);
     }
+    // Rebinding a retained engine restarts transport DATA but preserves
+    // every firmware-owned context/scratch byte and both exact aliases.
+    vm.write(&mut m,2,q.base,&vec![0x6d;SIZE as usize])?;
+    q.reset_retained(&mut m,&vm,case as u8)?;
+    let mut retained=before.clone();
+    for lane in 0..3usize {
+        let offset=lane*0x2c000+0xc000;
+        retained[offset..offset+0x20000].fill(0x6d);
+        assert_eq!(bytes(&m,&vm,0,q.lanes[lane].scratch_low,0x20000)?,vec![0x6d;0x20000]);
+    }
+    assert_eq!(bytes(&m,&vm,2,q.base,SIZE)?,retained);assert_eq!(m.calls,calls);
+    q.reset(&mut m,&vm,case as u8)?;assert_eq!(bytes(&m,&vm,2,q.base,SIZE)?,before);
     assert!(q.reset(&mut m,&vm,4).is_err());
     assert_eq!(bytes(&m,&vm,2,q.base,SIZE)?,before);
     assert!(QueueSetG16C::new(&mut m,&mut vm,q.base,0,0,None).is_err());
@@ -233,7 +248,7 @@ fn main()->Result {
         assert got==want,(name,[hex(i) for i,(a,b) in enumerate(zip(got,want)) if a!=b][:16])
     args.evidence.mkdir(parents=True,exist_ok=False)
     for name, want in expected.items(): (args.evidence/name).write_bytes(want)
-    summary=dict(actual_source_QueueSet_create_cases=4, whole_queue_RAM_owners=48,
+    summary=dict(actual_source_QueueSet_create_cases=4,detached_transport_backing_cases=4,transport_preparation_uses_only_preallocated_backing=True, whole_queue_RAM_owners=48,
         RAM_bytes=4*0x84000, context0_alias_pages=96, context1_unchanged=True,
         TTBS_unchanged=True, no_producer_publication=True,
         preallocation_geometry_rejections=7, collision_rejections=5,
@@ -246,7 +261,7 @@ fn main()->Result {
         independent_canonical_scratch_pages=48,
         canonical_scratch_aliases_exact=True,
         canonical_scratch_reallocation_refuses_without_writes=True,
-        complete_queue_reset_images=4,
+        complete_queue_reset_images=4,complete_retained_scratch_reset_images=4,retained_scratch_bytes_checked=4*3*0x20000,retained_scratch_all_bytes_and_aliases_preserved=True,
         queue_reset_allocations=0,
         reset_canonical_engine_arrays_unchanged=True,
         last_alias_mismatch_rejects_before_any_zero=True,

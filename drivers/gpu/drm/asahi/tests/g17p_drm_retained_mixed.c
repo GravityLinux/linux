@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* One render, 258 ordinary retained computes, then another render. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

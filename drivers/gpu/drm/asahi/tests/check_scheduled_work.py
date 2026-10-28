@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Check versioned work records against native Max DATA/source and tagged Neo.
 
 Executes the actual qualified Max ComputeWork.prepare over owned host DATA.
@@ -138,6 +138,35 @@ wrapper('native-wrapper', ref.Wrapper(q(8), q(0x10), q(0x36), q(0x4a), h(0x18), 
     field_52=h(0x52), field_5e=h(0x5e), field_62=h(0x62)), body)
 native[str(path)] = hashlib.sha256(body).hexdigest()
 
+# Compare full scheduler objects with multi-command captures, not only the
+# first zero-ID template. These are own workload DATA read from UAT captures.
+# Both warm queues share one owner; its program ordinal advances across them.
+sys.path.insert(0, str(args.m1n1 / 'proxyclient/experiments'))
+from agx_g16c_reference_image import ReferenceImage
+late_reference = args.m1n1 / 'build/m4max-gpu/g16c-native-late-admission-20261023'
+late_manifest = json.loads((late_reference / 'source-late-v3/manifest.json').read_text())
+native_scheduler_ids = []
+for phase, objects in late_manifest['phases'].items():
+    image = ReferenceImage(late_reference / 'native-held-v2' / phase / 'uat')
+    for obj in objects['objects']:
+        if obj['kind'] != 'descriptor':
+            continue
+        address = obj['inputs']['scheduler']
+        body = image.virtual(-1, address, 0x100)
+        slot, work_id = struct.unpack_from('<QI', body)
+        assert work_id == obj['program_inputs']['ordinal']
+        name = f'native-scheduler-{phase}-{obj["file"]}'
+        emit(3, name, [slot, work_id], body)
+        native[name] = hashlib.sha256(body).hexdigest()
+        native_scheduler_ids.append(work_id)
+assert native_scheduler_ids == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 10]
+for work_id in (255, 256, 65535, 0xffffffff):
+    body = bytearray(0x100)
+    struct.pack_into('<Q', body, 0, 0xfffffc2001560004)
+    struct.pack_into('<I', body, 8, work_id)
+    struct.pack_into('<I', body, 0x10, 0x50)
+    emit(3, f'scheduler-ID-width-{work_id}', [0xfffffc2001560004, work_id], body)
+
 with tempfile.TemporaryDirectory(prefix='scheduled-work-') as directory:
     tmp = Path(directory)
     flags = host_versions.build(tmp)
@@ -165,6 +194,7 @@ with tempfile.TemporaryDirectory(prefix='scheduled-work-') as directory:
     summary = dict(baseline=baseline, Neo_whole_objects=256 * 4,
         Neo_identical_bytes=neo_bytes, Max_whole_objects=len(cases),
         source_ComputeWork_prepare_cases=64, independent_native_DATA_objects=len(native),
+        native_scheduler_whole_objects=12, native_scheduler_owner_ordinals=native_scheduler_ids,
         native_DATA_sha256=native, Neo_sha256=hashlib.sha256(neo).hexdigest(),
         Max_sha256=hashlib.sha256(actual).hexdigest(), GPU_execution_tested=False,
         source_sha256={str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in [
@@ -172,5 +202,5 @@ with tempfile.TemporaryDirectory(prefix='scheduled-work-') as directory:
             args.m1n1 / 'proxyclient/m1n1/g16c/compute.py',
             args.m1n1 / 'proxyclient/m1n1/g16c/work.py']})
     (args.evidence / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-print(f'PASS: {len(cases)} complete Max objects / 4 native DATA objects / 64 actual Work.prepare cases; '
+print(f'PASS: {len(cases)} complete Max objects / {len(native)} native DATA objects / 64 actual Work.prepare cases; '
       '1024 complete Neo objects and reuse images identical to tag')

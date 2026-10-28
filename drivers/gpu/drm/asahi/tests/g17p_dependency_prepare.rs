@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 //! Execute production preparation/report logic with owned synthetic RAM.
 //! The models below replace kernel allocation/UAT/cache APIs, never protocol
 //! builders. This does not qualify cache instructions or execution on a GPU.

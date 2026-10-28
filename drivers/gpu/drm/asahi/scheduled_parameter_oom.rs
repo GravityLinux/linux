@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Owned Max OOM7 -> error9. Reply retirement does not complete the render:
 //! normal stamps/queues/channels must independently retire before ENOMEM.
@@ -9,7 +9,7 @@ use super::super::super::g17p_render::wire::FragmentDescriptorG16C;
 
 // Keep pure identity validation tied to the macro-generated actual layout.
 const _: () = {
-    assert!(core::mem::size_of::<FragmentDescriptorG16C>()==0x2280);
+    assert!(core::mem::size_of::<FragmentDescriptorG16C>()==0x2240);
     assert!(core::mem::offset_of!(FragmentDescriptorG16C,opcode)==0);
     assert!(core::mem::offset_of!(FragmentDescriptorG16C,context)==0xc);
     assert!(core::mem::offset_of!(FragmentDescriptorG16C,manager)==0x28);
@@ -29,14 +29,15 @@ pub(super) struct RepliedError {
 }
 impl State {
     pub(super) fn accept_parameter_error(&mut self,memory:&Memory,vm:&Vm,ttbs:u64,
-        raw:&[u8;0x48])->Result<AcceptedError> {
+        pending:&[RenderTicket],raw:&[u8;0x48])->Result<AcceptedError> {
         let request=ParameterErrorG16C::parse(raw).ok_or(EIO)?;
-        if self.pending.len()!=1 {return Err(EBUSY);}
-        let p=&self.pending[0];
-        if !matches!(p.receipt,ReceiptG16C::Render(_)) || p.parameter_error.is_some()
-            || unsafe {bindings::dma_fence_get_status(p.receipt.fence().raw())}!=0 {return Err(EIO);}
-        let owner=p.render_work.ok_or(EIO)?;
-        let oi=p.render_owner.ok_or(EIO)?;
+        let index=RenderWave::<RenderTicket>::find_owner(pending,|p|
+            p.render_work.matches_request(&request))?;
+        let p=&pending[index];
+        if p.parameter_error.is_some()
+            || unsafe {bindings::dma_fence_get_status(p.receipt.fence.raw())}!=0 {return Err(EIO);}
+        let owner=p.render_work;
+        let oi=p.render_owner;
         let o=self.owners.get(oi).ok_or(EIO)?;
         let r=o.render.as_ref().ok_or(EIO)?;
         if owner.context!=u32::from(o.context) || owner.slot!=r.parameter.slot
@@ -54,9 +55,10 @@ impl State {
         }
         Ok(AcceptedError {id:p.id,request,owner,before_driver})
     }
-    pub(super) fn service_parameter_error(&mut self,session:&mut Session,accepted:AcceptedError)->Result {
-        let pending=self.pending.first_mut().ok_or(EIO)?;
-        if pending.id!=accepted.id || pending.parameter_error.is_some() {return Err(EIO);}
+    pub(super) fn service_parameter_error(&mut self,session:&mut Session,pending:&mut [RenderTicket],accepted:AcceptedError)->Result {
+        let index=RenderWave::<RenderTicket>::find_owner(pending,|p|p.id==accepted.id)?;
+        let pending=&mut pending[index];
+        if pending.parameter_error.is_some() {return Err(EIO);}
         let reply=accepted.request.reply().ok_or(EIO)?;
         // The dispatcher has ACKed the validated RX slot before reaching here.
         // Any control uncertainty returns an error and retains all owners.

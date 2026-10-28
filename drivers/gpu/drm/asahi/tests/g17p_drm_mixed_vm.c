@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Synchronous R/C/R/C/R or C/R/C/R, separate files/VMs and independent caller programs. */
 #define main memory_test_main
 #include "g17p_drm_memory.c"

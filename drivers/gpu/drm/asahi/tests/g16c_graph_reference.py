@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# SPDX-License-Identifier: GPL-2.0-only
 """Run the qualified source startup's actual build_graph against owned host RAM.
 
 No target setup, device access, captures or Apple executable content is loaded.

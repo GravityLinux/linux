@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Firmware dependencies retain real output/fence/timestamp ownership through
  * render backlog and mixed commands. All GPU programs are existing authored
  * integration fixtures; each long-prefix render has distinct output backing. */
