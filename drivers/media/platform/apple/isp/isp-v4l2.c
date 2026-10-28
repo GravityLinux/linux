@@ -141,6 +141,7 @@ static int isp_submit_buffers(struct apple_isp *isp)
 		/* printk("Submit: 0x%llx .. 0x%llx (meta)\n", meta->iova,
 		       meta->iova + meta->size); */
 
+		memset(bufd, 0, sizeof(*bufd));
 		bufd->num_planes = 1;
 		bufd->pool_type = 0;
 		bufd->iovas[0] = meta->iova;
@@ -346,6 +347,12 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 		dev_err(isp->dev, "failed to start camera: %d\n", err);
 		goto release_buffers;
 	}
+
+	/* Firmware boot creates empty pools. Buffers still marked submitted by
+	 * a previous stream must be queued again, including after a failed start.
+	 */
+	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+		isp->meta_surfs[i]->submitted = false;
 
 	err = isp_submit_buffers(isp);
 	if (err) {

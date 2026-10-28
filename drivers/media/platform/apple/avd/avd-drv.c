@@ -24,11 +24,10 @@
 #include "avd-inst.h"
 #include "avd-regs.h"
 
-#define AVD_CONFIG_OFFSET	0x400
-#define AVD_CONFIG_SIZE		0x100
-#define AVD_CONFIG_CODEC_OFFSET	0x4
+#define AVD_CONFIG_SIZE		0x20
 #define AVD_CONFIG_MAGIC	((u32)'A' | ((u32)'V' << 8) | \
 				 ((u32)'D' << 16) | ((u32)'c' << 24))
+#define AVD_CONFIG_CODEC	0x4
 
 static void calc_tile_meta(u32 w, u32 h, u32 bpb, u32 tile_dim,
 			   u32 meta_hdr_bytes, u32 *tile, u32 *meta)
@@ -731,20 +730,15 @@ static int avd_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	if (avd->fw->size < (AVD_CONFIG_OFFSET + AVD_CONFIG_SIZE)) {
-		dev_err(avd->dev, "Firmware %s is too small, size: %zu bytes\n",
-			avd->variant->fw_name, avd->fw->size);
-		iommu_domain_free(avd->empty_domain);
-		return -EINVAL;
-	}
+	const u8 * fw_config = avd->fw->data + avd->fw->size - AVD_CONFIG_SIZE;
 
-	if (get_unaligned_le32(avd->fw->data + AVD_CONFIG_OFFSET) == AVD_CONFIG_MAGIC) {
-		u32 codec_offset = AVD_CONFIG_OFFSET + AVD_CONFIG_CODEC_OFFSET;
-		u32 fw_caps = get_unaligned_le32(avd->fw->data + codec_offset);
+	if (get_unaligned_le32(fw_config) == AVD_CONFIG_MAGIC) {
+		u32 fw_caps = get_unaligned_le32(fw_config + AVD_CONFIG_CODEC);
+
 		avd->capabilities = fw_caps & avd->variant->capabilities;
 	} else {
-		dev_err(avd->dev, "Too old or incompatible firmware without config\n");
-		return -EINVAL;
+		/* Backward compatibility to old firmware, do not upstream. */
+		avd->capabilities = avd->variant->capabilities;
 	}
 
 	ret = dma_set_mask_and_coherent(avd->dev,

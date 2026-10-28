@@ -3,6 +3,8 @@
 
 #include <linux/firmware.h>
 
+#include <linux/of.h>
+
 #include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-fw.h"
@@ -43,6 +45,7 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX514_2820_03] = {0x514, 0x28200305, "apple/isp_2820_03XX.dat", 0xa198},
 	[ISP_IMX514_2820_04] = {0x514, 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
 	[ISP_IMX558_1921_01] = {0x558, 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
+	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcba8},
 	[ISP_IMX558_1922_02] = {0x558, 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
 	[ISP_IMX603_7920_01] = {0x603, 0x79200109, "apple/isp_7920_01XX.dat", 0xad2c},
 	[ISP_IMX603_7920_02] = {0x603, 0x79200205, "apple/isp_7920_02XX.dat", 0xad2c},
@@ -114,7 +117,7 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		id = ISP_IMX514_2820_01;
 		break;
 	case 0x558:
-		id = ISP_IMX558_1921_01;
+		id = isp->hw->gen == ISP_GEN_T8140 ? ISP_IMX558_1925_03 : ISP_IMX558_1921_01;
 		break;
 	case 0x603:
 		id = ISP_IMX603_7920_01;
@@ -219,6 +222,7 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	err = isp_ch_get_sensor_id(isp, ch);
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
+	     fmt->id != ISP_IMX558_1925_03 &&
 	     fmt->id != ISP_IMX364_8720_01)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
@@ -352,6 +356,17 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 
 		/* If this failed due to a signal, propagate */
 		if (err == -EINTR)
+			return err;
+	}
+
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		u32 fuses[2];
+		err = of_property_read_u32_array(isp->dev->of_node,
+						 "apple,aciphy-fuses", fuses, 2);
+		if (err)
+			return err;
+		err = isp_cmd_neo_sensor_config(isp, ch, fuses[0], fuses[1]);
+		if (err)
 			return err;
 	}
 

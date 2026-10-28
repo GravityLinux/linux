@@ -53,6 +53,47 @@ static int cisp_send_read(struct apple_isp *isp, void *args, u32 insize,
 	return 0;
 }
 
+/* The modern response appends fields; the common prefix is unchanged. */
+static int cisp_send_neo_read(struct apple_isp *isp, void *args,
+			    u32 prefix_size, u32 response_size)
+{
+	u8 response[0x190] = {};
+	int err;
+
+	if (prefix_size > response_size || response_size > sizeof(response))
+		return -EINVAL;
+	memcpy(response, args, prefix_size);
+	err = cisp_send_read(isp, response, response_size, response_size);
+	if (!err)
+		memcpy(args, response, prefix_size);
+	return err;
+}
+
+/* Native Neo setup preceding capture configuration. Firmware logs identify
+ * 0x0632 as CISP_CMD_CH_STATUS_LED_THR_GET; PHY tuning uses per-unit ADT fuses.
+ */
+int isp_cmd_neo_sensor_config(struct apple_isp *isp, u32 chan, u32 fuse0, u32 fuse1)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 value;
+	} __packed setup = { CISP_OPCODE(0x0632), chan, 0 };
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 count;
+		u32 fuse0;
+		u32 fuse1;
+	} __packed tuning = {
+		CISP_OPCODE(CISP_CMD_CH_LPDP_HS_RECEIVER_TUNING_SET), chan, 2, fuse0, fuse1
+	};
+	int err = CISP_SEND_INOUT(isp, setup);
+	if (err)
+		return err;
+	return CISP_SEND_INOUT(isp, tuning);
+}
+
 int isp_cmd_start(struct apple_isp *isp, u32 mode)
 {
 	struct cmd_start args = {
@@ -172,6 +213,22 @@ int isp_cmd_pmp_ctrl_set(struct apple_isp *isp, u64 clock_scratch,
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_neo_dsid_config(struct apple_isp *isp)
+{
+	struct {
+		u64 opcode;
+		u32 count;
+		u32 range;
+		u64 base;
+	} __packed args = {
+		.opcode = CISP_OPCODE(0x3206),
+		.count = 1,
+		.range = isp->hw->dsid_clr_range0,
+		.base = isp->hw->dsid_clr_base0,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_fid_enter(struct apple_isp *isp)
 {
 	struct cmd_fid_enter args = {
@@ -220,6 +277,8 @@ int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 {
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET);
 	args->chan = chan;
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return cisp_send_neo_read(isp, args, sizeof(*args), 0x190);
 	return CISP_SEND_OUT(isp, args);
 }
 
@@ -229,6 +288,8 @@ int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET);
 	args->preset = preset;
 	args->chan = chan;
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return cisp_send_neo_read(isp, args, sizeof(*args), 0x120);
 	return CISP_SEND_OUT(isp, args);
 }
 
@@ -372,8 +433,8 @@ int isp_cmd_ch_sif_pixel_format_set(struct apple_isp *isp, u32 chan)
 	struct cmd_ch_sif_pixel_format_set args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_SIF_PIXEL_FORMAT_SET),
 		.chan = chan,
-		.format = 3,
-		.type = 1,
+		.format = isp->hw->gen == ISP_GEN_T8140 ? 1 : 3,
+		.type = isp->hw->gen == ISP_GEN_T8140 ? 0 : 1,
 		.compress = 0,
 		.unk_10 = 0,
 	};

@@ -32,6 +32,7 @@ enum isp_generation {
 	ISP_GEN_T8103,
 	ISP_GEN_T8112,
 	ISP_GEN_T6031,
+	ISP_GEN_T8140,
 };
 
 enum isp_firmware_version {
@@ -40,6 +41,7 @@ enum isp_firmware_version {
 	ISP_FIRMWARE_V_12_4,
 	ISP_FIRMWARE_V_13_5,
 	ISP_FIRMWARE_V_14_7,
+	ISP_FIRMWARE_V_26_6,
 };
 
 struct isp_surf {
@@ -152,6 +154,7 @@ enum isp_sensor_id {
 	ISP_IMX514_2820_03,
 	ISP_IMX514_2820_04,
 	ISP_IMX558_1921_01,
+	ISP_IMX558_1925_03,
 	ISP_IMX558_1922_02,
 	ISP_IMX603_7920_01,
 	ISP_IMX603_7920_02,
@@ -217,6 +220,8 @@ struct apple_isp {
 	int irq;
 
 	void __iomem *coproc;
+	void __iomem *boot_control;
+	void __iomem *watchdog;
 	void __iomem *mbox;
 	void __iomem *gpio;
 	void __iomem *mbox2;
@@ -228,10 +233,12 @@ struct apple_isp {
 
 	struct isp_firmware {
 		u64 heap_top;
+		u64 image_phys;
 	} fw;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;
+	struct isp_surf *boot_log_surf;
 	struct isp_surf *data_surf;
 	struct isp_surf *log_surf;
 	struct isp_surf *bt_surf;

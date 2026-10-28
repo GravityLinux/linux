@@ -119,6 +119,12 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	}
 
 	isp->fw.heap_top = heap_base + heap_size;
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		err = of_property_read_u64(dev->of_node, "apple,firmware-phys",
+					   &isp->fw.image_phys);
+		if (err)
+			return dev_err_probe(dev, err, "Missing ISP firmware physical address\n");
+	}
 
 	err = of_property_read_u64(dev->of_node, "apple,dart-vm-size",
 				   &vm_size);
@@ -227,6 +233,8 @@ static const char * isp_fw2str(enum isp_firmware_version version)
 		return "13.5";
 	case ISP_FIRMWARE_V_14_7:
 		return "14.7";
+	case ISP_FIRMWARE_V_26_6:
+		return "26.6";
 	default:
 		return "unknown";
 	}
@@ -253,6 +261,8 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 			return ISP_FIRMWARE_V_13_5;
 		else if (ver[0] == 14 && ver[1] == 7 && ver[2] == 0)
 			return ISP_FIRMWARE_V_14_7;
+		else if (ver[0] == 26 && ver[1] == 6)
+			return ISP_FIRMWARE_V_26_6;
 
 		dev_warn(dev, "unknown %s: %d.%d.%d\n", name, ver[0], ver[1], ver[2]);
 		break;
@@ -309,6 +319,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 	 * with unknown firmware.
 	 */
 	isp->fw_compat = isp_check_firmware_version(dev);
+	if (isp->hw->gen == ISP_GEN_T8140 && isp->fw_compat == ISP_FIRMWARE_V_UNKNOWN)
+		isp->fw_compat = ISP_FIRMWARE_V_26_6;
 
 	err = of_property_read_u32(dev->of_node, "apple,platform-id",
 				   &isp->platform_id);
@@ -339,6 +351,22 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (IS_ERR(isp->coproc)) {
 		err = PTR_ERR(isp->coproc);
 		goto detach_genpd;
+	}
+
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		isp->boot_control = devm_platform_ioremap_resource_byname(pdev, "boot-control");
+		if (IS_ERR(isp->boot_control)) {
+			err = PTR_ERR(isp->boot_control);
+			goto detach_genpd;
+		}
+	}
+
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		isp->watchdog = devm_platform_ioremap_resource_byname(pdev, "watchdog");
+		if (IS_ERR(isp->watchdog)) {
+			err = PTR_ERR(isp->watchdog);
+			goto detach_genpd;
+		}
 	}
 
 	isp->mbox = devm_platform_ioremap_resource_byname(pdev, "mbox");
@@ -603,7 +631,29 @@ static const struct apple_isp_hw apple_isp_hw_t6031 = {
 	.meta_size = ISP_META_SIZE_T6031,
 };
 
+/* Register layout and meta size observed on the Neo's 26.6.x firmware. */
+static const struct apple_isp_hw apple_isp_hw_t8140 = {
+	.gen = ISP_GEN_T8140,
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x220114000,
+	.dsid_clr_range0 = 0x2fc,
+	.clock_scratch = 0x3003d0ca0,
+	.clock_base = 0,
+	.clock_bit = 0,
+	.clock_size = 8,
+	/* The bandwidth-request unit is not initialized by this Linux port. */
+	.bandwidth_scratch = 0,
+	.bandwidth_base = 0,
+	.bandwidth_bit = 0,
+	.bandwidth_size = 0,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+	.meta_size = 0xa040,
+	.scl1 = false,
+	.lpdp = false,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
+	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
 	{ .compatible = "apple,t8122-isp", .data = &apple_isp_hw_t8122 },
