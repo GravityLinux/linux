@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Host tests of the real mesh parser, serializers, support and scratch setup.
 
-The ordinary-render byte comparison uses g16_render.rs from the commit before
-native mesh support was added (the parent of the commit that added
-g16_mesh.rs), found in this checkout's git history; production #214 in the
-original history. Without git history the test is skipped. No device, kernel
-module, or external package is needed; rustc must be on PATH.
+The ordinary-render byte comparison uses the bundled, hash-checked
+g16_render.rs from before native mesh support (production #214 in the
+original history). Its source revision is recorded beside the fixture. Older
+checkouts can instead resolve the reference from Git history. No device,
+kernel module, or external package is needed; rustc must be on PATH.
 """
 from pathlib import Path
 import os
+import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -32,7 +34,7 @@ def item(source, pattern):
 
 # Check that validation, support initialization and submission use the same
 # tested mode mapping, and that submission passes that mode into the decoder.
-runtime = (driver / 'g16_runtime.rs').read_text()
+runtime = ''.join(p.read_text() for p in sorted(driver.glob('g16_runtime*.rs')))
 bootstrap = (driver / 'g16.rs').read_text()
 mode_expr = r'g16_mesh::Mode::from_parameter\(crate::module_parameters::native_mesh.value\(\)\)\s*\.ok_or\(EINVAL\)\?'
 # The boot value is validated once; support and submission read the runtime
@@ -42,7 +44,7 @@ assert re.search(mode_expr, bootstrap)
 # Support and decode use the VM's latched mode, never the current runtime mode.
 assert re.search(r'fn acquire_render_support\(&mut self, pool: &render::OperandPool, mode: g16_mesh::Mode\)', runtime)
 assert re.search(r'let native = mode\.enabled\(\);', runtime)
-drm = (driver / 'g16_drm.rs').read_text()
+drm = ''.join(p.read_text() for p in sorted(driver.glob('g16_drm*.rs')))
 assert 'runtime.acquire_render_support(&pool, vm.native_mode)?' in drm
 assert re.search(r'native_mode: crate::g16_mesh::Mode::from_parameter\(crate::g16_mesh::snapshot\(\)\.1\)', drm)
 assert 'g16_mesh::mode()' not in runtime
@@ -116,6 +118,14 @@ fixture = fixture.replace('/* PREPARE_RENDER */', item(vm, r'    pub\(crate\) fn
 
 def baseline_render():
     """g16_render.rs as of the parent of the commit that added g16_mesh.rs."""
+    baseline_dir = Path(__file__).with_name("baselines")
+    fixture = baseline_dir / "g16_render_pre_mesh.rs"
+    if fixture.is_file():
+        source = fixture.read_bytes()
+        metadata = json.loads((baseline_dir / "g16_render_pre_mesh.json").read_text())
+        assert hashlib.sha256(source).hexdigest() == metadata["sha256"]
+        return source.decode()
+
     try:
         added = subprocess.run(
             ['git', 'log', '--diff-filter=A', '--format=%H', 'HEAD', '--',

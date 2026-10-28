@@ -79,7 +79,7 @@ pub(crate) fn validate_boot_resources(pdev: &platform::Device<Core<'_>>) -> Resu
 }
 
 use kernel::{
-    io::{self, mem::DevresIoMem, IoSysMap, SysMem},
+    io::{self, mem::DevresIoMem},
     soc::apple::rtkit,
     sync::Arc,
     sync::aref::ARef,
@@ -103,17 +103,8 @@ impl rtkit::Buffer for CrashBuffer {
         Ok(self.iova)
     }
 
-    fn buf(&mut self) -> Result<IoSysMap<'_, [u8]>> {
-        if self.offset.checked_add(self.size).ok_or(EINVAL)? > self.map.size() {
-            return Err(EINVAL);
-        }
-        // SAFETY: `offset..offset + size` lies within the mapped reserved
-        // firmware region, which stays mapped while `self` (and the borrow) lives.
-        let region = unsafe {
-            core::ptr::slice_from_raw_parts_mut(self.map.ptr().add(self.offset), self.size)
-        };
-        // SAFETY: As above; the region is valid kernel memory for the borrow.
-        Ok(IoSysMap::Sys(unsafe { SysMem::new(region) }))
+    fn buf(&mut self) -> Result<io::IoSysMap<'_, io::Region>> {
+        self.map.as_iosys_map(self.offset, self.size)
     }
 }
 
@@ -121,6 +112,8 @@ struct BootOps;
 
 #[vtable]
 impl rtkit::Operations for BootOps {
+    const QUIRKS: rtkit::Quirks = rtkit::Quirks::EARLY_CRASHLOG;
+
     type Data = Arc<BootData>;
     type Buffer = CrashBuffer;
 
@@ -493,7 +486,6 @@ impl Bootstrap {
             rtkit::RtKit::<BootOps>::new(dev, None, 0, data)?,
             GFP_KERNEL,
         )?;
-        rtkit.as_mut().set_early_crashlog();
         let asc_guard = asc.try_access().ok_or(ENODEV)?;
         asc_guard.as_view().relaxed().write32(control | 0x10, 0x44);
         drop(asc_guard);

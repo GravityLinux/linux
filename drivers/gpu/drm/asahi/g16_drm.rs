@@ -11,7 +11,7 @@
 use crate::{g16_compute as compute, g16_render as render};
 use core::{
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 use kernel::dma_fence::{self, RawDmaFence};
 use kernel::drm::sched;
@@ -454,8 +454,8 @@ impl DriverObject for Buffer {
     }
 
     /// Imported DMA-BUFs are shared, not private to a VM.
-    fn import_args() -> Self::Args {
-        (0, 0)
+    fn create_imported(_dev: &Device, _size: usize) -> impl PinInit<Self, Error> {
+        Ok(Self { owner: 0, vm: 0 })
     }
 
     fn export(obj: &Object, flags: u32) -> Result<drm::gem::DmaBuf<Object>> {
@@ -625,6 +625,7 @@ impl DriverObject for Buffer {
 #[pin_data(PinnedDrop)]
 pub(crate) struct File {
     device: DeviceRef,
+    raw: AtomicPtr<bindings::drm_file>,
     id: u64,
     state: Arc<Mutex<FileState>>,
     reaper: Arc<Reaper>,
@@ -633,7 +634,8 @@ pub(crate) struct File {
 }
 impl drm::file::DriverFile for File {
     type Driver = Driver;
-    fn open(device: &Device) -> Result<Pin<KBox<Self>>> {
+    fn open(device: &RegDevice) -> Result<Pin<KBox<Self>>> {
+        let device: &Device = device;
         let state = Arc::pin_init(
             kernel::new_mutex!(FileState {
                 next_vm: 1,
@@ -660,6 +662,7 @@ impl drm::file::DriverFile for File {
         KBox::pin_init(
             try_pin_init!(Self {
                 device: device.into(),
+                raw: AtomicPtr::new(core::ptr::null_mut()),
                 id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
                 drained <- kernel::new_condvar!("m4-file-drain"),
                 state,
@@ -667,6 +670,12 @@ impl drm::file::DriverFile for File {
             }),
             GFP_KERNEL,
         )
+    }
+    fn post_open(&self, file: &DrmFile) {
+        self.raw.store(file.as_raw(), Ordering::Release);
+    }
+    fn as_raw(&self) -> *mut bindings::drm_file {
+        self.raw.load(Ordering::Acquire)
     }
 }
 
