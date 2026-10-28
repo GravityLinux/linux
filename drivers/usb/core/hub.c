@@ -13,6 +13,7 @@
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/moduleparam.h>
 #include <linux/completion.h>
 #include <linux/sched/mm.h>
@@ -1995,7 +1996,23 @@ static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (id->driver_info & HUB_QUIRK_CHECK_PORT_AUTOSUSPEND)
 		hub->quirk_check_port_auto_suspend = 1;
 
-	if (id->driver_info & HUB_QUIRK_DISABLE_AUTOSUSPEND) {
+	/* Private Neo diagnostic: its on-board HS hub loses downstream attach
+	 * events after upstream runtime suspend. A runtime reference restores
+	 * enumeration without changing the global USB autosuspend policy or
+	 * downstream device policy. Scope this to the observed board/topology
+	 * and hub revision; unrelated VIA hubs must retain their PM policy.
+	 */
+	if (of_machine_is_compatible("apple,j700") &&
+	    hdev->parent && !hdev->parent->parent && hdev->portnum == 1 &&
+	    hdev->speed == USB_SPEED_HIGH &&
+	    le16_to_cpu(hdev->descriptor.idVendor) == 0x2109 &&
+	    le16_to_cpu(hdev->descriptor.idProduct) == 0x2122 &&
+	    le16_to_cpu(hdev->descriptor.bcdDevice) == 0x0425) {
+		hub->quirk_disable_autosuspend = 1;
+		usb_autopm_get_interface_no_resume(intf);
+		dev_info(&hdev->dev,
+			 "Neo internal hub: retain active upstream; downstream PM unchanged\n");
+	} else if (id->driver_info & HUB_QUIRK_DISABLE_AUTOSUSPEND) {
 		hub->quirk_disable_autosuspend = 1;
 		usb_autopm_get_interface_no_resume(intf);
 	}
