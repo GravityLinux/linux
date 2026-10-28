@@ -14,6 +14,7 @@ const REGISTER_LIMIT: u64 = 0xffff_fc21_8100_0000;
 const MCC_BASE: u64 = 0x2201c4000;
 const MCC_SIZE: u32 = 0x18000;
 const REGION_C_IDLE_ENABLE: usize = 0x30;
+const REGION_C_CLOCK_GATED_OFF_DELAY_MS: usize = 0x9bc;
 
 
 
@@ -365,6 +366,9 @@ impl Platform {
         // zero, T8132 keeps PMGR GFX ACTUAL at 15 even with no queued work.
         // Setting it to one permits idle state 0 and wake on new submissions.
         put32(&mut out, REGION_C_IDLE_ENABLE, 1);
+        // Keep GFX clock-gated briefly before powering it off. On T8132,
+        // 40 permits ACTUAL 4 between frames and state 0 after quiet time.
+        put32(&mut out, REGION_C_CLOCK_GATED_OFF_DELAY_MS, 40);
         for (off, value) in [
             (0x78, 1),
             (0x7ec, 1),
