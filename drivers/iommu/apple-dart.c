@@ -232,6 +232,7 @@ struct apple_dart {
 	u32 ias;
 	u32 oas;
 	u32 pgsize;
+	bool sid_exceptions;
 	u32 num_streams;
 	u32 supports_bypass : 1;
 	u32 four_level : 1;
@@ -241,6 +242,7 @@ struct apple_dart {
 	dma_addr_t dma_max;
 
 	u8 *sid_remap;
+	DECLARE_BITMAP(bypass_sids, DART_MAX_STREAMS);
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
@@ -640,12 +642,27 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 		}
 	}
 
+	/* ISP firmware uses an untranslated MMIO stream, retaining DAPF checks. */
+	if (dart->hw->type == DART_T8110) {
+		unsigned int sid;
+		for_each_set_bit(sid, dart->bypass_sids, dart->num_streams)
+			writel(DART_T8110_TCR_BYPASS_DART,
+			       dart->regs + DART_TCR(dart, sid));
+	}
+
 	/* enable all streams globally since TCR is used to control isolation */
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
 
 	/* clear any pending errors before the interrupt is unmasked */
-	writel(readl(dart->regs + dart->hw->error), dart->regs + dart->hw->error);
+	if (dart->sid_exceptions) {
+		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+			writel(readl(dart->regs + 0x4000 + 4 * i),
+			       dart->regs + 0x4000 + 4 * i);
+		writel(U32_MAX, dart->regs + 0x164);
+	} else {
+		writel(readl(dart->regs + dart->hw->error), dart->regs + dart->hw->error);
+	}
 
 	if (dart->hw->type == DART_T8110)
 		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
@@ -1407,6 +1424,23 @@ static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 	u64 addr = addr_lo | (((u64)addr_hi) << 32);
 	u8 stream_idx = FIELD_GET(DART_T8110_ERROR_STREAM, error);
 
+	if (dart->sid_exceptions) {
+		u32 pending;
+		unsigned int word;
+		bool handled = false;
+		for (word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+			pending = readl(dart->regs + 0x4000 + 4 * word);
+			if (!pending)
+				continue;
+			dev_err_ratelimited(dart->dev, "DART SID exceptions word %u: %#x\n",
+					    word, pending);
+			writel(pending, dart->regs + 0x4000 + 4 * word);
+			handled = true;
+		}
+		if (handled)
+			writel(U32_MAX, dart->regs + 0x164);
+		return handled ? IRQ_HANDLED : IRQ_NONE;
+	}
 	if (!(error & DART_T8110_ERROR_FLAG))
 		return IRQ_NONE;
 
@@ -1577,6 +1611,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
 		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, dart_params[3]);
 		dart->four_level = dart->ias > 36;
+		dart->sid_exceptions = resource_size(res) >= 0x4004 &&
+			(dart_params[2] & 0xffff) >= 0x202;
 		break;
 	}
 
@@ -1599,6 +1635,23 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 		dev_info(&pdev->dev, "Limiting DMA range to %pad..%pad\n",
 				&dart->dma_min, &dart->dma_max);
+	}
+
+	if (of_find_property(dev->of_node, "apple,bypass-sids", NULL)) {
+		int count = of_property_count_u32_elems(dev->of_node, "apple,bypass-sids");
+		u32 sid;
+		if (dart->hw->type != DART_T8110 || count <= 0) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		for (int i = 0; i < count; i++) {
+			ret = of_property_read_u32_index(dev->of_node, "apple,bypass-sids", i, &sid);
+			if (ret || sid >= dart->num_streams || sid >= DART_MAX_STREAMS) {
+				ret = -EINVAL;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->bypass_sids);
+		}
 	}
 
 	if (!dart->num_streams || dart->num_streams > DART_MAX_STREAMS) {
