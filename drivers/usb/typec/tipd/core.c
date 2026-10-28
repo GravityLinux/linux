@@ -570,26 +570,18 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 	}
 }
 
-/*
- * Does @st report a data connection, i.e. should the PHY leave safe mode?
- * The single test for this, shared by the mode update and the decision to
- * restart the role.
- */
 static bool cd321x_data_connected(const struct cd321x_status *st)
 {
 	return st->data_status & TPS_DATA_STATUS_DATA_CONNECTION;
 }
 
-/*
- * Switch the Type-C mux to cd321x->state. The PHY can only change modes while
- * dwc3 has released its PIPE interface: a switch under an active USB role
- * leaves the port on USB2. The role is restored by the caller afterwards.
- */
 static void cd321x_mux_set(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
-	if (usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)
+	/* Neo keeps its shared HS controller live; its PHY detaches PIPE itself. */
+	if (!of_machine_is_compatible("apple,j700") &&
+	    usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)
 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 	typec_mux_set(cd321x->mux, &cd321x->state);
 }
@@ -637,12 +629,16 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			return;
 		}
 
-		if (cd321x->state.alt == cd321x->port_altmode_dp &&
-		   cd321x->state.mode == mode) {
-			return;
-		}
-
+		/* Pin assignment can stay unchanged across HPD edges and IRQs.
+		 * DP_SID's IRQ bit is sticky; DATA_STATUS clears after event handling. */
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
+		dp_data.status &= ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
+		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+			dp_data.status |= DP_STATUS_HPD_STATE;
+		if ((st->data_status & CD321X_DATA_STATUS_HPD_IRQ) &&
+		    !cd321x->hpd_irq_asserted)
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+		cd321x->hpd_irq_asserted = !!(st->data_status & CD321X_DATA_STATUS_HPD_IRQ);
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
 		cd321x->state.alt = cd321x->port_altmode_dp;
 		cd321x->state.data = &dp_data;
@@ -743,7 +739,7 @@ static void cd321x_update_work(struct work_struct *work)
 	enum typec_orientation orientation = TYPEC_ORIENTATION_NONE;
 
 	if (usb_connection) {
-		if (st.data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
+		if (tps->data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
 			new_role = USB_ROLE_DEVICE;
 		else
 			new_role = USB_ROLE_HOST;
@@ -779,6 +775,8 @@ static void cd321x_update_work(struct work_struct *work)
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+		cd321x->hpd_irq_asserted = false;
+		typec_mux_set(cd321x->mux, &cd321x->state);
 	}
 
 	/* Update Type-C properties */
@@ -800,8 +798,11 @@ static void cd321x_update_work(struct work_struct *work)
 		desc.usb_pd = is_pd;
 		desc.accessory = TYPEC_ACCESSORY_NONE; /* XXX: handle accessories */
 
-		if (desc.usb_pd)
-			desc.identity = &st.partner_identity;
+		if (desc.usb_pd) {
+			/* The Type-C core retains this pointer after work returns. */
+			cd321x->cur_partner_identity = st.partner_identity;
+			desc.identity = &cd321x->cur_partner_identity;
+		}
 
 		tps->partner = typec_register_partner(tps->port, &desc);
 		if (IS_ERR(tps->partner)) {
@@ -841,17 +842,35 @@ static void cd321x_queue_status(struct cd321x *cd321x)
 static int cd321x_connect(struct tps6598x *tps, u32 status)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	unsigned int delay_ms = CD321X_DEBOUNCE_DELAY_MS;
+	u32 data = tps->data_status;
 
 	tps->status = status;
 	cd321x_queue_status(cd321x);
 
+	/* Private shared-controller timing experiment. On this board the HS
+	 * hub is already live for the other connector, so deferring a settled
+	 * plain USB3 host indication can let HS enumeration win before the SS
+	 * PHY is configured. Keep the original debounce for other boards,
+	 * disconnects, device mode and all negotiated alternate modes.
+	 */
+	if (of_machine_is_compatible("apple,j700") &&
+	    (status & TPS_STATUS_PLUG_PRESENT) &&
+	    (data & TPS_DATA_STATUS_DATA_CONNECTION) &&
+	    (data & TPS_DATA_STATUS_USB3_CONNECTION) &&
+	    !(data & (TPS_DATA_STATUS_USB_DATA_ROLE | TPS_DATA_STATUS_DP_CONNECTION |
+		      TPS_DATA_STATUS_TBT_CONNECTION | CD321X_DATA_STATUS_USB4_CONNECTION))) {
+		delay_ms = 0;
+		dev_info(tps->dev, "Neo shared USB3: immediate host update, data=%08x\n", data);
+	}
+
 	/*
-	 * Cancel pending work if not already running, then requeue after CD321X_DEBOUNCE_DELAY_MS
+	 * Cancel pending work if not already running, then requeue after the selected delay
 	 * regardless since the work function will check for any plug or altmodes changes since
 	 * its last run anyway.
 	 */
 	cancel_delayed_work(&cd321x->update_work);
-	schedule_delayed_work(&cd321x->update_work, msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+	schedule_delayed_work(&cd321x->update_work, msecs_to_jiffies(delay_ms));
 
 	return 0;
 }
@@ -1743,6 +1762,91 @@ static void cd321x_remove(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
 
+/* Private bring-up snapshot: selected status registers, never IRQ clear/FIFO. */
+static ssize_t neo_link_status_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct tps6598x_dp_sid_status_reg dp;
+	struct tps6598x_rx_identity_reg id;
+	u32 status, data;
+	u64 events;
+	u16 power;
+	u8 system_power;
+	int ret;
+
+	guard(mutex)(&tps->lock);
+	ret = tps6598x_read32(tps, TPS_REG_STATUS, &status);
+	if (ret)
+		return ret;
+	ret = tps6598x_read32(tps, TPS_REG_DATA_STATUS, &data);
+	if (ret)
+		return ret;
+	ret = tps6598x_read16(tps, TPS_REG_POWER_STATUS, &power);
+	if (ret)
+		return ret;
+	ret = tps6598x_block_read(tps, TPS_REG_RX_IDENTITY_SOP, &id, sizeof(id));
+	if (ret)
+		return ret;
+	ret = tps6598x_block_read(tps, TPS_REG_DP_SID_STATUS, &dp, sizeof(dp));
+	if (ret)
+		return ret;
+	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &events);
+	if (ret)
+		return ret;
+	ret = tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &system_power);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf,
+		"status=%08x data=%08x power=%04x system_power=%u events=%016llx cached=%08x/%08x identity=%*phN dp=%*phN\n",
+		status, data, power, system_power, events, tps->status, tps->data_status,
+		(int)sizeof(id), &id, (int)sizeof(dp), &dp);
+}
+static DEVICE_ATTR_RO(neo_link_status);
+
+/* Private diagnostic, not a power policy: only native-observed SSPS 0/2.
+ * Serialize with the IRQ worker; never issue raw SPMI commands from the host.
+ */
+static ssize_t neo_system_power_store(struct device *dev,
+                                     struct device_attribute *attr,
+                                     const char *buf, size_t count)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	u8 target, state;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &target);
+	if (ret)
+		return ret;
+	if (target != 0 && target != 2)
+		return -EINVAL;
+
+	guard(mutex)(&tps->lock);
+	/* Force the command even when the state already matches: test whether
+	 * the native per-attach command has side effects beyond register 0x20.
+	 */
+	ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target), &target, 0, NULL);
+	if (ret)
+		return ret;
+	ret = tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state);
+	if (ret)
+		return ret;
+	dev_info(dev, "private SSPS target=%u readback=%u\n", target, state);
+	if (state != target)
+		return -EIO;
+	return count;
+}
+static DEVICE_ATTR_WO(neo_system_power);
+
+static struct attribute *neo_link_attrs[] = {
+	&dev_attr_neo_link_status.attr,
+	&dev_attr_neo_system_power.attr,
+	NULL,
+};
+static const struct attribute_group neo_link_group = {
+	.attrs = neo_link_attrs,
+};
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -1827,6 +1931,11 @@ int tipd_init(struct tps6598x *tps)
 			goto err_unregister_port;
 		if (!tps->data->read_data_status(tps))
 			goto err_unregister_port;
+		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
+			ret = tps6598x_read_partner_identity(tps);
+			if (ret)
+				goto err_unregister_port;
+		}
 		ret = tps->data->connect(tps, status);
 		if (ret)
 			dev_err(tps->dev, "failed to register partner\n");
@@ -1847,7 +1956,18 @@ int tipd_init(struct tps6598x *tps)
 	if (ret)
 		goto err_disconnect;
 
+	/* SN201202x may latch an edge while S0/masks are set, before the
+	 * threaded handler exists. Drain pending events after registering it. */
+	if (tps->irq && device_is_compatible(tps->dev, "apple,sn201202x"))
+		tps->data->irq_handler(tps->irq, tps);
+
 	fwnode_handle_put(fwnode);
+
+	if (device_is_compatible(tps->dev, "apple,sn201202x")) {
+		ret = devm_device_add_group(tps->dev, &neo_link_group);
+		if (ret)
+			goto err_disconnect;
+	}
 
 	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
 	if (tps->wakeup && tps->irq) {
@@ -1983,7 +2103,7 @@ static const struct tipd_data tipd_tps6598x_data = {
 	.connect = tps6598x_connect,
 };
 
-static const struct tipd_data tipd_tps66993_data = {
+static const struct tipd_data tps66993_data = {
 	.irq_handler = tps6598x_interrupt,
 	.irq_mask1 = TPS_REG_INT_DATA_STATUS_UPDATE |
 		     TPS_REG_INT_PLUG_EVENT,
@@ -2043,7 +2163,7 @@ static const struct tipd_data tipd_sn201202x_data = {
 const struct tipd_data *tipd_hw_variants[] = {
 	[TIPD_VARIANT_CD321X] = &tipd_cd321x_data,
 	[TIPD_VARIANT_TPS6598X] = &tipd_tps6598x_data,
-	[TIPD_VARIANT_TPS66993] = &tipd_tps66993_data,
+	[TIPD_VARIANT_TPS66993] = &tps66993_data,
 	[TIPD_VARIANT_TPS25750] = &tipd_tps25750_data,
 	[TIPD_VARIANT_SN201202X] = &tipd_sn201202x_data,
 };
