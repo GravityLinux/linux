@@ -121,7 +121,6 @@ pub trait Driver {
     /// The lifetime parameter is tied to the [`Registration`] scope, which is enclosed in the
     /// parent bus device binding scope but may be shorter.
     type RegistrationData<'a>: Send + Sync + 'a;
-
     /// The type used to manage memory for this driver.
     type Object: AllocImpl;
 
