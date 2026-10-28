@@ -457,7 +457,16 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.irq_bit_send_empty = APPLE_M3_MBOX_IRQ_A2I_EMPTY,
 };
 
+
+static const struct apple_mbox_hw apple_mbox_neo_proxy_hw = {
+    .control_full = BIT(16), .control_empty = BIT(17),
+    .a2i_control = 0x0, .a2i_send0 = 0x180, .a2i_send1 = 0x188,
+    .i2a_control = 0x4, .i2a_recv0 = 0x1b0, .i2a_recv1 = 0x1b8,
+    .has_irq_controls = false,
+};
 static const struct of_device_id apple_mbox_of_match[] = {
+    { .compatible = "apple,neo-aop-proxy-mailbox", .data = &apple_mbox_neo_proxy_hw },
+
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
