@@ -8,7 +8,6 @@
 use core::mem;
 
 use kernel::{
-    bindings,
     device::{
         self,
         Core, //
@@ -18,12 +17,11 @@ use kernel::{
         CoherentBox, //
     },
     io::{
-        io_project,
-        Io,
+        mem::DevresIoMem,
         IoBase,
         IoSysMap,
-        Mmio,
-        Region, //
+        Region,
+        Io, //
     },
     kvec,
     module_platform_driver,
@@ -31,10 +29,7 @@ use kernel::{
     of,
     platform,
     prelude::*,
-    soc::apple::rtkit::{
-        self,
-        ASC_CPU_CONTROL, //
-    },
+    soc::apple::rtkit,
     str::CString,
     sync::{
         aref::ARef,
@@ -52,6 +47,8 @@ const PMP_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
+const CPU_CONTROL: usize = 0x44;
+const CPU_RUN: u32 = 0x1 << 4;
 const PMP_ENDPOINT: u8 = 0x20;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
@@ -122,6 +119,8 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
+    pmp_mmio: DevresIoMem<PMP_MMIO_SIZE>,
+    asc_mmio: DevresIoMem<ASC_MMIO_SIZE>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
@@ -130,10 +129,16 @@ struct PmpData {
 
 impl PmpData {
     fn new(dev: &platform::Device<Core<'_>>) -> Result<Arc<PmpData>> {
+        let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
+        let pmp_mmio = pmp_req.iomap_sized::<PMP_MMIO_SIZE>()?.into_devres()?;
+        let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?.into_devres()?;
         Arc::pin_init(
             try_pin_init!(
                 PmpData {
                     dev: dev.as_ref().into(),
+                    pmp_mmio,
+                    asc_mmio,
                     rtkit <- new_mutex!(None),
                     state <- new_mutex!(PmpState::new()?)
                 }
@@ -141,24 +146,33 @@ impl PmpData {
             GFP_KERNEL,
         )
     }
+    fn start_cpu(&self, dev: &platform::Device<Core<'_>>) -> Result<()> {
+        let asc_guard = self.asc_mmio.access(dev.as_ref())?;
+        let asc_mmio = asc_guard.as_view().relaxed();
+        let val = asc_mmio.read32(CPU_CONTROL);
+        asc_mmio.write32(val | CPU_RUN, CPU_CONTROL);
+        Ok(())
+    }
     fn start(&self) -> Result<()> {
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
         rtk.as_mut().wake()?;
         rtk.start_endpoint(PMP_ENDPOINT)
     }
-    fn patch_bootargs(
-        &self,
-        pmp_mmio: &Mmio<'_, Region<PMP_MMIO_SIZE>>,
-        patches: &[(u32, u32)],
-    ) -> Result<()> {
-        let io = pmp_mmio.as_view().relaxed();
+    fn patch_bootargs(&self, dev: &platform::Device<Core<'_>>, patches: &[(u32, u32)]) -> Result<()> {
+        let pmp_guard = self.pmp_mmio.access(dev.as_ref())?;
+        let io = pmp_guard.as_view().relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
         let mut arg_bytes = kvec![0u8; size]?;
-        let pmp_io_array: Mmio<'_, [u8; PMP_MMIO_SIZE]> = pmp_mmio.try_cast()?;
-        let bootargs = io_project!(pmp_io_array, [try: offset .. offset+size]);
-        bootargs.copy_to_slice(&mut arg_bytes);
+        // Check the complete bootarg window before the byte-wise I/O copy.
+        let end = offset.checked_add(size).ok_or(EINVAL)?;
+        if end > io.size() {
+            return Err(EINVAL);
+        }
+        for (i, byte) in arg_bytes.iter_mut().enumerate() {
+            *byte = io.try_read8(offset + i)?;
+        }
         let mut idx = 0;
         while idx < size {
             let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
@@ -173,7 +187,9 @@ impl PmpData {
             }
             idx += size;
         }
-        bootargs.copy_from_slice(&arg_bytes);
+        for (i, byte) in arg_bytes.iter().enumerate() {
+            io.try_write8(*byte, offset + i)?;
+        }
         Ok(())
     }
     fn get_iova_table(&self) -> Result<u64> {
@@ -196,22 +212,17 @@ impl PmpData {
         let bound_dev = unsafe { self.dev.as_bound() };
         let mut table = CoherentBox::<[IovaTableEntry]>::zeroed_slice(bound_dev, 170, GFP_KERNEL)?;
 
-        let domain = unsafe { bindings::iommu_get_domain_for_dev(self.dev.as_raw()) };
         for i in 0..n_entries {
             let host_addr = ranges[i * 2];
             let size = ranges[i * 2 + 1];
             unsafe {
-                let err = bindings::iommu_map(
-                    domain,
+                kernel::iommu::map_device_mmio(
+                    bound_dev,
                     pio_base as usize,
                     host_addr,
                     size as usize,
-                    (bindings::IOMMU_READ | bindings::IOMMU_WRITE | bindings::IOMMU_MMIO) as i32,
-                    bindings::GFP_KERNEL,
-                );
-                if err != 0 {
-                    return Err(Error::from_errno(err));
-                }
+                    GFP_KERNEL,
+                )?;
             }
             table[i] = IovaTableEntry {
                 _host_addr: host_addr,
@@ -403,21 +414,15 @@ kernel::of_device_table!(
 
 impl platform::Driver for PmpDriver {
     type IdInfo = ();
-    type Data<'bound> = PmpDriver;
+    type Data<'bound> = Self;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
-    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        _info: Option<&'bound ()>,
+    ) -> impl PinInit<Self, Error> + 'bound {
         let dev: ARef<device::Device> = pdev.as_ref().into();
-        let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = pmp_req.iomap_sized::<PMP_MMIO_SIZE>()?;
-        let pmp_mmio = pmp_mmio.as_view();
-        let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
-        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
-        let asc_mmio = asc_mmio.as_view().relaxed();
         let data = PmpData::new(pdev)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
@@ -426,7 +431,7 @@ impl platform::Driver for PmpDriver {
         let bdid = node.property_read(c"apple,board-id").required_by(&dev)?;
         match node.property_read(c"apple,dram-capacity").optional() {
             Some(dcap) => data.patch_bootargs(
-                &pmp_mmio,
+                pdev,
                 &[
                     (from_fourcc(b"BDID"), bdid),
                     (from_fourcc(b"DCAP"), dcap),
@@ -434,13 +439,13 @@ impl platform::Driver for PmpDriver {
                 ],
             )?,
             None => data.patch_bootargs(
-                &pmp_mmio,
+                pdev,
                 &[(from_fourcc(b"BDID"), bdid), (from_fourcc(b"DVID"), dvid)],
             )?,
         };
         let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
         data.rtkit.lock().as_mut().set(Some(rtkit));
-        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        data.start_cpu(pdev)?;
         data.start()?;
         Ok(PmpDriver(data))
     }

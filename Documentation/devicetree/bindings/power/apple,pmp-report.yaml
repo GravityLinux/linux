@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,pmp-report.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Power Management Processor power-state reports
+
+maintainers:
+  - Cody Ho <codyho@stanford.edu>
+
+description: |
+  The application processor reports power-domain transitions to PMP through
+  a shared register aperture. Each child represents one reported domain.
+  Some firmware device records describe notifications without an
+  acknowledgement guarantee; their observed state must not be polled as a
+  prerequisite to starting the device.
+
+properties:
+  compatible:
+    oneOf:
+      - enum:
+          - apple,t6000-pmp-v2-report
+          - apple,t6020-pmp-v2-report
+          - apple,t6030-pmp-v2-report
+          - apple,t8112-pmp-v2-report
+          - apple,t8122-pmp-v2-report
+          - apple,t8140-pmp-v2-report
+      - items:
+          - const: apple,t6031-pmp-v2-report
+          - const: apple,t6020-pmp-v2-report
+
+  reg:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  "#address-cells":
+    const: 1
+
+  "#size-cells":
+    const: 0
+
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      PMP controller providing the firmware device table. The bootloader
+      transfers the version-1 table in apple,tunable-soc-device and its
+      little-endian version in apple,tunable-ptd-driver-version. Records are
+      124 bytes; the little-endian flags word at byte 8 has bit 1 set for
+      records that require an acknowledgement. When this reference is
+      present, child reg values are device-table record indices, and only
+      records carrying that flag are polled. Without the reference, existing
+      platform report numbering and acknowledgement behaviour are retained.
+      A disabled controller without firmware metadata also retains the
+      existing ready-bit check, allowing operation without PMP firmware.
+
+patternProperties:
+  "^report@[0-9a-f]+$":
+    type: object
+    allOf:
+      - $ref: power-domain.yaml#
+    properties:
+      compatible:
+        oneOf:
+          - const: apple,t6000-pmp-v2-report-entry
+          - items:
+              - enum:
+                  - apple,t6020-pmp-v2-report-entry
+                  - apple,t6030-pmp-v2-report-entry
+                  - apple,t6031-pmp-v2-report-entry
+                  - apple,t8112-pmp-v2-report-entry
+                  - apple,t8122-pmp-v2-report-entry
+              - const: apple,t6000-pmp-v2-report-entry
+
+      reg:
+        maxItems: 1
+
+      label: true
+
+      "#power-domain-cells":
+        const: 0
+
+      power-domains: true
+
+      apple,always-on:
+        type: boolean
+        description: Keep the reported domain enabled.
+
+    required:
+      - compatible
+      - reg
+      - label
+      - "#power-domain-cells"
+
+    additionalProperties: false
+
+required:
+  - compatible
+  - reg
+  - "#address-cells"
+  - "#size-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        pmp-report@3003c0000 {
+            compatible = "apple,t8140-pmp-v2-report";
+            reg = <0x3 0x003c0000 0x0 0x30000>;
+            apple,pmp = <&pmp>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            report@b {
+                compatible = "apple,t6000-pmp-v2-report-entry";
+                reg = <11>;
+                label = "pmp-isp";
+                #power-domain-cells = <0>;
+                power-domains = <&ps_isp_sys>;
+            };
+        };
+    };

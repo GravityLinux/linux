@@ -5,6 +5,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/bitops.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -12,8 +13,14 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/unaligned.h>
 
 #define PMP_REPORT_READY 0x1
+
+/* PTD driver version 1 soc-device records, transferred unchanged from ADT. */
+#define PMP_SOC_DEVICE_SIZE 0x7c
+#define PMP_SOC_DEVICE_FLAGS_OFFSET 8
+#define PMP_SOC_DEVICE_ACK BIT(1)
 
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
@@ -27,7 +34,61 @@ struct apple_pmp_report {
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	spinlock_t lock;
+	u64 valid_mask;
+	u64 ack_mask;
 };
+
+static int apple_pmp_report_read_device_flags(struct apple_pmp_report *rep)
+{
+	struct device *dev = rep->dev;
+	struct device_node *pmp;
+	const u8 *table, *version;
+	unsigned int count, i;
+	int len, ret = 0;
+
+	/* Preserve the established behaviour of trees without this metadata. */
+	rep->valid_mask = ~0ULL;
+	rep->ack_mask = ~0ULL;
+	if (!of_property_present(dev->of_node, "apple,pmp"))
+		return 0;
+
+	pmp = of_parse_phandle(dev->of_node, "apple,pmp", 0);
+	if (!pmp)
+		return dev_err_probe(dev, -EINVAL, "invalid PMP reference\n");
+	/* A boot without optional PMP firmware still uses the ready-bit check. */
+	if (!of_device_is_available(pmp) &&
+	    !of_property_present(pmp, "apple,tunable-soc-device"))
+		goto out;
+
+	version = of_get_property(pmp, "apple,tunable-ptd-driver-version", &len);
+	if (!version || len != sizeof(u32) || get_unaligned_le32(version) != 1) {
+		ret = dev_err_probe(dev, -EINVAL, "unsupported PMP device table version\n");
+		goto out;
+	}
+
+	table = of_get_property(pmp, "apple,tunable-soc-device", &len);
+	if (!table || len <= 0 || len % PMP_SOC_DEVICE_SIZE ||
+	    len / PMP_SOC_DEVICE_SIZE > 64) {
+		ret = dev_err_probe(dev, -EINVAL, "invalid PMP device table\n");
+		goto out;
+	}
+
+	count = len / PMP_SOC_DEVICE_SIZE;
+	rep->valid_mask = GENMASK_ULL(count - 1, 0);
+	rep->ack_mask = 0;
+	for (i = 0; i < count; i++) {
+		u32 flags = get_unaligned_le32(table + i * PMP_SOC_DEVICE_SIZE +
+					     PMP_SOC_DEVICE_FLAGS_OFFSET);
+
+		if (flags & PMP_SOC_DEVICE_ACK)
+			rep->ack_mask |= BIT_ULL(i);
+	}
+
+	dev_dbg(dev, "%u PMP records, acknowledgement mask %#llx\n", count, rep->ack_mask);
+out:
+	of_node_put(pmp);
+	return ret;
+}
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -46,6 +107,9 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	ret = apple_pmp_report_read_device_flags(rep);
+	if (ret)
+		return ret;
 	dev_set_drvdata(dev, rep);
 	ret = of_platform_populate(np, NULL, NULL, dev);
 	if (ret)
@@ -53,6 +117,14 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 
 	return 0;
 }
+
+/* J700 native ptd-range request/ack/status data, not a new PMP protocol. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
+	.tgt_read = 0x1880,
+	.tgt_write = 0x10c40,
+	.actual = 0x18c0,
+	.status = 0x10,
+};
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x = {
 	.tgt_read = 0xf80,
@@ -90,6 +162,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8122 = {
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
+	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
@@ -119,7 +192,7 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
 	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
-	u64 bit_val = 1 << ent->id;
+	u64 bit_val = BIT_ULL(ent->id);
 	u64 val;
 	unsigned long flags;
 
@@ -130,6 +203,9 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 		val |= bit_val;
 	writeq(val, rep->base + rep->offsets->tgt_write);
 	spin_unlock_irqrestore(&rep->lock, flags);
+	/* A notification-only record does not promise an acknowledgement. */
+	if (!(rep->ack_mask & bit_val))
+		return 0;
 	val = readq(rep->base + rep->offsets->status);
 	if ((val & PMP_REPORT_READY) == 0)
 		return 0;
@@ -156,6 +232,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmp_report_entry *ent;
+	struct apple_pmp_report *rep = dev_get_drvdata(dev->parent);
 	int ret;
 	const char *name;
 	struct of_phandle_iterator it;
@@ -169,6 +246,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	ret = of_property_read_u32(node, "reg", &ent->id);
 	if (ret)
 		return dev_err_probe(dev, ret, "missing reg property\n");
+	if (ent->id >= 64 || !(rep->valid_mask & BIT_ULL(ent->id)))
+		return dev_err_probe(dev, -EINVAL, "report index outside PMP device table\n");
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0)
