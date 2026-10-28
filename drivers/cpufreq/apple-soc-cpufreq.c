@@ -366,6 +366,9 @@ static int __init apple_soc_cpufreq_module_init(void)
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return -ENODEV;
 
+	/* Allow T8132 governors to request turbo OPPs within hardware limits. */
+	apple_soc_cpufreq_driver.boost_enabled = of_machine_is_compatible("apple,t8132");
+
 	return cpufreq_register_driver(&apple_soc_cpufreq_driver);
 }
 module_init(apple_soc_cpufreq_module_init);
