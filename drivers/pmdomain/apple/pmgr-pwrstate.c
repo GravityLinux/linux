@@ -48,6 +48,7 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool no_auto_enable;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -58,6 +59,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	int ret;
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	u32 reg, cur;
+
+	if (ps->no_auto_enable)
+		auto_enable = false;
 
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret < 0)
@@ -278,6 +282,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
+	ps->no_auto_enable = of_property_read_bool(node, "apple,no-auto-enable");
 
 	ret = regmap_read(regmap, ps->offset, &boot_state);
 	if (ret < 0)
@@ -322,7 +327,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	/* Turn on auto-PM if the domain is already on */
 	if (active && !preserve_clkgated)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
-				   APPLE_PMGR_AUTO_ENABLE);
+				   ps->no_auto_enable ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
