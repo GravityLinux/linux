@@ -89,12 +89,20 @@ patternProperties:
     description: A single PCI root port
 
     properties:
+      compatible:
+        const: pciclass,0604
+
       reg:
         maxItems: 1
+
+      power-supply:
+        description: Regulator that supplies power to the devices on this port
 
       pwren-gpios:
         description: Optional GPIO to power on the device
         maxItems: 1
+
+      interrupt-controller: true
 
     required:
       - reset-gpios
@@ -102,6 +110,8 @@ patternProperties:
       - "#interrupt-cells"
       - interrupt-map-mask
       - interrupt-map
+
+    unevaluatedProperties: false
 
 required:
   - compatible
