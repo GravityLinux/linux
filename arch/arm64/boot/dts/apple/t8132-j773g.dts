@@ -400,4 +400,3 @@
 &pmp_report_atc2 {
 	apple,always-on;
 };
-
