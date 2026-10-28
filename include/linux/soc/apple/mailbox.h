@@ -8,7 +8,9 @@
 #ifndef _APPLE_MAILBOX_H_
 #define _APPLE_MAILBOX_H_
 
+#include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 /* encodes a single 96bit message sent over the single channel */

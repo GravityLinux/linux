@@ -12,6 +12,22 @@ config SND_SOC_APPLE_AOP_AUDIO
 	  co-processor on ARM Macs. This includes the built-in microphone on those
 	  machines.
 
+config SND_SOC_APPLE_NEO_MIC
+	bool "Apple T8140 AOP microphone capture"
+	depends on ARCH_APPLE
+	select APPLE_RTKIT
+	select APPLE_MAILBOX
+	select SND_PCM
+	help
+	  Microphone capture on the MacBook Neo using the resident AOP firmware.
+	  This also supplies the transport used by the protected speaker driver.
+
+config SND_SOC_APPLE_NEO_SPEAKER
+	bool "Apple T8140 protected speaker playback"
+	depends on SND_SOC_APPLE_NEO_MIC && GPIOLIB
+	help
+	  Neo speaker PCM with a fixed 3/256 gain cap, thermal admission and
+	  amplifier-first cutoff. The cap remains deliberately conservative.
 config SND_SOC_APPLE_MCA
 	tristate "Apple Silicon MCA driver"
 	depends on ARCH_APPLE || COMPILE_TEST
