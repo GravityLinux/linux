@@ -293,6 +293,14 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	if (dcp->cb_handlers[tag](dcp, tag, out, in)) {
 		dcp_ack(dcp, context);
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 && tag == 590) {
+			/* Publish only after the callback ACK is queued, so a mode
+			 * request cannot overtake the clear-frame completion. */
+			WRITE_ONCE(dcp->swap_acked_id, READ_ONCE(dcp->last_swap_id));
+			smp_store_release(&dcp->swap_ack_sequence,
+					  dcp->swap_ack_sequence + 1);
+			wake_up_all(&dcp->swap_ack_wait);
+		}
 	}
 }
 
@@ -450,6 +458,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_26_6:
 		ret = iomfb_modeset_v26_6_0(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		ret = iomfb_modeset_v26_6_t8140(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -505,6 +516,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_flush_v26_6_0(dcp, crtc, commit);
 		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_flush_v26_6_t8140(dcp, crtc, commit);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -525,6 +539,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_start_v26_6_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_start_v26_6_t8140(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -555,7 +572,7 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
 
-	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6)
+	if (!dcp_fw_is_26_6(dcp))
 		apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE,
 					 &shmem_iova, GFP_KERNEL);
@@ -588,6 +605,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_shutdown_v26_6_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_shutdown_v26_6_t8140(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

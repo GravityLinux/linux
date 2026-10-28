@@ -270,7 +270,11 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		afk_receive_message(dcp->remoteallocep, message);
 		return;
 	case EPIC2C_ENDPOINT:
-		afk_receive_message(dcp->epicep2c, message);
+		/* Neo moved the DPTX service from 0x2a to 0x2c. */
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 && dcp->phy)
+			afk_receive_message(dcp->dptxep, message);
+		else
+			afk_receive_message(dcp->epicep2c, message);
 		return;
 	case DCP_EXPERT_ENDPOINT:
 		afk_receive_message(dcp->expertep, message);
@@ -507,7 +511,10 @@ int dcp_get_connector_type(struct platform_device *pdev)
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	int ret = 0;
+	bool managed = of_property_present(dcp->dev->of_node, "apple,typec-connector");
 
+	if (port >= dcp->hw.num_dptx_ports)
+		return -EINVAL;
 	if (!dcp->phy) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
@@ -527,6 +534,12 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
 	dev_info(dcp->dev, "DPTX port %d: connecting remote port\n", port);
+	if (managed) {
+		ret = dptxport_validate_connection(dcp->dptxport[port].service, 0,
+					 dcp->dptx_phy, dcp->dptx_die);
+		if (ret)
+			goto out_unlock;
+	}
 	ret = dptxport_connect(dcp->dptxport[port].service, 0,
 			       dcp->dptx_phy, dcp->dptx_die);
 	if (ret) {
@@ -543,20 +556,31 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 		goto out_unlock;
 	}
 	dcp->dptxport[port].connected = true;
+	/* Firmware starts AUX discovery/training only after HPD is asserted. */
+	if (managed) {
+		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (ret)
+			goto out_release;
+	}
 
 	mutex_unlock(&dcp->hpd_mutex);
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
-				    DPTX_CONNECT_TIMEOUT);
+				    managed ? msecs_to_jiffies(8000) : DPTX_CONNECT_TIMEOUT);
+	if (!ret && managed) {
+		dev_warn(dcp->dev, "DPTX port %u: link configuration timed out\n", port);
+		mutex_lock(&dcp->hpd_mutex);
+		ret = -ETIMEDOUT;
+		goto out_release;
+	}
 	if (ret < 0)
-		dev_warn(dcp->dev, "dcp_dptx_connect: port %d link complete failed:%d\n",
-			 port, ret);
+		return ret;
 	else
 		dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
 			jiffies_to_msecs(DPTX_CONNECT_TIMEOUT - ret));
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+	if (!managed && dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
 		dptxport_set_hpd(dcp->dptxport[port].service, true);
 
 	if (dcp->avep)
@@ -564,6 +588,10 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	return 0;
 
+out_release:
+	dptxport_set_hpd(dcp->dptxport[port].service, false);
+	dptxport_release_display(dcp->dptxport[port].service);
+	dcp->dptxport[port].connected = false;
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
@@ -656,6 +684,90 @@ int dcp_dptx_release_oob(struct platform_device *pdev, u32 port)
 		return -EINVAL;
 
 	return dcp_dptx_disconnect(dcp, port);
+}
+
+/* This is an HPD consumer; ATC remains the Type-C lane/orientation mux. */
+static void dcp_typec_hpd_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, typec_hpd_work);
+	bool hpd, irq;
+	u32 seq;
+	int ret = 0;
+
+	for (;;) {
+		spin_lock_irq(&dcp->typec_hpd_lock);
+		if (!dcp->typec_hpd_ready) {
+			spin_unlock_irq(&dcp->typec_hpd_lock);
+			return;
+		}
+		hpd = dcp->typec_hpd_level;
+		irq = dcp->typec_hpd_irq;
+		dcp->typec_hpd_irq = false;
+		seq = dcp->typec_hpd_seq;
+		spin_unlock_irq(&dcp->typec_hpd_lock);
+
+		if (!hpd) {
+			if (dcp->dptxport[0].connected)
+				ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+		} else if (!dcp->dptxport[0].connected) {
+			ret = dcp_dptx_connect(dcp, 0);
+		} else if (irq) {
+			ret = dptxport_hpd_irq(dcp->dptxport[0].service);
+		}
+		if (ret)
+			dev_warn(dcp->dev, "Type-C HPD=%u IRQ=%u sequence=%u failed: %d\n",
+				 hpd, irq, seq, ret);
+
+		spin_lock_irq(&dcp->typec_hpd_lock);
+		if (seq == dcp->typec_hpd_seq) {
+			spin_unlock_irq(&dcp->typec_hpd_lock);
+			return;
+		}
+		spin_unlock_irq(&dcp->typec_hpd_lock);
+	}
+}
+
+static int dcp_typec_hpd_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+	struct apple_dcp *dcp = typec_mux_get_drvdata(mux);
+	const struct typec_displayport_data *dp = state->data;
+	bool hpd = false, irq = false;
+
+	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID && dp) {
+		hpd = !!(dp->status & DP_STATUS_HPD_STATE);
+		irq = hpd && !!(dp->status & DP_STATUS_IRQ_HPD);
+	}
+	spin_lock_irq(&dcp->typec_hpd_lock);
+	dcp->typec_hpd_level = hpd;
+	dcp->typec_hpd_irq |= irq;
+	dcp->typec_hpd_seq++;
+	spin_unlock_irq(&dcp->typec_hpd_lock);
+	queue_work(system_unbound_wq, &dcp->typec_hpd_work);
+	return 0;
+}
+
+static void dcp_typec_hpd_unregister(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	typec_mux_unregister(dcp->typec_hpd_mux);
+	cancel_work_sync(&dcp->typec_hpd_work);
+}
+
+static int dcp_typec_hpd_register(struct apple_dcp *dcp)
+{
+	struct typec_mux_desc desc = {
+		.fwnode = dev_fwnode(dcp->dev),
+		.set = dcp_typec_hpd_set,
+		.drvdata = dcp,
+	};
+
+	spin_lock_init(&dcp->typec_hpd_lock);
+	INIT_WORK(&dcp->typec_hpd_work, dcp_typec_hpd_work);
+	dcp->typec_hpd_mux = typec_mux_register(dcp->dev, &desc);
+	if (IS_ERR(dcp->typec_hpd_mux))
+		return PTR_ERR(dcp->typec_hpd_mux);
+	return devm_add_action_or_reset(dcp->dev, dcp_typec_hpd_unregister, dcp);
 }
 
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
@@ -885,6 +997,20 @@ static void dcp_dpavctrl_service_init(struct apple_epic_service *service,
 	struct apple_dcp *dcp = service->ep->dcp;
 	const char *service_class = class ?: name;
 
+	/* Neo has one AV/DP pair on interfaces 1/3, rather than M4's quartet.
+	 * The native host opens AV first, then releases the deferred DP service. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 && dcp->phy) {
+		if (service_class && strstr(service_class, "dcpav-controller-epic"))
+			dcp->dpavctrl_av_controller[0] = service;
+		if (service_class && strstr(service_class, "dcpdp-controller-epic")) {
+			service->defer_start = true;
+			dcp->dpavctrl_late_service = service;
+		}
+		if (dcp->dpavctrl_av_controller[0] && dcp->dpavctrl_late_service)
+			complete_all(&dcp->dpavctrl_ready);
+		return;
+	}
+
 	if (service_class && strstr(service_class, "dcpav-controller-epic"))
 		dcp->dpavctrl_av_controller[!!(service->channel & BIT(2))] =
 			service;
@@ -1018,6 +1144,19 @@ static int dcp_activate_dpavctrl(struct apple_dcp *dcp)
 {
 	int i, ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 && dcp->phy) {
+		u8 request[32] = { };
+
+		if (!dcp->dpavctrl_av_controller[0] || !dcp->dpavctrl_late_service)
+			return -ENODEV;
+		ret = afk_service_call(dcp->dpavctrl_av_controller[0], 0, 12,
+				       request, sizeof(request), 32, NULL, 0, 32);
+		if (ret)
+			return ret;
+		dev_info(dcp->dev, "Neo AV controller opened; starting DP controller\n");
+		return afk_start_service(dcp->dpavctrl_late_service);
+	}
+
 	/* The two AV controllers must be opened before the deferred interface. */
 	for (i = 1; i >= 0; i--) {
 		if (!dcp->dpavctrl_av_controller[i])
@@ -1037,7 +1176,7 @@ static int dcp_activate_dpavctrl(struct apple_dcp *dcp)
 int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-	bool v26_6 = dcp->fw_compat == DCP_FIRMWARE_V_26_6;
+	bool v26_6 = dcp_fw_is_26_6(dcp);
 	int ret;
 
 	init_completion(&dcp->start_done);
@@ -1066,6 +1205,9 @@ int dcp_start(struct platform_device *pdev)
 			return dev_err_probe(dcp->dev, ret,
 					     "Failed to start IOMFB transport endpoint\n");
 
+	}
+
+	if (v26_6 && dcp->fw_compat != DCP_FIRMWARE_V_26_6_T8140) {
 		init_completion(&dcp->dpdev_ready);
 		dcp->dpdev_service = NULL;
 		ret = dcp_start_aux_ep(dcp, DPDEV_ENDPOINT, &dcp->dpdevep);
@@ -1120,11 +1262,13 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 
 		if (v26_6) {
+			if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_T8140) {
 			ret = dcp_start_aux_ep(dcp, EPIC2C_ENDPOINT,
 					       &dcp->epicep2c);
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
 						     "Failed to start EPIC2C endpoint\n");
+			}
 
 			if (unstable_edid && !dcp_has_panel(dcp)) {
 				ret = dpavservep_init(dcp);
@@ -1146,13 +1290,22 @@ int dcp_start(struct platform_device *pdev)
 						     "Failed to start EPIC25 endpoint\n");
 		}
 
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140) {
+			ret = dcp_start_dpavctrl(dcp);
+			if (ret)
+				return dev_err_probe(dcp->dev, ret,
+						     "Failed to initialize Neo AV controllers\n");
+		}
+
 		/*
 		 * An internal eDP panel driven through the DPTX PHY (M4 MacBook
 		 * Air) needs the PHY powered, but its firmware runs the panel as
 		 * disp0 and offers no dcpdptx-port services: waiting for them
 		 * only times out.
 		 */
-		ret = dcp_has_panel(dcp) ? 0 : dptxep_init(dcp);
+		ret = dcp_has_panel(dcp) &&
+		      dcp->fw_compat != DCP_FIRMWARE_V_26_6_T8140 ?
+		      0 : dptxep_init(dcp);
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);
@@ -1180,7 +1333,9 @@ int dcp_start(struct platform_device *pdev)
 				dcp_dptx_connect(dcp, 0);
 #endif
 		}
-		if (v26_6 && !ret && dcp->dptxport[0].enabled) {
+		/* A Type-C link starts only after PD has configured the PHY and HPD. */
+		if (v26_6 && !ret && dcp->dptxport[0].enabled &&
+		    !of_property_present(dcp->dev->of_node, "apple,typec-connector")) {
 			ret = dcp_dptx_connect(dcp, 0);
 			if (ret)
 				dev_warn(dcp->dev,
@@ -1198,7 +1353,8 @@ int dcp_start(struct platform_device *pdev)
 				return dev_err_probe(dcp->dev, ret,
 						     "Failed to activate first HDCP controller\n");
 		}
-		if (v26_6 && enable_dpavctrl) {
+		if (v26_6 && (enable_dpavctrl ||
+			     dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140)) {
 			/*
 			 * DPAV owns link-control services used during ordinary plug and
 			 * unplug, even when content protection is disabled.  Keeping its
@@ -1251,6 +1407,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_poweroff_v26_6_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_poweroff_v26_6_t8140(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1259,6 +1418,12 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
+	if (dcp->typec_hpd_mux) {
+		spin_lock_irq(&dcp->typec_hpd_lock);
+		dcp->typec_hpd_ready = true;
+		spin_unlock_irq(&dcp->typec_hpd_lock);
+		queue_work(system_unbound_wq, &dcp->typec_hpd_work);
+	}
 	// check HPD state before enabling the edge triggered IRQ
 	if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
@@ -1316,6 +1481,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_sleep_v26_6_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_sleep_v26_6_t8140(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1355,6 +1523,9 @@ void dcp_poweron(struct platform_device *pdev)
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_poweron_v26_6_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_poweron_v26_6_t8140(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1375,7 +1546,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	 * after disabling ALPM on T8132.  A later atomic enable must modeset the
 	 * still-live instance instead of sending a second power-on sequence.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6 && !dcp->main_display &&
+	if (dcp_fw_is_26_6(dcp) && !dcp->main_display &&
 	    dcp->connector && !dcp->connector->connected) {
 		dev_info(dcp->dev,
 			 "keeping IOMFB alive across external connector disconnect\n");
@@ -1649,6 +1820,15 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	ret = dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
 
+	/* Neo has a distinct four-surface IOMFB ABI on the same OS release. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8140-dcpext")) {
+		if (ret >= 0 && !strcmp(fw_str, "26.6.2"))
+			return DCP_FIRMWARE_V_26_6_T8140;
+		dev_err(dev, "Neo DCP requires firmware 26.6.2 (FW: %s)\n", fw_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
 	/* T8132 is qualified only with this exact OS firmware release. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcp") ||
 	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
@@ -1728,6 +1908,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	/* initialize brightness scale to a sensible default to avoid divide by 0*/
 	dcp->brightness.scale = 65536;
+	dcp->brightness.actual_nits = -1;
 	panel_np = of_get_compatible_child(dev->of_node, "apple,panel-mini-led");
 	if (panel_np)
 		dcp->panel.has_mini_led = true;
@@ -1799,6 +1980,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 				     "Failed to initialize RTKit\n");
 	/* The crash callback can run before dcp_start() initializes IOMFB. */
 	init_completion(&dcp->start_done);
+	init_waitqueue_head(&dcp->swap_ack_wait);
 
 	return 0;
 }
@@ -1814,6 +1996,12 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (!dcp)
 		return;
 
+	if (dcp->typec_hpd_mux) {
+		spin_lock_irq(&dcp->typec_hpd_lock);
+		dcp->typec_hpd_ready = false;
+		spin_unlock_irq(&dcp->typec_hpd_lock);
+		cancel_work_sync(&dcp->typec_hpd_work);
+	}
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 
@@ -2071,6 +2259,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			 * Switch atcphy to DP-only. should move to a Macbook Pro
 			 * 14-/16-inch specific DP-to-HDMI drm_bridge.
 			 */
+			if (of_property_present(dev->of_node, "apple,typec-connector")) {
+				ret = dcp_typec_hpd_register(dcp);
+				if (ret)
+					return ret;
+				return component_add(&pdev->dev, &dcp_comp_ops);
+			}
+
 			dcp->typec_mux = fwnode_typec_mux_get(dev_fwnode(dcp->dev));
 			if (!IS_ERR_OR_NULL(dcp->typec_mux)) {
 				struct typec_altmode alt = {
@@ -2158,6 +2353,10 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
 
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140_dcpext = {
+	.num_dptx_ports = 1,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 	.num_dptx_ports = 2,
 };
@@ -2166,6 +2365,8 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132,  },
+	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_dcp, },
+	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_dcpext, },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}

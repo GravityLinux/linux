@@ -53,6 +53,11 @@
 #define DRIVER_NAME     "apple"
 #define DRIVER_DESC     "Apple display controller DRM driver"
 
+/* Allow diagnostic binding after the display master has been deferred. */
+static bool defer_master;
+module_param(defer_master, bool, 0644);
+MODULE_PARM_DESC(defer_master, "Defer display master probing until disabled for diagnostic binding");
+
 #define MAX_COPROCESSORS 3
 
 struct apple_drm_private {
@@ -920,7 +925,9 @@ static int add_dcp_components(struct device *dev,
 				 * collection for the Apple display-subsystem so
 				 * ignore it here.
 				 */
-				if (of_device_is_compatible(port, "apple,t8103-atcphy")) {
+				/* A Type-C connector supplies HPD/mux events, not a DRM component. */
+				if (of_device_is_compatible(port, "usb-c-connector") ||
+				    of_device_is_compatible(port, "apple,t8103-atcphy")) {
 					of_node_put(port);
 					continue;
 				}
@@ -943,6 +950,9 @@ static int apple_platform_probe(struct platform_device *pdev)
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
 	int num_dcp;
+
+	if (defer_master)
+		return -EPROBE_DEFER;
 
 	/* add DCP components, handle less than 1 as probe error */
 	num_dcp = add_dcp_components(mdev, &match);

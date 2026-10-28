@@ -6,6 +6,7 @@
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
 
 #include "afk.h"
 #include "dcp.h"
@@ -22,6 +23,10 @@
 static bool dptx_bypass_phy;
 module_param_named(dptx_bypass_phy, dptx_bypass_phy, bool, 0644);
 MODULE_PARM_DESC(dptx_bypass_phy, "Acknowledge DPTX PHY callbacks without MMIO");
+
+static unsigned int neo_max_link_rate = LINK_RATE_HBR2;
+module_param(neo_max_link_rate, uint, 0644);
+MODULE_PARM_DESC(neo_max_link_rate, "Neo rate-qualification limit (0x0a or 0x14)");
 
 struct dcpdptx_connection_cmd {
 	__le32 unk;
@@ -145,7 +150,11 @@ int dptxport_request_display(struct apple_epic_service *service)
 
 int dptxport_release_display(struct apple_epic_service *service)
 {
-	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	/* Neo's native disconnect uses group 8, command 7, with 16 zero bytes. */
+	u16 group = service->ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ?
+		    8 : 0;
+
+	return afk_service_call(service, group, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
@@ -162,9 +171,18 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 			       sizeof(resp), 12);
 	if (ret)
 		return ret;
-	if (le32_to_cpu(resp.unk) != 1)
+	if (le32_to_cpu(resp.unk) != hpd)
 		return -EINVAL;
 	return 0;
+}
+
+/* Native command 8:9 follows the controller's HPD IRQ indication. */
+int dptxport_hpd_irq(struct apple_epic_service *service)
+{
+	u8 cmd[16] = {}, reply[16];
+
+	return afk_service_call(service, 8, 9, cmd, sizeof(cmd), 16,
+				reply, sizeof(reply), 16);
 }
 
 static int
@@ -251,7 +269,13 @@ static int dptxport_call_get_max_link_rate(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->link_rate = cpu_to_le32(LINK_RATE_HBR3);
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140) {
+		if (neo_max_link_rate != LINK_RATE_HBR && neo_max_link_rate != LINK_RATE_HBR2)
+			return -EINVAL;
+		reply->link_rate = cpu_to_le32(neo_max_link_rate);
+	} else {
+		reply->link_rate = cpu_to_le32(LINK_RATE_HBR3);
+	}
 
 	return 0;
 }
@@ -281,17 +305,12 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 		reply->retcode = cpu_to_le32(1);
 		reply->lane_count = cpu_to_le64(0);
 	} else {
-		if (phy_ops.dp.lanes < 2) {
-			// phy_validate might return 0 lanes if atc phy is not
-			// yet switched to DP mode
-			dev_dbg(dcp->dev, "get_max_lane_count: phy lanes: %d\n",
-				phy_ops.dp.lanes);
-			// default to 4 lanes
+		/* M4 firmware queries before Type-C selects a DP assignment. */
+		if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_T8140 && phy_ops.dp.lanes < 2)
 			dptx->lane_count = 4;
-		} else {
+		else
 			dptx->lane_count = phy_ops.dp.lanes;
-		}
-		reply->retcode = cpu_to_le32(0);
+		reply->retcode = cpu_to_le32(!dptx->lane_count);
 		reply->lane_count = cpu_to_le64(dptx->lane_count);
 	}
 
@@ -377,6 +396,7 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 	dptx->phy_ops.dp.set_lanes = 0;
 	dptx->phy_ops.dp.set_rate = 0;
 	dptx->phy_ops.dp.set_voltages = 0;
+	dptx->neo_drive_valid = false;
 
 	return 0;
 }
@@ -470,7 +490,8 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(0);
+	reply->supported = cpu_to_le32(of_property_present(service->ep->dcp->dev->of_node,
+							 "apple,typec-connector"));
 	return 0;
 }
 
@@ -501,7 +522,8 @@ dptxport_call_activate(struct apple_epic_service *service,
 	// for standalone phy (i.e. not atc phy).
 	dev_info(dcp->dev, "DPTXPort: activating PHY\n");
 	if (!dcp->typec_mux && !dptx_bypass_phy) {
-		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP,
+				       dcp->dptx_phy > 3 ? dcp->index : 0);
 		if (ret)
 			dev_err(dcp->dev, "DPTXPort: PHY activation failed: %d\n",
 				ret);
@@ -539,6 +561,70 @@ dptxport_call_deactivate(struct apple_epic_service *service,
  * 80-byte record. Preserve the traced input prefix, clear the result word,
  * and never echo the pointer-bearing tail back to firmware.
  */
+/* Neo 26.6 carries a 32-byte envelope followed by per-lane triples.
+ * Native request/MMIO pairs establish words 1/2 as swing/pre-emphasis.
+ * Word 0 was only observed as zero; refuse other values without guessing. */
+static int dptxport_call_neo_drive(struct apple_epic_service *service, u32 idx,
+				 const void *data, size_t data_size,
+				 void *reply, size_t reply_size)
+{
+	struct dptx_port *dptx = service->cookie;
+	const __le32 *request = data;
+	__le32 *response = reply;
+	union phy_configure_opts opts = { }, limits = { };
+	u32 lanes, setting[4][3];
+	size_t size;
+	int ret;
+
+	if ((idx != 3 && idx != 4) || data_size < 32 || reply_size < 32)
+		return -EINVAL;
+	lanes = le32_to_cpu(request[idx == 3 ? 4 : 0]);
+	if (!lanes || lanes == 3 || lanes > ARRAY_SIZE(setting))
+		return -EINVAL;
+	size = 32 + lanes * 12;
+	if (data_size != size || reply_size < size || !dptx->atcphy)
+		return -EINVAL;
+	if (idx == 4) {
+		if (!dptx->neo_drive_valid || lanes != dptx->phy_ops.dp.lanes)
+			return -EAGAIN;
+		memcpy(reply, data, 16);
+		memset(reply + 16, 0, reply_size - 16);
+		for (u32 i = 0; i < lanes; i++)
+			for (u32 j = 0; j < 3; j++)
+				response[8 + i * 3 + j] = cpu_to_le32(dptx->neo_drive[i][j]);
+		return 0;
+	}
+	if (lanes != dptx->phy_ops.dp.lanes)
+		return -EINVAL;
+	ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &limits);
+	if (ret || lanes > limits.dp.lanes)
+		return ret ? ret : -EINVAL;
+	opts.dp.link_rate = dptx->phy_ops.dp.link_rate;
+	opts.dp.lanes = lanes;
+	opts.dp.set_voltages = 1;
+	for (u32 i = 0; i < lanes; i++) {
+		for (u32 j = 0; j < 3; j++)
+			setting[i][j] = le32_to_cpu(request[8 + i * 3 + j]);
+		if (setting[i][0] || setting[i][1] > 3 || setting[i][2] > 3 ||
+		    setting[i][1] + setting[i][2] > 3)
+			return -EINVAL;
+		opts.dp.voltage[i] = setting[i][1];
+		opts.dp.pre[i] = setting[i][2];
+	}
+	memcpy(reply, data, size);
+	if (reply_size > size)
+		memset(reply + size, 0, reply_size - size);
+	ret = phy_configure(dptx->atcphy, &opts);
+	response[0] = cpu_to_le32(ret ? 1 : 0);
+	if (ret) {
+		dev_warn(service->ep->dcp->dev, "Neo drive configuration failed: %d\n", ret);
+		return 0;
+	}
+	memcpy(dptx->neo_drive, setting, lanes * sizeof(setting[0]));
+	dptx->neo_drive_valid = true;
+	return 0;
+}
+
 static int dptxport_call_group1(u32 idx, const void *data, size_t data_size,
 				void *reply, size_t reply_size)
 {
@@ -566,6 +652,9 @@ static int dptxport_call(struct apple_epic_service *service, u16 group, u32 idx,
 {
 	struct dptx_port *dptx = service->cookie;
 
+	if (group == 1 && of_device_is_compatible(service->ep->dcp->dev->of_node,
+						 "apple,t8140-dcpext"))
+		return dptxport_call_neo_drive(service, idx, data, data_size, reply, reply_size);
 	if (group == 1)
 		return dptxport_call_group1(idx, data, data_size, reply,
 					    reply_size);
@@ -629,7 +718,11 @@ static int dptxport_call(struct apple_epic_service *service, u16 group, u32 idx,
 
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
+
 {
+	dev_info(service->ep->dcp->dev,
+		 "DPTX init name=%s class=%s unit=%lld compact=%d\n",
+		 name, class, unit, service->ep->compact);
 	if (service->ep->compact) {
 		if (unit < 0)
 			return;
@@ -689,7 +782,9 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT, dptxep_ops);
+	dcp->dptxep = afk_init(dcp,
+			dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ?
+			EPIC2C_ENDPOINT : DPTX_ENDPOINT, dptxep_ops);
 	if (IS_ERR(dcp->dptxep))
 		return PTR_ERR(dcp->dptxep);
 
@@ -697,6 +792,7 @@ int dptxep_init(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 
+	dev_info(dcp->dev, "DPTX waiting for %u port services\n", dcp->hw.num_dptx_ports);
 	for (port = 0; port < dcp->hw.num_dptx_ports; port++) {
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						timeout);

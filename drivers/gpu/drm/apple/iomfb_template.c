@@ -84,7 +84,7 @@ static dcp_bool_arg_t dcp_bool_arg(bool value)
 }
 
 /* Native 26.6 brightness and display-off swaps use binary64 nits, not iDAC. */
-static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits)
+static u64 dcp_nits_binary64(u32 nits)
 {
 	u64 bits = 0;
 
@@ -96,9 +96,26 @@ static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits
 		bits |= ((u64)nits << (52 - exponent)) & GENMASK_ULL(51, 0);
 	}
 
+	return bits;
+}
+
+static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits,
+				    u32 maximum)
+{
 	swap->bl_update = 1;
 	swap->bl_flags[1] = 1;
-	put_unaligned_le64(bits, &swap->bl_nits);
+#ifdef DCP_FW_T8140
+	/* Supply the complete linear-nits configuration. A zero gain or limit
+	 * can turn a valid requested level into zero physical backlight output. */
+	if (maximum) {
+		swap->bl_flags[2] = 1;
+		swap->bl_flags[4] = 1;
+		put_unaligned_le64(dcp_nits_binary64(maximum), &swap->bl_limit_nits);
+		put_unaligned_le64(0x3ff0000000000000ULL, &swap->bl_scale);
+		put_unaligned_le64(0x3ff0000000000000ULL, &swap->bl_scale_inverse);
+	}
+#endif
+	put_unaligned_le64(dcp_nits_binary64(nits), &swap->bl_nits);
 }
 #else
 typedef struct dcp_set_power_state_req dcp_power_state_req_t;
@@ -249,6 +266,14 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
+#ifdef DCP_FW_T8140
+	if (smp_load_acquire(&dcp->modeset_blank_valid) &&
+	    resp->swap_id == READ_ONCE(dcp->modeset_blank_id)) {
+		WRITE_ONCE(dcp->modeset_blank_valid, false);
+		/* An internal black frame is not the client's page flip. */
+		return;
+	}
+#endif
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	if (dcp->crc_enabled) {
@@ -327,6 +352,14 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
+#ifdef DCP_FW_T8140
+	case 19: /* 26.6 brightnessLevel, in 16.16 nits */
+		if (dcp_has_panel(dcp) && !dcp->brightness.initialized)
+			dcp->brightness.nits = min_t(u32,
+				prop->value / dcp->brightness.scale,
+				dcp->brightness.maximum);
+		break;
+#endif
 #if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	case IOMFB_PROPERTY_NITS_V13_3:
@@ -1193,12 +1226,12 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 */
 	if (dcp_has_panel(dcp)) {
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
-		dcp_swap_set_brightness(&swap->swap, 0);
+		dcp_swap_set_brightness(&swap->swap, 0, 0);
 #else
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-		swap->swap.bl_update = 1;
-#else
+#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 		swap->swap.bl_unk = 1;
+#else
+		swap->swap.bl_update = 1;
 #endif
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
@@ -1209,8 +1242,10 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	for (int l = 0; l < SWAP_SURFACES; l++)
 		swap->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#ifndef DCP_FW_T8140
 	for (int l = 0; l < ARRAY_SIZE(swap->surf2_null); l++)
 		swap->surf2_null[l] = true;
+#endif
 	swap->unkU32Ptr_null = true;
 	swap->unkU32out_null = true;
 #endif
@@ -1567,6 +1602,34 @@ static void dcp_get_mode_info(struct apple_dcp *dcp,
 		 sizeof(struct dcp_get_mode_info_resp_v26_6), &req, cb, cookie);
 }
 
+/* Neo selects the pipe, resets adaptive sync, and completes a black swap
+ * before A413. The M4 A364 prequery is absent from the native sequence. */
+static void dcp_modeset_neo_selected(struct apple_dcp *dcp, void *data, void *cookie)
+{
+#ifndef DCP_FW_T8140
+	struct dcp_modeset_cookie *modeset = cookie;
+#endif
+
+	if (get_unaligned_le32(data)) {
+		complete_set_digital_out_mode(dcp, data, cookie);
+		return;
+	}
+#ifdef DCP_FW_T8140
+	/* Native A411 -> adaptive-sync state -> blank -> A413 sequence. */
+	{
+		struct dcp_set_parameter_dcp param = { };
+
+		param.param = IOMFBPARAM_ADAPTIVE_SYNC;
+		param.count = 3;
+		dcp_set_parameter_dcp(dcp, false, &param,
+				      complete_set_digital_out_mode, cookie);
+	}
+#else
+	dcp_set_digital_out_mode(dcp, false, &modeset->actual,
+				 complete_set_digital_out_mode, cookie);
+#endif
+}
+
 static void dcp_modeset_after_actual_info(struct apple_dcp *dcp, void *data,
 					   void *cookie)
 {
@@ -1597,6 +1660,104 @@ static void dcp_modeset_after_bootstrap_info(struct apple_dcp *dcp, void *data,
 
 	dcp_set_digital_out_mode(dcp, false, &modeset->bootstrap,
 				 dcp_modeset_after_bootstrap, cookie);
+}
+#endif
+
+
+#ifdef DCP_FW_T8140
+struct dcp_modeset_blank_cookie {
+	struct kref refcount;
+	struct completion submitted;
+	struct DCP_FW_NAME(dcp_swap_submit_req) request;
+	u32 swap_id;
+	u32 result;
+};
+
+static void release_modeset_blank(struct kref *ref)
+{
+	kfree(container_of(ref, struct dcp_modeset_blank_cookie, refcount));
+}
+
+static void complete_modeset_blank(struct apple_dcp *dcp, void *data,
+				   void *opaque)
+{
+	struct dcp_modeset_blank_cookie *cookie = opaque;
+	struct DCP_FW_NAME(dcp_swap_submit_resp) *response = data;
+
+	cookie->result = response->ret;
+	complete(&cookie->submitted);
+	kref_put(&cookie->refcount, release_modeset_blank);
+}
+
+static void start_modeset_blank(struct apple_dcp *dcp, void *data, void *opaque)
+{
+	struct dcp_modeset_blank_cookie *cookie = opaque;
+	struct DCP_FW_NAME(dcp_swap_start_resp) *response = data;
+
+	if (response->ret) {
+		cookie->result = response->ret;
+		complete(&cookie->submitted);
+		kref_put(&cookie->refcount, release_modeset_blank);
+		return;
+	}
+	cookie->swap_id = response->swap_id;
+	cookie->request.swap.swap_id = response->swap_id;
+	WRITE_ONCE(dcp->modeset_blank_id, response->swap_id);
+	smp_store_release(&dcp->modeset_blank_valid, true);
+	dcp_swap_submit(dcp, false, &cookie->request,
+			complete_modeset_blank, cookie);
+}
+
+static int dcp_modeset_neo_blank(struct apple_dcp *dcp)
+{
+	struct dcp_modeset_blank_cookie *cookie;
+	struct DCP_FW_NAME(dcp_swap_start_req) start = dcp_swap_start_request(dcp);
+	u64 sequence = smp_load_acquire(&dcp->swap_ack_sequence);
+	u32 swap_id, result;
+	unsigned long remaining;
+	int ret;
+
+	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->submitted);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount); /* callback ownership, including late ACKs */
+	cookie->request.swap.swap_enabled = IOMFB_SET_BACKGROUND | 0x7;
+	cookie->request.swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
+	cookie->request.swap.bg_color = 0xff000000;
+	for (int i = 0; i < SWAP_SURFACES; i++)
+		cookie->request.surf_null[i] = true;
+	cookie->request.unkU32Ptr_null = true;
+	cookie->request.unkU32out_null = true;
+
+	dcp_swap_start(dcp, false, &start, start_modeset_blank, cookie);
+	remaining = wait_for_completion_timeout(&cookie->submitted,
+						msecs_to_jiffies(1000));
+	if (!remaining) {
+		kref_put(&cookie->refcount, release_modeset_blank);
+		dev_err(dcp->dev, "mode blank submit timed out\n");
+		return -ETIMEDOUT;
+	}
+	result = cookie->result;
+	swap_id = cookie->swap_id;
+	kref_put(&cookie->refcount, release_modeset_blank);
+	if (result) {
+		dev_err(dcp->dev, "mode blank submit failed: status=%u\n", result);
+		return -EIO;
+	}
+	/* A408 ACK only accepts the swap. Wait for its actual D590 callback
+	 * and the ACK of that callback before submitting a new digital mode. */
+	ret = wait_event_timeout(dcp->swap_ack_wait,
+		smp_load_acquire(&dcp->swap_ack_sequence) != sequence &&
+		READ_ONCE(dcp->swap_acked_id) == swap_id,
+		msecs_to_jiffies(1000));
+	if (!ret) {
+		dev_err(dcp->dev, "mode blank completion timed out: swap=%u\n", swap_id);
+		return -ETIMEDOUT;
+	}
+	dev_info(dcp->dev, "mode blank completed and ACKed: swap=%u\n", swap_id);
+	return 0;
 }
 #endif
 
@@ -1677,7 +1838,32 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->during_modeset = true;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
-	if (!dcp->valid_mode && mode->bootstrap.score >= 0) {
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140) {
+		u32 handle = dcp->main_display ? 0 : 2;
+
+		dcp_set_display_device(dcp, false, &handle,
+				       dcp_modeset_neo_selected, cookie);
+#ifdef DCP_FW_T8140
+		ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+		if (!ret || modeset_cookie->result) {
+			dev_err(dcp->dev, "mode pipe preparation failed: status=%u\n",
+				modeset_cookie->result);
+			ret = ret ? -EIO : -ETIMEDOUT;
+			goto neo_prepare_failed;
+		}
+		/* Before the first timing, firmware swallows swaps and emits no
+		 * D590. Quiesce only an acknowledged, already active mode. */
+		if (dcp->valid_mode) {
+			ret = dcp_modeset_neo_blank(dcp);
+			if (ret)
+				goto neo_prepare_failed;
+		}
+		reinit_completion(&cookie->done);
+		kref_get(&cookie->refcount);
+		dcp_set_digital_out_mode(dcp, false, &modeset_cookie->actual,
+					 complete_set_digital_out_mode, cookie);
+#endif
+	} else if (!dcp->valid_mode && mode->bootstrap.score >= 0) {
 		modeset_cookie->bootstrap =
 			(struct dcp_set_digital_out_mode_req) {
 				.color_mode_id = mode->bootstrap.id,
@@ -1737,6 +1923,13 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->valid_mode = true;
 
 	return 0;
+#ifdef DCP_FW_T8140
+neo_prepare_failed:
+	dcp->during_modeset = false;
+	dcp->valid_mode = false;
+	kref_put(&cookie->refcount, release_wait_cookie);
+	return ret;
+#endif
 }
 
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
@@ -1755,8 +1948,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < SWAP_SURFACES; l++)
 		req->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#ifndef DCP_FW_T8140
 	for (l = 0; l < ARRAY_SIZE(req->surf2_null); l++)
 		req->surf2_null[l] = true;
+#endif
 	req->unkU32Ptr_null = true;
 	req->unkU32out_null = true;
 #endif
@@ -1857,7 +2052,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
-		dcp_swap_set_brightness(&req->swap, dcp->brightness.nits);
+		dcp_swap_set_brightness(&req->swap, dcp->brightness.nits,
+					dcp->brightness.maximum);
+		dcp->brightness.initialized = true;
 #else
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 		req->swap.bl_update = 1;

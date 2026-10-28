@@ -97,7 +97,10 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	dev_dbg(dcp->dev, "systemep: mNits event: Nits: %u.%03u, iDAC: %u\n",
 		mnits.millinits / 1000, mnits.millinits % 1000, mnits.idac);
 
-	dcp->brightness.nits = mnits.millinits / 1000;
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140)
+		dcp->brightness.actual_nits = mnits.millinits / 1000;
+	else
+		dcp->brightness.nits = mnits.millinits / 1000;
 
 	return 0;
 }

@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/mutex.h>
+#include <linux/wait.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -20,6 +21,7 @@
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
 #include "iomfb_v26_6.h"
+#include "iomfb_v26_6_t8140.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -97,8 +99,10 @@ struct dcp_brightness {
 	u32 maximum;
 	u32 dac;
 	int nits;
+	int actual_nits;
 	int scale;
 	bool update;
+	bool initialized;
 };
 
 struct audiosrv_data;
@@ -184,11 +188,19 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v13_3 v13_3;
 		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
 		struct dcp_swap_submit_req_v26_6_0 v26_6_0;
+		struct dcp_swap_submit_req_v26_6_t8140 v26_6_t8140;
 	} swap;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
 	ktime_t swap_start;
+
+	/* Neo mode changes wait for the clear-frame callback to be ACKed. */
+	wait_queue_head_t swap_ack_wait;
+	u64 swap_ack_sequence;
+	u32 swap_acked_id;
+	u32 modeset_blank_id;
+	bool modeset_blank_valid;
 
 	/* Current display mode */
 	bool during_modeset;
@@ -288,6 +300,14 @@ struct apple_dcp {
 	struct phy *phy;
 	struct mux_control *xbar;
 	struct typec_mux *typec_mux;
+	/* Type-C notifications can precede RTKit/IOMFB startup. */
+	struct typec_mux_dev *typec_hpd_mux;
+	spinlock_t typec_hpd_lock;
+	struct work_struct typec_hpd_work;
+	bool typec_hpd_ready;
+	bool typec_hpd_level;
+	bool typec_hpd_irq;
+	u32 typec_hpd_seq;
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
@@ -307,5 +327,11 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+static inline bool dcp_fw_is_26_6(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6 ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140;
+}
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

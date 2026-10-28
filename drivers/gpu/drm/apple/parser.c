@@ -612,6 +612,10 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 
 	for (; it.idx < it.len; ++it.idx) {
 		mode = &modes[*count];
+		/* Optional fields (including VRR) must not inherit heap contents or
+		 * a rejected mode that reused this slot. */
+		memset(mode, 0, sizeof(*mode));
+		score = -1;
 		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm, notch_height);
 
 		/* Errors for a single mode are recoverable -- just skip it. */
@@ -1035,7 +1039,7 @@ int parse_sound_mode(struct dcp_parse_ctx *handle,
 int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mnits *entry)
 {
 	struct iterator it;
-	int ret;
+	int ret = 0;
 	s64 mnits = -1;
 	s64 idac = -1;
 	s64 timestamp = -1;
