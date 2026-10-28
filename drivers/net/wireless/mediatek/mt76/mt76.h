@@ -1316,6 +1316,8 @@ __mt76_wcid_ptr(struct mt76_dev *dev, u16 idx)
 struct mt76_dev *mt76_alloc_device(struct device *pdev, unsigned int size,
 				   const struct ieee80211_ops *ops,
 				   const struct mt76_driver_ops *drv_ops);
+int mt76_prepare_device(struct mt76_dev *dev, bool vht,
+			struct ieee80211_rate *rates, int n_rates);
 int mt76_register_device(struct mt76_dev *dev, bool vht,
 			 struct ieee80211_rate *rates, int n_rates);
 void mt76_unregister_device(struct mt76_dev *dev);

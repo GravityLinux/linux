@@ -266,6 +266,10 @@ int mt7921_init_debugfs(struct mt792x_dev *dev)
 	struct dentry *dir;
 
 	dir = mt76_register_debugfs_fops(&dev->mphy, &fops_regval);
+	if (IS_ERR_OR_NULL(dir))
+		return -ENOMEM;
+	if (is_mt7932(&dev->mt76))
+		mt7932_diag_init(dev, dir);
 
 	if (mt76_is_mmio(&dev->mt76))
 		debugfs_create_devm_seqfile(dev->mt76.dev, "xmit-queues",
