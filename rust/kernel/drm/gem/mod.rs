@@ -5,7 +5,8 @@
 //! C header: [`include/drm/drm_gem.h`](srctree/include/drm/drm_gem.h)
 
 use crate::{
-    bindings, dma_buf,
+    bindings,
+    dma_buf,
     drm::{
         self,
         device::{
@@ -36,6 +37,10 @@ use core::{
 
 #[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
 pub mod shmem;
+
+/// Owned GEM mapping interface retained for the Asahi firmware runtime.
+#[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
+pub mod legacy_shmem;
 
 /// A macro for implementing [`AlwaysRefCounted`] for any GEM object type.
 ///
