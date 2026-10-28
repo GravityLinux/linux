@@ -85,6 +85,12 @@ struct apple_rtkit_rx_work {
 	struct work_struct work;
 };
 
+static bool apple_rtkit_has_quirk(struct apple_rtkit *rtk,
+				 enum apple_rtkit_quirks quirk)
+{
+	return rtk->ops->quirks & quirk;
+}
+
 bool apple_rtkit_is_running(struct apple_rtkit *rtk)
 {
 	if (rtk->crashed)
@@ -170,7 +176,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
-		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
+		if (apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_EARLY_CRASHLOG) &&
+		    ep == APPLE_RTKIT_EP_CRASHLOG)
 			apple_rtkit_start_ep(rtk, ep);
 	}
 
@@ -186,7 +193,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		return;
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
-		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
+		if (apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_EARLY_CRASHLOG) &&
+		    ep == APPLE_RTKIT_EP_CRASHLOG)
 			continue;
 		switch (ep) {
 		/* the management endpoint is started by default */
@@ -311,7 +319,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		if (ep == APPLE_RTKIT_EP_OSLOG) {
 			reply = FIELD_PREP(APPLE_RTKIT_OSLOG_TYPE,
 					   APPLE_RTKIT_OSLOG_BUFFER_REQUEST);
-			reply |= FIELD_PREP(APPLE_RTKIT_OSLOG_SIZE, buffer->size);
+			if (!apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE))
+				reply |= FIELD_PREP(APPLE_RTKIT_OSLOG_SIZE, buffer->size);
 			reply |= FIELD_PREP(APPLE_RTKIT_OSLOG_IOVA,
 					    buffer->iova >> 12);
 		} else {
@@ -325,7 +334,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 					    buffer->iova);
 		}
 		apple_rtkit_send_message(rtk, ep, reply, NULL, false);
-	} else if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG) {
+	} else if (apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_EARLY_CRASHLOG) &&
+		   ep == APPLE_RTKIT_EP_CRASHLOG) {
 		apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
@@ -839,7 +849,6 @@ EXPORT_SYMBOL_GPL(apple_rtkit_set_boot_ap_power);
 
 void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
 {
-	rtk->early_crashlog = true;
 	reinit_completion(&rtk->crashlog_completion);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
@@ -988,7 +997,7 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			rtk->iop_power_state, ret);
 		return ret;
 	}
-	if (rtk->early_crashlog) {
+	if (apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_EARLY_CRASHLOG)) {
 		ret = apple_rtkit_wait_for_completion(&rtk->crashlog_completion);
 		if (ret) {
 			dev_err(rtk->dev, "RTKit: timed out waiting for crash buffer: %d\n", ret);

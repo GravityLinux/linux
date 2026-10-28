@@ -34,9 +34,25 @@ struct apple_rtkit_shmem {
 	void *private;
 };
 
+/**
+ * enum apple_rtkit_quirks - opt-in system endpoint protocol variants
+ * @APPLE_RTKIT_QUIRK_EARLY_CRASHLOG: Start the crashlog endpoint before
+ *     acknowledging its endpoint map, acknowledge firmware-owned crash buffers,
+ *     and wait for the buffer exchange before requesting AP power on.
+ * @APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE: Omit the size field from replies allocating
+ *     an oslog buffer; the reply contains only the type and page address.
+ *
+ * Clients select these at initialization. Zero preserves the default protocol.
+ */
+enum apple_rtkit_quirks {
+	APPLE_RTKIT_QUIRK_EARLY_CRASHLOG = 1U << 0,
+	APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE = 1U << 1,
+};
+
 /*
  * Struct to represent implementation-specific RTKit operations.
  *
+ * @quirks:        System endpoint protocol variants, fixed for this instance.
  * @crashed:       Called when the co-processor has crashed. Runs in process
  *                 context.
  * @recv_message:  Function called when a message from RTKit is received
@@ -56,6 +72,7 @@ struct apple_rtkit_shmem {
  *                 context.
  */
 struct apple_rtkit_ops {
+	u32 quirks;
 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
