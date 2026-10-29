@@ -99,6 +99,7 @@ config APPLE_SIO
 	depends on APPLE_RTKIT
 	depends on OF_ADDRESS
 	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
 	help
 	  Enable support for the SIO coprocessor found on Apple Silicon SoCs
 	  where it provides DMA services.
