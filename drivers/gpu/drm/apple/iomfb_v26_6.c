@@ -77,7 +77,118 @@ static bool trampoline_passthrough_dict_v26_6(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+/* D561 uses the compact OSObject dictionary encoding, not the 0xd3
+ * OSSerialize format used by the chunked mode lists. Only integer-valued
+ * entries occur in this particular firmware property.
+ */
+static bool dcp_parse_refresh_intervals(const u8 *data, size_t length,
+					struct dcp_refresh_intervals *result)
+{
+	struct dcp_refresh_intervals intervals = {};
+	size_t pos = 5;
+	u32 count, i;
+
+	if (length < pos || data[0] != 'd')
+		return false;
+	count = get_unaligned_le32(data + 1);
+	if (count > length / 14)
+		return false;
+
+	for (i = 0; i < count; i++) {
+		const u8 *key;
+		u32 key_length;
+		u64 value;
+
+		if (length - pos < 5 || data[pos++] != 's')
+			return false;
+		key_length = get_unaligned_le32(data + pos);
+		pos += 4;
+		if (key_length >= length - pos || data[pos + key_length])
+			return false;
+		key = data + pos;
+		pos += key_length + 1;
+		if (length - pos < 9 || data[pos++] != 'n')
+			return false;
+		value = get_unaligned_le64(data + pos);
+		pos += 8;
+
+#define READ_INTERVAL(name, field) \
+		if (key_length == sizeof(name) - 1 && \
+		    !memcmp(key, name, sizeof(name) - 1)) intervals.field = value
+		READ_INTERVAL("displayMinRefreshIntervalMachTime", minimum);
+		READ_INTERVAL("displayMaxRefreshIntervalMachTime", maximum);
+		READ_INTERVAL("displayRefreshStepMachTime", step);
+#undef READ_INTERVAL
+	}
+
+	if (!intervals.minimum || intervals.maximum < intervals.minimum ||
+	    !intervals.step)
+		return false;
+	*result = intervals;
+	return true;
+}
+
+static u8 dcpep_cb_set_property_dict_v26_6(struct apple_dcp *dcp,
+				 struct dcp_dict_passthrough_req_v26_6 *req)
+{
+	struct dcp_refresh_intervals intervals;
+
+	if (!req->value_null &&
+	    !strncmp(req->key, "IOMFBDisplayRefresh", sizeof(req->key)) &&
+	    dcp_parse_refresh_intervals(req->value, sizeof(req->value), &intervals)) {
+		dcp->refresh_intervals = intervals;
+		dev_info(dcp->dev, "firmware refresh intervals: min=%llu max=%llu step=%llu ticks\n",
+			 intervals.minimum, intervals.maximum, intervals.step);
+	}
+	return true;
+}
+
+TRAMPOLINE_INOUT(trampoline_set_property_dict_v26_6,
+		dcpep_cb_set_property_dict_v26_6,
+		struct dcp_dict_passthrough_req_v26_6, u8);
+
+/* D202 carries the 32-bit mapped-buffer token returned by D201. The
+ * legacy vaddr field was 64 bits, putting its DVA four bytes later.
+ */
+struct dcp_unmap_piodma_req_v26_6 {
+	u64 buffer;
+	u32 mapped_buffer;
+	u64 dva;
+	u8 unk;
+	u8 buf_null;
+	u8 padding[2];
+} __packed;
+
+static bool trampoline_unmap_piodma_v26_6(struct apple_dcp *dcp, int tag,
+					void *out, void *in)
+{
+	const struct dcp_unmap_piodma_req_v26_6 *req = in;
+	struct dcp_unmap_buf_resp unmap = {
+		.buffer = req->buffer,
+		.vaddr = req->mapped_buffer,
+		.dva = req->dva,
+		.unk = req->unk,
+		.buf_null = req->buf_null,
+	};
+
+	trace_iomfb_callback(dcp, tag, "dcpep_cb_unmap_piodma");
+	dcpep_cb_unmap_piodma(dcp, &unmap);
+	return true;
+}
+
+static_assert(sizeof(struct dcp_unmap_piodma_req_v26_6) == 0x18);
+static_assert(offsetof(struct dcp_unmap_piodma_req_v26_6, mapped_buffer) == 8);
+static_assert(offsetof(struct dcp_unmap_piodma_req_v26_6, dva) == 12);
+static_assert(offsetof(struct dcp_unmap_piodma_req_v26_6, unk) == 20);
+
 static_assert(sizeof(struct dcp_swap_v26_6_0) == 0x588);
+static_assert(offsetof(struct dcp_swap_v26_6_0, ts1) == 0);
+static_assert(offsetof(struct dcp_swap_v26_6_0, ts2) == 8);
+static_assert(offsetof(struct dcp_swap_v26_6_0, ts64_unk) == 0x20);
+static_assert(offsetof(struct dcp_swap_v26_6_0, ts3) == 0x30);
+static_assert(offsetof(struct dcp_swap_v26_6_0, flags1) == 0x40);
+static_assert(offsetof(struct dcp_swap_v26_6_0, flags2) == 0x48);
+static_assert(offsetof(struct dcp_swap_v26_6_0, surf_flags) == 0xec);
 static_assert(offsetof(struct dcp_swap_v26_6_0, bl_update) == 0x354);
 static_assert(offsetof(struct dcp_swap_v26_6_0, bl_flags) == 0x358);
 static_assert(offsetof(struct dcp_swap_v26_6_0, bl_nits) == 0x35e);
@@ -86,6 +197,7 @@ static_assert(sizeof(struct dcp_swap_start_resp_v26_6_0) == 0x8);
 static_assert(sizeof(struct dcp_swap_submit_req_v26_6_0) == 0x1bd8);
 static_assert(sizeof(struct dcp_swap_submit_resp_v26_6_0) == 0xc);
 static_assert(sizeof(struct dc_swap_complete_resp_v26_6_0) == 0x730);
+static_assert(offsetof(struct dc_swap_complete_resp_v26_6_0, timestamps) == 0x27);
 static_assert(sizeof(struct dcp_map_buf_resp_v26_6_0) == 0x10);
 static_assert(sizeof(struct dcp_set_power_state_req_v26_6) == 0x10);
 static_assert(sizeof(struct dcp_set_parameter_dcp) == 0x28);
@@ -133,6 +245,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[129] = trampoline_prop_end,
 	[134] = trampoline_zero,
 	[201] = trampoline_map_piodma,
+	[202] = trampoline_unmap_piodma_v26_6,
 	[206] = iomfbep_cb_match_pmu_service_2,
 	[207] = iomfbep_cb_match_backlight_service,
 	[208] = trampoline_nop,
@@ -147,8 +260,9 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[414] = trampoline_sr_set_property_int,
 	[415] = trampoline_true,
 	[451] = trampoline_allocate_buffer,
+	[454] = trampoline_release_mem_desc,
 	[552] = trampoline_true,
-	[561] = trampoline_true,
+	[561] = trampoline_set_property_dict_v26_6,
 	[563] = trampoline_true,
 	[565] = trampoline_true,
 	[567] = trampoline_true,

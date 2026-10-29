@@ -533,7 +533,6 @@ static int apple_probe_per_dcp(struct device *dev,
 	int zpos = 0;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 	enum drm_plane_type plane_type;
-	bool interchange;
 
 	surface_count = bitmap_weight(iomfb_surfaces, DCP_MAX_PLANES);
 	order_count = of_property_count_u32_elems(dcp->dev.of_node,
@@ -619,6 +618,10 @@ static int apple_probe_per_dcp(struct device *dev,
 
 	ret = drm_connector_init(drm, &connector->base, &apple_connector_funcs,
 				 dcp_get_connector_type(dcp));
+	if (ret)
+		return ret;
+
+	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		return ret;
 

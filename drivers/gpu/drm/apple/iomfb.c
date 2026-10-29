@@ -359,6 +359,22 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
 
+static bool dcp_vrr_capable(struct apple_dcp *dcp)
+{
+	unsigned int i;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6 || !dcp_has_panel(dcp) ||
+	    !dcp->main_display || !dcp->refresh_intervals.minimum ||
+	    dcp->refresh_intervals.maximum <= dcp->refresh_intervals.minimum)
+		return false;
+
+	for (i = 0; i < dcp->nr_modes; i++)
+		if (dcp->modes[i].vrr)
+			return true;
+
+	return false;
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -368,6 +384,8 @@ int dcp_get_modes(struct drm_connector *connector)
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
 	int i;
+
+	drm_connector_set_vrr_capable_property(connector, dcp_vrr_capable(dcp));
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
@@ -411,6 +429,19 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 	}
 
 	return NULL;
+}
+
+bool dcp_vrr_requested(struct apple_dcp *dcp,
+		       const struct drm_crtc_state *state)
+{
+	struct dcp_display_mode *mode;
+
+	if (!state->active || !(state->vrr_enabled || dcp_force_vrr) ||
+	    !dcp_vrr_capable(dcp))
+		return false;
+
+	mode = lookup_mode(dcp, &state->mode);
+	return mode && mode->vrr;
 }
 
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,

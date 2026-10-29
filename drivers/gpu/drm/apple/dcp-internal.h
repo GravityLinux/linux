@@ -4,6 +4,8 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include <asm/sysreg.h>
+
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
@@ -27,10 +29,19 @@
 
 #define DCP_MAX_PLANES 4
 
+/* DCP uses Apple's 24 MHz timebase, independent of CNTFRQ_EL0.
+ * On M4 the architectural counter runs at 1 GHz.
+ */
+static inline u64 dcp_read_firmware_time(void)
+{
+	return read_sysreg_s(sys_reg(3, 4, 15, 10, 6));
+}
+
 struct apple_dcp;
 struct apple_dcp_afkep;
 
 extern bool dcp_disable_rt_bandwidth;
+extern bool dcp_force_vrr;
 
 struct dcpav_service_epic;
 
@@ -103,6 +114,13 @@ struct dcp_brightness {
 	int scale;
 	bool update;
 	bool initialized;
+};
+
+/* Firmware IOMFBDisplayRefresh limits, in the native counter's ticks. */
+struct dcp_refresh_intervals {
+	u64 minimum;
+	u64 maximum;
+	u64 step;
 };
 
 struct audiosrv_data;
@@ -213,6 +231,10 @@ struct apple_dcp {
 	 */
 	bool hotplug_keepalive;
 	bool use_timestamps;
+	/* Firmware-capable mode; independent of the KMS presentation hint. */
+	bool vrr_active;
+	u64 last_fw_present_ticks;
+	struct dcp_refresh_intervals refresh_intervals;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */

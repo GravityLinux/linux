@@ -197,7 +197,9 @@ struct DCP_FW_NAME(dcp_swap_submit_resp) {
 struct DCP_FW_NAME(dc_swap_complete_resp) {
 	u32 swap_id;
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
-	u8 opaque[0x72c];
+	u8 opaque[0x23];
+	__le64 timestamps[5];
+	u8 opaque_tail[0x6e1];
 #else
 	u8 unkbool;
 	u64 swap_data;

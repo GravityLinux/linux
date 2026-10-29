@@ -55,6 +55,11 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
+bool dcp_force_vrr;
+module_param_named(force_vrr, dcp_force_vrr, bool, 0644);
+MODULE_PARM_DESC(force_vrr,
+		 "Force variable presentation scheduling on supported panels");
+
 bool hdmi_audio;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
@@ -1192,6 +1197,10 @@ int dcp_start(struct platform_device *pdev)
 		return dev_err_probe(dcp->dev, ret,
 				     "Failed to acquire RTKit: %d\n", ret);
 
+	for (unsigned int ep = 0x20; ep < 0x40; ep++)
+		if (apple_rtkit_has_endpoint(dcp->rtk, ep))
+			dev_info(dcp->dev, "Advertised application endpoint: 0x%02x\n", ep);
+
 	/* start RTKit endpoints */
 	ret = systemep_init(dcp);
 	if (ret)
@@ -1210,20 +1219,24 @@ int dcp_start(struct platform_device *pdev)
 	if (v26_6 && dcp->fw_compat != DCP_FIRMWARE_V_26_6_T8140) {
 		init_completion(&dcp->dpdev_ready);
 		dcp->dpdev_service = NULL;
-		ret = dcp_start_aux_ep(dcp, DPDEV_ENDPOINT, &dcp->dpdevep);
-		if (ret)
-			return dev_err_probe(dcp->dev, ret,
-					     "Failed to start DPDEV endpoint\n");
+		if (apple_rtkit_has_endpoint(dcp->rtk, DPDEV_ENDPOINT)) {
+			ret = dcp_start_aux_ep(dcp, DPDEV_ENDPOINT, &dcp->dpdevep);
+			if (ret)
+				return dev_err_probe(dcp->dev, ret,
+						     "Failed to start DPDEV endpoint\n");
+		}
 
 		ret = dcp_start_dpavctrl(dcp);
 		if (ret)
 			return dev_err_probe(dcp->dev, ret,
 					     "Failed to initialize DPAVCTRL endpoint\n");
 
-		ret = dcp_start_aux_ep(dcp, DPSAC_ENDPOINT, &dcp->dpsacep);
-		if (ret)
-			return dev_err_probe(dcp->dev, ret,
-					     "Failed to start DPSAC endpoint\n");
+		if (apple_rtkit_has_endpoint(dcp->rtk, DPSAC_ENDPOINT)) {
+			ret = dcp_start_aux_ep(dcp, DPSAC_ENDPOINT, &dcp->dpsacep);
+			if (ret)
+				return dev_err_probe(dcp->dev, ret,
+						     "Failed to start DPSAC endpoint\n");
+		}
 
 		/*
 		 * The 26.6 AV endpoint is compact, but its audio service still uses
@@ -1829,9 +1842,10 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
-	/* T8132 is qualified only with this exact OS firmware release. */
+	/* M4-family protocols require this exact OS firmware release. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcp") ||
-	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dcpext") ||
+	    of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
 		if (ret >= 0 && !strcmp(fw_str, "26.6.2"))
 			return DCP_FIRMWARE_V_26_6;
 
@@ -2362,6 +2376,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 };
 
 static const struct of_device_id of_match[] = {
+	{ .compatible = "apple,t6041-dcp", .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132,  },
