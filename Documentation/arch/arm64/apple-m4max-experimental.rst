@@ -4,7 +4,7 @@ Experimental M4 Max peripheral integration
 All M4 Max peripheral additions in the experimental topic branches are
 experimental. They are being integrated with the existing Neo and M4 drivers;
 they are not a production release or a claim of full hardware qualification.
-The existing Neo branches remain unchanged. No GPU-driver changes are part
+The existing Neo implementations and commit history are retained. No GPU-driver changes are part
 of this series.
 
 The combined tree adds J616c board descriptions and extends the existing
