@@ -128,6 +128,17 @@ void apple_rtkit_free(struct apple_rtkit *rtk);
  */
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
 
+/* Per-instance compatibility APIs retained for the original M4 PMP clients. */
+void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable);
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
+			      size_t n_endpoints);
+int apple_rtkit_reuse_syslog_buffer(struct apple_rtkit *rtk, dma_addr_t iova,
+				    size_t size, size_t n_entries,
+				    size_t msg_size);
+int apple_rtkit_reuse_crashlog_buffer(struct apple_rtkit *rtk,
+				      dma_addr_t iova, size_t size);
+
 /*
  * Handle RTKit's boot process. Should be called after the CPU of the
  * co-processor has been started.
