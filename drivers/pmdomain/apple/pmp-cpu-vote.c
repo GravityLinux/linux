@@ -42,7 +42,7 @@ static atomic64_t gpu_busy_clock = ATOMIC64_INIT(0);
 /* Reject transient desktop work; zero GPU threshold selects legacy pulses. */
 static unsigned int cpu_vote_p_samples = 1;
 static unsigned int cpu_vote_e_samples = 1;
-static unsigned int cpu_vote_gpu_percent = 20;
+static unsigned int cpu_vote_gpu_percent = 40;
 static unsigned int cpu_vote_gpu_window_ms = 100;
 
 static int cpu_vote_set_filter(const char *text, const struct kernel_param *kp)
