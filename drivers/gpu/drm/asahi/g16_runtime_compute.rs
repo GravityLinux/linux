@@ -292,6 +292,11 @@ impl Bootstrap {
         // Capacity was reserved with the flight in reserve_flight.
         let flight = self.flights.last().ok_or(EIO)?;
         self.ledger.add(flight)?;
+        #[cfg(CONFIG_APPLE_PMP_REPORT)]
+        // SAFETY: the helper publishes only scalar activity; it neither retains
+        // a GPU reference nor performs MMIO/locking in this runtime context.
+        unsafe { kernel::bindings::apple_pmp_cpu_vote_gpu_activity(self.flights.len() as u32) };
+
         self.render_failed = false;
         self.batch_works += 1;
         self.trace_publication("compute", a.work)?;
