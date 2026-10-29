@@ -27,6 +27,11 @@ static bool cpu_vote_enabled = true;
 module_param_named(cpu_vote, cpu_vote_enabled, bool, 0444);
 MODULE_PARM_DESC(cpu_vote, "Enable the T8132 CPU/GPU memory/fabric vote");
 
+/* Changes take effect at the next policy evaluation. */
+static bool cpu_vote_cpm = true;
+module_param_named(cpu_vote_cpm, cpu_vote_cpm, bool, 0644);
+MODULE_PARM_DESC(cpu_vote_cpm, "Tie T8132 cluster CPM bit0 to the CPU/GPU vote");
+
 static unsigned int cpu_vote_sources = APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU;
 static atomic_t gpu_flights = ATOMIC_INIT(0);
 static atomic64_t gpu_last_ms = ATOMIC64_INIT(0);
@@ -94,7 +99,7 @@ struct cpu_sample {
 
 struct apple_pmp_cpu_vote {
 	struct device *dev;
-	void __iomem *events, *request;
+	void __iomem *events, *request, *cpm[2];
 	/* Serializes samples, release, statistics and teardown. */
 	struct mutex lock;
 	struct delayed_work release_work;
@@ -103,17 +108,39 @@ struct apple_pmp_cpu_vote {
 	struct apple_pmp_vote_policy policy;
 	struct hlist_node hotplug_node;
 	int hotplug_state;
-	u32 saved_enables[2], active_vote;
+	u32 saved_enables[2], saved_cpm_bits[2], active_vote;
 	u64 started_ns, changed_ns, on_ns, ticks, changes;
 	unsigned int last_cpu, last_load;
 	bool active, stopping, instance_added, stats_created;
+	bool cpm_valid, cpm_raised;
 };
+
+/* Caller holds vote->lock. Only bit0 is owned; bits27:20 are status. */
+static void cpu_vote_cpm_write(struct apple_pmp_cpu_vote *vote, bool raised)
+{
+	unsigned int i;
+
+	if (!vote->cpm[0] || (!READ_ONCE(cpu_vote_cpm) && !vote->cpm_valid))
+		return;
+	raised = raised && READ_ONCE(cpu_vote_cpm);
+	if (vote->cpm_valid && raised == vote->cpm_raised)
+		return;
+	for (i = 0; i < 2; i++) {
+		u32 old = readl(vote->cpm[i]);
+
+		writel(apple_pmp_cpm_control(old, raised), vote->cpm[i]);
+		readl(vote->cpm[i]);
+	}
+	vote->cpm_valid = true;
+	vote->cpm_raised = raised;
+}
 
 /* Called with lock held, after PMP has completed its ready handshake. */
 static void cpu_vote_write(struct apple_pmp_cpu_vote *vote, unsigned int value)
 {
 	u64 now;
 
+	cpu_vote_cpm_write(vote, value != 0);
 	if (value == vote->active_vote)
 		return;
 	now = ktime_get_ns();
@@ -270,12 +297,13 @@ static ssize_t cpu_vote_show(struct device *dev, struct device_attribute *attr,
 	now = ktime_get_ns();
 	on = vote->on_ns + (vote->active_vote ? now - vote->changed_ns : 0);
 	n = sysfs_emit(buf,
-		       "active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
+		       "active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u cpm=%u sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
 		vote->active, vote->active_vote,
 		vote->active ? readl(vote->request) : 0,
 		vote->last_cpu, vote->last_load, vote->ticks, vote->changes,
 		on, now - vote->started_ns, READ_ONCE(cpu_vote_value),
 		CPU_VOTE_INTERVAL_MS, CPU_VOTE_HOLD_MS, CPU_VOTE_THRESHOLD,
+		READ_ONCE(cpu_vote_cpm) && !!vote->cpm[0],
 		READ_ONCE(cpu_vote_sources), atomic_read(&gpu_flights),
 		atomic64_read(&gpu_last_ms));
 	mutex_unlock(&vote->lock);
@@ -287,6 +315,7 @@ struct apple_pmp_cpu_vote *
 apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 {
 	struct apple_pmp_cpu_vote *vote;
+	bool cpm_e, cpm_p;
 	int cpu;
 
 	if (!cpu_vote_enabled || !events ||
@@ -304,6 +333,19 @@ apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 	vote->request = devm_platform_ioremap_resource_byname(pdev, "perf-vote");
 	if (IS_ERR(vote->request))
 		return ERR_CAST(vote->request);
+	/* Old DTBs retain the v13 policy without the optional CPM control. */
+	cpm_e = !!platform_get_resource_byname(pdev, IORESOURCE_MEM, "cpm-e");
+	cpm_p = !!platform_get_resource_byname(pdev, IORESOURCE_MEM, "cpm-p");
+	if (cpm_e != cpm_p)
+		return ERR_PTR(-EINVAL);
+	if (cpm_e) {
+		vote->cpm[0] = devm_platform_ioremap_resource_byname(pdev, "cpm-e");
+		if (IS_ERR(vote->cpm[0]))
+			return ERR_CAST(vote->cpm[0]);
+		vote->cpm[1] = devm_platform_ioremap_resource_byname(pdev, "cpm-p");
+		if (IS_ERR(vote->cpm[1]))
+			return ERR_CAST(vote->cpm[1]);
+	}
 	vote->dev = &pdev->dev;
 	vote->events = events;
 	vote->hotplug_state = -1;
@@ -351,6 +393,11 @@ void apple_pmp_cpu_vote_start(struct apple_pmp_cpu_vote *vote)
 		vote->saved_enables[i] = old & BIT(1);
 		writel(old | BIT(1), vote->events + 4 * i);
 		readl(vote->events + 4 * i);
+	}
+	if (vote->cpm[0]) {
+		for (i = 0; i < 2; i++)
+			vote->saved_cpm_bits[i] = readl(vote->cpm[i]) & 1;
+		cpu_vote_cpm_write(vote, false);
 	}
 	vote->started_ns = ktime_get_ns();
 	vote->changed_ns = vote->started_ns;
@@ -407,6 +454,16 @@ void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote)
 			writel((old & ~BIT(1)) | vote->saved_enables[i],
 			       vote->events + 4 * i);
 			readl(vote->events + 4 * i);
+		}
+		if (vote->cpm_valid) {
+			for (i = 0; i < 2; i++) {
+				u32 old = readl(vote->cpm[i]);
+
+				writel(apple_pmp_cpm_control(old, vote->saved_cpm_bits[i]),
+				       vote->cpm[i]);
+				readl(vote->cpm[i]);
+			}
+			vote->cpm_valid = false;
 		}
 		vote->active = false;
 	}

@@ -2,6 +2,15 @@
 #ifndef APPLE_PMP_VOTE_POLICY_H
 #define APPLE_PMP_VOTE_POLICY_H
 
+/*
+ * CPM +0x2f0: modify the bit0 request without echoing the independently
+ * changing bits27:20 status field. Preserve every other control bit.
+ */
+static inline unsigned int apple_pmp_cpm_control(unsigned int old, int raised)
+{
+	return (old & ~((0xffU << 20) | 1U)) | !!raised;
+}
+
 /* Activity sources share one release deadline and one vote output. */
 #define APPLE_PMP_VOTE_CPU (1U << 0)
 #define APPLE_PMP_VOTE_GPU (1U << 1)
