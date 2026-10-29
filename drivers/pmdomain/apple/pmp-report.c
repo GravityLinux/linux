@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/unaligned.h>
+#include <linux/soc/apple/pmp-report.h>
 
 #define PMP_REPORT_READY 0x1
 
@@ -89,6 +90,17 @@ out:
 	of_node_put(pmp);
 	return ret;
 }
+int apple_pmp_report_wait_ready(struct device *dev, unsigned long timeout_us)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+	u64 status;
+
+	if (!rep)
+		return -EPROBE_DEFER;
+	return readq_poll_timeout(rep->base + rep->offsets->status, status,
+				 status & PMP_REPORT_READY, 1000, timeout_us);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -161,8 +173,19 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8122 = {
 	.status = 0x10,
 };
 
+/* Native T6041 report accesses: the read bank expands each PTD entry
+ * to 16 bytes, while the update bank uses 8 bytes per entry.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
+	.tgt_read = 0x1e00,
+	.tgt_write = 0x10f00,
+	.actual = 0x1e80,
+	.status = 0x10,
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
+	{ .compatible = "apple,t6041-pmp-v2-report", .data = &apple_pmp_offsets_t6041 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
@@ -242,6 +265,10 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ent->dev = dev;
+	/* All report accesses use MMIO, a spinlock and atomic polling. This
+	 * domain can therefore parent the IRQ-safe PMGR power-state domains.
+	 */
+	ent->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 
 	ret = of_property_read_u32(node, "reg", &ent->id);
 	if (ret)
@@ -254,7 +281,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "missing label property\n");
 
 	if (of_property_read_bool(node, "apple,always-on")) {
-		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP | GENPD_FLAG_ALWAYS_ON;
 		apple_pmp_report_set_state(&ent->genpd, true);
 	}
 
@@ -262,7 +289,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
 	ent->genpd.power_off = apple_pmp_report_entry_power_off;
 
-	ret = pm_genpd_init(&ent->genpd, NULL, true);
+	ret = pm_genpd_init(&ent->genpd, NULL,
+			    !(ent->genpd.flags & GENPD_FLAG_ALWAYS_ON));
 	if (ret)
 		return dev_err_probe(dev, ret, "pm_genpd_init failed\n");
 
