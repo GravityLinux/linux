@@ -38,6 +38,7 @@ properties:
       - items:
           - enum:
               - apple,t6020-cluster-cpufreq
+              - apple,t6041-cluster-cpufreq
               - apple,t8132-cluster-cpufreq
           - const: apple,t8112-cluster-cpufreq
 
