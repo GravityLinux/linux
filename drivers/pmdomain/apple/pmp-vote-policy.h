@@ -11,6 +11,20 @@ struct apple_pmp_vote_policy {
 	int busy_seen;
 };
 
+/*
+ * A short GPU pulse may start and finish between two samples. Keep its
+ * timestamp, and never shorten a newer CPU activity hold with an old event.
+ */
+static inline void
+apple_pmp_vote_note_activity(struct apple_pmp_vote_policy *policy,
+			    unsigned long long when_ms)
+{
+	if (when_ms && (!policy->busy_seen || when_ms > policy->last_busy_ms)) {
+		policy->last_busy_ms = when_ms;
+		policy->busy_seen = 1;
+	}
+}
+
 static inline int apple_pmp_vote_valid(unsigned int value)
 {
 	return (value & 0xf) <= 5 && (value >> 4) <= 3;
