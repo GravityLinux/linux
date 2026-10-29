@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/thermal/thermal.h>
+
+/*
+ * The maximum of these load-responsive SMC keys covered every hottest Tp
+ * reading in the cold and warm J713 mixed-load captures of 2026-10-28.
+ * Keep key identity independent of optional hwmon channel enumeration.
+ */
+&smc_hwmon {
+	#thermal-sensor-cells = <0>;
+	apple,thermal-sensor-keys = "Tp0W", "Tp0Z", "Tp0c", "Tp0f", "Tp3P", "Tp3X";
+
+	temperature-Tp0W {
+		apple,key-id = "Tp0W";
+		label = "CPU Hotspot Tp0W";
+	};
+	temperature-Tp0Z {
+		apple,key-id = "Tp0Z";
+		label = "CPU Hotspot Tp0Z";
+	};
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "CPU Hotspot Tp0c";
+	};
+	temperature-Tp3P {
+		apple,key-id = "Tp3P";
+		label = "CPU Hotspot Tp3P";
+	};
+	temperature-Tp3X {
+		apple,key-id = "Tp3X";
+		label = "CPU Hotspot Tp3X";
+	};
+};
+
+/* The policy representative can be any online CPU in its cluster. */
+&cpu_e0 { #cooling-cells = <2>; };
+&cpu_e1 { #cooling-cells = <2>; };
+&cpu_e2 { #cooling-cells = <2>; };
+&cpu_e3 { #cooling-cells = <2>; };
+&cpu_e4 { #cooling-cells = <2>; };
+&cpu_e5 { #cooling-cells = <2>; };
+&cpu_p0 { #cooling-cells = <2>; };
+&cpu_p1 { #cooling-cells = <2>; };
+&cpu_p2 { #cooling-cells = <2>; };
+&cpu_p3 { #cooling-cells = <2>; };
+
+/ {
+	thermal-zones {
+		cpu-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			thermal-sensors = <&smc_hwmon>;
+
+			trips {
+				cpu_warm: cpu-warm {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				cpu_hot: cpu-hot {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map-warm {
+					trip = <&cpu_warm>;
+					cooling-device = <&cpu_p0 0 THERMAL_NO_LIMIT>,
+							 <&cpu_p1 0 THERMAL_NO_LIMIT>,
+							 <&cpu_p2 0 THERMAL_NO_LIMIT>,
+							 <&cpu_p3 0 THERMAL_NO_LIMIT>;
+				};
+				map-hot {
+					trip = <&cpu_hot>;
+					/*
+					 * E: 8 OPPs, P: 20 OPPs, including turbo entries.
+					 * cpufreq cooling counts those entries with boost
+					 * either on or off. State 7/19 selects 900/912 MHz.
+					 * Equal lower/upper limits clamp immediately.
+					 */
+					cooling-device = <&cpu_e0 7 7>, <&cpu_e1 7 7>,
+							 <&cpu_e2 7 7>, <&cpu_e3 7 7>,
+							 <&cpu_e4 7 7>, <&cpu_e5 7 7>,
+							 <&cpu_p0 19 19>, <&cpu_p1 19 19>,
+							 <&cpu_p2 19 19>, <&cpu_p3 19 19>;
+				};
+			};
+		};
+	};
+};
