@@ -7,10 +7,14 @@ config SND_SOC_APPLE_AOP_AUDIO
 	depends on RUST
 	select APPLE_AOP
 	select SND_DMAENGINE_PCM
+	select SND_SOC_TAS2764 if I2C
+	select I2C_APPLE if ARCH_APPLE && I2C
+	select REGULATOR_FIXED_VOLTAGE if REGULATOR
 	help
 	  This option enables an ASoC driver for sound devices connected to the AOP
 	  co-processor on ARM Macs. This includes the built-in microphone on those
-	  machines.
+	  machines, with protected AOP-configured speaker playback on supported
+	  boards when the amplifier dependencies are enabled.
 
 config SND_SOC_APPLE_NEO_MIC
 	bool "Apple T8140 AOP microphone capture"
