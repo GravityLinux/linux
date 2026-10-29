@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* T8132 CPU activity input to PMP's memory and fabric policy. */
+/* T8132 CPU/GPU activity inputs to PMP's memory and fabric policy. */
+#include <linux/atomic.h>
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
 #include <linux/cpuhotplug.h>
@@ -12,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/workqueue.h>
 
 #include "pmp-cpu-vote.h"
@@ -23,7 +25,41 @@
 
 static bool cpu_vote_enabled = true;
 module_param_named(cpu_vote, cpu_vote_enabled, bool, 0444);
-MODULE_PARM_DESC(cpu_vote, "Enable the T8132 CPU-load memory/fabric vote");
+MODULE_PARM_DESC(cpu_vote, "Enable the T8132 CPU/GPU memory/fabric vote");
+
+static unsigned int cpu_vote_sources = APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU;
+static atomic_t gpu_flights = ATOMIC_INIT(0);
+static atomic64_t gpu_last_ms = ATOMIC64_INIT(0);
+
+static int cpu_vote_set_sources(const char *text, const struct kernel_param *kp)
+{
+	unsigned int value;
+	int ret = kstrtouint(text, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value & ~(APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU))
+		return -EINVAL;
+	WRITE_ONCE(*(unsigned int *)kp->arg, value);
+	return 0;
+}
+
+static const struct kernel_param_ops cpu_vote_sources_ops = {
+	.set = cpu_vote_set_sources,
+	.get = param_get_uint,
+};
+module_param_cb(cpu_vote_sources, &cpu_vote_sources_ops, &cpu_vote_sources, 0644);
+MODULE_PARM_DESC(cpu_vote_sources, "Activity mask: bit0 CPU, bit1 GPU");
+
+/* Scalar publication only: no GPU pointer, allocation, locking or MMIO. */
+void apple_pmp_cpu_vote_gpu_activity(unsigned int active)
+{
+	if (!READ_ONCE(cpu_vote_enabled))
+		return;
+	atomic64_set(&gpu_last_ms, ktime_to_ms(ktime_get()));
+	atomic_set(&gpu_flights, active);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_cpu_vote_gpu_activity);
 
 /* Low nibble: DCS F1..F6; high nibble: SoC VMIN..VOVD. */
 static unsigned int cpu_vote_value = 0x35;
@@ -63,7 +99,7 @@ struct apple_pmp_cpu_vote {
 	struct mutex lock;
 	struct delayed_work release_work;
 	struct cpu_sample *samples;
-	cpumask_t p_cpus;
+	cpumask_t p_cpus, sample_cpus;
 	struct apple_pmp_vote_policy policy;
 	struct hlist_node hotplug_node;
 	int hotplug_state;
@@ -90,17 +126,43 @@ static void cpu_vote_write(struct apple_pmp_cpu_vote *vote, unsigned int value)
 	vote->changes++;
 }
 
+static u64 cpu_vote_idle_time(unsigned int cpu, u64 *wall)
+{
+#ifdef CONFIG_CPU_FREQ
+	return get_cpu_idle_time(cpu, wall, 0);
+#else
+	*wall = 0;
+	return 0;
+#endif
+}
+
+/*
+ * Called with lock held. Read the event before the clock so its timestamp
+ * cannot appear to be in the future relative to the policy decision.
+ */
+static unsigned int cpu_vote_gpu_input(struct apple_pmp_cpu_vote *vote, u64 *now)
+{
+	u64 last = atomic64_read(&gpu_last_ms);
+	unsigned int active = atomic_read(&gpu_flights);
+
+	*now = ktime_to_ms(ktime_get());
+	if (!(READ_ONCE(cpu_vote_sources) & APPLE_PMP_VOTE_GPU))
+		return 0;
+	apple_pmp_vote_note_activity(&vote->policy, min(last, *now));
+	return active ? APPLE_PMP_VOTE_GPU : 0;
+}
+
 static void cpu_vote_release(struct work_struct *work)
 {
 	struct apple_pmp_cpu_vote *vote = container_of(to_delayed_work(work),
 				struct apple_pmp_cpu_vote, release_work);
 	u64 now;
-	unsigned int next;
+	unsigned int next, inputs;
 
 	mutex_lock(&vote->lock);
-	now = ktime_to_ms(ktime_get());
+	inputs = cpu_vote_gpu_input(vote, &now);
 	if (!vote->stopping) {
-		next = apple_pmp_vote_decide(&vote->policy, now, 0,
+		next = apple_pmp_vote_decide(&vote->policy, now, inputs,
 					     CPU_VOTE_HOLD_MS,
 					     READ_ONCE(cpu_vote_value));
 		cpu_vote_write(vote, next);
@@ -117,8 +179,9 @@ static void cpu_vote_sample(struct work_struct *work)
 	struct cpu_sample *sample = container_of(to_delayed_work(work),
 					       struct cpu_sample, work);
 	struct apple_pmp_cpu_vote *vote = sample->vote;
-	u64 wall, idle = get_cpu_idle_time(sample->cpu, &wall, 0);
-	unsigned int load = 0, next;
+	u64 wall, idle = cpu_vote_idle_time(sample->cpu, &wall);
+	unsigned int load = 0, next, inputs;
+	u64 now;
 
 	mutex_lock(&vote->lock);
 	if (vote->stopping || !sample->enabled)
@@ -135,15 +198,19 @@ static void cpu_vote_sample(struct work_struct *work)
 	vote->last_cpu = sample->cpu;
 	vote->last_load = load;
 	vote->ticks++;
-	next = apple_pmp_vote_decide(&vote->policy, ktime_to_ms(ktime_get()),
-		apple_pmp_vote_cpu_input(load, CPU_VOTE_THRESHOLD),
-		CPU_VOTE_HOLD_MS, READ_ONCE(cpu_vote_value));
+	inputs = cpu_vote_gpu_input(vote, &now);
+	if ((READ_ONCE(cpu_vote_sources) & APPLE_PMP_VOTE_CPU) &&
+	    cpumask_test_cpu(sample->cpu, &vote->p_cpus))
+		inputs |= apple_pmp_vote_cpu_input(load, CPU_VOTE_THRESHOLD);
+	next = apple_pmp_vote_decide(&vote->policy, now, inputs,
+				     CPU_VOTE_HOLD_MS, READ_ONCE(cpu_vote_value));
 	cpu_vote_write(vote, next);
-	if (load >= CPU_VOTE_THRESHOLD)
+	if (next)
 		mod_delayed_work(system_wq, &vote->release_work,
-				 msecs_to_jiffies(CPU_VOTE_HOLD_MS));
+			msecs_to_jiffies(CPU_VOTE_HOLD_MS -
+					(now - vote->policy.last_busy_ms)));
 	/*
-	 * Each P-core has its own deferrable timer. Sampling neither depends
+	 * Each core has its own deferrable timer. Sampling neither depends
 	 * on another cluster waking nor periodically wakes an idle core.
 	 */
 	queue_delayed_work_on(sample->cpu, system_wq, &sample->work,
@@ -158,10 +225,10 @@ static int cpu_vote_online(unsigned int cpu, struct hlist_node *node)
 				struct apple_pmp_cpu_vote, hotplug_node);
 	struct cpu_sample *sample = &vote->samples[cpu];
 
-	if (!cpumask_test_cpu(cpu, &vote->p_cpus))
+	if (!cpumask_test_cpu(cpu, &vote->sample_cpus))
 		return 0;
 	mutex_lock(&vote->lock);
-	sample->idle = get_cpu_idle_time(cpu, &sample->wall, 0);
+	sample->idle = cpu_vote_idle_time(cpu, &sample->wall);
 	sample->valid = true;
 	sample->enabled = true;
 	queue_delayed_work_on(cpu, system_wq, &sample->work,
@@ -176,7 +243,7 @@ static int cpu_vote_offline(unsigned int cpu, struct hlist_node *node)
 				struct apple_pmp_cpu_vote, hotplug_node);
 	struct cpu_sample *sample = &vote->samples[cpu];
 
-	if (!cpumask_test_cpu(cpu, &vote->p_cpus))
+	if (!cpumask_test_cpu(cpu, &vote->sample_cpus))
 		return 0;
 	mutex_lock(&vote->lock);
 	sample->enabled = false;
@@ -203,12 +270,14 @@ static ssize_t cpu_vote_show(struct device *dev, struct device_attribute *attr,
 	now = ktime_get_ns();
 	on = vote->on_ns + (vote->active_vote ? now - vote->changed_ns : 0);
 	n = sysfs_emit(buf,
-		       "active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u\n",
+		       "active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
 		vote->active, vote->active_vote,
 		vote->active ? readl(vote->request) : 0,
 		vote->last_cpu, vote->last_load, vote->ticks, vote->changes,
 		on, now - vote->started_ns, READ_ONCE(cpu_vote_value),
-		CPU_VOTE_INTERVAL_MS, CPU_VOTE_HOLD_MS, CPU_VOTE_THRESHOLD);
+		CPU_VOTE_INTERVAL_MS, CPU_VOTE_HOLD_MS, CPU_VOTE_THRESHOLD,
+		READ_ONCE(cpu_vote_sources), atomic_read(&gpu_flights),
+		atomic64_read(&gpu_last_ms));
 	mutex_unlock(&vote->lock);
 	return n;
 }
@@ -244,8 +313,11 @@ apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 		struct device_node *np = of_cpu_device_node_get(cpu);
 		struct cpu_sample *sample = &vote->samples[cpu];
 
-		if (of_device_is_compatible(np, "apple,donan-p")) {
+		if (of_device_is_compatible(np, "apple,donan-p"))
 			cpumask_set_cpu(cpu, &vote->p_cpus);
+		if (of_device_is_compatible(np, "apple,donan-p") ||
+		    of_device_is_compatible(np, "apple,donan-e")) {
+			cpumask_set_cpu(cpu, &vote->sample_cpus);
 			sample->cpu = cpu;
 			sample->vote = vote;
 			INIT_DEFERRABLE_WORK(&sample->work, cpu_vote_sample);
@@ -296,8 +368,9 @@ void apple_pmp_cpu_vote_start(struct apple_pmp_cpu_vote *vote)
 	else
 		vote->stats_created = true;
 	dev_info(vote->dev,
-		 "CPU memory/fabric vote enabled: value=%#x P=%*pbl period=%u ms threshold=%u%% hold=%u ms\n",
-		 READ_ONCE(cpu_vote_value), cpumask_pr_args(&vote->p_cpus),
+		 "CPU/GPU memory/fabric vote enabled: sources=%#x value=%#x P=%*pbl period=%u ms threshold=%u%% hold=%u ms\n",
+		 READ_ONCE(cpu_vote_sources), READ_ONCE(cpu_vote_value),
+		 cpumask_pr_args(&vote->p_cpus),
 		 CPU_VOTE_INTERVAL_MS, CPU_VOTE_THRESHOLD, CPU_VOTE_HOLD_MS);
 }
 

@@ -28,6 +28,17 @@ int main(void)
 		APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU, 80, 0x35) == 0x35);
 	assert(apple_pmp_vote_decide(&p, 11099, 0, 80, 0x35) == 0x35);
 	assert(apple_pmp_vote_decide(&p, 11100, 0, 80, 0x35) == 0);
+	/* Preserve a complete GPU pulse without adding a sampling period. */
+	apple_pmp_vote_note_activity(&p, 12000);
+	assert(apple_pmp_vote_decide(&p, 12020, 0, 80, 0x35) == 0x35);
+	apple_pmp_vote_note_activity(&p, 11999);
+	assert(apple_pmp_vote_decide(&p, 12080, 0, 80, 0x35) == 0);
+	/* An in-flight GPU retains the floor even without CPU demand. */
+	assert(apple_pmp_vote_decide(&p, 13000, APPLE_PMP_VOTE_GPU, 80, 0x35) == 0x35);
+	assert(apple_pmp_vote_decide(&p, 14000, APPLE_PMP_VOTE_GPU, 80, 0x35) == 0x35);
+	apple_pmp_vote_note_activity(&p, 14010);
+	assert(apple_pmp_vote_decide(&p, 14089, 0, 80, 0x35) == 0x35);
+	assert(apple_pmp_vote_decide(&p, 14090, 0, 80, 0x35) == 0);
 	assert(apple_pmp_vote_valid(0) && apple_pmp_vote_valid(0x15));
 	assert(apple_pmp_vote_valid(0x25) && apple_pmp_vote_valid(0x35));
 	assert(!apple_pmp_vote_valid(0x36) && !apple_pmp_vote_valid(0x40));
