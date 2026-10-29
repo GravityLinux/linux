@@ -20,6 +20,7 @@ mod g16_power;
 mod g16_queue_fail;
 mod g16_render;
 mod g16_stamp;
+mod g16_thermal;
 mod g16_timeline;
 mod g16_tvb;
 mod g16_vm;
@@ -64,6 +65,8 @@ impl platform::Driver for M4Gpu {
         let dev = pdev.as_ref();
         if !(11..=g16_tvb::MAX_BLOCKS).contains(&module_parameters::tvb_max_blocks.value())
             || module_parameters::dependency_kind.value() > 1
+            || (module_parameters::fast_die_limit_c.value() != 0
+                && module_parameters::extra0.value() == 0)
         {
             return Err(EINVAL);
         }
@@ -155,6 +158,10 @@ kernel::module_platform_driver! {
         extra0: u32 {
             default: 1,
             description: "1 (default) fills the extra_0 policy object (power and thermal controller parameters) from the bundle; 0 leaves it zero, as before",
+        },
+        fast_die_limit_c: u32 {
+            default: 0,
+            description: "Firmware fast-die thermal limit in degrees C: 0 keeps 110 C; override must be 50..110 and above the ADT release temperature. Requires extra0=1. J713 qualification candidate: 95",
         },
         probe_only: u32 {
             default: 0,
