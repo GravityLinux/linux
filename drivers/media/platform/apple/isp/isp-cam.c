@@ -70,6 +70,7 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX913_7523_01] = {0x913, 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
 	[ISP_VD56G0_6221_01] = {0xd56, 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
 	[ISP_VD56G0_6222_01] = {0xd56, 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
+	[ISP_SENSOR_0958] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4},
 };
 // clang-format on
 
@@ -152,6 +153,13 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 	case 0x913:
 		id = ISP_IMX913_7523_01;
 		break;
+	case 0x958:
+		if (isp->hw->gen != ISP_GEN_T6041) {
+			err = -EINVAL;
+			break;
+		}
+		id = ISP_SENSOR_0958;
+		break;
 	case 0xd56:
 		id = ISP_VD56G0_6221_01;
 		break;
@@ -223,7 +231,7 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
 	     fmt->id != ISP_IMX558_1925_03 &&
-	     fmt->id != ISP_IMX364_8720_01)) {
+	     fmt->id != ISP_IMX364_8720_01 && fmt->id != ISP_SENSOR_0958)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
@@ -313,6 +321,9 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	u32 magic;
 	int err;
 
+	if (!setfile->path)
+		return -ENOENT;
+
 	err = request_firmware(&fw, setfile->path, isp->dev);
 	if (err) {
 		dev_err(isp->dev, "failed to request setfile '%s': %d\n",
@@ -337,8 +348,13 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	memcpy(isp->data_surf->virt, (void *)fw->data, setfile->size);
 	release_firmware(fw);
 
-	return isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
-					setfile->size);
+	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
+				       setfile->size);
+	if (!err)
+		dev_info(isp->dev, "loaded calibration setfile '%s' (%zu bytes)\n",
+			 setfile->path, setfile->size);
+
+	return err;
 }
 
 static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)

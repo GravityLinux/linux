@@ -26,6 +26,8 @@ static int cisp_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 	req->arg0 = isp->cmd_iova;
 	req->arg1 = insize;
 	req->arg2 = outsize;
+	if (isp->hw->gen == ISP_GEN_T6041 && !outsize)
+		req->arg2 = insize;
 
 	memcpy(isp->cmd_virt, args, insize);
 	err = ipc_chan_send(isp, chan, timeout);
@@ -229,6 +231,46 @@ int isp_cmd_neo_dsid_config(struct apple_isp *isp)
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_t6041_start(struct apple_isp *isp)
+{
+	/* Native 26.6.2 publishes eight DSID ranges through opcode 0x3206. */
+	struct {
+		u64 opcode;
+		u32 count;
+		u32 range;
+		u64 bases[8];
+	} __packed dsid = {
+		.opcode = CISP_OPCODE(0x3206), .count = 8, .range = 0x2fc,
+		.bases = { 0x2201d4000, 0x2221d4000, 0x2241d4000, 0x2261d4000,
+			   0x2281d4000, 0x22a1d4000, 0x22c1d4000, 0x22e1d4000 },
+	};
+	struct {
+		u64 opcode;
+		s32 value;
+	} __packed rpc = { .opcode = CISP_OPCODE(0x13), .value = -3 };
+	int ret;
+
+	static_assert(sizeof(dsid) == 0x50);
+	static_assert(sizeof(rpc) == 0xc);
+	ret = isp_cmd_print_enable(isp, 1);
+	if (ret)
+		return ret;
+	ret = isp_cmd_trace_enable(isp, 0x18);
+	if (ret)
+		return ret;
+	ret = CISP_SEND_INOUT(isp, dsid);
+	if (ret)
+		return ret;
+	ret = isp_cmd_pmp_ctrl_set(isp, isp->hw->clock_scratch, 0, 0, 8,
+				 isp->hw->bandwidth_scratch, 0, 0, 8);
+	if (ret)
+		return ret;
+	ret = CISP_SEND_IN(isp, rpc);
+	if (ret)
+		return ret;
+	return isp_cmd_start(isp, 0);
+}
+
 int isp_cmd_fid_enter(struct apple_isp *isp)
 {
 	struct cmd_fid_enter args = {
@@ -275,6 +317,21 @@ int isp_cmd_flicker_sensor_set(struct apple_isp *isp, u32 mode)
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args)
 {
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		struct {
+			struct cmd_ch_info prefix;
+			u8 tail[0x190 - sizeof(struct cmd_ch_info)];
+		} __packed native = { .prefix = {
+			.opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET), .chan = chan,
+		} };
+		int ret;
+
+		static_assert(sizeof(native) == 0x190);
+		ret = cisp_send_read(isp, &native, sizeof(native), sizeof(native));
+		if (!ret)
+			memcpy(args, &native.prefix, sizeof(*args));
+		return ret;
+	}
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET);
 	args->chan = chan;
 	if (isp->hw->gen == ISP_GEN_T8140)
@@ -285,6 +342,22 @@ int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
 				 struct cmd_ch_camera_config *args)
 {
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		struct {
+			struct cmd_ch_camera_config prefix;
+			u8 tail[0x120 - sizeof(struct cmd_ch_camera_config)];
+		} __packed native = { .prefix = {
+			.opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET),
+			.chan = chan, .preset = preset,
+		} };
+		int ret;
+
+		static_assert(sizeof(native) == 0x120);
+		ret = cisp_send_read(isp, &native, sizeof(native), sizeof(native));
+		if (!ret)
+			memcpy(args, &native.prefix, sizeof(*args));
+		return ret;
+	}
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET);
 	args->preset = preset;
 	args->chan = chan;

@@ -690,4 +690,6 @@ int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
 				     u32 enable);
 int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
 
+int isp_cmd_t6041_start(struct apple_isp *isp);
+
 #endif /* __ISP_CMD_H__ */

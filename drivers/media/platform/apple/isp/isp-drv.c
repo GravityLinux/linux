@@ -9,9 +9,11 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
@@ -235,6 +237,8 @@ static const char * isp_fw2str(enum isp_firmware_version version)
 		return "14.7";
 	case ISP_FIRMWARE_V_26_6:
 		return "26.6";
+	case ISP_FIRMWARE_V_26_6_2:
+		return "26.6.2";
 	default:
 		return "unknown";
 	}
@@ -261,6 +265,8 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 			return ISP_FIRMWARE_V_13_5;
 		else if (ver[0] == 14 && ver[1] == 7 && ver[2] == 0)
 			return ISP_FIRMWARE_V_14_7;
+		else if (ver[0] == 26 && ver[1] == 6 && ver[2] == 2)
+			return ISP_FIRMWARE_V_26_6_2;
 		else if (ver[0] == 26 && ver[1] == 6)
 			return ISP_FIRMWARE_V_26_6;
 
@@ -314,6 +320,21 @@ static int apple_isp_probe(struct platform_device *pdev)
 	isp->hw = of_device_get_match_data(dev);
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		struct device_node *report_node __free(device_node) =
+			of_parse_phandle(dev->of_node, "apple,pmp-report", 0);
+		struct platform_device *report;
+
+		if (!report_node)
+			return -EINVAL;
+		report = of_find_device_by_node(report_node);
+		if (!report)
+			return -EPROBE_DEFER;
+		err = apple_pmp_report_wait_ready(&report->dev, 15000000);
+		put_device(&report->dev);
+		if (err)
+			return dev_err_probe(dev, err, "PMP not ready for ISP startup\n");
+	}
 
 	/* Differences between firmware versions are rather minor so try to work
 	 * with unknown firmware.
@@ -386,6 +407,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 		err = PTR_ERR(isp->mbox2);
 		goto detach_genpd;
 	}
+
 
 	isp->irq = platform_get_irq(pdev, 0);
 	if (isp->irq < 0) {
@@ -652,8 +674,21 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.lpdp = false,
 };
 
+static const struct apple_isp_hw apple_isp_hw_t6041 = {
+	.gen = ISP_GEN_T6041,
+	/* Addresses and field widths observed in native PMP_CTRL_SET. */
+	.clock_scratch = 0x5003d0fa8,
+	.clock_size = 8,
+	.bandwidth_scratch = 0x504824000,
+	.bandwidth_size = 8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+	.scl1 = true,
+	.meta_size = ISP_META_SIZE_T6031,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
+	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6041 },
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
 	{ .compatible = "apple,t8122-isp", .data = &apple_isp_hw_t8122 },

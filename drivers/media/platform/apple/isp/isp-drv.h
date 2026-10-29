@@ -33,6 +33,7 @@ enum isp_generation {
 	ISP_GEN_T8112,
 	ISP_GEN_T6031,
 	ISP_GEN_T8140,
+	ISP_GEN_T6041,
 };
 
 enum isp_firmware_version {
@@ -42,6 +43,7 @@ enum isp_firmware_version {
 	ISP_FIRMWARE_V_13_5,
 	ISP_FIRMWARE_V_14_7,
 	ISP_FIRMWARE_V_26_6,
+	ISP_FIRMWARE_V_26_6_2,
 };
 
 struct isp_surf {
@@ -179,6 +181,7 @@ enum isp_sensor_id {
 	ISP_IMX913_7523_01,
 	ISP_VD56G0_6221_01,
 	ISP_VD56G0_6222_01,
+	ISP_SENSOR_0958,
 };
 
 struct isp_format {

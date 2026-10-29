@@ -5,6 +5,8 @@
 
 #include <asm/io.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
+#include <linux/iommu.h>
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
 
@@ -32,7 +34,8 @@ static inline u32 isp_coproc_read32(struct apple_isp *isp, u32 reg)
 
 static inline void isp_coproc_write32(struct apple_isp *isp, u32 reg, u32 val)
 {
-	if (isp->hw->gen == ISP_GEN_T8140 && reg == ISP_COPROC_CONTROL)
+	if ((isp->hw->gen == ISP_GEN_T8140 || isp->hw->gen == ISP_GEN_T6041) &&
+	    reg == ISP_COPROC_CONTROL)
 		reg = 0x1600044;
 	writel(val, isp->coproc + reg);
 }
@@ -83,7 +86,7 @@ static void apple_isp_power_down_domains(struct apple_isp *isp)
 		ret = pm_runtime_put_sync(isp->pd_dev[i]);
 		if (ret < 0)
 			dev_err(isp->dev,
-				"Failed to power up power domain %d: %d\n", i, ret);
+				"Failed to power down power domain %d: %d\n", i, ret);
 	}
 
 	isp->pds_active = false;
@@ -142,6 +145,36 @@ struct isp_firmware_bootargs {
 	u32 unk9;
 } __packed;
 static_assert(sizeof(struct isp_firmware_bootargs) == 0x180);
+
+/* T6041 / macOS 26.6.2. Unknown fields retain their observed names/offsets;
+ * this is a data layout, not a reinterpretation of the older boot arguments.
+ */
+struct isp_firmware_bootargs_t6041 {
+	u64 opaque_firmware_addr;
+	u64 ipc_iova;
+	u64 shared_base;
+	u64 shared_size;
+	u64 extra_iova;
+	u64 extra_size;
+	u64 platform_id;
+	u64 log_iova;
+	u64 log_size;
+	u64 log_entry_size;
+	u64 opaque_50;
+	u8 reserved_58[0x10];
+	u64 opaque_68;
+	u8 reserved_70[0x18];
+	u64 opaque_88;
+	u8 reserved_90[0x40];
+	u64 opaque_d0;
+	u8 reserved_d8[0x48];
+	u64 opaque_120;
+	u8 reserved_128[0x58];
+} __packed;
+static_assert(sizeof(struct isp_firmware_bootargs_t6041) == 0x180);
+static_assert(offsetof(struct isp_firmware_bootargs_t6041, log_iova) == 0x38);
+static_assert(offsetof(struct isp_firmware_bootargs_t6041, opaque_88) == 0x88);
+static_assert(offsetof(struct isp_firmware_bootargs_t6041, opaque_120) == 0x120);
 
 struct isp_chan_desc {
 	char name[64];
@@ -227,6 +260,10 @@ static int isp_enable_irq(struct apple_isp *isp)
 	isp_dbg(isp, "about to enable interrupts...\n");
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0xf);
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		isp_mbox_write32(isp, 0x18, 0);
+		isp_mbox_write32(isp, 0x38, 0);
+	}
 
 	return 0;
 }
@@ -245,6 +282,7 @@ static int isp_reset_coproc(struct apple_isp *isp)
 		udelay(10);
 		return 0;
 	}
+
 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
 
 	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0, 0xff00ff);
@@ -313,7 +351,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 		return err;
 
 
-	isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
+	if (isp->hw->gen != ISP_GEN_T6041)
+		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
 
 #if 0
 	/* This doesn't work well with system sleep */
@@ -325,7 +364,10 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	}
 #endif
 
-	err = isp_reset_coproc(isp);
+	/* Start T6041 from the retained iBoot state, as on fresh native boots.
+	 * Replaying the older reset prefix here prevents the first reply.
+	 */
+	err = isp->hw->gen == ISP_GEN_T6041 ? 0 : isp_reset_coproc(isp);
 	if (err < 0)
 		return err;
 
@@ -340,14 +382,27 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	isp_gpio_write32(isp, ISP_GPIO_3, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_4, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_5, 0x0);
-	isp_gpio_write32(isp, ISP_GPIO_6, 0x0);
+	if (isp->hw->gen != ISP_GEN_T6041)
+		isp_gpio_write32(isp, ISP_GPIO_6, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_7, 0x0);
 	if (isp->hw->gen == ISP_GEN_T8140)
 		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 1);
+	if (isp->hw->gen == ISP_GEN_T6041)
+		isp_gpio_write32(isp, ISP_GPIO_6, 1);
 
-	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
+	if (isp->hw->gen != ISP_GEN_T6041)
+		isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
-	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
+	if (isp->hw->gen != ISP_GEN_T6041)
+		isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		u64 vector = readq(isp->coproc + ISP_COPROC_RVBAR);
+		u64 expected = (isp->fw.heap_top & ~0xffffffffULL) | 1;
+		phys_addr_t code = iommu_iova_to_phys(isp->domain, expected & ~1ULL);
+
+		dev_info(isp->dev, "boot vector %#llx expected %#llx code %pa\n",
+			 vector, expected, &code);
+	}
 	isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x10);
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
@@ -364,6 +419,14 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (retries >= ISP_FIRMWARE_MAX_TRIES) {
 		isp_err(isp,
 			"never received first magic number from firmware\n");
+		if (isp->hw->gen == ISP_GEN_T6041) {
+			for (int i = 0; i < 8; i++)
+				dev_info(isp->dev, "boot GPIO%d=%#x\n", i,
+					 isp_gpio_read32(isp, i * 4));
+			dev_info(isp->dev, "ASC control=%#x status=%#x\n",
+				 isp_coproc_read32(isp, 0x1600044),
+				 isp_coproc_read32(isp, 0x1600048));
+		}
 		return -ENODEV;
 	}
 
@@ -411,6 +474,10 @@ void apple_isp_free_firmware_surface(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 {
+	if (isp->boot_log_surf) {
+		isp_free_surface(isp, isp->boot_log_surf);
+		isp->boot_log_surf = NULL;
+	}
 	isp_free_surface(isp, isp->extra_surf);
 }
 
@@ -477,6 +544,34 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	} else {
 		memcpy(args_virt, &args, sizeof(args));
 	}
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		struct isp_firmware_bootargs_t6041 native = {
+			.opaque_firmware_addr = iommu_iova_to_phys(isp->domain,
+				isp->fw.heap_top & ~0xffffffffULL),
+			.ipc_iova = isp->ipc_surf->iova,
+			.shared_base = args.shared_base,
+			.shared_size = args.shared_size,
+			.extra_iova = args.extra_iova,
+			.extra_size = args.extra_size,
+			.platform_id = isp->platform_id,
+			.log_size = 0x48000,
+			.log_entry_size = 0x90,
+			.opaque_50 = args_offset | 1,
+			.opaque_68 = 0x40,
+			/* Fresh native boots leave this optional field zero. */
+			.opaque_88 = 0,
+			.opaque_d0 = 0x10,
+			.opaque_120 = 1,
+		};
+
+		isp->boot_log_surf = isp_alloc_surface_vmap(isp, native.log_size);
+		if (!isp->boot_log_surf) {
+			err = -ENOMEM;
+			goto free_extra;
+		}
+		native.log_iova = isp->boot_log_surf->iova;
+		memcpy(args_virt, &native, sizeof(native));
+	}
 
 	isp_gpio_write32(isp, ISP_GPIO_0, args_iova);
 	/* TODO: handle this via Kconfig depends? hardware is only present on
@@ -509,7 +604,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	return 0;
 
 free_extra:
-	isp_free_surface(isp, isp->extra_surf);
+	isp_firmware_shutdown_stage2(isp);
 	return err;
 }
 
@@ -718,6 +813,9 @@ static int isp_stop_command_processor(struct apple_isp *isp)
 static int isp_start_command_processor(struct apple_isp *isp)
 {
 	int err;
+
+	if (isp->hw->gen == ISP_GEN_T6041)
+		return isp_cmd_t6041_start(isp);
 
 	err = isp_cmd_print_enable(isp, 1);
 	if (err)
