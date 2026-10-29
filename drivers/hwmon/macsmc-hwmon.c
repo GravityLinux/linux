@@ -27,6 +27,9 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/thermal.h>
+
+#include "macsmc-hwmon-thermal.h"
 
 #define MAX_LABEL_LENGTH	32
 
@@ -86,6 +89,9 @@ struct macsmc_hwmon {
 	struct macsmc_hwmon_sensors curr;
 	struct macsmc_hwmon_sensors power;
 	struct macsmc_hwmon_fans fan;
+	struct macsmc_hwmon_sensor *thermal_sensors;
+	unsigned int thermal_count;
+	struct macsmc_thermal_state thermal_state;
 };
 
 static int macsmc_hwmon_read_label(struct device *dev,
@@ -459,6 +465,127 @@ static int macsmc_hwmon_parse_key(struct device *dev, struct apple_smc *smc,
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_THERMAL_OF)
+static int macsmc_hwmon_passive_trip(struct thermal_trip *trip, void *data)
+{
+	int *highest = data;
+
+	if (trip->type == THERMAL_TRIP_PASSIVE &&
+	    trip->temperature != THERMAL_TEMP_INVALID)
+		*highest = max(*highest, trip->temperature);
+	return 0;
+}
+
+static int macsmc_hwmon_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct macsmc_hwmon *hwmon = thermal_zone_device_priv(tz);
+	bool was_fault = hwmon->thermal_state.fault;
+	int hottest = INT_MIN, failsafe = INT_MIN, error = 0;
+	unsigned int i;
+	long value;
+	int ret;
+
+	/* get_temp runs under the zone lock; the locking iterator would deadlock. */
+	for_each_thermal_trip(tz, macsmc_hwmon_passive_trip, &failsafe);
+	if (!macsmc_thermal_valid(failsafe))
+		return -EINVAL;
+
+	for (i = 0; i < hwmon->thermal_count; i++) {
+		ret = macsmc_hwmon_read_key(hwmon->smc, &hwmon->thermal_sensors[i],
+					    1000, &value);
+		if (!ret && !macsmc_thermal_valid(value))
+			ret = -ERANGE;
+		if (ret) {
+			error = ret;
+			dev_err_ratelimited(hwmon->dev,
+				"Thermal SMC key %#x read failed: %d\n",
+				hwmon->thermal_sensors[i].macsmc_key, ret);
+		} else {
+			hottest = max(hottest, (int)value);
+		}
+	}
+
+	ret = macsmc_thermal_update(&hwmon->thermal_state, hottest, error, failsafe, temp);
+	if (!was_fault && hwmon->thermal_state.fault)
+		dev_err(hwmon->dev,
+			"Thermal sensor fault: forcing control temperature to at least %d mC\n",
+			failsafe);
+	else if (was_fault && !hwmon->thermal_state.fault)
+		dev_info(hwmon->dev, "Thermal sensors recovered after three complete samples\n");
+	return ret;
+}
+
+static const struct thermal_zone_device_ops macsmc_hwmon_thermal_ops = {
+	.get_temp = macsmc_hwmon_thermal_get_temp,
+};
+
+static int macsmc_hwmon_parse_thermal(struct macsmc_hwmon *hwmon)
+{
+	struct device_node *node = hwmon->dev->of_node;
+	struct macsmc_hwmon_sensor *sensor;
+	const char *key;
+	u32 cells;
+	int count, i, j, ret;
+
+	if (!of_property_present(node, "apple,thermal-sensor-keys"))
+		return 0;
+
+	if (of_property_read_u32(node, "#thermal-sensor-cells", &cells) || cells)
+		return -EINVAL;
+	count = of_property_count_strings(node, "apple,thermal-sensor-keys");
+	if (count < 1 || count > 16)
+		return -EINVAL;
+	hwmon->thermal_sensors = devm_kcalloc(hwmon->dev, count, sizeof(*sensor), GFP_KERNEL);
+	if (!hwmon->thermal_sensors)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		ret = of_property_read_string_index(node, "apple,thermal-sensor-keys", i, &key);
+		if (ret || strlen(key) != 4 || key[0] != 'T')
+			return -EINVAL;
+		sensor = &hwmon->thermal_sensors[i];
+		ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, sensor, key);
+		if (ret)
+			return dev_err_probe(hwmon->dev, ret, "Required thermal key %s missing\n", key);
+		if (!(sensor->info.flags & APPLE_SMC_READABLE) ||
+		    (sensor->info.flags & APPLE_SMC_FUNCTION) ||
+		    !((sensor->info.type_code == __SMC_KEY('f', 'l', 't', ' ') && sensor->info.size == 4) ||
+		      (sensor->info.type_code == __SMC_KEY('i', 'o', 'f', 't') && sensor->info.size == 8)))
+			return dev_err_probe(hwmon->dev, -EINVAL,
+					     "Required thermal key %s has unsupported metadata\n", key);
+		for (j = 0; j < i; j++)
+			if (hwmon->thermal_sensors[j].macsmc_key == sensor->macsmc_key)
+				return -EINVAL;
+	}
+	hwmon->thermal_count = count;
+	return 0;
+}
+
+static int macsmc_hwmon_register_thermal(struct macsmc_hwmon *hwmon)
+{
+	struct thermal_zone_device *tz;
+
+	if (!hwmon->thermal_count)
+		return 0;
+	tz = devm_thermal_of_zone_register(hwmon->dev, 0, hwmon, &macsmc_hwmon_thermal_ops);
+	if (IS_ERR(tz))
+		return dev_err_probe(hwmon->dev, PTR_ERR(tz), "Registering SMC thermal aggregate failed\n");
+	dev_info(hwmon->dev, "Registered thermal maximum of %u named SMC keys\n", hwmon->thermal_count);
+	return 0;
+}
+#else
+static int macsmc_hwmon_parse_thermal(struct macsmc_hwmon *hwmon)
+{
+	return of_property_present(hwmon->dev->of_node, "apple,thermal-sensor-keys") ?
+		-EOPNOTSUPP : 0;
+}
+
+static int macsmc_hwmon_register_thermal(struct macsmc_hwmon *hwmon)
+{
+	return 0;
+}
+#endif
+
 /*
  * A sensor is a single key-value pair as made available by the SMC.
  * The devicetree gives us the SMC key ID and a friendly name where the
@@ -706,7 +833,9 @@ static int macsmc_hwmon_create_infos(struct macsmc_hwmon *hwmon)
 	int i = 0;
 
 	/* chip */
-	hwmon->channel_infos[i++] = macsmc_chip_channel_info;
+	/* Explicit key aggregates must not also register unstable hwmon indices. */
+	if (!hwmon->thermal_count)
+		hwmon->channel_infos[i++] = macsmc_chip_channel_info;
 
 	if (hwmon->curr.count) {
 		channel_info = &hwmon->curr.channel_info;
@@ -792,6 +921,9 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 
 	hwmon->dev = &pdev->dev;
 	hwmon->smc = smc;
+	ret = macsmc_hwmon_parse_thermal(hwmon);
+	if (ret)
+		return dev_err_probe(hwmon->dev, ret, "Parsing required SMC thermal keys failed\n");
 
 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
 	if (ret) {
@@ -829,7 +961,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		hwmon->power.count, hwmon->temp.count,
 		hwmon->volt.count);
 
-	return 0;
+	return macsmc_hwmon_register_thermal(hwmon);
 }
 
 static const struct of_device_id macsmc_hwmon_of_table[] = {
