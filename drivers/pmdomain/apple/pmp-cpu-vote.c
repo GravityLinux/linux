@@ -118,7 +118,7 @@ struct apple_pmp_cpu_vote {
 	struct hlist_node hotplug_node;
 	int hotplug_state;
 	u32 saved_enables[2], active_vote;
-	u64 started_ns, changed_ns, on_ns, ticks, changes;
+	u64 started_ns, changed_ns, on_ns, ticks, changes, cpm_deferred;
 	unsigned int last_cpu, last_load;
 	bool active, stopping, instance_added, stats_created;
 };
@@ -193,6 +193,7 @@ static void cpu_vote_cpm_write(struct apple_pmp_cpu_vote *vote, bool raised)
 	 * vote->lock: defer the access instead, and retry at a later policy sample.
 	 */
 	if (!cpus_read_trylock()) {
+		vote->cpm_deferred++;
 		/* A release must finish even if every deferrable sampler goes idle. */
 		if (!vote->stopping)
 			mod_delayed_work(
@@ -388,13 +389,14 @@ static ssize_t cpu_vote_show(struct device *dev, struct device_attribute *attr,
 	on = vote->on_ns + (vote->active_vote ? now - vote->changed_ns : 0);
 	n = sysfs_emit(
 		buf,
-		"active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u cpm=%u sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
+		"active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u cpm=%u cpm_deferred=%llu sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
 		vote->active, vote->active_vote,
 		vote->active ? readl(vote->request) : 0, vote->last_cpu,
 		vote->last_load, vote->ticks, vote->changes, on,
 		now - vote->started_ns, READ_ONCE(cpu_vote_value),
 		CPU_VOTE_INTERVAL_MS, CPU_VOTE_HOLD_MS, CPU_VOTE_THRESHOLD,
 		READ_ONCE(cpu_vote_cpm) && !!vote->cpm[0].reg,
+		vote->cpm_deferred,
 		READ_ONCE(cpu_vote_sources), atomic_read(&gpu_flights),
 		atomic64_read(&gpu_last_ms));
 	mutex_unlock(&vote->lock);
