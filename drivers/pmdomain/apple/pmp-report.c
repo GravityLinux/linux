@@ -18,6 +18,8 @@
 #include <linux/jiffies.h>
 #include <linux/soc/apple/pmp-report.h>
 
+#include "pmp-cpu-vote.h"
+
 #define PMP_REPORT_READY 0x1
 #define PMP_READY_WAIT_MS 120000
 
@@ -40,6 +42,7 @@ struct apple_pmp_report {
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	void __iomem *event_config;
+	struct apple_pmp_cpu_vote *cpu_vote;
 	struct delayed_work finalize_work;
 	unsigned long probed;
 	spinlock_t lock;
@@ -98,6 +101,13 @@ out:
 	of_node_put(pmp);
 	return ret;
 }
+struct apple_pmp_cpu_vote *apple_pmp_report_cpu_vote(struct device *dev)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	return rep ? rep->cpu_vote : NULL;
+}
+
 int apple_pmp_report_wait_ready(struct device *dev, unsigned long timeout_us)
 {
 	struct apple_pmp_report *rep = dev_get_drvdata(dev);
@@ -175,6 +185,8 @@ static void apple_pmp_report_finalize_work(struct work_struct *work)
 	if (rep->event_config)
 		writel(readl(rep->event_config + 0x20) & ~BIT(2),
 		       rep->event_config + 0x20);
+	if (!ret)
+		apple_pmp_cpu_vote_start(rep->cpu_vote);
 }
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
@@ -203,6 +215,9 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	ret = apple_pmp_report_read_device_flags(rep);
 	if (ret)
 		return ret;
+	rep->cpu_vote = apple_pmp_cpu_vote_probe(pdev, rep->event_config);
+	if (IS_ERR(rep->cpu_vote))
+		return PTR_ERR(rep->cpu_vote);
 	dev_set_drvdata(dev, rep);
 	ret = of_platform_populate(np, NULL, NULL, dev);
 	if (ret)
@@ -222,6 +237,7 @@ static void apple_pmp_report_remove(struct platform_device *pdev)
 
 	if (rep->offsets->finalize_after_ready)
 		cancel_delayed_work_sync(&rep->finalize_work);
+	apple_pmp_cpu_vote_stop(rep->cpu_vote);
 	of_platform_depopulate(&pdev->dev);
 }
 
@@ -232,6 +248,14 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.actual = 0x18c0,
 	.status = 0x10,
 };
+static void apple_pmp_report_shutdown(struct platform_device *pdev)
+{
+	struct apple_pmp_report *rep = platform_get_drvdata(pdev);
+
+	if (rep->offsets->finalize_after_ready)
+		cancel_delayed_work_sync(&rep->finalize_work);
+	apple_pmp_cpu_vote_stop(rep->cpu_vote);
+}
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x = {
 	.tgt_read = 0xf80,
@@ -302,6 +326,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 static struct platform_driver apple_pmp_report_driver = {
 	.probe = apple_pmp_report_probe,
 	.remove = apple_pmp_report_remove,
+	.shutdown = apple_pmp_report_shutdown,
 	.driver = {
 		.name = "apple-pmp-report",
 		.of_match_table = apple_pmp_report_of_match,
