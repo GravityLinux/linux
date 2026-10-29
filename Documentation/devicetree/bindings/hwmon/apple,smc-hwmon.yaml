@@ -59,7 +59,7 @@ properties:
       This fault control value does not replace individual hwmon readings.
 
 dependencies:
-  '#thermal-sensor-cells': [apple,thermal-sensor-keys]
+  '#thermal-sensor-cells': ['apple,thermal-sensor-keys']
   apple,thermal-sensor-keys: ['#thermal-sensor-cells']
 
 patternProperties:
