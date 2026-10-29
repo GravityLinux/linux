@@ -81,6 +81,71 @@ int main(void)
 	assert(apple_pmp_cpm_control(0xf78abcfc, 1) == 0xf00abcfd);
 	assert(apple_pmp_cpm_control(0x12345678056000fcULL, 1) ==
 	       0x12345678000000fdULL);
+	{
+		struct apple_pmp_vote_run r = {0};
+		struct apple_pmp_vote_gpu_window w = {0};
+		unsigned long long clock = 0, busy = 0;
+		unsigned int percent;
+
+		assert(!apple_pmp_vote_sustained(&r, 1, 20, 3));
+		assert(!apple_pmp_vote_sustained(&r, 1, 40, 3));
+		assert(apple_pmp_vote_sustained(&r, 1, 60, 3));
+		assert(!apple_pmp_vote_sustained(&r, 0, 80, 3));
+		assert(!apple_pmp_vote_sustained(&r, 1, 100, 3));
+		assert(!apple_pmp_vote_sustained(&r, 1, 1000, 3));
+		assert(r.count == 1);
+		clock = apple_pmp_vote_gpu_clock(clock, 1000000, 1);
+		assert(((clock + (6000000ULL << 1)) >> 1) == 5000000);
+		assert(apple_pmp_vote_gpu_clock(clock, 2000000, 1) == clock);
+		clock = apple_pmp_vote_gpu_clock(clock, 11000000, 0);
+		assert((clock >> 1) == 10000000);
+		clock = apple_pmp_vote_gpu_clock(clock, 20000000, 1);
+		clock = apple_pmp_vote_gpu_clock(clock, 25000000, 0);
+		assert((clock >> 1) == 15000000);
+		/* Five 20ms intervals, 40% union busy; overlapping jobs count once. */
+		for (i = 0; i <= 5; i++) {
+			busy = i * 8000000ULL;
+			percent = apple_pmp_vote_gpu_fraction(
+				&w, i * 20000000ULL, busy, 100);
+			assert(percent == (i == 5 ? 40 : 0));
+		}
+		percent = apple_pmp_vote_gpu_fraction(&w, 110000000, busy, 100);
+		assert(percent == 40);
+		percent = apple_pmp_vote_gpu_fraction(&w, 1000000000, busy, 100);
+		assert(percent == 0 && w.count == 1);
+		/* Parameter change starts a fresh window. */
+		percent = apple_pmp_vote_gpu_fraction(&w, 1020000000,
+						      busy + 20000000, 20);
+		assert(percent == 0);
+		percent = apple_pmp_vote_gpu_fraction(&w, 1040000000,
+						      busy + 40000000, 20);
+		assert(percent == 100);
+		/* Transition stress: compare the packed scalar with an ordinary union. */
+		clock = 0;
+		busy = 0;
+		{
+			unsigned long long now = 0, start = 0;
+			unsigned int seed = 1;
+			int active = 0;
+
+			for (i = 0; i < 100000; i++) {
+				int next;
+
+				seed = 1664525U * seed + 1013904223U;
+				now += seed % 1000000 + 1;
+				next = (seed >> 17) & 1;
+				if (next && !active)
+					start = now;
+				if (!next && active)
+					busy += now - start;
+				clock = apple_pmp_vote_gpu_clock(clock, now, next);
+				active = next;
+				assert(((clock + (active ? now << 1 : 0)) >> 1) ==
+				       busy + (active ? now - start : 0));
+			}
+		}
+		puts("light-use filters: busy clock, fraction, debounce and gaps PASS");
+	}
 	puts("E aggregate: equivalence, threshold boundaries, resets and hold PASS");
 	puts("CPM: bit0 update, status suppression and control preservation PASS");
 	puts("policy: threshold, shared hysteresis, expiry and vote range PASS");

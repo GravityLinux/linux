@@ -54,6 +54,90 @@ apple_pmp_vote_e_input(unsigned int load, unsigned int threshold)
 	return load >= threshold ? APPLE_PMP_VOTE_E_CPU : 0;
 }
 
+/* Busy-time clock: low bit is active; upper bits hold total minus time
+ * while active, total while idle. One scalar CAS publishes each transition.
+ * Repeated in-flight counts do not restart the occupied interval.
+ */
+static inline unsigned long long
+apple_pmp_vote_gpu_clock(unsigned long long old, unsigned long long now_ns,
+			 int active)
+{
+	if (!!(old & 1) == !!active)
+		return old;
+	return active ? (old - (now_ns << 1)) | 1 :
+			(old & ~1ULL) + (now_ns << 1);
+}
+
+struct apple_pmp_vote_run {
+	unsigned long long last_ms;
+	unsigned int count;
+};
+
+/* A deferred timer gap is not evidence of consecutive occupied samples. */
+static inline int
+apple_pmp_vote_sustained(struct apple_pmp_vote_run *run, int busy,
+			 unsigned long long now_ms, unsigned int required)
+{
+	if (!busy || (run->count && now_ms - run->last_ms > 40))
+		run->count = 0;
+	if (busy && run->count < 255)
+		run->count++;
+	run->last_ms = now_ms;
+	return busy && run->count >= required;
+}
+
+#define APPLE_PMP_GPU_HISTORY 32
+struct apple_pmp_vote_gpu_window {
+	unsigned long long ns[APPLE_PMP_GPU_HISTORY];
+	unsigned long long busy[APPLE_PMP_GPU_HISTORY];
+	unsigned int head, count, window_ms, percent;
+};
+
+/* Rolling union of in-flight GPU intervals, never a sum of overlapping jobs.
+ * Actual elapsed time is used: deferrable timers need not fire exactly on time.
+ * History after a long idle gap is discarded, rather than treating that gap
+ * as sustained demand. A new window must fill before it can request a vote.
+ */
+static inline unsigned int
+apple_pmp_vote_gpu_fraction(struct apple_pmp_vote_gpu_window *w,
+			    unsigned long long now, unsigned long long busy,
+			    unsigned int window_ms)
+{
+	unsigned long long target = window_ms * 1000000ULL;
+	unsigned int j, latest = (w->head + APPLE_PMP_GPU_HISTORY - 1) %
+				APPLE_PMP_GPU_HISTORY;
+
+	if (window_ms != w->window_ms ||
+	    (w->count && (now < w->ns[latest] || busy < w->busy[latest] ||
+			 now - w->ns[latest] > 2 * target))) {
+		*w = (struct apple_pmp_vote_gpu_window){0};
+		w->window_ms = window_ms;
+	}
+	if (w->count && now - w->ns[latest] < 20000000ULL)
+		return w->percent;
+	w->percent = 0;
+	/* Newest point at least one full window old; error < one sample. */
+	for (j = 0; j < w->count; j++) {
+		unsigned int n = (w->head + APPLE_PMP_GPU_HISTORY - 1 - j) %
+				 APPLE_PMP_GPU_HISTORY;
+		unsigned long long dt = now - w->ns[n];
+		unsigned long long db = busy - w->busy[n];
+
+		if (dt >= target) {
+			if (db > dt)
+				db = dt;
+			w->percent = 100 * db / dt;
+			break;
+		}
+	}
+	w->ns[w->head] = now;
+	w->busy[w->head] = busy;
+	w->head = (w->head + 1) % APPLE_PMP_GPU_HISTORY;
+	if (w->count < APPLE_PMP_GPU_HISTORY)
+		w->count++;
+	return w->percent;
+}
+
 struct apple_pmp_vote_policy {
 	unsigned long long last_busy_ms;
 	int busy_seen;
