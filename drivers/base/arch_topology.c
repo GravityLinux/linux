@@ -386,6 +386,20 @@ static cpumask_var_t cpus_to_visit;
 static void parsing_done_workfn(struct work_struct *work);
 static DECLARE_WORK(parsing_done_work, parsing_done_workfn);
 
+static unsigned int topology_policy_max_freq(struct cpufreq_policy *policy)
+{
+	struct cpufreq_frequency_table *pos;
+	unsigned int max_freq = policy->cpuinfo.max_freq;
+
+	/* The reference stays fixed when policy limits disable boost. */
+	if (policy->freq_table) {
+		cpufreq_for_each_valid_entry(pos, policy->freq_table)
+			max_freq = max(max_freq, pos->frequency);
+	}
+
+	return max_freq;
+}
+
 static int
 init_cpu_capacity_callback(struct notifier_block *nb,
 			   unsigned long val,
@@ -404,7 +418,7 @@ init_cpu_capacity_callback(struct notifier_block *nb,
 	cpumask_andnot(cpus_to_visit, cpus_to_visit, policy->related_cpus);
 
 	for_each_cpu(cpu, policy->related_cpus) {
-		per_cpu(capacity_freq_ref, cpu) = policy->cpuinfo.max_freq;
+		per_cpu(capacity_freq_ref, cpu) = topology_policy_max_freq(policy);
 		freq_inv_set_max_ratio(cpu,
 				       per_cpu(capacity_freq_ref, cpu) * HZ_PER_KHZ);
 	}
