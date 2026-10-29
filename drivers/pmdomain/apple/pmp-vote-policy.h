@@ -2,7 +2,10 @@
 #ifndef APPLE_PMP_VOTE_POLICY_H
 #define APPLE_PMP_VOTE_POLICY_H
 
-/* Pure policy shared by the driver and its standalone host test. */
+/* Activity sources share one release deadline and one vote output. */
+#define APPLE_PMP_VOTE_CPU (1U << 0)
+#define APPLE_PMP_VOTE_GPU (1U << 1)
+
 struct apple_pmp_vote_policy {
 	unsigned long long last_busy_ms;
 	int busy_seen;
@@ -14,12 +17,17 @@ static inline int apple_pmp_vote_valid(unsigned int value)
 }
 
 static inline unsigned int
-apple_pmp_vote_decide(struct apple_pmp_vote_policy *policy,
-		      unsigned long long now_ms, unsigned int peak,
-		     unsigned int threshold, unsigned int hold_ms,
-		     unsigned int value)
+apple_pmp_vote_cpu_input(unsigned int load, unsigned int threshold)
 {
-	if (peak >= threshold) {
+	return load >= threshold ? APPLE_PMP_VOTE_CPU : 0;
+}
+
+static inline unsigned int
+apple_pmp_vote_decide(struct apple_pmp_vote_policy *policy,
+		     unsigned long long now_ms, unsigned int inputs,
+		     unsigned int hold_ms, unsigned int value)
+{
+	if (inputs) {
 		policy->last_busy_ms = now_ms;
 		policy->busy_seen = 1;
 	}

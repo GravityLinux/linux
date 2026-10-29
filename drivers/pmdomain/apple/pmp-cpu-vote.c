@@ -101,8 +101,8 @@ static void cpu_vote_release(struct work_struct *work)
 	now = ktime_to_ms(ktime_get());
 	if (!vote->stopping) {
 		next = apple_pmp_vote_decide(&vote->policy, now, 0,
-					     CPU_VOTE_THRESHOLD, CPU_VOTE_HOLD_MS,
-			READ_ONCE(cpu_vote_value));
+					     CPU_VOTE_HOLD_MS,
+					     READ_ONCE(cpu_vote_value));
 		cpu_vote_write(vote, next);
 		if (next)
 			mod_delayed_work(system_wq, &vote->release_work,
@@ -136,8 +136,8 @@ static void cpu_vote_sample(struct work_struct *work)
 	vote->last_load = load;
 	vote->ticks++;
 	next = apple_pmp_vote_decide(&vote->policy, ktime_to_ms(ktime_get()),
-				     load, CPU_VOTE_THRESHOLD, CPU_VOTE_HOLD_MS,
-		READ_ONCE(cpu_vote_value));
+		apple_pmp_vote_cpu_input(load, CPU_VOTE_THRESHOLD),
+		CPU_VOTE_HOLD_MS, READ_ONCE(cpu_vote_value));
 	cpu_vote_write(vote, next);
 	if (load >= CPU_VOTE_THRESHOLD)
 		mod_delayed_work(system_wq, &vote->release_work,
