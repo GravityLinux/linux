@@ -1,33 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
 
-config DRM_ASAHI_NEO
-	tristate "Apple A18 Pro GPU driver (experimental)"
-	depends on RUST && DRM=y
-	depends on ARM64 && ARCH_APPLE && PAGE_SIZE_16KB
-	depends on PM
-	select RUST_DRM_GEM_SHMEM_HELPER
-	select RUST_APPLE_RTKIT
-	select APPLE_MAILBOX
-	help
-	  Experimental Rust driver for the T8140 (A18 Pro / G17P) GPU in
-	  the MacBook Neo. Supports firmware startup, Asahi DRM memory and
-	  synchronization UAPIs, and asynchronous render and compute submission.
-
-config DRM_ASAHI_M4
-	tristate "Apple M4 GPU driver"
-	depends on RUST && DRM=y
-	depends on ARM64 && ARCH_APPLE && PAGE_SIZE_16KB
-	depends on PM
-	select RUST_DRM_GEM_SHMEM_HELPER
-	select RUST_DRM_SCHED
-	select RUST_APPLE_RTKIT
-	select APPLE_MAILBOX
-	help
-	  Rust DRM driver for the T8132 (M4) GPU, following the Asahi UAPI
-	  and the M4 Python DRM-shim firmware implementation. Intended for
-	  development under m1n1. Normal initialization is the default;
-	  probe_only selects identification without firmware startup.
-
 config RUST_DRM_SCHED
 	bool
 	select DRM_SCHED
@@ -44,13 +16,17 @@ config DRM_ASAHI
 	depends on MMU
 	depends on IOMMU_SUPPORT
 	depends on PAGE_SIZE_16KB
+	depends on PM
+	select APPLE_MAILBOX
 	select APPLE_PMP_REPORT
 	select RUST_DRM_SCHED
 	select RUST_DRM_GEM_SHMEM_HELPER
 	select RUST_DRM_GPUVM
 	select RUST_APPLE_RTKIT
 	help
-	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
+	  Rust DRM driver for Apple AGX GPUs in the M1 and M2 SoC families,
+	  M4, M4 Max, and A18 Pro (MacBook Neo). Device-tree matching selects
+	  the appropriate firmware backend.
 
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"
