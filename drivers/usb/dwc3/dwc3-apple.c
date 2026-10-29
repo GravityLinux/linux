@@ -11,6 +11,7 @@
 #include <linux/of.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
 #include <linux/usb/ch11.h>
@@ -21,7 +22,6 @@
 #include <linux/soc/apple/tunable.h>
 
 #include "glue.h"
-#include "io.h"
 
 /* USB3 hub SetPortFeature(LINK_STATE): port in the low byte of wIndex,
  * unshifted link-state selector in the high byte.
@@ -266,16 +266,19 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
 
 static void dwc3_apple_setup_suspend_scale(struct dwc3_apple *appledwc)
 {
+	void __iomem *gctl;
 	u32 reg;
 
 	if (!of_machine_is_compatible("apple,j700") || appledwc->dwc.susp_clk)
 		return;
 
-	reg = dwc3_readl(&appledwc->dwc, DWC3_GCTL);
+	/* The core mapping starts at the global registers, not the xHCI area. */
+	gctl = appledwc->dwc.regs + DWC3_GCTL - DWC3_GLOBALS_REGS_START;
+	reg = readl(gctl);
 	reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
 	reg |= FIELD_PREP(DWC3_GCTL_PWRDNSCALE_MASK,
 			  DWC3_APPLE_NEO_NATIVE_PWRDNSCALE);
-	dwc3_writel(&appledwc->dwc, DWC3_GCTL, reg);
+	writel(reg, gctl);
 }
 
 static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
