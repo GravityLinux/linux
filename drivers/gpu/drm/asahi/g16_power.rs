@@ -268,9 +268,13 @@ impl Platform {
 
         // Fast-die uses the untruncated AIC interval, unlike the other loops.
         let fast_dt = F32::from(self.period_clocks) / f32!(24000.0) / f32!(1000.0);
-        let release = uint!("gpu-fast-die0-release-temp", 80);
+        let (limit, release) = crate::g16_thermal::fast_die_limits(
+            crate::module_parameters::fast_die_limit_c.value(),
+            uint!("gpu-fast-die0-release-temp", 80),
+        )
+        .ok_or(EINVAL)?;
         let delta = uint!("gpu-fast-die0-prop-tgt-delta", 0);
-        if release > u32::MAX / 100 || delta > u32::MAX / 100 {
+        if delta > u32::MAX / 100 {
             return Err(EINVAL);
         }
         put64(
@@ -278,10 +282,10 @@ impl Platform {
             0x75e8,
             (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 11) | (1 << 13) | (1 << 14),
         );
-        ints!(0x75f0 => (F32::from(release)*f32!(100.0)).to_u32_checked().ok_or(EINVAL)?,
+        ints!(0x75f0 => release,
             0x75f8 => 4, 0x7630 => duty, 0x7634 => max_scaled, 0x7638 => max_scaled,
             0x763c => (F32::from(delta)*f32!(100.0)).to_u32_checked().ok_or(EINVAL)?,
-            0x7644 => 11000, 0x7678 => max_scaled);
+            0x7644 => limit, 0x7678 => max_scaled);
         floats!(0x7604 => f32!(0.0), 0x760c => f32!(1.0),
             0x7614 => gain!("gpu-fast-die0-integral-gain", 200.0)*fast_dt,
             0x761c => f32!(0.0), 0x7620 => f32!(65536.0),

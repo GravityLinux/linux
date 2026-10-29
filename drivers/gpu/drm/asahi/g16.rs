@@ -545,9 +545,11 @@ impl Bootstrap {
                         power
                     );
                 }
-                // A wrong thermal limit is a safety bug: leave the object
-                // zero (the previous behaviour) and say so.
-                Err(e) => dev_err!(dev, "G16: extra_0 not built, bundle limits out of range: {:?}\n", e),
+                // Do not start firmware with a requested but invalid policy.
+                Err(e) => {
+                    dev_err!(dev, "G16: invalid extra_0 thermal/power policy: {:?}\n", e);
+                    return Err(e);
+                }
             }
         }
         // Extra policy objects, computed descriptors, PB/UMA tables and
