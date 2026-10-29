@@ -15,6 +15,44 @@ apple_pmp_cpm_control(unsigned long long old, int raised)
 /* Activity sources share one release deadline and one vote output. */
 #define APPLE_PMP_VOTE_CPU (1U << 0)
 #define APPLE_PMP_VOTE_GPU (1U << 1)
+#define APPLE_PMP_VOTE_E_CPU (1U << 2)
+
+struct apple_pmp_vote_cpu_time {
+	unsigned long long idle, wall;
+	int valid;
+};
+
+/* Non-idle percent over one counter interval, with reset/hotplug handling. */
+static inline unsigned int
+apple_pmp_vote_load(struct apple_pmp_vote_cpu_time *time,
+		    unsigned long long idle, unsigned long long wall)
+{
+	unsigned int load = 0;
+
+	if (idle == ~0ULL || wall == ~0ULL) {
+		time->valid = 0;
+		return 0;
+	}
+	if (time->valid && wall > time->wall && idle >= time->idle) {
+		unsigned long long dt = wall - time->wall;
+		unsigned long long di = idle - time->idle;
+
+		if (di > dt)
+			di = dt;
+		load = 100 * (dt - di) / dt;
+	}
+	time->idle = idle;
+	time->wall = wall;
+	time->valid = 1;
+	return load;
+}
+
+/* Summed per-core percent: 100 is one fully occupied E-core equivalent. */
+static inline unsigned int
+apple_pmp_vote_e_input(unsigned int load, unsigned int threshold)
+{
+	return load >= threshold ? APPLE_PMP_VOTE_E_CPU : 0;
+}
 
 struct apple_pmp_vote_policy {
 	unsigned long long last_busy_ms;

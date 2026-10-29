@@ -5,6 +5,35 @@
 int main(void)
 {
 	struct apple_pmp_vote_policy p = {0};
+	struct apple_pmp_vote_cpu_time t = {0};
+	unsigned int sum = 0, i;
+
+	assert(apple_pmp_vote_load(&t, 1000, 2000) == 0);
+	assert(apple_pmp_vote_load(&t, 1000, 22000) == 100);
+	assert(apple_pmp_vote_load(&t, 21000, 42000) == 0);
+	assert(apple_pmp_vote_load(&t, 31000, 62000) == 50);
+	assert(apple_pmp_vote_load(&t, 71000, 82000) == 0);
+	/* Counter reset, offline/re-online and invalid idle accounting. */
+	assert(apple_pmp_vote_load(&t, 0, 100) == 0);
+	t.valid = 0;
+	assert(apple_pmp_vote_load(&t, 0, 20100) == 0);
+	assert(apple_pmp_vote_load(&t, ~0ULL, 40100) == 0);
+	assert(!t.valid);
+	assert(apple_pmp_vote_load(&t, 0, 60100) == 0);
+	assert(apple_pmp_vote_load(&t, 0, 80100) == 100);
+	assert(apple_pmp_vote_e_input(99, 100) == 0);
+	assert(apple_pmp_vote_e_input(100, 100) == APPLE_PMP_VOTE_E_CPU);
+	assert(apple_pmp_vote_e_input(299, 300) == 0);
+	assert(apple_pmp_vote_e_input(300, 300) == APPLE_PMP_VOTE_E_CPU);
+	/* Equivalent distributed demand and only one shared output/hold. */
+	for (i = 0; i < 6; i++)
+		sum += 50;
+	assert(apple_pmp_vote_e_input(sum, 300) == APPLE_PMP_VOTE_E_CPU);
+	assert(apple_pmp_vote_decide(&p, 10, APPLE_PMP_VOTE_E_CPU,
+				    80, 0x35) == 0x35);
+	assert(apple_pmp_vote_decide(&p, 89, 0, 80, 0x35) == 0x35);
+	assert(apple_pmp_vote_decide(&p, 90, 0, 80, 0x35) == 0);
+	p = (struct apple_pmp_vote_policy){0};
 
 	assert(apple_pmp_vote_cpu_input(49, 50) == 0);
 	assert(apple_pmp_vote_cpu_input(50, 50) == APPLE_PMP_VOTE_CPU);
@@ -50,6 +79,9 @@ int main(void)
 	assert(apple_pmp_cpm_control(0x034000fd, 1) == 0xfd);
 	assert(apple_pmp_cpm_control(0xf56abcfd, 0) == 0xf00abcfc);
 	assert(apple_pmp_cpm_control(0xf78abcfc, 1) == 0xf00abcfd);
+	assert(apple_pmp_cpm_control(0x12345678056000fcULL, 1) ==
+	       0x12345678000000fdULL);
+	puts("E aggregate: equivalence, threshold boundaries, resets and hold PASS");
 	puts("CPM: bit0 update, status suppression and control preservation PASS");
 	puts("policy: threshold, shared hysteresis, expiry and vote range PASS");
 }
