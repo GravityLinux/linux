@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Verified J616c power-state nodes needed by PMP, ISP and internal DCP. */
+&{/soc} {
+	pmgr0: power-management@502280000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x2280000 0 0x8000>;
+		ps_ispsens0: power-controller@0 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x0 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "ispsens0";
+		};
+		ps_disp_sys: power-controller@258 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x258 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "disp_sys";
+			power-domains = <&ps_fab6_soc>;
+		};
+		ps_disp_fe: power-controller@368 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x368 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "disp_fe";
+			power-domains = <&ps_disp_sys>;
+		};
+		ps_isp_sys: power-controller@378 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x378 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "isp_sys";
+			power-domains = <&ps_fab6_soc>;
+		};
+	};
+	pmgr1: power-management@502800000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x2800000 0 0x4000>;
+		ps_pms: power-controller@100 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x100 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "pms";
+			apple,always-on;
+		};
+		ps_afi: power-controller@110 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x110 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "afi";
+			apple,always-on;
+		};
+		ps_pmp: power-controller@410 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x410 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "pmp";
+			apple,always-on;
+			power-domains = <&ps_pms>;
+		};
+		ps_pms_sram: power-controller@418 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x418 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "pms_sram";
+			apple,always-on;
+			power-domains = <&ps_pms>;
+		};
+		ps_fab6_soc: power-controller@480 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x480 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "fab6_soc";
+			apple,always-on;
+			power-domains = <&ps_afi>;
+		};
+	};
+};
+
+/* Native ISP virtual-domain implementation uses this six-register bank.
+ * It is not described by ordinary PMGR ps-groups entries in the ADT.
+ */
+&pmgr0 {
+	ps_isp_block0: power-controller@4000 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp-block0";
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	ps_isp_block1: power-controller@4008 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp-block1";
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	ps_isp_block2: power-controller@4010 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp-block2";
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	ps_isp_block3: power-controller@4018 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp-block3";
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	ps_isp_block4: power-controller@4020 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp-block4";
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	ps_isp_block5: power-controller@4028 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp-block5";
+		power-domains = <&pmp_report_isp_sys>;
+	};
+};

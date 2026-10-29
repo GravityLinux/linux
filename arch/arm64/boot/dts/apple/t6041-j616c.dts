@@ -1,10 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /dts-v1/;
 #include "t6041.dtsi"
+#include "t6041-pmgr.dtsi"
+#include "t6041-pmp.dtsi"
+#include "t6041-isp.dtsi"
+#include "t6041-mtp.dtsi"
+#include "t6041-wireless.dtsi"
+#include "t6041-aop.dtsi"
+#include "t6041-audio.dtsi"
+#include "t6041-display.dtsi"
+
+&aop_audio {
+	apple,chassis-name = "J616";
+	apple,machine-kind = "MacBook Pro";
+};
 / {
     compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
     model = "Apple MacBook Pro (16-inch, M4 Max, 2024)";
     chassis-type = "laptop";
     chosen { stdout-path = "serial0:115200n8"; };
     memory@800000000 { device_type = "memory"; reg = <8 0 0 0>; };
+};
+
+&dcp {
+	panel {
+		/* 3456 x 2234 at 254 ppi: 345.6 x 223.4 mm. */
+		width-mm = <346>;
+		height-mm = <223>;
+	};
 };

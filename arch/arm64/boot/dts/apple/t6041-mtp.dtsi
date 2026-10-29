@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J616c MTP. Addresses are resolved CPU physical addresses from the board ADT.
+ * Raw arm-io addresses for these devices require a 0x200000000 translation.
+ */
+/ {
+	aliases {
+		keyboard = &mtp_keyboard;
+	};
+};
+
+&{/soc} {
+	mtp: mtp@514600000 {
+		compatible = "apple,t6041-mtp", "apple,mtp", "apple,rtk-helper-asc4";
+		reg = <0x5 0x14600000 0 0x4000>;
+		reg-names = "asc";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+		#helper-cells = <0>;
+	};
+
+	mtp_mbox: mailbox@514608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x14608000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 792 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 793 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 794 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 795 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dart: iommu@514800000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x14800000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 775 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>;
+	};
+
+	mtp_dockchannel: fifo@514b14000 {
+		compatible = "apple,t6041-dockchannel", "apple,dockchannel";
+		reg = <0x5 0x14b14000 0 0x1000>;
+		reg-names = "irq";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 776 IRQ_TYPE_LEVEL_HIGH>;
+		ranges = <0 0x5 0x14b28000 0x10000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mtp_hid: input@0 {
+			/* M4-family shared-ring transport, rather than the older FIFO ABI. */
+			compatible = "apple,t6041-dockchannel-hid", "apple,t8132-dockchannel-hid", "apple,dockchannel-hid";
+			reg = <0x0000 0x1000>, <0x4000 0x1000>, <0x8000 0x1000>, <0xc000 0x1000>;
+			reg-names = "rmt-config", "rmt-data", "config", "data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>, <3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+
+			mtp_keyboard: keyboard {
+				hid-country-code = <0>;
+				apple,keyboard-layout-id = <0>;
+			};
+			multi-touch {
+				firmware-name = "apple/tpmtfw-j616c.bin";
+			};
+			stm {};
+			actuator {};
+			tp-accel {};
+		};
+	};
+};

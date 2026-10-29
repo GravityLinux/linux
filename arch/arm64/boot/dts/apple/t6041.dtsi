@@ -267,3 +267,5 @@
 };
 #include "t6041-gpu-memory.dtsi"
 #include "t6041-gpu-config.dtsi"
+
+#include "t6041-cpufreq.dtsi"

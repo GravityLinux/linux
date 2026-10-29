@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J616c Wi-Fi/Bluetooth PCIe port. Resources verified through live ADT get_reg.
+ * m1n1 supplies MAC addresses, antenna SKU and calibration blobs.
+ */
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/apple.h>
+/ {
+	aliases { wifi0 = &wifi0; bluetooth0 = &bluetooth0; };
+};
+&{/soc} {
+	pinctrl_ap: pinctrl@51c000000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <5 0x1c000000 0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_ap 0 0 200>;
+		apple,npins = <200>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 479 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 480 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 482 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 483 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 484 IRQ_TYPE_LEVEL_HIGH>;
+		pcie0_pins: pcie0-pins { pinmux = <APPLE_PINMUX(0, 2)>; };
+	};
+	pcie0_dart: iommu@410000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <4 0x10000000 0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1724 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+	};
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6041-pcie", "apple,t6020-pcie";
+		device_type = "pci";
+		reg = <0x1c 0xb0000000 0 0x1000000>, <4 0x14000000 0 0x4000>,
+			<4 0x10028000 0 0x8000>, <4 0x17020000 0 0x4000>;
+		reg-names = "config", "rc", "port0", "phy0";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>;
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+		iommu-map = <0x100 &pcie0_dart 0 1>, <0x101 &pcie0_dart 1 1>;
+		iommu-map-mask = <0xffff>;
+		bus-range = <0 4>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000>,
+			<0x02000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		pinctrl-0 = <&pcie0_pins>;
+		pinctrl-names = "default";
+		port00: pci@0,0 {
+			compatible = "pciclass,0604";
+			device_type = "pci";
+			reg = <0 0 0 0 0>;
+			reset-gpios = <&pinctrl_ap 4 GPIO_ACTIVE_LOW>;
+			power-supply = <&vreg_wifi>;
+			bus-range = <1 1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>, <0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>, <0 0 0 4 &port00 0 0 0 3>;
+			wifi0: wifi@0,0 {
+				compatible = "pci14e4,4434";
+				reg = <0x10000 0 0 0 0>;
+				brcm,board-type = "apple,hostomel";
+				local-mac-address = [00 00 00 00 00 00];
+				apple,antenna-sku = "XX";
+			};
+			bluetooth0: bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x10100 0 0 0 0>;
+				brcm,board-type = "apple,hostomel";
+				local-bd-address = [00 00 00 00 00 00];
+			};
+		};
+	};
+};
+
+/ {
+	vreg_wifi: regulator-wifi {
+		compatible = "regulator-fixed";
+		regulator-name = "pwren-wifi-bt";
+		/* /amfm/function-reg_on identifies SMC GPIO gP13. */
+		gpio = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+&{/soc} {
+	smc_mbox: mailbox@50c608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <5 0x0c608000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 998 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 999 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+	smc: smc@50c600000 {
+		compatible = "apple,t6041-smc", "apple,t8103-smc";
+		reg = <5 0x0c600000 0 0x4000>, <5 0x0de00000 0 0x100000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+		smc_gpio: gpio {
+			compatible = "apple,smc-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+};
