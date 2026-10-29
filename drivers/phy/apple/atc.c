@@ -2874,6 +2874,7 @@ static const struct atcphy_hw atcphy_hw_t8130 = {
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.configure_post_tunable = atcphy_configure_post_tunable_t8122,
 	.t8130 = true,
 };
 
