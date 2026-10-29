@@ -344,6 +344,7 @@ static int cpu_vote_offline(unsigned int cpu, struct hlist_node *node)
 	sample->valid = false;
 	{
 		unsigned int i;
+
 		for (i = 0; i < ARRAY_SIZE(vote->cpm); i++) {
 			struct cpm_cluster *cluster = &vote->cpm[i];
 			cpumask_t online;
