@@ -43,5 +43,13 @@ int main(void)
 	assert(apple_pmp_vote_valid(0x25) && apple_pmp_vote_valid(0x35));
 	assert(!apple_pmp_vote_valid(0x36) && !apple_pmp_vote_valid(0x40));
 	assert(!apple_pmp_vote_valid(0x100));
+	/* Status must never be written back, including on teardown restore. */
+	assert(apple_pmp_cpm_control(0x056000fc, 1) == 0xfd);
+	assert(apple_pmp_cpm_control(0x078000fd, 0) == 0xfc);
+	assert(apple_pmp_cpm_control(0x012000fc, 0) == 0xfc);
+	assert(apple_pmp_cpm_control(0x034000fd, 1) == 0xfd);
+	assert(apple_pmp_cpm_control(0xf56abcfd, 0) == 0xf00abcfc);
+	assert(apple_pmp_cpm_control(0xf78abcfc, 1) == 0xf00abcfd);
+	puts("CPM: bit0 update, status suppression and control preservation PASS");
 	puts("policy: threshold, shared hysteresis, expiry and vote range PASS");
 }
