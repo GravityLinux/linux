@@ -354,6 +354,11 @@ impl Drop for Bootstrap {
             core::mem::forget(self._address_space.take());
             core::mem::forget(self._firmware_space.take());
             core::mem::forget(self._opening_client.take());
+        } else {
+            #[cfg(CONFIG_APPLE_PMP_REPORT)]
+            // SAFETY: successful shutdown proves the GPU stopped. Retained
+            // work after a failed shutdown must keep its activity published.
+            unsafe { kernel::bindings::apple_pmp_cpu_vote_gpu_activity(0) };
         }
     }
 }

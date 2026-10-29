@@ -334,6 +334,10 @@ impl Bootstrap {
             // already examined. Order carries no meaning (removal shifted
             // every later flight, tens of KB per Work under load).
             let flight = self.flights.swap_remove(index);
+            #[cfg(CONFIG_APPLE_PMP_REPORT)]
+            // SAFETY: the helper publishes only scalar activity; it neither retains
+            // a GPU reference nor performs MMIO/locking in this runtime context.
+            unsafe { kernel::bindings::apple_pmp_cpu_vote_gpu_activity(self.flights.len() as u32) };
             self.ledger.remove(&flight)?;
             let root = match &flight.render {
                 Some(render) => render.root,
