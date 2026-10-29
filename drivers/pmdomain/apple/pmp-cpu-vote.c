@@ -192,8 +192,14 @@ static void cpu_vote_cpm_write(struct apple_pmp_cpu_vote *vote, bool raised)
 	 * The hotplug writer drains these workers. Never wait on it while holding
 	 * vote->lock: defer the access instead, and retry at a later policy sample.
 	 */
-	if (!cpus_read_trylock())
+	if (!cpus_read_trylock()) {
+		/* A release must finish even if every deferrable sampler goes idle. */
+		if (!vote->stopping)
+			mod_delayed_work(
+				system_wq, &vote->release_work,
+				msecs_to_jiffies(CPU_VOTE_INTERVAL_MS));
 		return;
+	}
 	cpu_vote_cpm_apply(vote, raised, false);
 	cpus_read_unlock();
 }
