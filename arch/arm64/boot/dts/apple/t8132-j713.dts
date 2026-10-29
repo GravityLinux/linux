@@ -13,6 +13,7 @@
 #include "t8132-jxxx.dtsi"
 #include "t8132-mtp.dtsi"
 #include "t8132-gpu.dtsi"
+#include "t8132-j713-thermal.dtsi"
 #include <dt-bindings/leds/common.h>
 
 / {
