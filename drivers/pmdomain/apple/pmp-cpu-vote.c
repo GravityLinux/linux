@@ -33,7 +33,8 @@ static bool cpu_vote_cpm = true;
 module_param_named(cpu_vote_cpm, cpu_vote_cpm, bool, 0644);
 MODULE_PARM_DESC(cpu_vote_cpm, "Tie T8132 cluster CPM bit0 to the CPU/GPU vote");
 
-static unsigned int cpu_vote_sources = APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU;
+static unsigned int cpu_vote_sources =
+	APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU | APPLE_PMP_VOTE_E_CPU;
 static atomic_t gpu_flights = ATOMIC_INIT(0);
 static atomic64_t gpu_last_ms = ATOMIC64_INIT(0);
 
@@ -58,7 +59,7 @@ static const struct kernel_param_ops cpu_vote_sources_ops = {
 module_param_cb(cpu_vote_sources, &cpu_vote_sources_ops, &cpu_vote_sources, 0644);
 MODULE_PARM_DESC(cpu_vote_sources, "Activity mask: bit0 P-core, bit1 GPU, bit2 E-cluster");
 
-/* Default-off until the native idle/performance tradeoff is measured. */
+/* Summed non-idle percent: the default is one occupied E-core equivalent. */
 static unsigned int cpu_vote_e_threshold = 100;
 
 static int cpu_vote_set_e_threshold(const char *text, const struct kernel_param *kp)
