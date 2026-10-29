@@ -39,10 +39,10 @@ static atomic_t gpu_flights = ATOMIC_INIT(0);
 static atomic64_t gpu_last_ms = ATOMIC64_INIT(0);
 static atomic64_t gpu_busy_clock = ATOMIC64_INIT(0);
 
-/* Research filters are opt-in. Legacy behavior remains the default. */
+/* Reject transient desktop work; zero GPU threshold selects legacy pulses. */
 static unsigned int cpu_vote_p_samples = 1;
 static unsigned int cpu_vote_e_samples = 1;
-static unsigned int cpu_vote_gpu_percent;
+static unsigned int cpu_vote_gpu_percent = 20;
 static unsigned int cpu_vote_gpu_window_ms = 100;
 
 static int cpu_vote_set_filter(const char *text, const struct kernel_param *kp)
@@ -353,7 +353,7 @@ static u64 cpu_vote_gpu_busy(u64 *now)
 	return state >> 1;
 }
 
-/* Called with lock held; legacy pulse preservation is bypassed only opt-in. */
+/* Called with lock held; a zero threshold preserves legacy event pulses. */
 static unsigned int cpu_vote_gpu_input(struct apple_pmp_cpu_vote *vote, u64 *now)
 {
 	u64 ns, busy = cpu_vote_gpu_busy(&ns);

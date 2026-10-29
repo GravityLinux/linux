@@ -87,6 +87,14 @@ int main(void)
 		unsigned long long clock = 0, busy = 0;
 		unsigned int percent;
 
+		/* Optional two-sample qualification: idle and deferred gaps reset it. */
+		assert(!apple_pmp_vote_sustained(&r, 1, 20, 2));
+		assert(apple_pmp_vote_sustained(&r, 1, 40, 2));
+		assert(!apple_pmp_vote_sustained(&r, 0, 60, 2));
+		assert(!apple_pmp_vote_sustained(&r, 1, 80, 2));
+		assert(!apple_pmp_vote_sustained(&r, 1, 140, 2));
+		assert(apple_pmp_vote_sustained(&r, 1, 160, 2));
+		r = (struct apple_pmp_vote_run){0};
 		assert(!apple_pmp_vote_sustained(&r, 1, 20, 3));
 		assert(!apple_pmp_vote_sustained(&r, 1, 40, 3));
 		assert(apple_pmp_vote_sustained(&r, 1, 60, 3));
