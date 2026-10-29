@@ -133,19 +133,19 @@ static void cpu_vote_cpm_access(void *arg)
 {
 	struct cpm_request *request = arg;
 	struct cpm_cluster *cluster = request->cluster;
-	u32 old;
+	u64 old;
 	bool raised;
 
 	if (WARN_ON_ONCE(!cpumask_test_cpu(smp_processor_id(), &cluster->cpus)))
 		return;
-	old = readl(cluster->reg);
+	old = readq(cluster->reg);
 	if (!cluster->saved) {
 		cluster->saved_bit = old & 1;
 		cluster->saved = true;
 	}
 	raised = request->restore ? cluster->saved_bit : request->raised;
-	writel(apple_pmp_cpm_control(old, raised), cluster->reg);
-	readl(cluster->reg);
+	writeq(apple_pmp_cpm_control(old, raised), cluster->reg);
+	readq(cluster->reg);
 	cluster->raised = raised;
 	cluster->valid = !request->restore;
 	if (request->restore)

@@ -6,9 +6,10 @@
  * CPM +0x2f0: modify the bit0 request without echoing the independently
  * changing bits27:20 status field. Preserve every other control bit.
  */
-static inline unsigned int apple_pmp_cpm_control(unsigned int old, int raised)
+static inline unsigned long long
+apple_pmp_cpm_control(unsigned long long old, int raised)
 {
-	return (old & ~((0xffU << 20) | 1U)) | !!raised;
+	return (old & ~((0xffULL << 20) | 1ULL)) | !!raised;
 }
 
 /* Activity sources share one release deadline and one vote output. */
