@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/workqueue.h>
 
@@ -97,9 +98,17 @@ struct cpu_sample {
 	bool enabled, valid;
 };
 
+struct cpm_cluster {
+	void __iomem *reg;
+	cpumask_t cpus;
+	u32 saved_bit;
+	bool saved, valid, raised;
+};
+
 struct apple_pmp_cpu_vote {
 	struct device *dev;
-	void __iomem *events, *request, *cpm[2];
+	void __iomem *events, *request;
+	struct cpm_cluster cpm[2];
 	/* Serializes samples, release, statistics and teardown. */
 	struct mutex lock;
 	struct delayed_work release_work;
@@ -108,31 +117,85 @@ struct apple_pmp_cpu_vote {
 	struct apple_pmp_vote_policy policy;
 	struct hlist_node hotplug_node;
 	int hotplug_state;
-	u32 saved_enables[2], saved_cpm_bits[2], active_vote;
+	u32 saved_enables[2], active_vote;
 	u64 started_ns, changed_ns, on_ns, ticks, changes;
 	unsigned int last_cpu, last_load;
 	bool active, stopping, instance_added, stats_created;
-	bool cpm_valid, cpm_raised;
 };
+
+struct cpm_request {
+	struct cpm_cluster *cluster;
+	bool raised, restore;
+};
+
+/* Runs synchronously on an online CPU in the register's own cluster. */
+static void cpu_vote_cpm_access(void *arg)
+{
+	struct cpm_request *request = arg;
+	struct cpm_cluster *cluster = request->cluster;
+	u32 old;
+	bool raised;
+
+	if (WARN_ON_ONCE(!cpumask_test_cpu(smp_processor_id(), &cluster->cpus)))
+		return;
+	old = readl(cluster->reg);
+	if (!cluster->saved) {
+		cluster->saved_bit = old & 1;
+		cluster->saved = true;
+	}
+	raised = request->restore ? cluster->saved_bit : request->raised;
+	writel(apple_pmp_cpm_control(old, raised), cluster->reg);
+	readl(cluster->reg);
+	cluster->raised = raised;
+	cluster->valid = !request->restore;
+	if (request->restore)
+		cluster->saved = false;
+}
+
+/* Caller holds vote->lock and protects cpu_online_mask against hotplug. */
+static void cpu_vote_cpm_apply(struct apple_pmp_cpu_vote *vote, bool raised,
+			       bool restore)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(vote->cpm); i++) {
+		struct cpm_cluster *cluster = &vote->cpm[i];
+		struct cpm_request request = { cluster, raised, restore };
+		int ret;
+
+		if (!cluster->reg || (restore && !cluster->saved) ||
+		    (!restore && cluster->valid && cluster->raised == raised))
+			continue;
+		ret = smp_call_function_any(&cluster->cpus, cpu_vote_cpm_access,
+					    &request, 1);
+		if (ret) {
+			/* Retry an offline cluster after its next online event. */
+			cluster->valid = false;
+			dev_warn_ratelimited(
+				vote->dev,
+				"CPM cluster %u access deferred: %d\n", i, ret);
+		}
+	}
+}
 
 /* Caller holds vote->lock. Only bit0 is owned; bits27:20 are status. */
 static void cpu_vote_cpm_write(struct apple_pmp_cpu_vote *vote, bool raised)
 {
-	unsigned int i;
-
-	if (!vote->cpm[0] || (!READ_ONCE(cpu_vote_cpm) && !vote->cpm_valid))
+	if (!vote->cpm[0].reg || (!READ_ONCE(cpu_vote_cpm) &&
+				  !vote->cpm[0].saved && !vote->cpm[1].saved))
 		return;
 	raised = raised && READ_ONCE(cpu_vote_cpm);
-	if (vote->cpm_valid && raised == vote->cpm_raised)
+	if (vote->cpm[0].valid && vote->cpm[1].valid &&
+	    vote->cpm[0].raised == raised && vote->cpm[1].raised == raised)
 		return;
-	for (i = 0; i < 2; i++) {
-		u32 old = readl(vote->cpm[i]);
-
-		writel(apple_pmp_cpm_control(old, raised), vote->cpm[i]);
-		readl(vote->cpm[i]);
-	}
-	vote->cpm_valid = true;
-	vote->cpm_raised = raised;
+	/*
+	 * The hotplug writer drains these workers. Never wait on it while holding
+	 * vote->lock: defer the access instead, and retry at a later policy sample.
+	 */
+	if (!cpus_read_trylock())
+		return;
+	cpu_vote_cpm_apply(vote, raised, false);
+	cpus_read_unlock();
 }
 
 /* Called with lock held, after PMP has completed its ready handshake. */
@@ -248,8 +311,8 @@ unlock:
 
 static int cpu_vote_online(unsigned int cpu, struct hlist_node *node)
 {
-	struct apple_pmp_cpu_vote *vote = container_of(node,
-				struct apple_pmp_cpu_vote, hotplug_node);
+	struct apple_pmp_cpu_vote *vote =
+		container_of(node, struct apple_pmp_cpu_vote, hotplug_node);
 	struct cpu_sample *sample = &vote->samples[cpu];
 
 	if (!cpumask_test_cpu(cpu, &vote->sample_cpus))
@@ -258,6 +321,10 @@ static int cpu_vote_online(unsigned int cpu, struct hlist_node *node)
 	sample->idle = cpu_vote_idle_time(cpu, &sample->wall);
 	sample->valid = true;
 	sample->enabled = true;
+	if (cpumask_test_cpu(cpu, &vote->cpm[0].cpus))
+		vote->cpm[0].valid = false;
+	if (cpumask_test_cpu(cpu, &vote->cpm[1].cpus))
+		vote->cpm[1].valid = false;
 	queue_delayed_work_on(cpu, system_wq, &sample->work,
 			      msecs_to_jiffies(CPU_VOTE_INTERVAL_MS));
 	mutex_unlock(&vote->lock);
@@ -266,8 +333,8 @@ static int cpu_vote_online(unsigned int cpu, struct hlist_node *node)
 
 static int cpu_vote_offline(unsigned int cpu, struct hlist_node *node)
 {
-	struct apple_pmp_cpu_vote *vote = container_of(node,
-				struct apple_pmp_cpu_vote, hotplug_node);
+	struct apple_pmp_cpu_vote *vote =
+		container_of(node, struct apple_pmp_cpu_vote, hotplug_node);
 	struct cpu_sample *sample = &vote->samples[cpu];
 
 	if (!cpumask_test_cpu(cpu, &vote->sample_cpus))
@@ -275,9 +342,25 @@ static int cpu_vote_offline(unsigned int cpu, struct hlist_node *node)
 	mutex_lock(&vote->lock);
 	sample->enabled = false;
 	sample->valid = false;
+	{
+		unsigned int i;
+		for (i = 0; i < ARRAY_SIZE(vote->cpm); i++) {
+			struct cpm_cluster *cluster = &vote->cpm[i];
+			cpumask_t online;
+			struct cpm_request request = { cluster, false, true };
+
+			cpumask_and(&online, &cluster->cpus, cpu_online_mask);
+			if (cluster->saved && cpumask_test_cpu(cpu, &online) &&
+			    cpumask_weight(&online) == 1)
+				smp_call_function_single(
+					cpu, cpu_vote_cpm_access, &request, 1);
+			if (cpumask_test_cpu(cpu, &cluster->cpus))
+				cluster->valid = false;
+		}
+	}
 	mutex_unlock(&vote->lock);
 	/*
-	 * Sampling does not take cpus_read_lock(), so draining it here cannot
+	 * Sampling only tries the CPU read lock, so draining it here cannot
 	 * deadlock with the CPU hotplug writer.
 	 */
 	cancel_delayed_work_sync(&sample->work);
@@ -296,14 +379,15 @@ static ssize_t cpu_vote_show(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&vote->lock);
 	now = ktime_get_ns();
 	on = vote->on_ns + (vote->active_vote ? now - vote->changed_ns : 0);
-	n = sysfs_emit(buf,
-		       "active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u cpm=%u sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
+	n = sysfs_emit(
+		buf,
+		"active=%u vote=%#x readback=%#x last_cpu=%u load=%u samples=%llu changes=%llu on_ns=%llu total_ns=%llu value=%#x interval_ms=%u hold_ms=%u threshold=%u cpm=%u sources=%#x gpu_flights=%d gpu_last_ms=%lld\n",
 		vote->active, vote->active_vote,
-		vote->active ? readl(vote->request) : 0,
-		vote->last_cpu, vote->last_load, vote->ticks, vote->changes,
-		on, now - vote->started_ns, READ_ONCE(cpu_vote_value),
+		vote->active ? readl(vote->request) : 0, vote->last_cpu,
+		vote->last_load, vote->ticks, vote->changes, on,
+		now - vote->started_ns, READ_ONCE(cpu_vote_value),
 		CPU_VOTE_INTERVAL_MS, CPU_VOTE_HOLD_MS, CPU_VOTE_THRESHOLD,
-		READ_ONCE(cpu_vote_cpm) && !!vote->cpm[0],
+		READ_ONCE(cpu_vote_cpm) && !!vote->cpm[0].reg,
 		READ_ONCE(cpu_vote_sources), atomic_read(&gpu_flights),
 		atomic64_read(&gpu_last_ms));
 	mutex_unlock(&vote->lock);
@@ -330,7 +414,8 @@ apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 				     sizeof(*vote->samples), GFP_KERNEL);
 	if (!vote->samples)
 		return ERR_PTR(-ENOMEM);
-	vote->request = devm_platform_ioremap_resource_byname(pdev, "perf-vote");
+	vote->request =
+		devm_platform_ioremap_resource_byname(pdev, "perf-vote");
 	if (IS_ERR(vote->request))
 		return ERR_CAST(vote->request);
 	/* Old DTBs retain the v13 policy without the optional CPM control. */
@@ -339,12 +424,14 @@ apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 	if (cpm_e != cpm_p)
 		return ERR_PTR(-EINVAL);
 	if (cpm_e) {
-		vote->cpm[0] = devm_platform_ioremap_resource_byname(pdev, "cpm-e");
-		if (IS_ERR(vote->cpm[0]))
-			return ERR_CAST(vote->cpm[0]);
-		vote->cpm[1] = devm_platform_ioremap_resource_byname(pdev, "cpm-p");
-		if (IS_ERR(vote->cpm[1]))
-			return ERR_CAST(vote->cpm[1]);
+		vote->cpm[0].reg =
+			devm_platform_ioremap_resource_byname(pdev, "cpm-e");
+		if (IS_ERR(vote->cpm[0].reg))
+			return ERR_CAST(vote->cpm[0].reg);
+		vote->cpm[1].reg =
+			devm_platform_ioremap_resource_byname(pdev, "cpm-p");
+		if (IS_ERR(vote->cpm[1].reg))
+			return ERR_CAST(vote->cpm[1].reg);
 	}
 	vote->dev = &pdev->dev;
 	vote->events = events;
@@ -355,8 +442,12 @@ apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 		struct device_node *np = of_cpu_device_node_get(cpu);
 		struct cpu_sample *sample = &vote->samples[cpu];
 
-		if (of_device_is_compatible(np, "apple,donan-p"))
+		if (of_device_is_compatible(np, "apple,donan-p")) {
 			cpumask_set_cpu(cpu, &vote->p_cpus);
+			cpumask_set_cpu(cpu, &vote->cpm[1].cpus);
+		}
+		if (of_device_is_compatible(np, "apple,donan-e"))
+			cpumask_set_cpu(cpu, &vote->cpm[0].cpus);
 		if (of_device_is_compatible(np, "apple,donan-p") ||
 		    of_device_is_compatible(np, "apple,donan-e")) {
 			cpumask_set_cpu(cpu, &vote->sample_cpus);
@@ -366,7 +457,8 @@ apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events)
 		}
 		of_node_put(np);
 	}
-	if (cpumask_empty(&vote->p_cpus))
+	if (cpumask_empty(&vote->p_cpus) ||
+	    (vote->cpm[0].reg && cpumask_empty(&vote->cpm[0].cpus)))
 		return ERR_PTR(-ENODEV);
 	return vote;
 }
@@ -379,7 +471,8 @@ void apple_pmp_cpu_vote_start(struct apple_pmp_cpu_vote *vote)
 	if (!vote || vote->active)
 		return;
 	ret = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN,
-				      "pmdomain/apple-pmp:online", cpu_vote_online, cpu_vote_offline);
+				      "pmdomain/apple-pmp:online",
+				      cpu_vote_online, cpu_vote_offline);
 	if (ret < 0) {
 		dev_err(vote->dev, "CPU vote hotplug setup failed: %d\n", ret);
 		return;
@@ -394,31 +487,31 @@ void apple_pmp_cpu_vote_start(struct apple_pmp_cpu_vote *vote)
 		writel(old | BIT(1), vote->events + 4 * i);
 		readl(vote->events + 4 * i);
 	}
-	if (vote->cpm[0]) {
-		for (i = 0; i < 2; i++)
-			vote->saved_cpm_bits[i] = readl(vote->cpm[i]) & 1;
-		cpu_vote_cpm_write(vote, false);
-	}
+	cpu_vote_cpm_write(vote, false);
 	vote->started_ns = ktime_get_ns();
 	vote->changed_ns = vote->started_ns;
 	vote->active = true;
-	ret = cpuhp_state_add_instance(vote->hotplug_state, &vote->hotplug_node);
+	ret = cpuhp_state_add_instance(vote->hotplug_state,
+				       &vote->hotplug_node);
 	if (ret) {
-		dev_err(vote->dev, "CPU vote hotplug registration failed: %d\n", ret);
+		dev_err(vote->dev, "CPU vote hotplug registration failed: %d\n",
+			ret);
 		apple_pmp_cpu_vote_stop(vote);
 		return;
 	}
 	vote->instance_added = true;
 	ret = device_create_file(vote->dev, &dev_attr_cpu_vote);
 	if (ret)
-		dev_warn(vote->dev, "CPU vote statistics unavailable: %d\n", ret);
+		dev_warn(vote->dev, "CPU vote statistics unavailable: %d\n",
+			 ret);
 	else
 		vote->stats_created = true;
-	dev_info(vote->dev,
-		 "CPU/GPU memory/fabric vote enabled: sources=%#x value=%#x P=%*pbl period=%u ms threshold=%u%% hold=%u ms\n",
-		 READ_ONCE(cpu_vote_sources), READ_ONCE(cpu_vote_value),
-		 cpumask_pr_args(&vote->p_cpus),
-		 CPU_VOTE_INTERVAL_MS, CPU_VOTE_THRESHOLD, CPU_VOTE_HOLD_MS);
+	dev_info(
+		vote->dev,
+		"CPU/GPU memory/fabric vote enabled: sources=%#x value=%#x P=%*pbl period=%u ms threshold=%u%% hold=%u ms\n",
+		READ_ONCE(cpu_vote_sources), READ_ONCE(cpu_vote_value),
+		cpumask_pr_args(&vote->p_cpus), CPU_VOTE_INTERVAL_MS,
+		CPU_VOTE_THRESHOLD, CPU_VOTE_HOLD_MS);
 }
 
 void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote)
@@ -435,7 +528,8 @@ void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote)
 		vote->stats_created = false;
 	}
 	if (vote->instance_added) {
-		cpuhp_state_remove_instance(vote->hotplug_state, &vote->hotplug_node);
+		cpuhp_state_remove_instance(vote->hotplug_state,
+					    &vote->hotplug_node);
 		vote->instance_added = false;
 	}
 	if (vote->hotplug_state >= 0) {
@@ -443,6 +537,8 @@ void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote)
 		vote->hotplug_state = -1;
 	}
 	cancel_delayed_work_sync(&vote->release_work);
+	/* All workers and our hotplug callbacks are gone before blocking. */
+	cpus_read_lock();
 	mutex_lock(&vote->lock);
 	if (vote->active) {
 		cpu_vote_write(vote, 0);
@@ -455,17 +551,9 @@ void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote)
 			       vote->events + 4 * i);
 			readl(vote->events + 4 * i);
 		}
-		if (vote->cpm_valid) {
-			for (i = 0; i < 2; i++) {
-				u32 old = readl(vote->cpm[i]);
-
-				writel(apple_pmp_cpm_control(old, vote->saved_cpm_bits[i]),
-				       vote->cpm[i]);
-				readl(vote->cpm[i]);
-			}
-			vote->cpm_valid = false;
-		}
+		cpu_vote_cpm_apply(vote, false, true);
 		vote->active = false;
 	}
 	mutex_unlock(&vote->lock);
+	cpus_read_unlock();
 }
