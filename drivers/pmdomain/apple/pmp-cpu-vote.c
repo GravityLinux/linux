@@ -37,6 +37,46 @@ static unsigned int cpu_vote_sources =
 	APPLE_PMP_VOTE_CPU | APPLE_PMP_VOTE_GPU | APPLE_PMP_VOTE_E_CPU;
 static atomic_t gpu_flights = ATOMIC_INIT(0);
 static atomic64_t gpu_last_ms = ATOMIC64_INIT(0);
+static atomic64_t gpu_busy_clock = ATOMIC64_INIT(0);
+
+/* Research filters are opt-in. Legacy behavior remains the default. */
+static unsigned int cpu_vote_p_samples = 1;
+static unsigned int cpu_vote_e_samples = 1;
+static unsigned int cpu_vote_gpu_percent;
+static unsigned int cpu_vote_gpu_window_ms = 100;
+
+static int cpu_vote_set_filter(const char *text, const struct kernel_param *kp)
+{
+	unsigned int value;
+	int ret = kstrtouint(text, 0, &value);
+
+	if (ret)
+		return ret;
+	if (kp->arg == &cpu_vote_gpu_percent) {
+		if (value > 100)
+			return -EINVAL;
+	} else if (kp->arg == &cpu_vote_gpu_window_ms) {
+		if (value < 20 || value > 500 || value % 20)
+			return -EINVAL;
+	} else if (!value || value > 5) {
+		return -EINVAL;
+	}
+	WRITE_ONCE(*(unsigned int *)kp->arg, value);
+	return 0;
+}
+
+static const struct kernel_param_ops cpu_vote_filter_ops = {
+	.set = cpu_vote_set_filter,
+	.get = param_get_uint,
+};
+module_param_cb(cpu_vote_p_samples, &cpu_vote_filter_ops, &cpu_vote_p_samples, 0644);
+MODULE_PARM_DESC(cpu_vote_p_samples, "Consecutive P-core occupied samples (1..5)");
+module_param_cb(cpu_vote_e_samples, &cpu_vote_filter_ops, &cpu_vote_e_samples, 0644);
+MODULE_PARM_DESC(cpu_vote_e_samples, "Consecutive E aggregate occupied samples (1..5)");
+module_param_cb(cpu_vote_gpu_percent, &cpu_vote_filter_ops, &cpu_vote_gpu_percent, 0644);
+MODULE_PARM_DESC(cpu_vote_gpu_percent, "GPU in-flight union busy percent (0 = legacy)");
+module_param_cb(cpu_vote_gpu_window_ms, &cpu_vote_filter_ops, &cpu_vote_gpu_window_ms, 0644);
+MODULE_PARM_DESC(cpu_vote_gpu_window_ms, "GPU busy window ms (20..500, multiple of 20)");
 
 static int cpu_vote_set_sources(const char *text, const struct kernel_param *kp)
 {
@@ -87,9 +127,17 @@ MODULE_PARM_DESC(cpu_vote_e_threshold,
 /* Scalar publication only: no GPU pointer, allocation, locking or MMIO. */
 void apple_pmp_cpu_vote_gpu_activity(unsigned int active)
 {
+	u64 old, next, now;
+
 	if (!READ_ONCE(cpu_vote_enabled))
 		return;
-	atomic64_set(&gpu_last_ms, ktime_to_ms(ktime_get()));
+
+	do {
+		old = atomic64_read(&gpu_busy_clock);
+		now = ktime_get_ns();
+		next = apple_pmp_vote_gpu_clock(old, now, active != 0);
+	} while (atomic64_cmpxchg(&gpu_busy_clock, old, next) != old);
+	atomic64_set(&gpu_last_ms, div_u64(now, NSEC_PER_MSEC));
 	atomic_set(&gpu_flights, active);
 }
 EXPORT_SYMBOL_GPL(apple_pmp_cpu_vote_gpu_activity);
@@ -122,6 +170,7 @@ struct cpu_sample {
 	struct apple_pmp_cpu_vote *vote;
 	u64 idle, wall;
 	struct apple_pmp_vote_cpu_time e_time;
+	struct apple_pmp_vote_run p_run;
 	unsigned int cpu;
 	bool enabled, valid;
 };
@@ -131,6 +180,10 @@ struct cpm_cluster {
 	cpumask_t cpus;
 	u32 saved_bit;
 	bool saved, valid, raised;
+};
+
+struct vote_source_stats {
+	u64 start_ms, until_ms, completed_ms, raises, events;
 };
 
 struct apple_pmp_cpu_vote {
@@ -143,6 +196,11 @@ struct apple_pmp_cpu_vote {
 	struct cpu_sample *samples;
 	cpumask_t p_cpus, e_cpus, sample_cpus;
 	struct apple_pmp_vote_policy policy;
+	struct apple_pmp_vote_run e_run;
+	struct apple_pmp_vote_gpu_window gpu_window;
+	struct vote_source_stats source[3];
+	u64 p_hot[3], e_hot[3], gpu_hist[11], p_samples, e_samples;
+	u64 gpu_hist_ms;
 	struct hlist_node hotplug_node;
 	int hotplug_state;
 	u32 saved_enables[2], active_vote;
@@ -263,19 +321,65 @@ static u64 cpu_vote_idle_time(unsigned int cpu, u64 *wall)
 #endif
 }
 
-/*
- * Called with lock held. Read the event before the clock so its timestamp
- * cannot appear to be in the future relative to the policy decision.
- */
+/* Caller holds the policy mutex. Source holds overlap and must not be summed. */
+static void cpu_vote_note_source(struct apple_pmp_cpu_vote *vote,
+				 unsigned int index, u64 when_ms)
+{
+	struct vote_source_stats *s = &vote->source[index];
+
+	if (when_ms < div_u64(vote->started_ns, NSEC_PER_MSEC) ||
+	    (s->until_ms && when_ms + CPU_VOTE_HOLD_MS < s->until_ms))
+		return;
+	s->events++;
+	if (!s->until_ms || when_ms > s->until_ms) {
+		s->completed_ms += s->until_ms - s->start_ms;
+		s->start_ms = when_ms;
+		s->raises++;
+	}
+	s->until_ms = when_ms + CPU_VOTE_HOLD_MS;
+}
+
+/* One consistent snapshot, with no lock/allocation/MMIO in the GPU producer. */
+static u64 cpu_vote_gpu_busy(u64 *now)
+{
+	u64 state;
+
+	do {
+		state = atomic64_read(&gpu_busy_clock);
+		*now = ktime_get_ns();
+	} while (state != atomic64_read(&gpu_busy_clock));
+	if (state & 1)
+		state += *now << 1;
+	return state >> 1;
+}
+
+/* Called with lock held; legacy pulse preservation is bypassed only opt-in. */
 static unsigned int cpu_vote_gpu_input(struct apple_pmp_cpu_vote *vote, u64 *now)
 {
+	u64 ns, busy = cpu_vote_gpu_busy(&ns);
 	u64 last = atomic64_read(&gpu_last_ms);
 	unsigned int active = atomic_read(&gpu_flights);
+	unsigned int threshold = READ_ONCE(cpu_vote_gpu_percent);
+	unsigned int percent;
 
-	*now = ktime_to_ms(ktime_get());
+	*now = div_u64(ns, NSEC_PER_MSEC);
+	percent = apple_pmp_vote_gpu_fraction(&vote->gpu_window, ns, busy,
+					      READ_ONCE(cpu_vote_gpu_window_ms));
+	if (*now - vote->gpu_hist_ms >= CPU_VOTE_INTERVAL_MS) {
+		vote->gpu_hist_ms = *now;
+		vote->gpu_hist[percent / 10]++;
+	}
 	if (!(READ_ONCE(cpu_vote_sources) & APPLE_PMP_VOTE_GPU))
 		return 0;
-	apple_pmp_vote_note_activity(&vote->policy, min(last, *now));
+	if (!threshold) {
+		apple_pmp_vote_note_activity(&vote->policy, min(last, *now));
+		if (last)
+			cpu_vote_note_source(vote, 1, min(last, *now));
+	} else {
+		active = percent >= threshold;
+	}
+	if (active)
+		cpu_vote_note_source(vote, 1, *now);
 	return active ? APPLE_PMP_VOTE_GPU : 0;
 }
 
@@ -288,10 +392,11 @@ static unsigned int cpu_vote_gpu_input(struct apple_pmp_cpu_vote *vote, u64 *now
 static unsigned int cpu_vote_e_input(struct apple_pmp_cpu_vote *vote, u64 now)
 {
 	bool fresh = !vote->e_sampling;
-	unsigned int cpu, load = 0;
+	unsigned int cpu, load = 0, threshold;
 
 	if (!(READ_ONCE(cpu_vote_sources) & APPLE_PMP_VOTE_E_CPU)) {
 		vote->e_sampling = false;
+		vote->e_run = (struct apple_pmp_vote_run){0};
 		vote->last_e_load = 0;
 		return 0;
 	}
@@ -311,7 +416,15 @@ static unsigned int cpu_vote_e_input(struct apple_pmp_cpu_vote *vote, u64 now)
 		load += apple_pmp_vote_load(&sample->e_time, idle, wall);
 	}
 	vote->last_e_load = load;
-	return apple_pmp_vote_e_input(load, READ_ONCE(cpu_vote_e_threshold));
+	vote->e_samples++;
+	threshold = READ_ONCE(cpu_vote_e_threshold);
+	fresh = apple_pmp_vote_sustained(&vote->e_run, load >= threshold,
+					 now, READ_ONCE(cpu_vote_e_samples));
+	for (cpu = 0; cpu < ARRAY_SIZE(vote->e_hot); cpu++)
+		vote->e_hot[cpu] += vote->e_run.count > cpu;
+	if (fresh)
+		cpu_vote_note_source(vote, 2, now);
+	return fresh ? APPLE_PMP_VOTE_E_CPU : 0;
 }
 
 static void cpu_vote_release(struct work_struct *work)
@@ -342,7 +455,7 @@ static void cpu_vote_sample(struct work_struct *work)
 					       struct cpu_sample, work);
 	struct apple_pmp_cpu_vote *vote = sample->vote;
 	u64 wall, idle = cpu_vote_idle_time(sample->cpu, &wall);
-	unsigned int load = 0, next, inputs;
+	unsigned int load = 0, next, inputs, i;
 	u64 now;
 
 	mutex_lock(&vote->lock);
@@ -363,8 +476,19 @@ static void cpu_vote_sample(struct work_struct *work)
 	inputs = cpu_vote_gpu_input(vote, &now);
 	inputs |= cpu_vote_e_input(vote, now);
 	if ((READ_ONCE(cpu_vote_sources) & APPLE_PMP_VOTE_CPU) &&
-	    cpumask_test_cpu(sample->cpu, &vote->p_cpus))
-		inputs |= apple_pmp_vote_cpu_input(load, CPU_VOTE_THRESHOLD);
+	    cpumask_test_cpu(sample->cpu, &vote->p_cpus)) {
+		bool busy = apple_pmp_vote_sustained(&sample->p_run,
+			apple_pmp_vote_cpu_input(load, CPU_VOTE_THRESHOLD),
+			now, READ_ONCE(cpu_vote_p_samples));
+
+		vote->p_samples++;
+		for (i = 0; i < ARRAY_SIZE(vote->p_hot); i++)
+			vote->p_hot[i] += sample->p_run.count > i;
+		if (busy) {
+			inputs |= APPLE_PMP_VOTE_CPU;
+			cpu_vote_note_source(vote, 0, now);
+		}
+	}
 	next = apple_pmp_vote_decide(&vote->policy, now, inputs,
 				     CPU_VOTE_HOLD_MS, READ_ONCE(cpu_vote_value));
 	cpu_vote_write(vote, next);
@@ -394,6 +518,7 @@ static int cpu_vote_online(unsigned int cpu, struct hlist_node *node)
 	sample->idle = cpu_vote_idle_time(cpu, &sample->wall);
 	sample->valid = true;
 	sample->enabled = true;
+	sample->p_run = (struct apple_pmp_vote_run){0};
 	if (cpumask_test_cpu(cpu, &vote->cpm[0].cpus))
 		vote->cpm[0].valid = false;
 	if (cpumask_test_cpu(cpu, &vote->cpm[1].cpus))
@@ -446,7 +571,8 @@ static ssize_t cpu_vote_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
 	struct apple_pmp_cpu_vote *vote = apple_pmp_report_cpu_vote(dev);
-	u64 now, on;
+	u64 now, on, gpu_now, gpu_busy;
+	unsigned int i;
 	ssize_t n;
 
 	if (!vote)
@@ -467,6 +593,35 @@ static ssize_t cpu_vote_show(struct device *dev, struct device_attribute *attr,
 		READ_ONCE(cpu_vote_e_threshold), READ_ONCE(cpu_vote_sources),
 		atomic_read(&gpu_flights),
 		atomic64_read(&gpu_last_ms));
+	/* Extend the existing attribute without changing its original counters. */
+	n--; /* replace newline */
+	for (i = 0; i < ARRAY_SIZE(vote->source); i++) {
+		struct vote_source_stats *s = &vote->source[i];
+		static const char * const name[] = { "p", "gpu", "e" };
+		u64 ms = s->completed_ms;
+
+		if (s->until_ms)
+			ms += min(div_u64(now, NSEC_PER_MSEC), s->until_ms) -
+				s->start_ms;
+		n += sysfs_emit_at(buf, n,
+			" %s_on_ns=%llu %s_raises=%llu %s_events=%llu",
+			name[i], ms * NSEC_PER_MSEC, name[i], s->raises,
+			name[i], s->events);
+	}
+	gpu_busy = cpu_vote_gpu_busy(&gpu_now);
+	n += sysfs_emit_at(buf, n,
+		" gpu_busy_ns=%llu gpu_percent=%u gpu_window_ms=%u gpu_threshold=%u p_required=%u e_required=%u p_samples=%llu e_samples=%llu",
+		gpu_busy, vote->gpu_window.percent,
+		READ_ONCE(cpu_vote_gpu_window_ms), READ_ONCE(cpu_vote_gpu_percent),
+		READ_ONCE(cpu_vote_p_samples), READ_ONCE(cpu_vote_e_samples),
+		vote->p_samples, vote->e_samples);
+	for (i = 0; i < ARRAY_SIZE(vote->p_hot); i++)
+		n += sysfs_emit_at(buf, n, " p_hot%u=%llu e_hot%u=%llu",
+				i + 1, vote->p_hot[i], i + 1, vote->e_hot[i]);
+	for (i = 0; i < ARRAY_SIZE(vote->gpu_hist); i++)
+		n += sysfs_emit_at(buf, n, " gpu_hist%u=%llu", i,
+				vote->gpu_hist[i]);
+	n += sysfs_emit_at(buf, n, "\n");
 	mutex_unlock(&vote->lock);
 	return n;
 }
