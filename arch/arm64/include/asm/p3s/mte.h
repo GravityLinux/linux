@@ -30,4 +30,18 @@ static inline void mte_zero_clear_slice_tags(void *addr)
 	mte_set_mem_tag_range(addr, PAGE_SIZE_4KB, 0, true);
 }
 
+/*
+ * mte_clear_slice_tags - Clear the allocation tags of a 4KB slice
+ * @addr: Kernel address of a 4KB slice of a host page
+ *
+ * The 4KB counterpart of mte_clear_page_tags(), for a slice whose data the
+ * caller overwrites in full: like mte_zero_clear_slice_tags(), but the
+ * data is left alone.
+ */
+static inline void mte_clear_slice_tags(void *addr)
+{
+	addr = (void *)((u64)addr & GENMASK_ULL(MTE_TAG_SHIFT - 1, 0));
+	mte_set_mem_tag_range(addr, PAGE_SIZE_4KB, 0, false);
+}
+
 #endif /* _ASM_ARM64_P3S_MTE_H */

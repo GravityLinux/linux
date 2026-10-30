@@ -425,9 +425,9 @@ static inline bool p3s_uffd_install_anon_folio(struct vm_area_struct *dst_vma,
 
 	offset = (unsigned long)vma_slice_offset(dst_vma, dst_addr) << PAGE_SHIFT_4KB;
 
-	/* The data is replaced below; the old allocation tags must go too */
+	/* The copy below replaces all of the data, but not the old tags */
 	if (dst_vma->vm_flags & VM_MTE)
-		mte_zero_clear_slice_tags(folio_address(existing_folio) + offset);
+		mte_clear_slice_tags(folio_address(existing_folio) + offset);
 	memcpy(folio_address(existing_folio) + offset,
 	       folio_address(folio) + offset, PAGE_SIZE_4KB);
 	flush_dcache_folio(existing_folio);
