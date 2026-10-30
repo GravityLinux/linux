@@ -36,6 +36,9 @@
 
 #define APPLE_ANS_BOOT_TIMEOUT	  USEC_PER_SEC
 
+/* Optional DT-described T8132 idle-control register. */
+#define APPLE_ANS_IDLE_ENABLE BIT(0)
+
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
 
@@ -1663,6 +1666,29 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 			       "nvme-apple", anv);
 	if (ret)
 		goto put_dev;
+
+	/*
+	 * T8132 retains firmware configuration in this separate control word.
+	 * Bit 0 permits automatic ANS power gating while the firmware is idle;
+	 * it does not stop the coprocessor. Set it before RTKit INIT and keep
+	 * all other firmware-programmed bits. Older DTs omit this resource.
+	 */
+	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "idle")) {
+		void __iomem *idle;
+
+		idle = devm_platform_ioremap_resource_byname(pdev, "idle");
+		if (IS_ERR(idle)) {
+			ret = PTR_ERR(idle);
+			goto put_dev;
+		}
+		writel(readl(idle) | APPLE_ANS_IDLE_ENABLE, idle);
+		if (!(readl(idle) & APPLE_ANS_IDLE_ENABLE)) {
+			ret = dev_err_probe(dev, -EIO,
+					    "Failed to enable automatic ANS idle\n");
+			goto put_dev;
+		}
+		dev_info(dev, "Automatic ANS idle enabled\n");
+	}
 
 	anv->rtk =
 		devm_apple_rtkit_init(dev, anv, NULL, 0, &apple_nvme_rtkit_ops);
