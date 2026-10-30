@@ -101,11 +101,6 @@ static inline unsigned long mm_reader_pages(const struct mm_struct *mm,
 
 #else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
 
-static inline bool personality_4kb_pages(unsigned long pers)
-{
-	return false;
-}
-
 static inline unsigned int mm_pte_shift(const struct mm_struct *mm)
 {
 	return PAGE_SHIFT_KERNEL;

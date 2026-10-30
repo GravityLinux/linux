@@ -50,7 +50,6 @@
 #ifndef __ASSEMBLY__
 /* 4KB process page alignment helpers */
 #define PAGE_ALIGN_4KB(addr)          ALIGN((addr), PAGE_SIZE_4KB)
-#define PAGE_ALIGN_DOWN_4KB(addr)     ALIGN_DOWN((addr), PAGE_SIZE_4KB)
 
 /*
  * In bottom-up mmap layout, start unmapped allocations at 1/4 of the
