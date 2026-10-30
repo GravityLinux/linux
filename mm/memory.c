@@ -1277,6 +1277,7 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 		}
 		rss[MM_ANONPAGES]++;
 		VM_WARN_ON_FOLIO(PageAnonExclusive(page), folio);
+		p3s_fork_wrprotect_siblings(src_vma, folio, src_pte, addr);
 	} else {
 		folio_dup_file_rmap_pte(folio, page, dst_vma);
 		rss[mm_counter_file(folio)]++;
@@ -1623,6 +1624,7 @@ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 	if (is_cow) {
 		mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE,
 					0, src_mm, addr, end);
+		p3s_fork_widen_range(src_vma, &range.start, &range.end);
 		mmu_notifier_invalidate_range_start(&range);
 		/*
 		 * Disabling preemption is not needed for the write side, as

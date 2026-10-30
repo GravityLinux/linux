@@ -167,6 +167,42 @@ static inline bool p3s_folio_slices_in_window(struct vm_area_struct *vma,
 }
 
 /*
+ * p3s_migration_share_slices - Keep sliced folios shared across migration
+ * @vma: Pointer to struct vm_area_struct
+ * @folio: Folio being migrated, whose PTE in @vma has just been cleared
+ * @writable: In/out: whether to make a writable migration entry
+ * @anon_exclusive: In/out: whether to make an exclusive migration entry
+ *
+ * remove_migration_pte() marks the folio exclusive again when it restores
+ * a writable or exclusive migration entry. When several slice PTEs of a
+ * 4KB VMA map a small anonymous folio, they share its single
+ * PageAnonExclusive flag, so, as for their swap PTEs, none of their
+ * migration entries may keep it: until all of them are restored, a 4KB
+ * madvise() or mremap() can move the entry that would restore the flag out
+ * of the part of the window that fork() copies, or the restore can reach
+ * that entry before fork() copies the others, and the folio would come
+ * back exclusive while the child maps it. Nor may a slice of a folio that
+ * is not exclusive come back writable, such as one that
+ * p3s_fork_wrprotect_siblings() could not reach because mremap() had moved
+ * it out of the window.
+ *
+ * Such slices come back read-only, and do_wp_page() decides on the first
+ * write whether the folio can be reused, as after a swap-in.
+ */
+static inline void p3s_migration_share_slices(const struct vm_area_struct *vma,
+					      const struct folio *folio,
+					      bool *writable,
+					      bool *anon_exclusive)
+{
+	if (!vma_is_p3s_4k(vma) || !folio_test_anon(folio))
+		return;
+	if (p3s_folio_mapped_by_slices(vma, folio))
+		*anon_exclusive = false;
+	if (!*anon_exclusive)
+		*writable = false;
+}
+
+/*
  * vma_folio_nr_ptes - Number of PTEs that map all of @folio in @vma
  * @vma: Pointer to struct vm_area_struct
  * @folio: Folio mapped by @vma

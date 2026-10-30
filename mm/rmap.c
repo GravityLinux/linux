@@ -2747,6 +2747,8 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 				page_vma_mapped_walk_done(&pvmw);
 				break;
 			}
+			p3s_migration_share_slices(vma, folio, &writable,
+						   &anon_exclusive);
 
 			/*
 			 * Store the pfn of the page in a special migration

@@ -89,4 +89,86 @@ static inline int vma_insert_pages_slices(struct vm_area_struct *vma,
 	return 0;
 }
 
+/*
+ * p3s_fork_wrprotect_siblings - Write-protect sibling slices of a shared folio
+ * @src_vma: The VMA that fork() copies
+ * @folio: Folio that fork() has just shared with the child through @src_pte
+ * @src_pte: PTE of @src_vma that maps @folio, with its page table locked
+ * @addr: Address of @src_pte
+ *
+ * Up to four slice PTEs of a 16KB window in a 4KB VMA can map one small
+ * anonymous folio, and a 4KB madvise() can split the window between VMAs.
+ * fork() write-protects the PTEs of the VMAs that it copies, but a sibling
+ * in a VMA that it skips (MADV_DONTFORK, MADV_WIPEONFORK) would stay
+ * writable on a folio that is no longer exclusive:
+ *
+ *              slice 0    slice 1    slice 2    slice 3
+ *            ┌──────────┬──────────┬──────────┬──────────┐
+ *    parent  │    RO    │ RW ─► RO │    RO    │    RO    │
+ *            ├──────────┼──────────┼──────────┼──────────┤
+ *    child   │    RO    │          │    RO    │    RO    │
+ *            └──────────┴──────────┴──────────┴──────────┘
+ *                         DONTFORK
+ *
+ * Write-protect every other PTE of the window that maps @folio writable,
+ * as __copy_present_ptes() does for @src_pte. The window follows the slice
+ * offset of @src_vma and is clipped to the PTE table of @src_pte, as in
+ * vma_folio_slice_bounds(), so @src_pte's page table lock covers it. The
+ * MMU notifier range of copy_page_range() covers it too, through
+ * p3s_fork_widen_range(), and dup_mmap() flushes the parent's TLB at the
+ * end. Its PTEs can belong to other VMAs, so match @folio by PFN rather
+ * than through vm_normal_folio().
+ */
+static inline void p3s_fork_wrprotect_siblings(struct vm_area_struct *src_vma,
+					       struct folio *folio,
+					       pte_t *src_pte,
+					       unsigned long addr)
+{
+	unsigned long off, pt, start, end;
+	pte_t *pte;
+
+	if (!vma_is_p3s_4k(src_vma) || folio_test_large(folio))
+		return;
+
+	/* The slice window of @addr, clipped to its PTE table */
+	off = (unsigned long)vma_slice_offset(src_vma, addr) << PAGE_SHIFT_4KB;
+	pt = addr & ~(PMD_SIZE_4KB - 1);
+	start = addr - min(off, addr - pt);
+	end = min(addr - off + PAGE_SIZE_KERNEL, pt + PMD_SIZE_4KB);
+	pte = src_pte - ((addr - start) >> PAGE_SHIFT_4KB);
+	for (; start < end; start += PAGE_SIZE_4KB, pte++) {
+		pte_t ptent = ptep_get(pte);
+
+		if (pte != src_pte && pte_present(ptent) && pte_write(ptent) &&
+		    pte_pfn(ptent) == folio_pfn(folio))
+			wrprotect_ptes(src_vma->vm_mm, start, pte, 1);
+	}
+}
+
+/*
+ * p3s_fork_widen_range - Widen the MMU notifier range of fork() to windows
+ * @src_vma: The VMA that fork() copies
+ * @start: In/out start of the range, initially @src_vma->vm_start
+ * @end: In/out end of the range, initially @src_vma->vm_end
+ *
+ * In a 4KB VMA, p3s_fork_wrprotect_siblings() can write-protect PTEs of
+ * other VMAs in the slice windows at either end of @src_vma, so secondary
+ * MMUs must drop their translations too.
+ */
+static inline void p3s_fork_widen_range(const struct vm_area_struct *src_vma,
+					unsigned long *start,
+					unsigned long *end)
+{
+	unsigned long off;
+
+	if (!vma_is_p3s_4k(src_vma))
+		return;
+	off = (unsigned long)vma_slice_offset(src_vma, *start) <<
+	      PAGE_SHIFT_4KB;
+	*start -= min(off, *start);
+	off = (unsigned long)vma_slice_offset(src_vma, *end - PAGE_SIZE_4KB) <<
+	      PAGE_SHIFT_4KB;
+	*end += PAGE_SIZE_KERNEL - PAGE_SIZE_4KB - off;
+}
+
 #endif /* __MM_P3S_MEMORY_H */
