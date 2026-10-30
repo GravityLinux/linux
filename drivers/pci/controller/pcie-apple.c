@@ -156,6 +156,10 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
  */
 #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
 
+/* AXI automatic-idle permission, shared with the T8132 ANS interface. */
+#define AXI_IDLE_CTRL		0x108
+#define AXI_IDLE_ENABLE		BIT(0)
+
 struct hw_info {
 	bool tunneled;
 	u32 phy_lane_ctl;
@@ -206,6 +210,7 @@ struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
 	void __iomem            *base;
+	void __iomem		*axi;
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
@@ -1225,6 +1230,31 @@ static void apple_pcie_rescan(struct work_struct *work)
 		queue_delayed_work(system_wq, &pcie->rescan_work, HZ);
 }
 
+/* Keep the firmware's AXI setup and permit the PCIe island to idle. */
+static int apple_pcie_enable_axi_idle(void __iomem *axi)
+{
+	if (!axi)
+		return 0;
+
+	writel(readl(axi + AXI_IDLE_CTRL) | AXI_IDLE_ENABLE,
+	       axi + AXI_IDLE_CTRL);
+	if (!(readl(axi + AXI_IDLE_CTRL) & AXI_IDLE_ENABLE))
+		return -EIO;
+
+	return 0;
+}
+
+static int apple_pcie_resume_noirq(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+
+	return apple_pcie_enable_axi_idle(pcie->axi);
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(apple_pcie_pm_ops, NULL,
+			     apple_pcie_resume_noirq);
+
 static int apple_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1232,10 +1262,28 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	struct device_node *of_port;
 	struct apple_pcie *pcie;
 	const struct hw_info *hw = of_device_get_match_data(dev);
+	struct resource *res;
+	void __iomem *axi = NULL;
 	int ret;
 
 	if (!hw)
 		return -ENODEV;
+
+	/* The internal T8132 controller exposes its AXI aperture as ADT reg[4]. */
+	if (!hw->tunneled &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-pcie")) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "axi");
+		/* Preserve compatibility with older DTs without this resource. */
+		if (res) {
+			axi = devm_ioremap_resource(dev, res);
+			if (IS_ERR(axi))
+				return PTR_ERR(axi);
+			ret = apple_pcie_enable_axi_idle(axi);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "AXI idle permission did not stick\n");
+		}
+	}
 
 	/* A tunneled port uses the ACIO's reset, with no external PERST GPIO. */
 	for_each_available_child_of_node(dev->of_node, of_port) {
@@ -1255,6 +1303,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	pcie->axi = axi;
 	if (hw->tunneled) {
 		ret = of_property_read_u32(dev->of_node, "apple,msi-vector-base",
 					   &pcie->msi_vector_base);
@@ -1315,6 +1364,7 @@ static struct platform_driver apple_pcie_driver = {
 		.name			= "pcie-apple",
 		.of_match_table		= apple_pcie_of_match,
 		.suppress_bind_attrs	= true,
+		.pm			= pm_sleep_ptr(&apple_pcie_pm_ops),
 	},
 };
 
