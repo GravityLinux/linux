@@ -21,6 +21,9 @@ description: |
   separate from the port registers. In that case, there is one PHY
   register range per port register range.
 
+  On T8132, the internal controller also has an AXI control aperture,
+  named "axi", which permits automatic idle of the PCIe island.
+
   All root ports share a single ECAM space, but separate GPIOs are
   used to take the PCI devices on those ports out of reset.  Therefore
   the standard "reset-gpios" and "max-link-speed" properties appear on
@@ -44,10 +47,10 @@ properties:
       - items:
           - const: apple,t8122-pcie
           - const: apple,t6020-pcie
+      - const: apple,t6020-pcie
       - items:
           - const: apple,t8132-pcie
           - const: apple,t6020-pcie
-      - const: apple,t6020-pcie
 
   reg:
     minItems: 3
@@ -82,6 +85,18 @@ properties:
           - const: phy1
           - const: phy2
           - const: phy3
+      - minItems: 9
+        maxItems: 9
+        items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: port1
+          - const: port2
+          - const: phy0
+          - const: phy1
+          - const: phy2
+          - const: axi
 
   ranges:
     minItems: 2
@@ -161,6 +176,16 @@ allOf:
           maxItems: 5
         interrupts:
           maxItems: 3
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pcie
+    then:
+      properties:
+        reg:
+          minItems: 9
+          maxItems: 9
   - if:
       allOf:
         - properties:
