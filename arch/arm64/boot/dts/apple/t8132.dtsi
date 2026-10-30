@@ -1596,8 +1596,10 @@
 		nvme: nvme@4c5cc0000 {
 			compatible = "apple,t8132-nvme-ans2";
 			reg = <0x4 0xc5cc0000 0x0 0x60000>,
-			      <0x4 0x81600000 0x0 0x4000>;
-			reg-names = "nvme", "ans";
+			      <0x4 0x81600000 0x0 0x4000>,
+			      /* ANS ADT reg[4] + 0x108: automatic idle permission. */
+			      <0x4 0x83000108 0x0 0x4>;
+			reg-names = "nvme", "ans", "idle";
 
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1018 IRQ_TYPE_LEVEL_HIGH>;
