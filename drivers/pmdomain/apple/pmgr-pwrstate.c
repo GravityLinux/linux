@@ -130,11 +130,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	return ret;
 }
 
-static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
+static bool apple_pmgr_ps_is_active(u32 reg)
 {
-	u32 reg = 0;
-
-	regmap_read(ps->regmap, ps->offset, &reg);
 	/*
 	 * We consider domains as active if they are actually on, or if they have auto-PM
 	 * enabled and the intended target is on.
@@ -241,6 +238,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	int ret;
 	const char *name;
 	bool active;
+	bool preserve_clkgated = false;
+	u32 boot_state;
 
 	regmap = syscon_node_to_regmap(node->parent);
 	if (IS_ERR(regmap))
@@ -285,9 +284,29 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->externally_clocked = true;
 	ps->no_auto_enable = of_property_read_bool(node, "apple,no-auto-enable");
 
-	active = apple_pmgr_ps_is_active(ps);
+	ret = regmap_read(regmap, ps->offset, &boot_state);
+	if (ret < 0)
+		return ret;
+
+	active = apple_pmgr_ps_is_active(boot_state);
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+		/*
+		 * Firmware can leave a critical domain clock-gated rather than
+		 * fully active. Keep that usable, non-off state without requesting
+		 * ACTIVE or changing its automatic-PM policy. ALWAYS_ON still
+		 * prevents genpd from powering it off. Do not extend this to
+		 * unknown intermediate states, reset or disabled domains.
+		 */
+		if (!active &&
+		    FIELD_GET(APPLE_PMGR_PS_TARGET, boot_state) == APPLE_PMGR_PS_CLKGATE &&
+		    FIELD_GET(APPLE_PMGR_PS_ACTUAL, boot_state) == APPLE_PMGR_PS_CLKGATE &&
+		    !(boot_state & (APPLE_PMGR_RESET | APPLE_PMGR_DEV_DISABLE))) {
+			preserve_clkgated = true;
+			active = true;
+			dev_info(dev, "preserving boot clock-gated always-on domain %s (PS %#x)\n",
+				 name, boot_state);
+		}
 		if (!active) {
 			dev_warn(dev, "always-on domain %s is not on at boot\n", name);
 			/* Turn it on so pm_genpd_init does not fail */
@@ -298,7 +317,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active)
+	if (active && !preserve_clkgated)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   ps->no_auto_enable ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
