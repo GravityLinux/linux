@@ -268,6 +268,9 @@ impl StateG16C {
     pub(crate) fn poisoned(&self) -> bool {
         self.poisoned
     }
+    pub(crate) fn idle(&self) -> bool {
+        !self.poisoned && self.flights.iter().all(|flight| flight.quiescent)
+    }
     pub(crate) fn retains_owner(&self, owner: (u64, u32)) -> bool {
         self.flights.iter().any(|flight|
             flight._owners.iter().any(|lease| lease.owner == owner))

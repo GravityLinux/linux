@@ -785,6 +785,7 @@ impl Schedule {
         if matches!(dev.abi, super::super::GpuAbi::G16C) {
             runtime.session.reap_g16c_contexts()?;
         }
+        runtime.session.reap_source_backing();
         let poll_us = poll_started.map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         for index in 0..self.nodes.len() {
             let node = &mut self.nodes[index];

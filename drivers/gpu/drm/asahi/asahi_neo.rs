@@ -367,6 +367,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Share immutable caller leaf tables during retired render/compute context switches",
         },
+        release_backing: u32 {
+            default: 1,
+            description: "Reclaim sole-referenced caller BOs after idle global UAT invalidation; 0 retains backing until shutdown",
+        },
         partial_independent_owner: u32 {
             default: 0,
             description: "Source G17P_PARTIAL_INDEPENDENT_OWNER: retain two render pools",

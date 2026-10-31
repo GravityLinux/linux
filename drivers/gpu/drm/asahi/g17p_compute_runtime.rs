@@ -41,7 +41,8 @@ const ROBUSTNESS: u64 = 0x1000018000;
 /// CPU mappings are created only by execution-time cache maintenance. The
 /// retained cache lives outside GEM Objects, avoiding an Object/ARef cycle.
 /// Entries own their exact Object identity, so addresses cannot be recycled
-/// while a mapping remains cached. Roots/binding snapshots stay immutable.
+/// while a mapping remains cached. Only the most recently maintained buffer
+/// set is cached; roots and execution leases own backing independently.
 #[derive(Clone)]
 pub(crate) struct CpuMaps(
     Arc<Mutex<RBTree<usize, shmem::VMap<super::g17p_drm::Bo, u8>>>>,
@@ -348,6 +349,23 @@ fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps
                 map.ptr_from_index(bo.size() - 1)?;
             }
         }
+        // A retained queue can visit arbitrarily many clients. Keeping every
+        // old vmap also keeps every old BO alive, even after its roots retire.
+        // Move existing nodes rather than allocating a second identity index.
+        // Repeated bindings of one BO remove its node only once. Cache users
+        // borrow mappings under this mutex and can recreate misses on demand;
+        // no executable mapping depends on membership in this cache.
+        let mut current = RBTree::new();
+        for bo in buffers {
+            let identity = &**bo as *const Object as usize;
+            if let Some(node) = maps.remove_node(&identity) {
+                current.insert(node);
+            }
+        }
+        core::mem::swap(&mut *maps, &mut current);
+        drop(maps);
+        // Vunmap and the associated GEM puts must run without the tree lock.
+        drop(current);
         super::g17p_memory::sync();
         Ok(())
 }

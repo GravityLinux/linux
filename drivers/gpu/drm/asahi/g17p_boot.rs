@@ -200,13 +200,13 @@ pub(crate) struct Session {
     cleanup: cleanup::Receipts,
     submission_error: Option<Error>,
     submissions: usize,
-    // Published backing remains session-owned even after GEM close/unmap.
-    // Submission paths may append temporary duplicate references; retiring
-    // those duplicates must preserve the permanent owners established below.
+    // Published backing survives GEM close/unmap until all other owners have
+    // gone and an idle global UAT invalidation permits reclamation.
     retained_buffers: KVec<kernel::sync::aref::ARef<super::g17p_drm::Object>>,
-    // Compare-only identity keys for the permanent owners above. No backing
+    // Compare-only identity keys for the retained owners above. No backing
     // reference lives in this index; retained_buffers owns the allocations.
     retained_buffer_ids: RBTree<usize, ()>,
+    retained_since_reap: usize,
     timestamps: Option<super::g17p_timestamp::Registry>,
     peers: KVec<Peer>,
     memory: Option<Memory>,
@@ -415,29 +415,56 @@ impl Report {
 }
 
 impl Session {
-    /// The synchronous source adapter allocates BO physical backing once and
-    /// does not return it on GEM close. Keep the same physical lifetime: queue
-    /// retirement permits unmapping, but does not certify that a firmware
-    /// execution context has released all cached references to the allocation.
-    /// Session shutdown stops both peers before releasing these owners.
+    /// Keep published BO backing until no root, handle, vmap or execution lease
+    /// owns it. Queue retirement alone is insufficient to release a BO.
     pub(crate) fn retain_source_backing(&mut self, bo: &ARef<super::g17p_drm::Object>) -> Result {
-        // Max's context owner and exact publication/CPU leases retain these
-        // BOs until its qualified context-close/root-invalidation receipt.
-        // Do not add a second permanent reference after that receipt.
         let identity = &**bo as *const super::g17p_drm::Object as usize;
         if self.retained_buffer_ids.get(&identity).is_some() {
             return Ok(());
         }
-        // Allocate before recording membership. The permanent ARef prevents
+        // Allocate before recording membership. The retained ARef prevents
         // this address from being reused while its key remains in the index.
-        // Live tickets retain independent execution ARefs. This permanent
-        // vector is never truncated by retirement, including prefix retirement
-        // when a newer accepted job has added a different permanent owner.
         let node = RBTreeNode::new(identity, (), GFP_KERNEL)?;
         self.retained_buffers.reserve(1, GFP_KERNEL)?;
         self.retained_buffers.push(bo.clone(), GFP_KERNEL)?;
         self.retained_buffer_ids.insert(node);
+        self.retained_since_reap = self.retained_since_reap.saturating_add(1);
         Ok(())
+    }
+
+    /// Called under the publication mutex after CPU completions are signalled.
+    /// Batch scans, but leave the request armed when another owner is busy.
+    pub(crate) fn reap_source_backing(&mut self) {
+        if crate::module_parameters::release_backing.value() == 0
+            || self.retained_since_reap < 64
+            || self.phase != Phase::Running
+            || self.native.is_some()
+            || self.pending.is_some() || self.compute_pending.is_some()
+            || self.render_control.is_some() || !self.independent_pending.is_empty()
+            || !self.independent_compute.reclaim_idle() || !self.completions.is_empty()
+            || self.cleanup.require_idle().is_err()
+            || self.render_prepare_leases.iter().any(|(_, lease)| lease.load(Ordering::Acquire))
+            || self.render_cpu_leases.iter().any(|(_, fence)|
+                unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) } == 0)
+            || self.g16c_transport.as_ref().is_some_and(|transport| !transport.idle())
+        { return; }
+        // Every installed root's Client and every off-lock preparation or CPU
+        // completion owns its BOs. A sole-referenced object is therefore absent
+        // from all live roots. Flush cached translations before its final put;
+        // neither new publication nor ownership acquisition can race this pass.
+        if !self.retained_buffers.iter().any(|bo| super::g17p_drm::sole_backing_reference(bo)) {
+            self.retained_since_reap = 0;
+            return;
+        }
+        Vm::invalidate_gpu();
+        let identities = &mut self.retained_buffer_ids;
+        self.retained_buffers.retain(|bo| {
+            if !super::g17p_drm::sole_backing_reference(bo) { return true; }
+            let identity = &**bo as *const super::g17p_drm::Object as usize;
+            identities.remove(&identity);
+            false
+        });
+        self.retained_since_reap = 0;
     }
 
     fn unstarted(memory: Memory, ttbs: u64, events: Arc<super::g17p_drm::asynchronous::Events>) -> Result<KBox<Self>> {
@@ -470,6 +497,7 @@ impl Session {
                 submissions: 0,
                 retained_buffers: KVec::new(),
                 retained_buffer_ids: RBTree::new(),
+                retained_since_reap: 0,
                 timestamps: Some(super::g17p_timestamp::Registry::new()),
                 peers: KVec::new(),
                 memory: Some(memory),
