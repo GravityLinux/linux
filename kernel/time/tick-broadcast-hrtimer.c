@@ -27,6 +27,8 @@ module_param_named(cpu, preferred_cpu, int, 0444);
 MODULE_PARM_DESC(cpu, "Preferred hrtimer broadcast CPU (-1: follow the caller)");
 
 #ifdef CONFIG_SMP
+DEFINE_STATIC_KEY_FALSE(tick_broadcast_hrtimer_preferred_key);
+
 static call_single_data_t bc_handoff = CSD_INIT(tick_broadcast_hrtimer_reprogram,
 					       &ce_broadcast_hrtimer);
 
@@ -103,7 +105,8 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
 	 * base lock.
 	 */
 	bc->bound_on = bctimer.base->cpu_base->cpu;
-	tick_broadcast_hrtimer_queue(bc);
+	if (tick_broadcast_hrtimer_preferred_enabled())
+		tick_broadcast_hrtimer_queue(bc);
 
 	return 0;
 }
@@ -143,3 +146,14 @@ void tick_setup_hrtimer_broadcast(void)
 	hrtimer_setup(&bctimer, bc_handler, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
 	clockevents_register_device(&ce_broadcast_hrtimer);
 }
+
+#ifdef CONFIG_SMP
+static int __init bc_preferred_cpu_init(void)
+{
+	/* Static-key patching needs process context, not time_init(). */
+	if (preferred_cpu >= 0)
+		static_branch_enable(&tick_broadcast_hrtimer_preferred_key);
+	return 0;
+}
+early_initcall(bc_preferred_cpu_init);
+#endif
