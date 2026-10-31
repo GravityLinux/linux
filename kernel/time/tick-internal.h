@@ -138,6 +138,8 @@ extern int tick_broadcast_oneshot_active(void);
 extern void tick_check_oneshot_broadcast_this_cpu(void);
 bool tick_broadcast_oneshot_available(void);
 extern struct cpumask *tick_get_broadcast_oneshot_mask(void);
+void tick_broadcast_hrtimer_queue(struct clock_event_device *bc);
+void tick_broadcast_hrtimer_reprogram(void *arg);
 #else /* !(BROADCAST && ONESHOT): */
 static inline void tick_broadcast_switch_to_oneshot(void) { }
 static inline int tick_broadcast_oneshot_active(void) { return 0; }
