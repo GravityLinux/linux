@@ -780,7 +780,7 @@ static void tick_handle_oneshot_broadcast(struct clock_event_device *dev)
 	}
 }
 
-static int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
+static __always_inline int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
 {
 	if (!(bc->features & CLOCK_EVT_FEAT_HRTIMER))
 		return 0;
