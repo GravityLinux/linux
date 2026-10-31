@@ -1,5 +1,11 @@
 # Shared G16C/G17P render performance, 2026-10-31
 
+> Performance conclusions superseded by
+> [the two-client latency investigation](QUALIFICATION.two-client-latency-20261031.md).
+> The original lab used coarse timers and a serial benchmark whose final CPU
+> validation scan was timed. The current pipelined DMA-BUF/DCP test reaches
+> 119.5 fps; the historical receipts below are preserved unchanged.
+
 Code is on `experimental/gpu-performance-7.3`, based on unified kernel
 `6c6a2497cac2` (its GPU source matches `replacement/210-gpu`).
 

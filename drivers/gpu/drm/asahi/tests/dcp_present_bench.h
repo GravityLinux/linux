@@ -12,6 +12,7 @@
 #include <drm_fourcc.h>
 static unsigned perf_width, perf_height, perf_frames;
 static int client_socket;
+static bool perf_pipeline;
 static uint64_t now_ns(void) { struct timespec t; if(clock_gettime(CLOCK_MONOTONIC,&t)) abort(); return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
 static void exact_read(int fd,void *p,size_t n) { while(n) { ssize_t r=read(fd,p,n);if(r<0&&errno==EINTR)continue;if(r<=0){perror("read");exit(1);}p=(char*)p+r;n-=r;} }
 static void exact_write(int fd,const void *p,size_t n) { while(n) { ssize_t r=write(fd,p,n);if(r<0&&errno==EINTR)continue;if(r<=0){perror("write");exit(1);}p=(const char*)p+r;n-=r;} }
