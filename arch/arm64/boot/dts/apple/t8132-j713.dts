@@ -33,6 +33,12 @@
 		/delete-property/ dcpext1;
 	};
 
+	sound {
+		compatible = "apple,j713-headphones";
+		apple,mca = <&mca>;
+		apple,headphone-codec = <&jack_codec>;
+	};
+
 	led-controller {
 		compatible = "pwm-leds";
 		led-0 {
@@ -357,4 +363,42 @@
 
 &pmp {
 	status = "okay";
+};
+
+/* Stage A: no amplifier nodes, and hold the shared amp enable inactive. */
+&pinctrl_ap {
+	speaker-disable-hog {
+		gpio-hog;
+		gpios = <15 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "J713 speaker disable";
+	};
+};
+
+&dart_audio {
+	status = "okay";
+};
+
+&admac {
+	status = "okay";
+};
+
+&mca {
+	status = "okay";
+	/* Only TX2 is available to the headphone-only card. */
+	dmas = <&admac 4>;
+	dma-names = "tx2a";
+};
+
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
 };
