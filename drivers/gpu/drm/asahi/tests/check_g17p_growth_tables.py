@@ -38,9 +38,9 @@ use super::*;
 use std::collections::BTreeMap;
 const PAGE:u64=0x4000;const ADDRESS:u64=0x3ffffffc000;
 #[derive(Clone)]
-pub struct UserVm {tables:BTreeMap<u64,Vec<u64>>,next:u64,writes:Vec<(u64,usize,u64)>,links:Vec<(u64,Vec<u64>)>}
+pub struct UserVm {tables:BTreeMap<u64,Vec<u64>>,next:u64,writes:Vec<(u64,usize,u64)>,links:Vec<(u64,Vec<u64>)>,borrowed:Vec<u64>}
 impl UserVm {
-pub fn new()->Self{Self{tables:BTreeMap::from([(PAGE,vec![0;2048])]),next:PAGE*2,writes:Vec::new(),links:Vec::new()}}
+pub fn new()->Self{Self{tables:BTreeMap::from([(PAGE,vec![0;2048])]),next:PAGE*2,writes:Vec::new(),links:Vec::new(),borrowed:vec![]}}
 fn root(&self)->u64{PAGE}
 fn table(&mut self)->Result<u64>{allocation()?;let p=self.next;self.next+=PAGE;self.tables.insert(p,vec![0;2048]);Ok(p)}
 fn page(&self,pa:u64)->Result{if self.tables.contains_key(&pa){Ok(())}else{Err(EINVAL)}}

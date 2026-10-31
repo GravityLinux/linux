@@ -325,7 +325,7 @@ impl Session {
             if start.elapsed().as_millis() >= 10000 {
                 return Err(ETIMEDOUT);
             }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(20));
         }
     }
 }

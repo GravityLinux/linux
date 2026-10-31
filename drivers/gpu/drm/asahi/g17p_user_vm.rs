@@ -11,37 +11,58 @@ use kernel::{
 };
 const PAGE: u64 = 0x4000;
 const ADDRESS: u64 = 0x000003ffffffc000;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Mapping batches can contain arbitrarily many leaves. Keep sorting stack
-/// usage constant even in the deep render-publication call path: the standard
-/// recursive slice sort overflowed a kernel worker's stack on Mesa images.
+/// Sort small indices, rather than large PTE/store records, on the kernel
+/// stack. Cache keys once and retain the constant-stack fallback if host
+/// storage cannot be allocated. Sorting itself has no fallible public API.
 #[inline(never)]
 pub(crate) fn sort_by_key<T, K: Ord>(rows: &mut [T], key: impl Fn(&T) -> K) {
-    fn sift_down<T, K: Ord>(rows: &mut [T], mut root: usize, end: usize,
-        key: &impl Fn(&T) -> K) {
-        // This bound also prevents overflow in the child-index calculation.
-        while root < end / 2 {
-            let mut child = root * 2 + 1;
-            if child + 1 < end && key(&rows[child]) < key(&rows[child + 1]) {
-                child += 1;
+    if rows.len() < 2 { return; }
+    let prepare = || -> Result<(KVVec<K>, KVVec<usize>)> {
+        let mut keys = KVVec::with_capacity(rows.len(), GFP_KERNEL)?;
+        let mut order = KVVec::with_capacity(rows.len(), GFP_KERNEL)?;
+        for (index, row) in rows.iter().enumerate() {
+            keys.push(key(row), GFP_KERNEL)?;
+            order.push(index, GFP_KERNEL)?;
+        }
+        Ok((keys, order))
+    };
+    if let Ok((keys, mut order)) = prepare() {
+        order.sort_unstable_by(|a,b| keys[*a].cmp(&keys[*b]));
+        // order[destination] names the original row. Rotate each permutation
+        // cycle in place, marking visited positions with their own index.
+        for start in 0..order.len() {
+            let mut current = start;
+            loop {
+                let next = order[current];
+                order[current] = current;
+                if next == start { break; }
+                rows.swap(current, next);
+                current = next;
             }
-            if key(&rows[root]) >= key(&rows[child]) { break; }
-            rows.swap(root, child);
-            root = child;
+        }
+        return;
+    }
+    fn sift_down<T,K:Ord>(rows:&mut[T],mut root:usize,end:usize,key:&impl Fn(&T)->K) {
+        while root < end/2 {
+            let mut child=root*2+1;
+            if child+1<end && key(&rows[child])<key(&rows[child+1]) {child+=1;}
+            if key(&rows[root])>=key(&rows[child]) {break;}
+            rows.swap(root,child);root=child;
         }
     }
-    for root in (0..rows.len() / 2).rev() {
-        sift_down(rows, root, rows.len(), &key);
-    }
-    for end in (1..rows.len()).rev() {
-        rows.swap(0, end);
-        sift_down(rows, 0, end, &key);
-    }
+    for root in (0..rows.len()/2).rev() {sift_down(rows,root,rows.len(),&key);}
+    for end in (1..rows.len()).rev() {rows.swap(0,end);sift_down(rows,0,end,&key);}
 }
 
 pub(crate) struct UserVm {
     tables: KVec<Arc<Owned<Page>>>,
+    // Hints only: validate the physical address on every hit, including after
+    // a root swap. Atomic hints permit concurrent immutable snapshot readers.
+    table_cache: [AtomicUsize; 4],
+    // Immutable caller-only leaves retained by a quiescent render switch.
+    borrowed: KVec<u64>,
     generation: AtomicU64,
     spare_tables: KVec<Arc<Owned<Page>>>,
 }
@@ -58,14 +79,17 @@ impl RootLease {
     /// releasing its execution owner so every newly reachable table is pinned.
     pub(crate) fn refresh(&mut self, owner: &UserVm) -> Result {
         if self.root != owner.root() { return Err(EIO); }
-        // UserVm table ownership is append-only after its root is installed.
-        // Validate the pinned prefix once, then retain only new growth pages.
-        // Avoid two quadratic membership scans on every live render poll.
-        if self.tables.len() > owner.tables.len() || self.tables.iter().zip(&owner.tables)
-            .any(|(old, page)| old.phys() != page.phys()) { return Err(EIO); }
-        let first = self.tables.len();
-        self.tables.reserve(owner.tables.len() - first, GFP_KERNEL)?;
-        for page in &owner.tables[first..] { self.tables.push(page.clone(), GFP_KERNEL)?; }
+        let prefix = self.tables.len() <= owner.tables.len() && self.tables.iter().zip(&owner.tables)
+            .all(|(old, page)| old.phys() == page.phys());
+        if !prefix {
+            let mut tables = KVec::with_capacity(owner.tables.len(), GFP_KERNEL)?;
+            for page in &owner.tables { tables.push(page.clone(), GFP_KERNEL)?; }
+            self.tables = tables;
+        } else {
+            let first = self.tables.len();
+            self.tables.reserve(owner.tables.len() - first, GFP_KERNEL)?;
+            for page in &owner.tables[first..] { self.tables.push(page.clone(), GFP_KERNEL)?; }
+        }
         Ok(())
     }
 }
@@ -140,6 +164,7 @@ pub(crate) struct TableSnapshot {
 pub(crate) struct RebindSnapshot {
     snapshot: TableSnapshot,
     lease: RootLease,
+    borrowed: KVec<u64>,
 }
 pub(crate) struct RebindRelocation {
     source: RebindSnapshot,
@@ -148,8 +173,9 @@ pub(crate) struct RebindRelocation {
 pub(crate) struct PreparedRebind {
     source: RebindSnapshot,
     tables: KVec<Arc<Owned<Page>>>,
-    stores: KVec<(usize, Arc<Owned<Page>>, usize, u64, u64)>,
+    stores: KVec<(usize, Arc<Owned<Page>>, usize, u64, u64, u64)>,
     contexts: KVec<u16>,
+    borrowed: KVec<u64>,
 }
 impl RebindSnapshot {
     pub(crate) fn clone_tree(self) -> Result<(UserVm, RebindRelocation)> {
@@ -170,8 +196,9 @@ impl RebindRelocation {
         while cursor < levels.len() {
             let (pa, depth) = levels[cursor]; cursor += 1;
             if depth == 2 { continue; }
+            let body = shadow.read_table(pa)?;
             for index in 0..if depth == 0 { 64 } else { 2048 } {
-                let word = shadow.read(pa, index)?;
+                let word = body[index];
                 if word == 0 { continue; }
                 if word & 3 != 3 { return Err(EINVAL); }
                 let child = word & ADDRESS;
@@ -182,24 +209,29 @@ impl RebindRelocation {
         }
         let original_child = |word: u64| {
             if word & 3 != 3 { return word; }
-            self.copies.iter().find(|row| row.2 == word & ADDRESS)
+            self.copies.iter().find(|row| row.2 == word & ADDRESS
+                && !self.source.borrowed.contains(&row.0))
                 .map_or(word, |row| (word & !ADDRESS) | row.0)
         };
         let capacity = self.source.lease.tables.len().checked_add(levels.len()).ok_or(EOVERFLOW)?;
         let mut tables = KVec::with_capacity(capacity, GFP_KERNEL)?;
-        for page in &self.source.lease.tables { tables.push(page.clone(), GFP_KERNEL)?; }
+        for page in &self.source.lease.tables {
+            if !self.source.borrowed.contains(&page.phys()) { tables.push(page.clone(), GFP_KERNEL)?; }
+        }
         let mut stores = KVec::new();
         for &(pa, depth) in &levels {
             let count = if depth == 0 { 64 } else { 2048 };
-            if let Some(&(original, level, _)) = self.copies.iter().find(|row| row.2 == pa) {
+            let body = shadow.read_table(pa)?;
+            if let Some(&(original, level, _)) = self.copies.iter().find(|row|
+                row.2 == pa && !self.source.borrowed.contains(&row.0)) {
                 if level as usize != depth { return Err(EINVAL); }
                 let old = self.source.snapshot.rows.iter().find(|row| row.0 == original).ok_or(EIO)?;
                 let page = self.source.lease.tables.iter().find(|page| page.phys() == original).ok_or(EIO)?;
                 for index in 0..count {
                     let before = u64::from_le(old.1[index]);
-                    let mut after = shadow.read(pa, index)?;
+                    let mut after = body[index];
                     if depth < 2 { after = original_child(after); }
-                    if before != after { stores.push((depth, page.clone(), index, before, after), GFP_KERNEL)?; }
+                    if before != after { stores.push((depth, page.clone(), index, before, after, original), GFP_KERNEL)?; }
                 }
             } else {
                 // This parent table was allocated only in the speculative
@@ -221,23 +253,82 @@ impl RebindRelocation {
                 tables.push(page.clone(), GFP_KERNEL)?;
             }
         }
-        sort_by_key(&mut stores, |row| (row.0, row.1.phys(), row.2));
-        if stores.windows(2).any(|rows| rows[0].1.phys() == rows[1].1.phys()
+        sort_by_key(&mut stores, |row| (row.0, row.5, row.2));
+        if stores.windows(2).any(|rows| rows[0].5 == rows[1].5
             && rows[0].2 == rows[1].2) { return Err(EINVAL); }
         let mut held_contexts = KVec::new(); held_contexts.extend_from_slice(contexts, GFP_KERNEL)?;
-        Ok(PreparedRebind { source: self.source, tables, stores, contexts: held_contexts })
+        let mut plan=PreparedRebind { source: self.source, tables, stores, contexts: held_contexts,
+            borrowed: KVec::new() };
+        plan.prune_tables()?;
+        Ok(plan)
     }
 }
 impl PreparedRebind {
+    /// Determine reachability from captured data plus the prepared stores,
+    /// before publication. Old pages remain pinned by source.lease through
+    /// the final TLBI. Repeated copy fallbacks must not retain dead leaves.
+    fn prune_tables(&mut self) -> Result {
+        let mut reachable=KVec::new();
+        reachable.push((self.source.snapshot.root,0usize),GFP_KERNEL)?;
+        let mut cursor=0;
+        while cursor<reachable.len() {
+            let (pa,depth)=reachable[cursor];cursor+=1;
+            if depth==2 {continue;}
+            let page=self.tables.iter().find(|page|page.phys()==pa).ok_or(EIO)?;
+            let mut body=KVVec::with_capacity(2048,GFP_KERNEL)?;
+            body.resize(2048,0u64,GFP_KERNEL)?;
+            if let Some(row)=self.source.snapshot.rows.iter().find(|row|row.0==pa) {
+                body.copy_from_slice(&row.1);
+            } else {
+                page.with_page_mapped(|pointer| {
+                    // SAFETY: A separately owned, unpublished parent page.
+                    unsafe {core::ptr::copy_nonoverlapping(pointer.cast::<u64>(),body.as_mut_ptr(),2048);}
+                });
+            }
+            let first=self.stores.partition_point(|row|(row.0,row.5)<(depth,pa));
+            for row in self.stores[first..].iter().take_while(|row|row.0==depth && row.5==pa) {
+                body[row.2]=row.4.to_le();
+            }
+            for index in 0..if depth==0 {64}else{2048} {
+                let word=u64::from_le(body[index]);
+                if word==0 {continue;}
+                if word & !ADDRESS != 3 {return Err(EINVAL);}
+                let next=word & ADDRESS;
+                if let Some((_,prior))=reachable.iter().find(|row|row.0==next) {
+                    if *prior!=depth+1 {return Err(EINVAL);}
+                } else {reachable.push((next,depth+1),GFP_KERNEL)?;}
+            }
+        }
+        let mut tables=KVec::with_capacity(reachable.len(),GFP_KERNEL)?;
+        let mut borrowed=KVec::new();
+        for &(pa,_) in &reachable {
+            tables.push(self.tables.iter().find(|page|page.phys()==pa).ok_or(EIO)?.clone(),GFP_KERNEL)?;
+            if self.borrowed.contains(&pa) {borrowed.push(pa,GFP_KERNEL)?;}
+        }
+        self.tables=tables;self.borrowed=borrowed;
+        Ok(())
+    }
+    /// Only a separately allocated root which has never been installed may
+    /// use this construction path. It must not invalidate any live ASID.
+    fn commit_unpublished(mut self, root: &mut UserVm) -> Result {
+        if !self.matches(root) {return Err(EBUSY);}
+        core::mem::swap(&mut root.tables,&mut self.tables);
+        core::mem::swap(&mut root.borrowed,&mut self.borrowed);
+        root.generation.fetch_add(1,Ordering::Relaxed);
+        for depth in [2,1,0] {self.store_batch(depth,false);}
+        Ok(())
+    }
     pub(crate) fn matches(&self, root: &UserVm) -> bool { self.source.snapshot.matches(root) }
     /// The caller additionally proves this pool is retired and exclusively
     /// selected. All allocation and preflight already completed off-lock.
     /// Keep this plan owned by the worker so host storage drops off-lock.
     pub(crate) fn commit(&mut self, root: &mut UserVm) -> Result {
         if !self.matches(root) { return Err(EBUSY); }
+        // Keep the outgoing backing retained by this plan through both TLBIs.
         core::mem::swap(&mut root.tables, &mut self.tables);
+        core::mem::swap(&mut root.borrowed, &mut self.borrowed);
         root.generation.fetch_add(1, Ordering::Relaxed);
-        self.store_batch(2, true);
+        for depth in [0, 1, 2] { self.store_batch(depth, true); }
         for &context in &self.contexts { UserVm::invalidate(context); }
         for depth in [2, 1, 0] {
             self.store_batch(depth, false);
@@ -256,11 +347,11 @@ impl PreparedRebind {
             let page = &self.stores[first].1;
             cursor += 1;
             while cursor < self.stores.len() && self.stores[cursor].0 == self.stores[first].0
-                && self.stores[cursor].1.phys() == page.phys() { cursor += 1; }
+                && self.stores[cursor].5 == self.stores[first].5 { cursor += 1; }
             if self.stores[first].0 != depth { continue; }
             page.with_page_mapped(|pointer| {
                 let mut line: Option<usize> = None;
-                for &(_, _, index, before, after) in &self.stores[first..cursor] {
+                for &(_, _, index, before, after, _) in &self.stores[first..cursor] {
                     if clear && before == 0 { continue; }
                     let next = index & !7;
                     if line != Some(next) {
@@ -412,6 +503,8 @@ impl UserVm {
         }
         let mut vm = Self {
             tables: KVec::new(),
+            table_cache: [const { AtomicUsize::new(0) }; 4],
+            borrowed: KVec::new(),
             generation: AtomicU64::new(0),
             spare_tables: KVec::new(),
         };
@@ -457,11 +550,16 @@ impl UserVm {
         Ok(())
     }
     fn page(&self, pa: u64) -> Result<&Page> {
-        self.tables
-            .iter()
-            .find(|p| p.phys() == pa)
-            .map(|p| &***p)
-            .ok_or(EINVAL)
+        let slot = ((pa >> 14) & 3) as usize;
+        let hint = self.table_cache[slot].load(Ordering::Relaxed);
+        let index = if self.tables.get(hint).is_some_and(|page| page.phys() == pa) {
+            hint
+        } else {
+            let index = self.tables.iter().position(|page| page.phys() == pa).ok_or(EINVAL)?;
+            self.table_cache[slot].store(index, Ordering::Relaxed);
+            index
+        };
+        Ok(&***self.tables.get(index).ok_or(EINVAL)?)
     }
     fn clean(page: &Page) {
         page.with_page_mapped(|p| {
@@ -481,10 +579,22 @@ impl UserVm {
             u64::from_le(unsafe { p.cast::<u64>().add(index).read_volatile() })
         }))
     }
+    fn read_table(&self, pa: u64) -> Result<KVVec<u64>> {
+        let mut body = KVVec::with_capacity(2048, GFP_KERNEL)?;
+        body.resize(2048, 0, GFP_KERNEL)?;
+        self.page(pa)?.with_page_mapped(|pointer| {
+            // SAFETY: The source is a retained table and the destination is
+            // separate, fully allocated storage; the owner serializes writes.
+            unsafe { core::ptr::copy_nonoverlapping(pointer.cast::<u64>(), body.as_mut_ptr(), 2048); }
+        });
+        for word in body.iter_mut() { *word = u64::from_le(*word); }
+        Ok(body)
+    }
     fn write(&mut self, pa: u64, index: usize, word: u64) -> Result {
         if index >= 2048 {
             return Err(EINVAL);
         }
+        if self.borrowed.contains(&pa) { return Err(EBUSY); }
         let page = self.page(pa)?;
         self.generation.fetch_add(1, Ordering::Relaxed);
         Self::store(page, index, word);
@@ -501,6 +611,16 @@ impl UserVm {
     }
     /// g17p_context.clone_low_tables: clone table DATA only. Data/code leaves
     /// retain their exact physical owners and attributes; none is dereferenced.
+    pub(crate) fn has_borrowed_tables(&self) -> bool { !self.borrowed.is_empty() }
+    /// Read-only admission view for a retained-owner rebind. Only its root
+    /// and middle tables are new; the immutable snapshot owns every leaf.
+    /// Cold owners still need a fully private copy before private-map writes.
+    pub(crate) fn clone_admission_view(&self) -> Result<Self> {
+        let mut view=Self::new()?;
+        let seed=view.capture_rebind(TableStorage::new(view.table_count())?)?.ok_or(EIO)?;
+        seed.prepare_leaf_switch(self,&[],&[],&[],&[1])?.commit_unpublished(&mut view)?;
+        Ok(view)
+    }
     pub(crate) fn table_count(&self) -> usize { self.tables.len() }
     pub(crate) fn capture_tables(&self, mut storage: TableStorage) -> Result<Option<TableSnapshot>> {
         if storage.rows.len() != self.tables.len() { return Ok(None); }
@@ -517,7 +637,9 @@ impl UserVm {
     }
     pub(crate) fn capture_rebind(&self, storage: TableStorage) -> Result<Option<RebindSnapshot>> {
         let Some(snapshot) = self.capture_tables(storage)? else { return Ok(None); };
-        Ok(Some(RebindSnapshot { snapshot, lease: self.lease()? }))
+        let mut borrowed = KVec::new();
+        borrowed.extend_from_slice(&self.borrowed, GFP_KERNEL)?;
+        Ok(Some(RebindSnapshot { snapshot, lease: self.lease()?, borrowed }))
     }
     pub(crate) fn clone_low_tables(&self) -> Result<(Self, KVec<(u64, u32, u64)>)> {
         let storage = TableStorage::new(self.table_count())?;
@@ -637,6 +759,43 @@ impl UserVm {
         self.read(table, ((va >> 14) & 2047) as usize)
     }
 
+    /// Read consecutive caller leaves with one walk and one map per 32 MiB
+    /// leaf table. Returned storage is independent of the source snapshot.
+    pub(crate) fn ptes(&self, va: u64, size: u64) -> Result<KVVec<u64>> {
+        if (va | size) & (PAGE - 1) != 0
+            || va.checked_add(size).is_none_or(|end| end > 1 << 42) {
+            return Err(EINVAL);
+        }
+        let count = usize::try_from(size / PAGE)?;
+        let mut out = KVVec::with_capacity(count, GFP_KERNEL)?;
+        out.resize(count, 0, GFP_KERNEL)?;
+        let mut done = 0;
+        while done < count {
+            let current = va + done as u64 * PAGE;
+            let first = ((current >> 14) & 2047) as usize;
+            let n = (2048 - first).min(count - done);
+            let mut table = self.root();
+            for index in [((current >> 36) & 63) as usize, ((current >> 25) & 2047) as usize] {
+                let entry = self.read(table, index)?;
+                if entry == 0 { table = 0; break; }
+                if entry & 3 != 3 { return Err(EINVAL); }
+                table = entry & ADDRESS;
+            }
+            if table != 0 {
+                self.page(table)?.with_page_mapped(|pointer| {
+                    for i in 0..n {
+                        // SAFETY: first+n <= 2048 and out was fully allocated.
+                        out[done+i] = u64::from_le(unsafe {
+                            pointer.cast::<u64>().add(first+i).read_volatile()
+                        });
+                    }
+                });
+            }
+            done += n;
+        }
+        Ok(out)
+    }
+
     pub(crate) fn invalidate(context: u16) {
         super::g17p_memory::sync();
         // SAFETY: Called under the runtime lock with the source's quiescent
@@ -655,6 +814,13 @@ impl UserVm {
     /// Each change names its expected old leaf (zero for an addition). Allocate
     /// and validate the complete plan before breaking any live mapping. Failed
     /// preparation leaves active tables intact, including all parent entries.
+    pub(crate) fn make_owned(&mut self, contexts: &[u16]) -> Result {
+        if self.borrowed.is_empty() { return Ok(()); }
+        let snapshot = self.capture_rebind(TableStorage::new(self.table_count())?)?.ok_or(EIO)?;
+        let (shadow, relocation) = snapshot.clone_tree()?;
+        relocation.prepare(&shadow, contexts)?.commit(self)
+    }
+
     pub(crate) fn rebind(&mut self, changes: &[(u64, u64, u64)], contexts: &[u16]) -> Result {
         self.prepare_rebind(changes, contexts)?.commit();
         Ok(())
@@ -667,6 +833,8 @@ impl UserVm {
         changes: &[(u64, u64, u64)],
         contexts: &[u16],
     ) -> Result<RebindPlan<'a>> {
+        // Shared admission leaves are immutable. Caller unbind converts them
+        // through make_owned(); normal render switches use a prepared plan.
         if contexts.is_empty()
             || contexts.iter().enumerate().any(|(i, &context)| {
                 context == 0 || context >= 64 || contexts[..i].contains(&context)
@@ -680,6 +848,7 @@ impl UserVm {
         // reassignment quadratic in the caller's mapped page count.
         let mut parents: KVec<(usize, u64, usize, u64)> = KVec::new();
         let mut leaf_keys: KVec<(u64, usize)> = KVec::with_capacity(changes.len(), GFP_KERNEL)?;
+        let mut last_leaf: Option<(u64, u64)> = None;
         for &(va, old, new) in changes {
             if va >= 1 << 42
                 || va & (PAGE - 1) != 0
@@ -689,11 +858,14 @@ impl UserVm {
                             || pte & !(ADDRESS | 0x00c0000000000fff) != 0
                             || pte & 3 != 3)
                 })
-                || self.pte(va)? != old
             {
                 return Err(EINVAL);
             }
+            let key = va >> 25;
             let mut table = self.root();
+            if let Some((_, cached)) = last_leaf.filter(|(prior, _)| *prior == key) {
+                table = cached;
+            } else {
             for (depth, index) in [((va >> 36) & 63) as usize, ((va >> 25) & 2047) as usize]
                 .into_iter()
                 .enumerate()
@@ -714,7 +886,11 @@ impl UserVm {
                 table = entry & ADDRESS;
                 self.page(table)?;
             }
+            last_leaf = Some((key, table));
+            }
             let index = ((va >> 14) & 2047) as usize;
+            if self.borrowed.contains(&table) && old != new { return Err(EBUSY); }
+            if self.read(table, index)? != old { return Err(EINVAL); }
             leaf_keys.push((table, index), GFP_KERNEL)?;
             writes.push((2, table, index, new), GFP_KERNEL)?;
         }
@@ -756,6 +932,7 @@ impl UserVm {
             }
             pa = entry & ADDRESS;
         }
+        if create && self.borrowed.contains(&pa) { return Err(EBUSY); }
         self.page(pa)?;
         Ok(Some((pa, ((va >> 14) & 2047) as usize)))
     }
@@ -843,6 +1020,7 @@ impl UserVm {
                 table = entry & ADDRESS;
                 self.page(table)?;
             }
+            if self.borrowed.contains(&table) { return Err(EBUSY); }
             let index = ((va >> 14) & 2047) as usize;
             if self.read(table, index)? != 0 || writes.iter().any(|r| r.1 == table && r.2 == index)
             {
@@ -860,3 +1038,6 @@ impl UserVm {
         Ok(())
     }
 }
+
+#[path = "g17p_leaf_switch.rs"]
+mod leaf_switch;

@@ -130,8 +130,12 @@ fn main(){
     assert!(schedule.nodes[0].point.error.get().is_none());
     {let mut held=dev.runtime.lock();held.as_mut().unwrap().session.can_stage=true;}
     prepared.render_client=None;
-    assert!(schedule.prepare_render(&dev,&prepared).is_none());
+    // Immutable admission DATA is enough; no throwaway execution-tree clone
+    // is required just to prepare a retained caller/root replacement.
+    assert!(schedule.prepare_render(&dev,&prepared).unwrap().2.is_some());
     assert!(schedule.nodes[0].point.error.get().is_none());
+    prepared.render_snapshot=None;
+    assert!(schedule.prepare_render(&dev,&prepared).is_none());
     println!("PASS actual cold/warm preparation, independent root/descriptor plans and failure/retry ownership");
 }
 '''

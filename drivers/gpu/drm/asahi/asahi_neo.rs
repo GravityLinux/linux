@@ -363,6 +363,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Source G17P_NATIVE_RENDER_VMS: retain two standalone render VM roots",
         },
+        render_splice: u32 {
+            default: 1,
+            description: "Share immutable caller leaf tables during retired render-context switches",
+        },
         partial_independent_owner: u32 {
             default: 0,
             description: "Source G17P_PARTIAL_INDEPENDENT_OWNER: retain two render pools",

@@ -39,11 +39,11 @@ use super::*;
 use std::collections::BTreeMap;
 const PAGE:u64=0x4000;const ADDRESS:u64=0x3ffffffc000;const FLAGS:u64=0x00c0000000000c8b;
 #[derive(Clone)]struct Page {pa:u64,body:Vec<Cell<u64>>}
-pub struct UserVm {tables:BTreeMap<u64,Page>,next:u64,generation:AtomicU64}
-impl Clone for UserVm{fn clone(&self)->Self{Self{tables:self.tables.clone(),next:self.next,generation:AtomicU64::new(self.generation.load(Ordering::Relaxed))}}}
+pub struct UserVm {tables:BTreeMap<u64,Page>,next:u64,generation:AtomicU64,borrowed:Vec<u64>}
+impl Clone for UserVm{fn clone(&self)->Self{Self{tables:self.tables.clone(),next:self.next,generation:AtomicU64::new(self.generation.load(Ordering::Relaxed)),borrowed:self.borrowed.clone()}}}
 PLAN
 impl UserVm {
-fn new()->Self{Self{tables:BTreeMap::from([(PAGE,Page{pa:PAGE,body:vec![Cell::new(0);2048]})]),next:PAGE*2,generation:AtomicU64::new(0)}}
+fn new()->Self{Self{tables:BTreeMap::from([(PAGE,Page{pa:PAGE,body:vec![Cell::new(0);2048]})]),next:PAGE*2,generation:AtomicU64::new(0),borrowed:vec![]}}
 fn root(&self)->u64{PAGE}
 fn table(&mut self)->Result<u64>{allocation()?;let p=self.next;self.next+=PAGE;self.tables.insert(p,Page{pa:p,body:vec![Cell::new(0);2048]});Ok(p)}
 fn page(&self,pa:u64)->Result<&Page>{self.tables.get(&pa).ok_or(EINVAL)}

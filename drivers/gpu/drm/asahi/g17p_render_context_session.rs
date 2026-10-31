@@ -804,6 +804,23 @@ impl PoolRebindSeed {
 
     pub(crate) fn prepare(self, desired: &compute::Client) -> Result<PreparedPoolRebind> {
         let started = kernel::time::Instant::<kernel::time::Monotonic>::now();
+        if crate::module_parameters::render_splice.value() != 0 && self.private.is_none()
+            && self.primer_aliases.is_none() && desired.primer_aliases.is_none() {
+            let root = self.snapshot.prepare_leaf_switch(&desired.root,&self.bindings,
+                &self.fallback,&self.foreign_growth,&[self.context])?;
+            let mut new_bindings = KVec::new();new_bindings.extend_from_slice(&desired.bindings,GFP_KERNEL)?;
+            let mut new_buffers = KVec::with_capacity(desired.buffers.len(),GFP_KERNEL)?;
+            for bo in &desired.buffers {new_buffers.push(bo.clone(),GFP_KERNEL)?;}
+            desired.cache_with(false,&self.cpu_maps)?;
+            if crate::module_parameters::submission_log.value() >= 3 {
+                pr_info!("G17P: RENDER_ROOT_SPLICED pair {} context {} bindings {} elapsed_us {} outside_runtime_lock\n",
+                    self.pair,self.context,new_bindings.len(),started.elapsed().as_nanos()/1000);
+            }
+            return Ok(PreparedPoolRebind {pair:self.pair,context:self.context,root,
+                old_owner:self.owner,old_bindings:self.bindings,old_buffers:self.buffers,
+                new_owner:desired.owner,new_bindings,new_buffers,primer_aliases:desired.primer_aliases,
+                private:None});
+        }
         let (root, relocation) = self.snapshot.clone_tree()?;
         let mut shadow = compute::Client { root, buffers: self.buffers, bindings: self.bindings,
             owner: desired.owner, cpu_maps: self.cpu_maps, primer_aliases: self.primer_aliases };
@@ -877,13 +894,14 @@ impl PreparedPoolRebind {
 }
 impl Session {
     fn render_rebind_context(&self,pair:u32) -> Result<u16> {
+        if !self.independent_render_roots() {return Ok(1);}
         let slot = self.render_pool_asids[pair as usize];
         if slot != 0 { return Ok(slot); }
         super::super::g17p_render_lifecycle::render_asid(pair,self.independent_compute.asid_mask()).ok_or(EBUSY)
     }
     pub(crate) fn render_rebind_size(&self,incoming:&compute::Client,p:&Parameters) -> Result<Option<usize>> {
         if let Some(state)=self.g16c_compute.as_ref() {return state.render_rebind_size(self,incoming,p);}
-        if !self.independent_render_roots() { return Ok(None); }
+        if self.native.is_some() || self.render_contexts.is_some() {return Ok(None);}
         let Some(installed) = self.render_selected_client(incoming,p)? else { return Ok(None); };
         Ok((!Self::same_client(installed,incoming)).then(||installed.root.table_count()))
     }
@@ -904,11 +922,13 @@ impl Session {
         incoming:&compute::Client,p:&Parameters) -> Result<bool> {
         if self.next_render_pool_for_geometry(Some(incoming),p)? != Some(plan.pair)
             || self.render_rebind_context(plan.pair)? != plan.context { return Ok(false); }
+        let shared = !self.independent_render_roots();
+        if shared && self.live_render_count() != 0 {return Ok(false);}
         let work=self.render.as_mut().ok_or(EIO)?;
         if !work.growth.as_ref().ok_or(EIO)?.pools.get(plan.pair as usize).ok_or(EIO)?.retired {
             return Ok(false);
         }
-        let target = if work.layout.pair == plan.pair { &mut work.client } else {
+        let target = if shared || work.layout.pair == plan.pair { &mut work.client } else {
             &mut self.render_pool_clients.iter_mut().find(|(pair,_)| *pair==plan.pair).ok_or(EIO)?.1
         };
         if !plan.matches(target,incoming) { return Ok(false); }
