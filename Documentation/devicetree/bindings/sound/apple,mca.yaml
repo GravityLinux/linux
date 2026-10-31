@@ -31,13 +31,10 @@ allOf:
           maxItems: 6
         dma-names:
           minItems: 1
+          maxItems: 6
+          uniqueItems: true
           items:
-            - const: tx0a
-            - const: tx1a
-            - const: tx2a
-            - const: tx3a
-            - const: tx4a
-            - const: tx5a
+            enum: [tx0a, tx1a, tx2a, tx3a, tx4a, tx5a]
     else:
       properties:
         reg:
