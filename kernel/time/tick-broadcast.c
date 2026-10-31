@@ -804,9 +804,23 @@ void tick_broadcast_hrtimer_reprogram(void *arg)
 
 	raw_spin_lock_irqsave(&tick_broadcast_lock, flags);
 	bc = tick_broadcast_device.evtdev;
-	if (bc == arg && (bc->features & CLOCK_EVT_FEAT_HRTIMER) &&
-	    clockevent_state_oneshot(bc) && bc->next_event != KTIME_MAX)
-		bc->set_next_ktime(bc->next_event, bc);
+	if (bc != arg || !(bc->features & CLOCK_EVT_FEAT_HRTIMER) ||
+	    !clockevent_state_oneshot(bc) || bc->next_event == KTIME_MAX)
+		goto out;
+
+	/*
+	 * An IPI can run before broadcast EXIT, or after EXIT deferred the
+	 * local event to a broadcast IPI. In either case the local clockevent
+	 * might be unprogrammed. Starting an hrtimer with an equal or later
+	 * expiry does not necessarily reprogram it. Keep the current owner
+	 * until this CPU no longer depends on broadcast delivery.
+	 */
+	if (cpumask_test_cpu(smp_processor_id(), tick_broadcast_oneshot_mask) ||
+	    tick_check_broadcast_expired())
+		goto out;
+
+	bc->set_next_ktime(bc->next_event, bc);
+out:
 	raw_spin_unlock_irqrestore(&tick_broadcast_lock, flags);
 }
 
