@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,j713-headphones.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J713 headphone sound card
+
+maintainers:
+  - Niklas Sheth <hi@niklassheth.com>
+
+description: |
+  Headphone-only sound card for the T8132 MacBook Air J713. MCA frontend and
+  port 2 drive a CS42L84 headphone codec using ADMAC TX2. Speaker amplifiers
+  and microphone capture are not part of this card.
+
+properties:
+  compatible:
+    const: apple,j713-headphones
+
+  apple,mca:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: MCA controller providing frontend and port 2.
+
+  apple,headphone-codec:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: CS42L84 headphone codec.
+
+required:
+  - compatible
+  - apple,mca
+  - apple,headphone-codec
+
+additionalProperties: false
+
+examples:
+  - |
+    sound {
+        compatible = "apple,j713-headphones";
+        apple,mca = <&mca>;
+        apple,headphone-codec = <&jack_codec>;
+    };
