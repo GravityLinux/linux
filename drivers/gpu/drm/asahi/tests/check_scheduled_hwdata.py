@@ -92,6 +92,7 @@ with tempfile.TemporaryDirectory(prefix='scheduled-hwdata-') as temporary:
 use std::{fs,path::Path};
 '''
     harness+=f'#[path={json.dumps(str(tests.parent/"scheduled_initdata.rs"))}] mod scheduled_initdata;\n'
+    harness+=f'#[path={json.dumps(str(tests.parent / "scheduled_profile.rs"))}] mod scheduled_profile;\n'
     harness+='use scheduled_initdata as wire;\n'
     harness+=f'#[path={json.dumps(str(checked))}] mod hw;\n'
     harness+='fn main() { let root=std::env::args().nth(1).unwrap();let root=Path::new(&root);fs::create_dir_all(root).unwrap();\n'
@@ -158,7 +159,7 @@ use std::{fs,path::Path};
         harness+='let registers=['+','.join(register(r) for r in p.registers)+'];\n'
         harness+='let cs=['+','.join(f'hw::CsState{{frequency:{f//1000000},core_voltage:{v//1000},memory_voltage:{max(v//1000,minimum)}}}' for v,f in states)+'];\n'
         harness+='let _regions=['+','.join('wire::HardwareRegion{'+f'lead:{r.lead}u32.to_le_bytes(),low:{r.low-0x7000000000}u32.to_le_bytes(),high:{r.high}u64.to_le_bytes(),count:{r.count}u32.to_le_bytes(),stride:{r.stride}u32.to_le_bytes(),trail:{r.trail}u32.to_le_bytes(),..Default::default()'+'}' for r in regions)+'];\n'
-        harness+='let mut params=hw::ParametersG16C { registers:&registers,cs:&cs,\n'
+        harness+='let mut params=hw::ParametersG16C { profile:scheduled_profile::Profile::G16C,registers:&registers,cs:&cs,\n'
         for field in ['freq_a','freq_b','core_voltage','memory_voltage','relative_a','relative_b','index_a','index_b']:
             harness+=f'{field}:&{scalar_array(getattr(p,field))},\n'
         harness+='cluster_core:&'+matrix(p.cluster_core_voltage)+',cluster_memory:&'+matrix(p.cluster_memory_voltage)+',\n'

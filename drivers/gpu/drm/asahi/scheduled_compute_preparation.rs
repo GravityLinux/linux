@@ -55,7 +55,7 @@ impl WrappedSeed {
             // not an inherent firmware association between bank and ASID.
             execution_gate: u64::from(self.context - 1),
             register_a599: 0x13200400020,
-        }.build()
+        }.build_for(super::super::scheduled_profile::Profile::for_chip(p.chip_id).ok_or(ENODEV)?)
         .map_err(|_| EINVAL)?;
         let mut descriptor=KVVec::with_capacity(PAGE,GFP_KERNEL)?;
         descriptor.resize(PAGE,0,GFP_KERNEL)?;

@@ -17,11 +17,11 @@ pub(crate) struct DispatchState {
 
 #[versions(AGX_SCHEDULED)]
 impl DispatchState::ver {
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     const DIRECTORY_TAG: u64 = 0x4000000000000000;
     #[ver(G == G17P)]
     const DIRECTORY_TAG: u64 = 0x0800000000000000;
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     const INITIAL_PAGES: u32 = 20 * 2048;
     #[ver(G == G17P)]
     const INITIAL_PAGES: u32 = 0x1c00;
@@ -29,14 +29,14 @@ impl DispatchState::ver {
     /// Current host reservation policy: one bank per retained physical root.
     /// Native clients can change pools/banks without changing their ASID;
     /// this arithmetic is not an inherent firmware ownership relationship.
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) fn bank_for_context(context: u16) -> Option<u32> {
         if !(1..64).contains(&context) {
             return None;
         }
         Some(u32::from(context - 1))
     }
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) fn slot_offset(context: u16) -> Option<usize> {
         Self::bank_for_context(context).map(|bank| bank as usize * 0x20)
     }

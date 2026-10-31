@@ -172,6 +172,7 @@ impl Session {
                 }
             }
             let parameters = compute::Parameters {
+                chip_id: 0x8140,
                 preempt,
                 kernel_end: preempt + 0x20000000,
                 cdm: CDM,

@@ -217,11 +217,17 @@ after_submit=after_submit.replace('letmutg16c_kernel_end=0;','').replace('g16c_k
 after_submit=after_submit.replace('letmutparsed=None;','').replace(
     'let(mutparameters,barriers)=matchparsed{Some(parameters)=>parameters,None=>Self::parameters(vm,&state.objects,&bytes)?,};',
     'let(mutparameters,barriers)=Self::parameters(vm,&state.objects,&bytes)?;')
+# Trusted SoC metadata selects only the multi-cluster constant profile.
+profile_metadata='forcommandin&mutparameters{ifletCommand::Compute(p)=command{p.chip_id=dev.params.chip_id;}}'
+assert after_submit.count(profile_metadata)==1
+after_submit=after_submit.replace(profile_metadata,'')
 assert before_submit==after_submit, 'Neo ioctl admission changed beyond the immutable Max gate'
 assert normalize(body(new_drm,'fn parameters('))=='Self::parameters_with_limits(vm,objects,bytes,1024,2|(1<<3)|(1<<18)|(1<<29))', 'Neo sampler/flag limits changed beyond the downstream barrier alias'
 parser_body=normalize(body(new_drm,'fn parameters_with_limits('))
 assert parser_body.count('kernel_end:vm.kernel_end,') == 1, 'Compute private limit must come directly from the immutable VM'
 parser_body=parser_body.replace('kernel_end:vm.kernel_end,','')
+assert parser_body.count('chip_id:0,')==1
+parser_body=parser_body.replace('chip_id:0,','')
 parser_body=parser_body.replace('fragment_count,sampler_limit,render_flags','fragment_count').replace('sampler_limit','1024')
 assert normalize(body(old_drm,'fn parameters('))==parser_body, 'Shared parameter parser changed beyond explicit hardware policy'
 render_body=normalize(body(new_drm,'fn render_parameters(')).replace('u32::from(cmd.sampler_count)','cmd.sampler_count').replace('sampler_limit','1024').replace('!render_flags','!(2|(1<<3)|(1<<18))')

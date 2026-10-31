@@ -88,7 +88,7 @@ mod g17p_user_vm {
 '''
     code+='mod g17p_render { #[derive(Debug)] pub enum Error {Invalid,Overflow}\n'
     code+=f'#[path={json.dumps(str(tests.parent/"scheduled_render_admission.rs"))}] pub mod admission; }}\n'
-    for name in ['float','scheduled_initdata','scheduled_boot_records','scheduled_hwdata',
+    for name in ['scheduled_profile', 'float','scheduled_initdata','scheduled_boot_records','scheduled_hwdata',
                  'scheduled_board','scheduled_power','scheduled_initgraph','scheduled_mmio',
                  'scheduled_resources','scheduled_image','g17p_abi','g17p_layout',
                  'g17p_initgraph','g17p_opening','g17p_topology','g17p_vm','scheduled_vm_g16c','scheduled_bootstrap']:

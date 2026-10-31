@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='scheduled-graph-') as temporary:
     flags = host_versions.build(tmp, args.rustc)
     loader = host_fdt.Loader(args.m1n1, tmp, args.fdt_template)
     code = host_fdt.rust_prelude() + 'use std::{fs,path::Path};\n'
-    for name in ['float', 'scheduled_initdata', 'scheduled_boot_records',
+    for name in ['scheduled_profile', 'float', 'scheduled_initdata', 'scheduled_boot_records',
                  'scheduled_hwdata', 'scheduled_power', 'scheduled_board',
                  'scheduled_initgraph', 'scheduled_mmio']:
         code += f'#[path={json.dumps(str(tests.parent / (name + ".rs")))}] mod {name};\n'

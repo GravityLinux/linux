@@ -78,7 +78,7 @@ pub(crate) struct RegionC {
     pub(crate) field_0e3c: [u8; 4],
     pub(crate) pad_0e40: [u8; 0x10],
     pub(crate) field_0e50: [u8; 4],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) pad_end: [u8; 0x31ac],
     #[ver(G == G17P)]
     pub(crate) pad_end: [u8; 0x1ac],
@@ -582,7 +582,7 @@ impl PrimaryStatus::ver {
         if out.len() < Self::SIZE {
             return Err(InvalidSize);
         }
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         out[..Self::SIZE].copy_from_slice(PRIMARYSTATUS_G16C.as_bytes());
         #[ver(G == G17P)]
         out[..Self::SIZE].copy_from_slice(PRIMARYSTATUS_G17P.as_bytes());

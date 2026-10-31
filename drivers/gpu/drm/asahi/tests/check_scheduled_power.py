@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='scheduled-power-') as temporary:
     loader=host_fdt.Loader(args.m1n1,tmp,args.fdt_template)
     _,baseline_node=loader.build(platform)
     prefix=host_fdt.rust_prelude()+'use std::{fs,path::Path};\n'
-    for module in ['float','scheduled_initdata','scheduled_hwdata','scheduled_board']:
+    for module in ['scheduled_profile','float','scheduled_initdata','scheduled_hwdata','scheduled_board']:
         prefix+=f'#[path={json.dumps(str(tests.parent/(module+".rs")))}] mod {module};\n'
     code='fn main(){let root=std::env::args().nth(1).unwrap();let root=Path::new(&root);fs::create_dir_all(root).unwrap();\n'
     code+='let baseline_node='+host_fdt.rust_node(baseline_node)+';\n'

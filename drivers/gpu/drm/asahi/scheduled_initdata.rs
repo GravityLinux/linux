@@ -79,9 +79,9 @@ pub(crate) struct InitRoot {
     pub(crate) pad_94: [u8; 0x14],
     pub(crate) status_a: [u8; 8],
     pub(crate) status_b: [u8; 8],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) extra_0: [u8; 8],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) extra_1: [u8; 8],
 }
 
@@ -107,9 +107,9 @@ impl Default for InitRoot::ver {
             pad_94: [0; 0x14],
             status_a: [0; 8],
             status_b: [0; 8],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             extra_0: [0; 8],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             extra_1: [0; 8],
         }
     }
@@ -193,16 +193,16 @@ pub(crate) struct MainConfig {
     pub(crate) repeated_2: [u8; 8],
     pub(crate) pad_18: [u8; 8],
     pub(crate) channels: [Channel; 17],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) pad_240: [u8; 0xc],
     #[ver(G == G17P)]
     pub(crate) pad_240: [u8; 0x14],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) auxiliary: [[u8; 8]; 6],
     #[ver(G == G17P)]
     pub(crate) auxiliary: [[u8; 8]; 5],
     pub(crate) pad_27c: [u8; 0x54],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) regions: [[u8; 8]; 6],
     #[ver(G == G17P)]
     pub(crate) regions: [RegionTriple; 3],
@@ -213,7 +213,7 @@ pub(crate) struct MainConfig {
     pub(crate) unaligned: [u8; 8],
     pub(crate) pad_479: [u8; 0x47],
     pub(crate) interval: [u8; 4],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) pad_4c4: [u8; 0x3c],
     #[ver(G == G17P)]
     pub(crate) pad_4c4: [u8; 0x13c],
@@ -228,20 +228,20 @@ impl Default for MainConfig::ver {
             repeated_2: [0; 8],
             pad_18: [0; 8],
             channels: [Channel::default(); 17],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             pad_240: [0; 0xc],
             #[ver(G == G17P)]
             pad_240: [0; 0x14],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             auxiliary: [[0; 8]; 6],
             #[ver(G == G17P)]
             auxiliary: [[0; 8]; 5],
             pad_27c: [0; 0x54],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             regions: [[0; 8]; 6],
             #[ver(G == G17P)]
             regions: [RegionTriple::default(); 3],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             kind: 4u32.to_le_bytes(),
             #[ver(G == G17P)]
             kind: [0; 4],
@@ -251,7 +251,7 @@ impl Default for MainConfig::ver {
             unaligned: [0; 8],
             pad_479: [0; 0x47],
             interval: 0x16u32.to_le_bytes(),
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             pad_4c4: [0; 0x3c],
             #[ver(G == G17P)]
             pad_4c4: [0; 0x13c],

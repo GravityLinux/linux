@@ -121,7 +121,7 @@ impl WorkWrapper::ver {
         }
     }
 
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) fn new(p: &WrapperParameters) -> Result<Self, Error> {
         if !(1..64).contains(&p.context)
             || p.grid >= 128
@@ -266,7 +266,7 @@ impl Default for WorkRecord::ver {
         // SAFETY: Every field is a byte array, so all-zero is valid staging.
         #[allow(unused_mut)]
         let mut raw: Self = unsafe { core::mem::zeroed() };
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         {
             raw.header = (1u64 << 60).to_le_bytes();
             raw.dependency_header = 0x0fa0080400000001u64.to_le_bytes();
@@ -467,7 +467,7 @@ impl Default for ComputeScheduler::ver {
 impl ComputeScheduler::ver {
     pub(crate) const SIZE: usize = core::mem::size_of::<Self>();
 
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) fn for_compute(slot: u64, work_id: u32) -> Self {
         Self {
             slot: slot.to_le_bytes(),
@@ -602,4 +602,5 @@ const COMPUTESCHEDULER_LAYOUT: () = {
 pub(crate) type ComputeWrapperG16C = WorkWrapperG16C;
 pub(crate) type ComputeWrapperG17P = WorkWrapperG17P;
 pub(crate) type ComputeRecordG16C = WorkRecordG16C;
+pub(crate) type ComputeRecordG16S = WorkRecordG16S;
 pub(crate) type ComputeRecordG17P = WorkRecordG17P;

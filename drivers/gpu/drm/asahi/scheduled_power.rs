@@ -9,6 +9,7 @@
 //! Constant-heavy wire storage uses a source Default template in static memory.
 
 use super::scheduled_board::BoardG16C;
+use kernel::macros::versions;
 use crate::{f32, float::F32};
 
 pub(crate) const OFFSET: usize = 0x5240;
@@ -18,8 +19,10 @@ pub(crate) const SIZE: usize = 0x63d4;
 pub(crate) struct InvalidPower;
 type Result<T = ()> = core::result::Result<T, InvalidPower>;
 
+#[versions(AGX_SCHEDULED)]
+#[ver(G == G16S || G == G16C)]
 #[repr(C)]
-pub(crate) struct PowerControllerG16C {
+pub(crate) struct PowerController {
     pub(crate) pad_0000: [u8; 0x4],
     pub(crate) field_5244: [u8; 0x4],
     pub(crate) field_5248: [u8; 0x4],
@@ -429,12 +432,27 @@ impl Default for PowerControllerG16C {
     }
 }
 
-impl PowerControllerG16C {
+#[versions(AGX_SCHEDULED)]
+#[ver(G == G16S || G == G16C)]
+impl PowerController::ver {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         // SAFETY: byte-array fields, alignment one and no implicit padding.
         unsafe { core::slice::from_raw_parts(core::ptr::from_ref(self).cast(), SIZE) }
     }
 }
+const fn template_g16s() -> PowerControllerG16S {
+    // SAFETY: initialized byte fields and identical generated wire layouts.
+    let mut raw: PowerControllerG16S = unsafe { core::mem::transmute(template()) };
+    raw.field_7504 = 10100u32.to_le_bytes();
+    raw.field_b5a0 = 3u32.to_le_bytes();
+    raw.field_b568 = [0;4];raw.field_b56c = [0;4];
+    raw.field_74a8 = 0x2a222aa2u64.to_le_bytes();
+    raw.field_8148 = 0x2a222aa2u64.to_le_bytes();
+    raw.field_8d98 = 0x2a222aa2u64.to_le_bytes();
+    raw
+}
+impl Default for PowerControllerG16S {fn default()->Self {template_g16s()}}
+static TEMPLATE_G16S: PowerControllerG16S = template_g16s();
 static TEMPLATE: PowerControllerG16C = template();
 
 fn checked_float(bits: u32) -> Result<F32> {
@@ -487,6 +505,7 @@ fn filter(count: u32, period: u32, request: Option<u32>) -> Result<Filter> {
 /// property validation/arithmetic completes before encode mutates storage.
 #[derive(Default)]
 pub(crate) struct ParametersG16C {
+    pub(crate) profile: super::scheduled_profile::Profile,
     field_5244: [u8; 4],
     field_5248: [u8; 4],
     field_5c04: [u8; 4],
@@ -750,6 +769,7 @@ impl ParametersG16C {
             return Err(InvalidPower);
         }
         let mut raw = Self::default();
+        raw.profile=board.profile;
         let max_scaled = 100 * (board.freq_a.len() as u32 - 1);
         let maximum = F32::from(board.maximum_power);
         let duty = settings.pwr_min_duty_cycle.unwrap_or(40);
@@ -979,7 +999,7 @@ impl ParametersG16C {
 
         // Fast-die uses the untruncated AIC interval, unlike the other loops.
         let fast_dt = F32::from(board.period_clocks) / f32!(24000.0) / f32!(1000.0);
-        let release = settings.fast_die0_release_temp.unwrap_or(80);
+        let release = settings.fast_die0_release_temp.unwrap_or(if board.profile==super::scheduled_profile::Profile::G16S {96}else{80});
         let delta = settings.fast_die0_prop_tgt_delta.unwrap_or(0);
         if release > u32::MAX / 100 || delta > u32::MAX / 100 {
             return Err(InvalidPower);
@@ -1036,7 +1056,10 @@ impl ParametersG16C {
         if out.len() < SIZE {
             return Err(InvalidPower);
         }
-        out[..SIZE].copy_from_slice(TEMPLATE.as_bytes());
+        out[..SIZE].copy_from_slice(match self.profile {
+            super::scheduled_profile::Profile::G16C=>TEMPLATE.as_bytes(),
+            super::scheduled_profile::Profile::G16S=>TEMPLATE_G16S.as_bytes(),
+        });
         // SAFETY: exclusive initialized host staging, not live DMA. The
         // validated extent is sufficient; this wire type has alignment one,
         // no padding, and all byte-array fields. The reference does not escape.

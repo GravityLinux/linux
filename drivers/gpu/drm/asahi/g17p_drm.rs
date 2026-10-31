@@ -195,23 +195,24 @@ pub(crate) fn register_g16c<'bound>(
     dev: &'bound kernel::platform::Device<device::Bound>,
     version: u32,
     max_mhz: u32,
+    profile: super::scheduled_profile::Profile,
     runtime: RuntimeRef,
 ) -> Result<drm::Registration<'bound, Driver>> {
     // The qualified Max profile is the 40-core T6041. GPU revision is from
     // ID_VERSION, independently of the SoC revision used in initdata.
-    if version != 0x0a041100 || max_mhz == 0 {
+    if version != profile.gpu_id() || max_mhz == 0 {
         return Err(ENODEV);
     }
     let mut masks = [0u64; uapi::DRM_ASAHI_MAX_CLUSTERS as usize];
-    masks[..4].fill(0x3ff);
+    masks[..profile.clusters()].fill(0x3ff);
     register_params(dev, uapi::drm_asahi_params_global {
         features: 0,
         gpu_generation: 16,
-        gpu_variant: b'C' as u32,
+        gpu_variant: profile.variant(),
         gpu_revision: (version >> 8) & 255,
-        chip_id: 0x6041,
+        chip_id: profile.chip(),
         num_dies: 1,
-        num_clusters_total: 4,
+        num_clusters_total: profile.clusters() as u32,
         num_cores_per_cluster: 10,
         max_frequency_khz: max_mhz.checked_mul(1000).ok_or(EINVAL)?,
         core_masks: masks,
@@ -1476,6 +1477,7 @@ impl File {
             }
             commands.push(
                 Command::Compute(compute::Parameters {
+                    chip_id: 0,
                     preempt: vm.kernel_start,
                     kernel_end: vm.kernel_end,
                     cdm: base,
@@ -1556,6 +1558,9 @@ impl File {
         }
         let owner = (inner.id, vm.id);
         let vm_pending = vm.pending.clone();
+        for command in &mut parameters {
+            if let Command::Compute(p) = command { p.chip_id = dev.params.chip_id; }
+        }
         let render = parameters.iter().any(|p| matches!(p, Command::Render(_)));
         let compute = parameters.iter().any(|p| matches!(p, Command::Compute(_)));
         let vm = state

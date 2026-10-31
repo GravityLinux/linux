@@ -128,7 +128,7 @@ impl Session {
         };
         {
             let regs = sgx.try_access().ok_or(ENODEV)?;
-            if regs.read32(0xd04000) != 0x0a041100 {
+            if regs.read32(0xd04000) != image.profile.gpu_id() {
                 return Err(ENODEV);
             }
         }
@@ -256,7 +256,7 @@ impl Session {
             GFP_KERNEL,
         )?);
         session.phase = Phase::Running;
-        session.g16c_compute = Some(KBox::new(super::g16c_compute::State::new(), GFP_KERNEL)?);
+        session.g16c_compute = Some(KBox::new(super::g16c_compute::State::new(image.profile), GFP_KERNEL)?);
         session.independent_compute=super::super::g17p_compute_queues::Queues::wrapped();
         dev_info!(dev,"G16C: single-ASC initdata accepted; opening controls retired\n");
         Ok(session)

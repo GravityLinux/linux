@@ -372,6 +372,7 @@ fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Parameters {
+    pub(crate) chip_id: u32,
     pub(crate) preempt: u64,
     // Immutable caller-private window, separate from the CDM stream end.
     pub(crate) kernel_end: u64,

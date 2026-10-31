@@ -114,27 +114,27 @@ pub(crate) struct HardwareData {
     pub(crate) max_state_b: [u8; 4],
     pub(crate) table_b: ClockVoltageTable,
     pub(crate) pad_policy_2540: [u8; 0x164],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) policy_2540: [u8; 0x56],
     #[ver(G == G17P)]
     pub(crate) policy_2540: [u8; 0x4e],
     // Neo's field is its twelve work channels. Max carries 46 here; its
     // meaning is unresolved, so do not give it Neo's semantic name.
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) unk_2596: [u8; 2],
     #[ver(G == G17P)]
     pub(crate) channel_count: [u8; 2],
     pub(crate) flag_groups: [[[u8; 4]; 4]; 2],
     pub(crate) pad_unassigned: [u8; 0x4],
     pub(crate) unassigned: [[u8; 4]; 12],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) transport_policy: [u8; 0x30],
     #[ver(G == G17P)]
     pub(crate) transport_policy: [u8; 0x2c],
     pub(crate) regions: [HardwareRegion; 2],
     pub(crate) pad_computed: [u8; 0x1c],
     pub(crate) computed: [u8; 8],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) policy_tail: [u8; 0x40],
     #[ver(G == G17P)]
     pub(crate) policy_tail: [u8; 0x4c],
@@ -315,6 +315,24 @@ const fn template_g16c() -> HardwareDataG16C {
     raw
 }
 
+// Identical initialized wire shape; only the observed Pro constants differ.
+const fn template_g16s() -> HardwareDataG16S {
+    // SAFETY: both generated types contain only initialized byte-array fields;
+    // the macro/layout tests require identical sizes, offsets and alignment.
+    let mut raw: HardwareDataG16S = unsafe { core::mem::transmute(template_g16c()) };
+    raw.chip = 0x6040u32.to_le_bytes();
+    raw.core_count = 20u32.to_le_bytes();
+    raw.core_count_copy = 20u32.to_le_bytes();
+    raw.policy_f8c = 0xfu32.to_le_bytes();
+    raw.policy_fb8 = 0x1cu32.to_le_bytes();
+    // 0xfbc stays four on the Pro: it is not the active cluster count.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut raw).cast(), SIZE) };
+    write32(bytes, 0x2570, 20);
+    raw
+}
+static G16S_TEMPLATE: HardwareDataG16S = template_g16s();
+impl Default for HardwareDataG16S { fn default()->Self {template_g16s()} }
+
 static G16C_TEMPLATE: HardwareDataG16C = template_g16c();
 static G17P_TRANSPORT_TEMPLATE: HardwareDataG17P = template_g17p_transport();
 static G17P_TEMPLATE: HardwareDataG17P = template_g17p();
@@ -352,6 +370,7 @@ pub(crate) struct CsState {
 
 /// Board-derived values are constructor inputs, not another wire-layout axis.
 pub(crate) struct ParametersG16C<'a> {
+    pub(crate) profile: super::scheduled_profile::Profile,
     pub(crate) registers: &'a [(usize, MmioRegion)],
     pub(crate) freq_a: &'a [u32; 11],
     pub(crate) freq_b: &'a [u32; 11],
@@ -440,7 +459,10 @@ impl ParametersG16C<'_> {
         }
         self.validate()?;
         // All caller-controlled geometry is validated before any mutation.
-        out[..SIZE].copy_from_slice(template_g16c_bytes());
+        out[..SIZE].copy_from_slice(match self.profile {
+            super::scheduled_profile::Profile::G16C=>template_g16c_bytes(),
+            super::scheduled_profile::Profile::G16S=>G16S_TEMPLATE.as_bytes(),
+        });
         // SAFETY: `out` is exclusive, initialized host staging storage;
         // validated SIZE bytes are available. HardwareDataG16C has alignment
         // one, no padding, and exclusively byte-array fields (all bit patterns
@@ -449,6 +471,8 @@ impl ParametersG16C<'_> {
         for (slot, register) in self.registers {
             raw.registers[*slot] = *register;
         }
+        raw.core_count=(self.profile.cores() as u32).to_le_bytes();
+        raw.core_count_copy=raw.core_count;
         raw.revision_major = (self.revision >> 4).to_le_bytes();
         raw.revision_minor = (self.revision & 7).to_le_bytes();
         raw.gpc = u32::from(self.gpc).to_le_bytes();
@@ -457,7 +481,7 @@ impl ParametersG16C<'_> {
         raw.hardware_status = self.hardware_status.to_le_bytes();
         raw.computed = self.computed.to_le_bytes();
         let voltage = |state: usize, word: usize| {
-            if word < 4 {
+            if word < self.profile.clusters() {
                 (
                     self.cluster_core[state][word],
                     self.cluster_memory[state][word],
