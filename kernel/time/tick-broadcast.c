@@ -786,7 +786,28 @@ static int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
 		return 0;
 	if (bc->next_event == KTIME_MAX)
 		return 0;
+	/* Retry a handoff which could not move a running hrtimer callback. */
+	if (bc->bound_on == cpu)
+		tick_broadcast_hrtimer_queue(bc);
 	return bc->bound_on == cpu ? -EBUSY : 0;
+}
+
+/*
+ * Run on the preferred CPU, after the programming CPU released the lock.
+ * Until this actually moves the hrtimer, bound_on still protects the old
+ * owner from entering a state which stops its local timer.
+ */
+void tick_broadcast_hrtimer_reprogram(void *arg)
+{
+	struct clock_event_device *bc;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&tick_broadcast_lock, flags);
+	bc = tick_broadcast_device.evtdev;
+	if (bc == arg && (bc->features & CLOCK_EVT_FEAT_HRTIMER) &&
+	    clockevent_state_oneshot(bc) && bc->next_event != KTIME_MAX)
+		bc->set_next_ktime(bc->next_event, bc);
+	raw_spin_unlock_irqrestore(&tick_broadcast_lock, flags);
 }
 
 static void broadcast_shutdown_local(struct clock_event_device *bc,

@@ -15,7 +15,41 @@
 
 #include "tick-internal.h"
 
+#undef MODULE_PARAM_PREFIX
+#define MODULE_PARAM_PREFIX "tick_broadcast_hrtimer."
+
 static struct hrtimer bctimer;
+static struct clock_event_device ce_broadcast_hrtimer;
+
+/* Opt-in until timer latency and power have been measured on the target. */
+static int preferred_cpu = -1;
+module_param_named(cpu, preferred_cpu, int, 0444);
+MODULE_PARM_DESC(cpu, "Preferred hrtimer broadcast CPU (-1: follow the caller)");
+
+#ifdef CONFIG_SMP
+static call_single_data_t bc_handoff = CSD_INIT(tick_broadcast_hrtimer_reprogram,
+					       &ce_broadcast_hrtimer);
+
+/* Called with tick_broadcast_lock held, including from the idle entry path. */
+void tick_broadcast_hrtimer_queue(struct clock_event_device *bc)
+{
+	int cpu = preferred_cpu;
+
+	if (bc != &ce_broadcast_hrtimer || cpu < 0 || cpu >= nr_cpu_ids ||
+	    !cpu_online(cpu) || cpu == smp_processor_id() ||
+	    bc->bound_on == cpu || bc->next_event == KTIME_MAX)
+		return;
+
+	/*
+	 * Never wait under tick_broadcast_lock: the remote callback takes it.
+	 * A busy CSD already carries a request; it reads the latest deadline
+	 * under that lock. An offline target leaves the local timer intact.
+	 */
+	smp_call_function_single_async(cpu, &bc_handoff);
+}
+#else
+void tick_broadcast_hrtimer_queue(struct clock_event_device *bc) { }
+#endif
 
 static int bc_shutdown(struct clock_event_device *evt)
 {
@@ -69,6 +103,7 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
 	 * base lock.
 	 */
 	bc->bound_on = bctimer.base->cpu_base->cpu;
+	tick_broadcast_hrtimer_queue(bc);
 
 	return 0;
 }
@@ -99,6 +134,12 @@ static enum hrtimer_restart bc_handler(struct hrtimer *t)
 
 void tick_setup_hrtimer_broadcast(void)
 {
+	if (preferred_cpu < -1 || preferred_cpu >= nr_cpu_ids ||
+	    (preferred_cpu >= 0 && !cpu_possible(preferred_cpu))) {
+		pr_warn("bc_hrtimer: invalid preferred CPU %d, using the caller\n",
+			preferred_cpu);
+		preferred_cpu = -1;
+	}
 	hrtimer_setup(&bctimer, bc_handler, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
 	clockevents_register_device(&ce_broadcast_hrtimer);
 }
