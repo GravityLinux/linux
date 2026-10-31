@@ -787,7 +787,7 @@ static int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
 	if (bc->next_event == KTIME_MAX)
 		return 0;
 	/* Retry a handoff which could not move a running hrtimer callback. */
-	if (bc->bound_on == cpu)
+	if (tick_broadcast_hrtimer_preferred_enabled() && bc->bound_on == cpu)
 		tick_broadcast_hrtimer_queue(bc);
 	return bc->bound_on == cpu ? -EBUSY : 0;
 }

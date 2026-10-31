@@ -7606,6 +7606,10 @@ Kernel parameters
 			Preferred CPU for the hrtimer broadcast clockevent.
 			Format: <cpu-number>
 			Default: -1 (follow the CPU programming the event).
+			With the parameter unset or -1, a disabled static key
+			bypasses preference work in the programming/owner paths.
+			This preserves timer decisions, not instruction identity.
+			A valid opt-in enables the key at early initcall time.
 			Reprogramming requests an asynchronous handoff to this
 			CPU. Until the handoff completes, the existing owner is
 			kept out of timer-stopping idle states. An offline target
