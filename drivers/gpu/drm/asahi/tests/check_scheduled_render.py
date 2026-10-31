@@ -149,7 +149,7 @@ for directory in ('single-user-texture-pixel-20261010','single-user-render32-msa
 with tempfile.TemporaryDirectory() as directory:
     tmp=Path(directory);flags=host_versions.build(tmp)
     code='#![allow(dead_code,unused_mut,unused_assignments)]\nuse std::io::Write;\n'
-    for name in ('g17p_compute','g17p_render'):
+    for name in ('scheduled_profile','g17p_compute','g17p_render'):
         code+=f'#[path={json.dumps(str(tests.parent/(name+".rs")))}]mod {name};\n'
     code+='mod g17p_render_lifecycle{pub const POOL_SLOTS:u32=(u32::BITS-2)/2;}\n'
     code+='use g17p_render::program;\n'
@@ -169,6 +169,7 @@ with tempfile.TemporaryDirectory() as directory:
     (tmp/'legacy.rs').write_bytes(subprocess.check_output(['git','show',
         baseline+':drivers/gpu/drm/asahi/g17p_render.rs'],cwd=linux))
     neo='#![allow(dead_code)]\nuse std::io::Write;\n'
+    neo+=f'#[path={json.dumps(str(tests.parent/"scheduled_profile.rs"))}]mod scheduled_profile;\n'
     neo+=f'#[path={json.dumps(str(tests.parent/"g17p_compute.rs"))}]mod g17p_compute;\n'
     neo+=f'#[path={json.dumps(str(tests.parent/"g17p_render.rs"))}]mod current;\n'
     neo+='mod legacy;\nmod g17p_render_lifecycle {pub const POOL_SLOTS:u32=(u32::BITS-2)/2;}\n'

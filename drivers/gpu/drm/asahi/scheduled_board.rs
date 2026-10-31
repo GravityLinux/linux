@@ -10,6 +10,7 @@ use super::scheduled_initdata::{HardwareRegion, MmioRegion};
 use kernel::{c_str, of, prelude::*};
 
 pub(crate) struct BoardG16C {
+    pub(crate) profile: super::scheduled_profile::Profile,
     pub(crate) freq_a: [u32; 11],
     pub(crate) freq_b: [u32; 11],
     pub(crate) core_voltage: [u32; 11],
@@ -31,7 +32,12 @@ pub(crate) struct BoardG16C {
 
 impl BoardG16C {
     pub(crate) fn from_fdt(node: &of::Node) -> Result<Self> {
+        let compatibles: KVec<u8> = node.get_property(c_str!("compatible"))?;
+        let profile = if compatibles.split(|v| *v == 0).any(|v| v == b"apple,agx-t6040" || v == b"apple,agx-g16s") {
+            super::scheduled_profile::Profile::G16S
+        } else { super::scheduled_profile::Profile::G16C };
         let mut out = Self {
+            profile,
             freq_a: [0; 11],
             freq_b: [0; 11],
             core_voltage: [0; 11],
@@ -74,8 +80,8 @@ impl BoardG16C {
             let memory: KVec<u32> = opp.get_property(c_str!("apple,sram-microvolt"))?;
             let index: KVec<u32> = opp.get_property(c_str!("apple,perf-index"))?;
             let relative: KVec<u32> = opp.get_property(c_str!("apple,relative-power"))?;
-            if core.len() != 4
-                || memory.len() != 4
+            if core.len() != profile.clusters()
+                || memory.len() != profile.clusters()
                 || index.len() != 2
                 || relative.len() != 2
                 || index.iter().any(|v| *v >= 16)
@@ -96,7 +102,7 @@ impl BoardG16C {
             out.index_b[count] = index[1];
             out.relative_a[count] = relative[0];
             out.relative_b[count] = relative[1];
-            for cluster in 0..4 {
+            for cluster in 0..profile.clusters() {
                 out.cluster_core[count][cluster] = core[cluster] / 1000;
                 out.cluster_memory[count][cluster] = memory[cluster] / 1000;
             }
@@ -147,6 +153,7 @@ impl BoardG16C {
         regions: Option<&'a [HardwareRegion; 2]>,
     ) -> ParametersG16C<'a> {
         ParametersG16C {
+            profile: self.profile,
             registers,
             freq_a: &self.freq_a,
             freq_b: &self.freq_b,

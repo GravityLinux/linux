@@ -83,49 +83,53 @@ pub(crate) struct Program {
     pub(crate) operand_state: u64,
     #[ver(G == G17P)]
     pub(crate) usc_exec_base: u64,
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) usc_exec_base: Option<u64>,
     pub(crate) helper_binary: u64,
     pub(crate) helper_data: u64,
     pub(crate) helper_cfg: u64,
     pub(crate) execution_gate: u64,
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) register_a599: u64,
 }
 pub(crate) type ProgramOutputG17P = [Register; 40];
 pub(crate) type ProgramOutputG16C = wire::ComputeProgramG16C;
+pub(crate) type ProgramOutputG16S = wire::ComputeProgramG16S;
 #[versions(AGX_SCHEDULED)]
 impl Program::ver {
     pub(crate) fn build(&self) -> Result<ProgramOutput::ver> {
-        let raw=wire::ComputeProgram::ver::new(&wire::ProgramParameters {
+        let raw=wire::ComputeProgram::ver::new(&self.parameters()).map_err(wire_error)?;
+        #[ver(G == G17P)]
+        return Ok(raw.into_array());
+        #[ver(G == G16S || G == G16C)]
+        return Ok(raw);
+    }
+    fn parameters(&self)->wire::ProgramParameters {
+        wire::ProgramParameters {
             save_area: self.preempt, cdm: self.cdm, identity: self.identity,
             context: self.context, ordinal: self.ordinal, robustness: self.robustness,
             operand_state: self.operand_state,
             #[ver(G == G17P)]
             usc_exec_base: Some(self.usc_exec_base),
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             usc_exec_base: self.usc_exec_base,
             helper_binary: self.helper_binary, helper_data: self.helper_data,
             helper_config: self.helper_cfg, execution_gate: self.execution_gate,
             #[ver(G == G17P)]
             register_a599: 0x13200400020,
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             register_a599: self.register_a599,
-        }).map_err(wire_error)?;
-        #[ver(G == G17P)]
-        return Ok(raw.into_array());
-        #[ver(G == G16C)]
-        return Ok(raw);
+        }
     }
 }
 
 #[versions(AGX_SCHEDULED)]
 pub(crate) struct Descriptor {
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) save_area: u64,
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) cdm: u64,
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) identity: u64,
     pub(crate) scheduler: u64,
     pub(crate) low_alias: u64,
@@ -140,9 +144,9 @@ pub(crate) struct Descriptor {
     pub(crate) zero_page: u64,
     pub(crate) support_control: u32,
     pub(crate) support_flags: u32,
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) support_kind: u16,
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) support_phase: u8,
     pub(crate) ordinal: u32,
     pub(crate) queue_submission: u32,
@@ -156,7 +160,7 @@ impl Descriptor::ver {
     pub(crate) fn build(&self, out: &mut [u8], registers: &[Register]) -> Result {
         #[ver(G == G17P)]
         if out.len() != PAGE { return Err(Error::Invalid); }
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         if out.len() != 0x1000 && out.len() != PAGE { return Err(Error::Invalid); }
         wire::ComputeDescriptor::ver::write(out, &wire::Parameters {
             #[ver(G == G17P)]
@@ -165,11 +169,11 @@ impl Descriptor::ver {
             cdm: 0,
             #[ver(G == G17P)]
             identity: 0,
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             save_area: self.save_area,
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             cdm: self.cdm,
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             identity: self.identity,
             sequence: self.sequence,
             context: self.context,
@@ -191,11 +195,11 @@ impl Descriptor::ver {
             support_flags: self.support_flags,
             #[ver(G == G17P)]
             support_kind: 0x9f,
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             support_kind: self.support_kind,
             #[ver(G == G17P)]
             support_phase: 1,
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             support_phase: self.support_phase,
             zero_page: self.zero_page,
         }, registers).map_err(wire_error)
@@ -303,7 +307,7 @@ impl work::ComputeRecord::ver {
         if dependencies.is_empty() { return Ok(()); }
         #[ver(G == G17P)]
         if dependencies.len()>3 {return Err(Error::Invalid);}
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         if dependencies.len()>4 {return Err(Error::Invalid);}
         let header=u64::from_le_bytes(self.dependency_header);
         let previous=u64::from_le_bytes(self.previous);
@@ -319,7 +323,7 @@ impl work::ComputeRecord::ver {
             if let Some(existing)=merged[..count].iter_mut().find(|p|p.0==grid) {
                 existing.1=existing.1.max(value);
             } else {
-                #[ver(G == G16C)]
+                #[ver(G == G16S || G == G16C)]
                 if count==3 {return Err(Error::Invalid);}
                 merged[count]=(grid,value);count+=1;
             }
@@ -327,7 +331,7 @@ impl work::ComputeRecord::ver {
         merged[count]=own;count+=1;
         #[ver(G == G17P)]
         let prefix=0xffff080000000000u64 | (((header>>32)&255)<<32);
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         let prefix=header & !0xffffffff;
         self.dependency_header=prefix.to_le_bytes();
         self.write_dependencies(&merged[..count]);Ok(())
@@ -454,4 +458,10 @@ pub(crate) fn scheduler_slot(first: u64, occupied: usize) -> Result<[u8; 0x40]> 
         );
     }
     Ok(out)
+}
+
+impl ProgramG16C {
+    pub(crate) fn build_for(&self,profile:super::scheduled_profile::Profile)->Result<ProgramOutputG16C> {
+        wire::ComputeProgramG16C::for_profile(&self.parameters(),profile).map_err(wire_error)
+    }
 }

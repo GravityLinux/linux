@@ -123,6 +123,7 @@ with tempfile.TemporaryDirectory(prefix='scheduled-compute-') as directory:
 use std::io::{Read,Write};
 #[path=LEGACY] mod legacy;
 #[path=CURRENT] mod current;
+#[path=PROFILE] mod scheduled_profile;
 use current::wire::{ComputeDescriptorG16C as Max,ComputeProgramG16C as MaxProgram,ProgramParameters,Parameters,Error};
 fn main() {
     // Original tagged Neo builders are compiled independently in this crate.
@@ -246,7 +247,7 @@ fn main() {
         assert_eq!(&packed,&guarded[16..0x1010]);
     }
 }
-'''.replace('LEGACY', json.dumps(str(legacy))).replace('CURRENT',
+'''.replace('PROFILE', json.dumps(str(tests.parent/'scheduled_profile.rs'))).replace('LEGACY', json.dumps(str(legacy))).replace('CURRENT',
         json.dumps(str(tests.parent / 'g17p_compute.rs'))))
     binary = tmp / 'gate'
     subprocess.run(['rustc', '--edition=2021', '-Dwarnings', str(harness),

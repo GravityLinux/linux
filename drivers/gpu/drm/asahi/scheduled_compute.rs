@@ -103,7 +103,7 @@ impl ComputeProgram::ver {
         if p.usc_exec_base.is_none() {
             return Err(Error::UnsupportedExecBase);
         }
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         if !(1..64).contains(&p.context)
             || p.ordinal > 255
             || p.cdm == 0
@@ -119,10 +119,12 @@ impl ComputeProgram::ver {
         }
         #[ver(G == G16C)]
         let save_offsets = [0x2980, 0x2988, 0x2990, 0x2998];
-        #[ver(G == G17P)]
+        #[ver(G == G16S || G == G17P)]
         let save_offsets = [0x1480, 0x1488, 0x1490, 0x1498];
         #[ver(G == G16C)]
         let operand_offsets = [0x78800, 0x7a800, 0x3c405, 0x78400, 5, 0x3c000];
+        #[ver(G == G16S)]
+        let operand_offsets = [0x3c800, 0x3d800, 0x1e405, 0x3c400, 5, 0x1e000];
         #[ver(G == G17P)]
         let operand_offsets = [0x12800, 0x13000, 0x9405, 0x12400, 5, 0x9000];
         let mut raw = Self::default();
@@ -154,7 +156,7 @@ impl ComputeProgram::ver {
         for (i, offset) in operand_offsets.into_iter().enumerate() {
             raw.registers[32 + i].1 = p.operand_state.checked_add(offset).ok_or(Error::Overflow)?;
         }
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         if p.usc_exec_base.is_none() {
             raw.registers.copy_within(10..40, 6);
             raw.registers[36..].fill((0, 0));
@@ -313,7 +315,7 @@ impl ComputeDescriptor::ver {
         if p.queue_submission == 0 {
             return Err(Error::Invalid);
         }
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         if registers.len() < 2
             || !(1..64).contains(&p.context)
             || p.scheduler == 0
@@ -335,7 +337,7 @@ impl ComputeDescriptor::ver {
                 .map(|(_, v)| *v)
                 .ok_or(Error::MissingRegister)
         };
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         let one = |number| {
             registers
                 .iter()
@@ -352,23 +354,23 @@ impl ComputeDescriptor::ver {
         ];
         #[ver(G == G17P)]
         let (save_area, cdm, identity) = (one(0x1a510)?, one(0x1a420)?, one(0x1a540)?);
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         let (save_area, cdm, identity) = (p.save_area, p.cdm, p.identity);
         #[ver(G == G17P)]
         let control = one(0x1a440)?;
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         let control = 0x154024201u64;
         if p.terminator < cdm {
             return Err(Error::Invalid);
         }
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         if cdm == 0 || (cdm | p.terminator) & 3 != 0 {
             return Err(Error::Invalid);
         }
         let primary_address = p.alias.checked_add(0x40).ok_or(Error::Overflow)?;
         let secondary_address = p.alias.checked_add(0x760).ok_or(Error::Overflow)?;
 
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         out[..Self::SIZE].copy_from_slice(TEMPLATE_G16C.as_bytes());
         #[ver(G == G17P)]
         out[..Self::SIZE].copy_from_slice(TEMPLATE_G17P.as_bytes());
@@ -380,7 +382,7 @@ impl ComputeDescriptor::ver {
         raw.sequence = p.sequence.to_le_bytes();
         raw.context = p.context.to_le_bytes();
         raw.scheduler = p.scheduler.to_le_bytes();
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         {
             let n = registers.len() as u16;
             raw.counts = [n - 2, n - 1, n - 1, n].map(u16::to_le_bytes);
@@ -496,3 +498,15 @@ const COMPUTE_LAYOUT: () = {
     assert!(core::mem::offset_of!(ComputeDescriptor::ver, support_phase) == 0xfd3);
     assert!(core::mem::offset_of!(ComputeDescriptor::ver, pad_0fd4) == 0xfd4);
 };
+
+impl ComputeProgramG16C {
+    pub(crate) fn for_profile(p:&ProgramParameters,profile:crate::scheduled_profile::Profile)->core::result::Result<Self,Error> {
+        match profile {
+            crate::scheduled_profile::Profile::G16C=>Self::new(p),
+            crate::scheduled_profile::Profile::G16S=>{
+                let raw=ComputeProgramG16S::new(p)?;
+                Ok(Self {registers:raw.registers,count:raw.count})
+            }
+        }
+    }
+}

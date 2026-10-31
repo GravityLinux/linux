@@ -232,9 +232,9 @@ pub(crate) struct QueuePointers {
     pad_44: [u8; 0xc],
     capacity: [u8; 4],
     pad_54: [u8; 0xc],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     extended_60: [u8; 4],
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pad_64: [u8; 0x1c],
 }
 
@@ -254,12 +254,12 @@ impl Default for QueuePointers::ver {
             pad_44: [0; 0xc],
             #[ver(G == G17P)]
             capacity: [0; 4],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             capacity: u32::MAX.to_le_bytes(),
             pad_54: [0; 0xc],
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             extended_60: 0x500u32.to_le_bytes(),
-            #[ver(G == G16C)]
+            #[ver(G == G16S || G == G16C)]
             pad_64: [0; 0x1c],
         }
     }
@@ -277,7 +277,7 @@ impl QueuePointers::ver {
         }
     }
 
-    #[ver(G == G16C)]
+    #[ver(G == G16S || G == G16C)]
     pub(crate) fn with_write(write: u32) -> Self {
         Self {
             write: write.to_le_bytes(),

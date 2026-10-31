@@ -34,6 +34,7 @@ mod scheduled_resources;
 #[allow(dead_code)]
 mod scheduled_queues;
 mod scheduled_operands;
+mod scheduled_profile;
 #[allow(dead_code)]
 mod scheduled_dispatch;
 mod scheduled_lifetime;
@@ -151,6 +152,8 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,agx-t8140")), GpuAbi::G17P),
         (of::DeviceId::new(c_str!("apple,agx-g16c")), GpuAbi::G16C),
         (of::DeviceId::new(c_str!("apple,agx-t6041")), GpuAbi::G16C),
+        (of::DeviceId::new(c_str!("apple,agx-t6040")), GpuAbi::G16C),
+        (of::DeviceId::new(c_str!("apple,agx-g16s")), GpuAbi::G16C),
     ]
 );
 
@@ -180,6 +183,10 @@ impl<'bound> ScheduledGpu<'bound> {
         let sgx = request.iomap_sized::<0x3758000>()?.into_devres()?;
         let version = sgx.try_access().ok_or(ENODEV)?.read32(ID_VERSION);
         let board = scheduled_board::BoardG16C::from_fdt(&node)?;
+        if board.profile == scheduled_profile::Profile::G16S && crate::module_parameters::partial_independent_owner.value() != 0 {
+            dev_err!(pdev, "G16S: two retained render pools are not qualified; partial_independent_owner must be zero\n");
+            return Err(EINVAL);
+        }
         let max_mhz = *board.freq_a.iter().max().ok_or(EINVAL)?;
         let image = KBox::new(scheduled_image::ImageG16C::new(&node, 0)?, GFP_KERNEL)?;
         let session = g17p_boot::Session::prepare_g16c(pdev, &resources, sgx, &image)?;
@@ -200,7 +207,7 @@ impl<'bound> ScheduledGpu<'bound> {
             })),
             GFP_KERNEL,
         )?;
-        let drm = g17p_drm::register_g16c(pdev, version, max_mhz, runtime.clone())?;
+        let drm = g17p_drm::register_g16c(pdev, version, max_mhz, board.profile, runtime.clone())?;
         Ok(Self::G16C {
             _resources: resources,
             runtime,

@@ -388,7 +388,8 @@ impl Schedule {
                 if private && prepared.render_storage.is_none() {
                     let Command::Render(p)=command else {return Err(EIO);};
                     prepared.render_storage=Some(super::super::g17p_boot::OwnerPrivateG16C::build(
-                        slot.as_mut().ok_or(EIO)?,p.kernel_start,p.kernel_end)?);
+                        slot.as_mut().ok_or(EIO)?,p.kernel_start,p.kernel_end,
+                        super::super::scheduled_profile::Profile::for_chip(dev.params.chip_id).ok_or(ENODEV)?)?);
                     if crate::module_parameters::submission_log.value()!=0 {
                         pr_info!("G16C: fresh render private backing prepared queue={:?} base={:#x} limit={:#x}\n",
                             prepared.queue_key,p.kernel_start,p.kernel_end);

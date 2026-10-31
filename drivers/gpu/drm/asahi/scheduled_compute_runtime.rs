@@ -100,7 +100,7 @@ impl OwnerPrivateG16C {
     pub(crate) fn matches(&self,client:&compute::Client,base:u64,limit:u64)->bool {
         self.root==client.root.root() && self.base==base && self.limit==limit
     }
-    pub(crate) fn build(client:&mut compute::Client,base:u64,limit:u64)->Result<Self> {
+    pub(crate) fn build(client:&mut compute::Client,base:u64,limit:u64,profile:super::super::scheduled_profile::Profile)->Result<Self> {
         let [table,state,buffers,end,_]=owner_layout(base,limit)?;
         let mut memory=Memory::detached();
         let support_pages=[memory.allocate(PAGE as usize)?,memory.allocate(PAGE as usize)?];
@@ -108,8 +108,8 @@ impl OwnerPrivateG16C {
         let mut private=KVec::new();
         private_span(&mut memory,&mut private,0,operands::DIRECTORY_SIZE)?;
         private_span(&mut memory,&mut private,table-base,operands::TABLE_SIZE)?;
-        private_span(&mut memory,&mut private,state-base,0x7c000)?;
-        private_span(&mut memory,&mut private,end-base,0x7c000)?;
+        private_span(&mut memory,&mut private,state-base,profile.operand_bytes())?;
+        private_span(&mut memory,&mut private,end-base,profile.operand_bytes())?;
         let mut operand_buffers=KVec::with_capacity(operands::INITIAL_BUFFERS as usize,GFP_KERNEL)?;
         for i in 0..operands::INITIAL_BUFFERS as u64 {
             let offset=buffers-base+i*operands::BUFFER_STRIDE;
@@ -214,6 +214,7 @@ pub(super) struct RenderTicket {
 enum WorkEvent {Growth(parameter_growth::AcceptedGrowth),ParameterError(parameter_oom::AcceptedError)}
 
 pub(super) struct State {
+    profile: super::super::scheduled_profile::Profile,
     owners: KVec<Owner>,
     queues: KVec<Queue>,
     selected: Option<usize>,
@@ -464,8 +465,9 @@ impl State {
         Ok(())
     }
 
-    pub(super) fn new() -> Self {
+    pub(super) fn new(profile: super::super::scheduled_profile::Profile) -> Self {
         Self {
+            profile,
             owners: KVec::new(),
             queues: KVec::new(),
             selected: None,

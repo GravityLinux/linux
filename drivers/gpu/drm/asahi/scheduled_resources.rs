@@ -37,7 +37,10 @@ impl ResourcesG16C {
         let names: KVec<u8> = node.get_property(c_str!("memory-region-names"))?;
         let private: KVec<u64> = node.get_property(c_str!("apple,rtkit-private-vm-region"))?;
         let handles: KVec<u32> = node.get_property(c_str!("memory-region"))?;
-        if firmware.as_slice() != b"mBoot-18000.161.10\0"
+        let pro = node.get_property::<KVec<u8>>(c_str!("compatible"))?.split(|v| *v == 0)
+            .any(|v| v == b"apple,agx-t6040" || v == b"apple,agx-g16s");
+        if (firmware.as_slice() != b"mBoot-18000.161.10\0"
+            && !(pro && firmware.as_slice() == b"mBoot-20457.1.29\0"))
             || names.as_slice() != b"ttbs\0pagetables\0l2\0handoff\0firmware\0"
             || private.as_slice() != [0xfffffc0000000000, 0x2000000000]
             || handles.len() != REGIONS

@@ -573,7 +573,7 @@ impl TilingDescriptor::ver {
         // SAFETY: Every field is an initialized byte array, alignment one.
         let mut raw: Self = unsafe { core::mem::zeroed() };
         raw.sampler_sentinel = u32::MAX.to_le_bytes();
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         {
             raw.support_opcode = [0x4f];
         }
@@ -610,7 +610,7 @@ impl FragmentDescriptor::ver {
         raw.depth_control = 0x04040404u32.to_le_bytes();
         raw.sampler_sentinel = u32::MAX.to_le_bytes();
         raw.field_2128 = 1u32.to_le_bytes();
-        #[ver(G == G16C)]
+        #[ver(G == G16S || G == G16C)]
         {
             raw.support_opcode = [0x54];
         }

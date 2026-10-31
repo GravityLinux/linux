@@ -230,9 +230,10 @@ impl State {
         q.key=p.queue_owner.ok_or(EINVAL)?;self.owners[oi].close_requested=false;
         drop(client.take());Ok(true)
     }
-    fn configured_render(input:&command::Parameters,n:u32,sequence:u32,geo:[u64;3])->Result<command::Parameters> {
+    fn configured_render(profile:super::super::super::scheduled_profile::Profile,input:&command::Parameters,n:u32,sequence:u32,geo:[u64;3])->Result<command::Parameters> {
         let mut p=*input;
-        p.context_base=0x1000000000;p.deflake_1=0x1000068da0;p.deflake_2=0x1000068120;p.deflake_3=0x1000068000;
+        p.context_base=0x1000000000;p.deflake_3=0x1000068000;
+        let offsets=profile.deflake();p.deflake_1=p.deflake_3+offsets[1];p.deflake_2=p.deflake_3+offsets[0];
         p.ta_status=0x1000078000;p.fragment_status=0x1000490000;p.aux_fb=0x10004d0000;
         p.reactive_tvb_growth=true;
         if crate::module_parameters::g16c_parameter_oom_test.value()==n {
@@ -249,7 +250,7 @@ impl State {
         ->Result<(command::Parameters,super::super::super::g17p_render_runtime::WrappedSeed)> {
         use super::super::super::g17p_render_runtime::{WrappedSeed,WrappedLane};
         let q=&self.queues[qi];let o=&self.owners[q.owner];let r=o.render.as_ref().ok_or(EIO)?;
-        let geo=r.geometry_addresses();let p=Self::configured_render(input,self.render_ordinal,r.sequence,geo)?;
+        let geo=r.geometry_addresses();let p=Self::configured_render(self.profile,input,self.render_ordinal,r.sequence,geo)?;
         Ok((p,WrappedSeed {base:super::super::super::g17p_render_runtime::wrapped_storage_base(storage)?,storage,ordinal:self.render_ordinal,local:q.render_count,
             sequence:r.sequence,milestone:r.sequence_base.checked_add(r.sequence).ok_or(EOVERFLOW)?,grids:super::super::super::g17p_render_lifecycle::pool_grids(o.pool).map_err(|_|EINVAL)?.map(|grid|grid as u8),context:o.context,slot:r.parameter.slot,support:r.support,
             manager:r.manager,scene:r.scene+u64::from(r.sequence%79)*0x80,empty:r.empty_scene,
@@ -416,9 +417,9 @@ impl State {
         }
         let mut p = *input;
         p.context_base = 0x1000000000;
-        p.deflake_1 = 0x1000068da0;
-        p.deflake_2 = 0x1000068120;
         p.deflake_3 = 0x1000068000;
+        let offsets=self.profile.deflake();
+        p.deflake_1=p.deflake_3+offsets[1];p.deflake_2=p.deflake_3+offsets[0];
         p.ta_status = 0x1000078000;
         p.fragment_status = 0x1000490000;
         p.aux_fb = 0x10004d0000;
@@ -431,13 +432,14 @@ impl State {
             kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: test-only parameter OOM policy at render ordinal={} TA892=0 FG2100=1\n",n);
         }
         p.aux_fb_flags = 0xc000 | (p.aux_fb_flags & (1 << 18));
+        let profile = self.profile;
         let o = &mut self.owners[oi];
         let r = o.render.as_mut().ok_or(EIO)?;
         let root=&mut o.client.as_mut().ok_or(EIO)?.root;
         if r.geometry_plan(root,geometry_sizes(&p)?)?.is_some() {return Ok(None);}
         r.refresh_root(root)?;
         let geo=r.geometry_addresses();
-        p=Self::configured_render(input,n,r.sequence,geo)?;
+        p=Self::configured_render(profile,input,n,r.sequence,geo)?;
         let Some(storage)=session.next_wrapped_render_storage(n) else {return Ok(None);};
         if !self.render_work_pages.iter().any(|(old,_)|*old==storage) && work_backing.is_none() {return Ok(None);}
         let (configured,wire)=self.render_seed(qi,storage,input)?;

@@ -21,6 +21,7 @@ impl graph::Storage for Buffers {
 }
 
 pub(crate) struct ImageG16C {
+    pub(crate) profile: super::scheduled_profile::Profile,
     buffers: Buffers,
     pub(crate) graph: graph::Graph,
     pub(crate) mmio: KBox<MmioG16C>,
@@ -38,6 +39,7 @@ impl ImageG16C {
         let graph = graph::build(&mut buffers, &board, mmio.registers(), &settings, entropy)
             .map_err(|_| EINVAL)?;
         Ok(Self {
+            profile: board.profile,
             buffers,
             graph,
             mmio,

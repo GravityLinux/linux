@@ -108,8 +108,8 @@ static AGX_VERSIONS: VersionConfig = VersionConfig {
 // profiles remain independent of the older driver's firmware-version axis.
 static AGX_SCHEDULED_VERSIONS: VersionConfig = VersionConfig {
     fields: &["G"],
-    enums: &[&["G16C", "G17P"]],
-    versions: &[&["G16C"], &["G17P"]],
+    enums: &[&["G16S", "G16C", "G17P"]],
+    versions: &[&["G16S"], &["G16C"], &["G17P"]],
 };
 
 fn check_version(

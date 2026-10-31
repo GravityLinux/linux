@@ -96,7 +96,7 @@ class Loader:
                 for key,data in [('opp-hz',bytes(8)),('opp-microvolt',bytes(4))]:
                     assert self.set(dt,child,key.encode(),data,len(data))==0
         core_bytes=platform.properties['perf-states'];sram_bytes=platform.properties['perf-states-sram']
-        core=(PerfState*64).from_buffer_copy(core_bytes);sram=(PerfState*64).from_buffer_copy(sram_bytes)
+        core=(PerfState*(len(core_bytes)//8)).from_buffer_copy(core_bytes);sram=(PerfState*(len(sram_bytes)//8)).from_buffer_copy(sram_bytes)
         cs=C.create_string_buffer(platform.properties['cs-perf-states'])
         values=[(k,struct.unpack('<I',v)[0]) for k,v in platform.properties.items() if self.ispower(k.encode()) and len(v)==4]
         scalars=(Scalar*len(values))(*[Scalar(k.encode(),v) for k,v in values])

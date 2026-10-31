@@ -24,9 +24,12 @@ pub(crate) struct PrivateLayout {
     pub(crate) save:u64,
     pub(crate) robustness:u64,
     pub(crate) end:u64,
+    pub(crate) operand_bytes:u64,
 }
 impl PrivateLayout {
     pub(crate) fn new(p:&Parameters)->Result<Self> {
+        let profile=super::super::scheduled_profile::Profile::for_chip(p.chip_id).ok_or(ENODEV)?;
+        let operand_bytes=profile.operand_bytes();
         let base=p.preempt;
         let table=base.checked_add(operands::DIRECTORY_SIZE+2*PAGE).ok_or(EOVERFLOW)?;
         let state=table.checked_add(operands::TABLE_SIZE+2*PAGE).ok_or(EOVERFLOW)?;
@@ -35,12 +38,12 @@ impl PrivateLayout {
         let robustness=save.checked_add(256*SAVE_STRIDE).ok_or(EOVERFLOW)?;
         let end=robustness.checked_add(PAGE).ok_or(EOVERFLOW)?;
         if base<PAGE || base&(PAGE-1)!=0 || end>p.kernel_end || p.kernel_end>1<<42 {return Err(EINVAL);}
-        Ok(Self {base,table,state,buffers,save,robustness,end})
+        Ok(Self {base,table,state,buffers,save,robustness,end,operand_bytes})
     }
     pub(crate) fn offsets(&self)->Result<KVec<u64>> {
         let mut offsets=KVec::new();
         for (address,size) in [(self.base,operands::DIRECTORY_SIZE),(self.table,operands::TABLE_SIZE),
-            (self.state,0x7c000),(self.robustness,PAGE)] {
+            (self.state,self.operand_bytes),(self.robustness,PAGE)] {
             for offset in (0..size).step_by(PAGE as usize) {offsets.push(address-self.base+offset,GFP_KERNEL)?;}
         }
         for i in 0..u64::from(operands::INITIAL_BUFFERS) {
@@ -58,7 +61,7 @@ impl PrivateLayout {
             client_storage(memory,&mut client.root,self.base+offset,0x200000)?;
         }
         let table=client_storage(memory,&mut client.root,self.table,operands::TABLE_SIZE as usize)?;
-        client_storage(memory,&mut client.root,self.state,0x7c000)?;
+        client_storage(memory,&mut client.root,self.state,self.operand_bytes as usize)?;
         let mut entries=KVVec::with_capacity(operands::TABLE_SIZE as usize,GFP_KERNEL)?;
         entries.resize(operands::TABLE_SIZE as usize,0,GFP_KERNEL)?;
         let mut list=KVVec::with_capacity(PAGE as usize,GFP_KERNEL)?;
