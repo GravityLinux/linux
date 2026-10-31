@@ -69,12 +69,12 @@ impl RebindSnapshot {
     /// from its snapshot; the prepared pool plan also retains all incoming BOs.
     pub(crate) fn prepare_leaf_switch(self, incoming: &UserVm,
         old_bindings: &[(u64,u64,u64,u32)], fallback: &[(u64,u64)],
-        foreign_growth: &[(u64,u64)], contexts: &[u16]) -> Result<PreparedRebind> {
+        foreign_growth: &[(u64,u64)], contexts: &[u16], render_relative: bool) -> Result<PreparedRebind> {
         if contexts.is_empty() || contexts.iter().enumerate().any(|(i,&c)|
             c == 0 || c >= 64 || contexts[..i].contains(&c)) { return Err(EINVAL); }
         let mut ranges = KVec::with_capacity(old_bindings.len(),GFP_KERNEL)?;
         for &(base,size,_,_) in old_bindings {
-            let start = address(base);
+            let start = if render_relative {address(base)} else {base};
             let end = start.checked_add(size).ok_or(EOVERFLOW)?;
             ranges.push((start,end),GFP_KERNEL)?;
         }

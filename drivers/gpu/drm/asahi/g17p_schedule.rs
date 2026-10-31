@@ -235,6 +235,11 @@ impl Schedule {
     pub(super) fn fast_retry(&self) -> bool {
         self.control_waiting || self.nodes.iter().any(|node| status(&node.point.completion) == 0)
     }
+    pub(super) fn fast_retry_us(&self) -> i64 {
+        // Receipt-only handshakes do not require a GPU job to finish. Keep
+        // those short without increasing polling for ordinary GPU execution.
+        if self.control_waiting {20} else {200}
+    }
     pub(super) fn tail(&self) -> History { self.tail.clone() }
     pub(super) fn callback_fences(&self) -> Result<KVec<Fence>> {
         let mut fences = KVec::new();
@@ -545,9 +550,17 @@ impl Schedule {
                 if !waits[..count].contains(&point) { waits[count] = point; count += 1; }
             }
             let table_count = {
-                let held=dev.runtime.lock();
-                let runtime=Option::as_ref(&*held).ok_or(ENODEV)?;
+                let mut held=dev.runtime.lock();
+                let runtime=Option::as_mut(&mut *held).ok_or(ENODEV)?;
                 let snapshot=prepared.compute_snapshot.as_ref().ok_or(EIO)?;
+                // Advance the selected owner's nonblocking control handshake
+                // before copying any tables. A wrapped owner needs eight
+                // receipts; preparing and discarding the same rebind before
+                // every receipt made a client switch take tens of ms.
+                // Publication still repeats admission and full seed checks.
+                let (ready,_) = runtime.session.can_stage_independent_compute(&runtime.image,
+                    prepared.queue_key,snapshot.client(),parameters,prepared.queue_priority)?;
+                if !ready {continue;}
                 runtime.session.compute_rebind_size(prepared.queue_key,snapshot.client(),parameters,prepared.queue_priority)
             };
             let storage=if let Some(count)=table_count {Some(super::super::g17p_user_vm::TableStorage::new(count)?)} else {None};
@@ -566,7 +579,7 @@ impl Schedule {
             };
             let Some(rebind)=rebind else {continue;};
             let rebind=if let Some(seed)=rebind {
-                let Some(client)=prepared.compute_client.as_ref() else {continue;};
+                let client=prepared.compute_snapshot.as_ref().ok_or(EIO)?.client();
                 if crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
                     && !PREPARATION_PAUSED.swap(true,core::sync::atomic::Ordering::AcqRel) {
                     pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} compute_root_plan outside_runtime_lock\n",prepared.queue_key);
@@ -692,20 +705,33 @@ impl Schedule {
         self.control_waiting = false;
         let profile_started = (crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
+        let phase_us = || profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         self.prepare_shared_backing(dev)?;
+        let backing_us = phase_us();
         self.prepare_clients(dev, prepared)?;
+        let clients_us = phase_us();
         self.prepare_render_scratch(dev, prepared)?;
+        let scratch_us = phase_us();
         self.prepare_render_templates(dev, prepared)?;
+        let templates_us = phase_us();
         self.prepare_clients(dev, prepared)?;
+        let clients2_us = phase_us();
         let (mut prepared_compute, mut prepared_compute_rebind)=match self.prepare_compute(dev,prepared)? {
             Some((index,objects,rebind))=>(Some((index,objects)),rebind.map(|plan|(index,plan))),
             None=>(None,None),
         };
+        let compute_us = phase_us();
         let (mut prepared_append, mut prepared_rebind) = match self.prepare_render(dev, prepared) {
             Some((index,objects,rebind)) => (objects.map(|objects|(index,objects)),rebind.map(|plan|(index,plan))),
             None => (None,None),
         };
         let seed_us = profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
+        if crate::module_parameters::submission_log.value() >= 4 && seed_us >= 500 {
+            pr_info!("G17P: SWITCH_PHASE queue {:?} id {} backing_us {} clients_us {} scratch_us {} templates_us {} clients2_us {} compute_us {} render_us {}\n",
+                prepared.queue_key, self.profile_id, backing_us, clients_us-backing_us,
+                scratch_us-clients_us,templates_us-scratch_us,clients2_us-templates_us,
+                compute_us-clients2_us,seed_us-compute_us);
+        }
         let lock_started = RuntimeInterval::waiting();
         let mut held = dev.runtime.lock();
         let interval = RuntimeInterval::acquired(lock_started, prepared.queue_key, "retirement");

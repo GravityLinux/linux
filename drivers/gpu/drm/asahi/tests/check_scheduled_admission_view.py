@@ -20,6 +20,10 @@ start=s.index('    pub(super) fn fast_retry(')
 b=s.index('{',start);end=b+1;depth=1
 while depth:depth+=(s[end]=='{')-(s[end]=='}');end+=1
 retry=s[start:end].replace('pub(super)', 'pub')
+start=s.index('    pub(super) fn fast_retry_us(')
+b=s.index('{',start);end=b+1;depth=1
+while depth:depth+=(s[end]=='{')-(s[end]=='}');end+=1
+retry_us=s[start:end].replace('pub(super)', 'pub')
 code=r'''#![allow(dead_code,non_upper_case_globals,unused_variables)]
 type Result<T=()>=std::result::Result<T,i32>;const EIO:i32=5;const EOVERFLOW:i32=75;
 #[derive(Default)]struct Root{borrowed:bool,spares:usize}
@@ -39,7 +43,7 @@ fn prepare(prepared:&mut Prepared,engine:usize,needed:bool,readonly:bool)->Resul
 struct Node{staged:bool,point:Point}struct Point{completion:i32}
 fn status(f:&i32)->i32{*f}
 struct Schedule{control_waiting:bool,nodes:Vec<Node>}
-impl Schedule{RETRY}
+impl Schedule{RETRY RETRY_US}
 fn main(){
  for engine in 0..2 {
   let mut p=Prepared{render_client:None,compute_client:None};
@@ -60,11 +64,11 @@ fn main(){
   let c=if engine==0{p.render_client.as_ref()}else{p.compute_client.as_ref()}.unwrap();assert!(!c.root.borrowed);assert!(c.root.spares>3);
  }
  for (control,staged,completion,expected) in [(false,false,0,true),(true,true,0,true),(false,true,0,true),(false,true,1,false)] {
-  let s=Schedule{control_waiting:control,nodes:vec![Node{staged,point:Point{completion}}]};assert_eq!(s.fast_retry(),expected);
+  let s=Schedule{control_waiting:control,nodes:vec![Node{staged,point:Point{completion}}]};assert_eq!(s.fast_retry(),expected);assert_eq!(s.fast_retry_us(),if control{20}else{200});
  }
  println!("PASS actual shared admission view: both engines, borrowed-to-owned selection race, owned reuse, cold/unused paths and fast retry predicate");
 }
-'''.replace('BLOCK',block).replace('RETRY',retry)
+'''.replace('BLOCK',block).replace('RETRY_US',retry_us).replace('RETRY',retry)
 a.evidence.mkdir(exist_ok=False,parents=True)
 (a.evidence/'harness.rs').write_text(code)
 subprocess.run(['rustc','--edition=2021',str(a.evidence/'harness.rs'),'-o',str(a.evidence/'gate')],check=True)

@@ -1638,6 +1638,11 @@ impl File {
         queue.tail = Some(fence);
         queue.publication = Some(job.publication_fence());
         queue.render_pipeline = pipeline;
+        if crate::module_parameters::submission_log.value() >= 4 {
+            if let Some(started) = submission_started {
+                pr_info!("G17P: SUBMIT_ACCEPT file {} queue {} latency_us {}\n",inner.id,data.queue_id,started.elapsed().as_nanos()/1000);
+            }
+        }
         asynchronous::Job::enqueue(job);
         Ok(0)
     }

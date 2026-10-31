@@ -365,7 +365,7 @@ kernel::module_platform_driver! {
         },
         render_splice: u32 {
             default: 1,
-            description: "Share immutable caller leaf tables during retired render-context switches",
+            description: "Share immutable caller leaf tables during retired render/compute context switches",
         },
         partial_independent_owner: u32 {
             default: 0,

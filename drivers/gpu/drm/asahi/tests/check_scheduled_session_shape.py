@@ -163,12 +163,12 @@ root_only_changes = {
 for current, previous in root_only_changes.items():
     assert new_schedule.count(current)==1, 'Unexpected shared root-plan preparation change'
     new_schedule=new_schedule.replace(current,previous)
-# Shared performance work intentionally changes these four scheduler methods
+# Shared performance work intentionally changes these shared scheduler methods
 # for BOTH G16C and G17P. Their algorithms are covered by actual-source cold
 # rebind, leaf-switch and admission tests, plus Max DMA-BUF/DCP hardware runs.
 # Keep the historical equality check for every other scheduler method and
 # all constructor/probe/admission checks below; Neo is a reference, not frozen.
-for name in ['prepare_clients', 'prepare_render', 'progress']:
+for name in ['prepare_clients', 'prepare_render', 'prepare_compute', 'progress']:
     marker = 'fn '+name+'('
     for which in ['old', 'new']:
         text = old_schedule if which == 'old' else new_schedule
@@ -177,7 +177,7 @@ for name in ['prepare_clients', 'prepare_render', 'progress']:
         text = text[:at] + text[at:].replace(content, '', 1)
         if which == 'old': old_schedule = text
         else: new_schedule = text
-for which, name in [('old', 'control_waiting'), ('new', 'fast_retry')]:
+for which, name in [('old', 'control_waiting'), ('new', 'fast_retry'), ('new', 'fast_retry_us')]:
     text = old_schedule if which == 'old' else new_schedule
     marker = '    pub(super) fn '+name+'('
     at = text.index(marker)
@@ -196,7 +196,14 @@ assert normalize(after_params).count('features:(1<<29)|(1<<1),') == 1
 after_params=normalize(after_params).replace('features:(1<<29)|(1<<1),','features:1<<1,')
 assert normalize(before_params)==normalize(after_params), 'Neo identity checks or UAPI parameters changed'
 before_submit=normalize(body(old_drm,'fn submit(dev:'))
-after_submit=normalize(remove_Max_branches(body(new_drm,'fn submit(dev:')))
+new_submit=body(new_drm,'fn submit(dev:')
+# Optional source profiling records ioctl admission separately from publication.
+# It does not alter the accepted work or any production/default branch.
+profile_marker='if crate::module_parameters::submission_log.value() >= 4 {'
+at=new_submit.index(profile_marker)
+end=new_submit.index('{',at)+len(body(new_submit,profile_marker))+2
+new_submit=new_submit[:at]+new_submit[end:]
+after_submit=normalize(remove_Max_branches(new_submit))
 assert after_submit.count('render_storage:None,')==1
 after_submit=after_submit.replace('render_storage:None,','')
 for field in ['render_transport','render_work']:
@@ -256,7 +263,10 @@ before_async=before_async.replace('workqueue::system_unbound()', 'workqueue::sys
 # fence waits remain in their separate callback-only branch.
 assert after_async.count('schedule.fast_retry()') == 1
 assert before_async.count('s.control_waiting()') == 1
-after_async=after_async.replace('|schedule|schedule.fast_retry()', '|s|s.control_waiting()')
+assert after_async.count('schedule.fast_retry_us()') == 1
+after_async=after_async.replace('ifletSome(schedule)=e.schedule.as_ref().filter(|schedule|schedule.fast_retry()){',
+    'ife.schedule.as_ref().is_some_and(|s|s.control_waiting()){').replace(
+    'Delta::from_micros(schedule.fast_retry_us())', 'Delta::from_micros(200)')
 assert before_async==after_async,'Neo async worker changed beyond common drop order, queue API migration and fast admission retry'
 
 summary={'baseline':baseline,'identical_Session_initializer_fields':len(before),

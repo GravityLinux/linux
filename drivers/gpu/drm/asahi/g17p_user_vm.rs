@@ -618,7 +618,7 @@ impl UserVm {
     pub(crate) fn clone_admission_view(&self) -> Result<Self> {
         let mut view=Self::new()?;
         let seed=view.capture_rebind(TableStorage::new(view.table_count())?)?.ok_or(EIO)?;
-        seed.prepare_leaf_switch(self,&[],&[],&[],&[1])?.commit_unpublished(&mut view)?;
+        seed.prepare_leaf_switch(self,&[],&[],&[],&[1],false)?.commit_unpublished(&mut view)?;
         Ok(view)
     }
     pub(crate) fn table_count(&self) -> usize { self.tables.len() }
