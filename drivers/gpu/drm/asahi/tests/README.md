@@ -602,7 +602,7 @@ The diagnostic build pauses before the original assertion so caller-owned
 images and all six CPU states can be captured. No expected output is relaxed.
 Artifacts are in `whole-shim-integration/final-uapi-context-reuse/`.
 
-The backing-page policy follows the M1/M2/M4 heap: it grows without returning
+The historical backing-page policy follows the M1/M2/M4 heap: it grows without returning
 pages on object retirement. Neo's `Memory.allocations` retains firmware
 backing until session shutdown. Before work publication, the session also
 retains deduplicated GEM owners, preserving physical pages across GEM close
@@ -612,6 +612,10 @@ and still fails an image check in the retained wave; it is not evidence that
 page retention fixes the corruption. Kernel#119 additionally preserves
 firmware-owned fields when compute context records wrap, but still fails the
 combined sequence described above. The image corruption remains unresolved.
+
+The permanent **caller GEM** retention described above is superseded by the
+2026-10-31 reclamation change below. Firmware/private `Memory.allocations`
+still follows its separate lifetime policy.
 
 
 `g16c_drm_compute_private` accepts fixtures from `prepare_g16c_private_compute.py`.
@@ -886,3 +890,41 @@ The timing window drains the last measured event before stopping. Both buffers
 per client have complete first/last pixel oracles outside the timing window;
 all frames retain sparse color and guard checks. The mode changes buffering
 and overlap, so label it separately from the default serial latency test.
+
+### Caller BO reclamation
+
+`bo-reclaim.c` is a Zink/EGL/GLES regression for the retained caller BO leak.
+It allocates two buffers, optionally GPU-copies between them, checks every word
+of a submitted copy, deletes the buffers, and destroys the context. It rejects
+llvmpipe. Build against the Mesa runtime being tested:
+
+```sh
+cc -O2 -Wall -Wextra -Werror bo-reclaim.c -o bo-reclaim -lEGL -lGLESv2 -lgbm
+MESA_LOADER_DRIVER_OVERRIDE=zink ./bo-reclaim 16 1 0
+MESA_LOADER_DRIVER_OVERRIDE=zink ./bo-reclaim 16 1 1
+```
+
+Compare `/proc/meminfo` Shmem and Unevictable **after process exit** across
+separate clients; within one context Mesa's own BO cache can mask the leak.
+Start with a few 16 MiB clients. Final qualification can use 64 MiB buffers,
+multiple clients and 30 alloc/copy/delete iterations in one context. Capture
+the renderer string and environment so the test cannot silently use another
+Vulkan driver. Shmem also includes the initramfs, logs and userspace caches:
+compare deltas within one boot, rather than absolute values across images.
+
+CPU-map caches now retain only the latest maintenance set, reusing existing
+tree nodes and dropping stale vmaps after unlocking. Every root/client/lease
+owns its BO references independently and can recreate a missing CPU map.
+The shared scheduler scans retained BOs after at least 64 new enrollments and
+only with a Running, quiescent session, consumed cleanup/maintenance receipts,
+no active preparation or CPU lease, and no live wrapped transport flight. It
+invalidates the global UAT before dropping sole-referenced GEM objects and
+their identity keys. `asahi_neo.release_backing=0` restores permanent backing
+retention. Firmware/private allocations follow their separate lifetime rules.
+
+`check_backing_reclamation.py` runs the actual reap method against counted
+owners: busy/failed gates, the batch threshold, disabled release, live-object
+retention, key removal, invalidation before final puts, and a blocked pass
+remaining armed until retirement. This is a host ownership test, not firmware
+qualification. See `QUALIFICATION.bo-reclamation-20261031.md` for Max hardware
+results and remaining idle/batch limitations.

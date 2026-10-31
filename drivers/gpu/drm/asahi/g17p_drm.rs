@@ -13,7 +13,7 @@ use kernel::{
     dma_fence::RawDmaFence,
     drm,
     drm::{
-        gem::{self, legacy_shmem as shmem, BaseObject, DriverObject},
+        gem::{self, legacy_shmem as shmem, BaseObject, DriverObject, IntoGEMObject},
         ioctl,
     },
     new_mutex,
@@ -37,6 +37,17 @@ const SINGLE: u32 = uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE;
 type Device = drm::Device<Driver>;
 type DrmFile = drm::File<File>;
 pub(crate) type Object = shmem::Object<Bo>;
+
+/// Whether a retained backing reference is the object's only GEM reference.
+/// The caller owns that reference and holds the runtime mutex, excluding new
+/// execution owners. A live handle, DMA-BUF, root's Client, or CPU vmap owns a
+/// separate reference, so none can be reachable when this returns true.
+pub(crate) fn sole_backing_reference(object: &Object) -> bool {
+    // SAFETY: BaseObject supplies the live embedded GEM object. Its kref is
+    // initialized for the object's lifetime. atomic_read is the same load used
+    // by refcount_read; do not read this concurrently modified field in Rust.
+    unsafe { bindings::atomic_read(core::ptr::addr_of!((*object.as_raw()).refcount.refcount.refs)) == 1 }
+}
 /// Boot graphs have different semantics; keep their actual types while the
 /// file, GEM, fence and CPU scheduling owners remain shared.
 pub(crate) enum RuntimeImage {

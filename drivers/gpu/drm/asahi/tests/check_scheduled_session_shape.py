@@ -53,6 +53,7 @@ before=fields(old_boot,old_boot.index('pub(crate) fn prepare('))
 after=fields(new_boot,new_boot.index('fn unstarted('))
 for name in ['g16c_transport','g16c_compute','g16c_sgx']:
     assert after.pop(name) == 'None', 'Neo must not construct Max owners: '+name
+assert after.pop('retained_since_reap') == '0', 'Shared reclamation must start without pending backing'
 after.update(ttbs='platform.regions[0].base',memory='Some(Memory::new(dev,platform)?)',events='events.clone()')
 assert before==after,(before.keys()^after.keys(),[(k,before[k],after.get(k)) for k in before if before[k]!=after.get(k)])
 old_driver=old('asahi_neo.rs');new_driver=(root/'asahi_neo.rs').read_text()
@@ -240,7 +241,9 @@ render_body=render_body.replace(fixed_dispatch,legacy_dispatch)
 assert normalize(body(old_drm,'fn render_parameters('))==render_body, 'Neo render admission changed beyond explicit hardware policy and the measured dispatch fix'
 before_retention=normalize(body(old_boot,'pub(crate) fn retain_source_backing('))
 after_retention=normalize(body(new_boot,'pub(crate) fn retain_source_backing(')).replace('ifself.g16c_transport.is_some(){returnOk(());}','')
-assert before_retention==after_retention, 'Neo permanent BO ownership changed'
+reap_counter='self.retained_since_reap=self.retained_since_reap.saturating_add(1);'
+assert after_retention.count(reap_counter)==1
+assert before_retention==after_retention.replace(reap_counter,''), 'Shared BO enrollment changed beyond reclamation accounting'
 before_create=normalize(body(old_drm,'fn queue_create('))
 after_create=normalize(remove_Max_branches(body(new_drm,'fn queue_create(')))
 after_create=after_create.replace('letmutactive_jobs=None;','').replace('QueueHistory::new(active_jobs)?','QueueHistory::new()?')
@@ -277,7 +280,7 @@ summary={'baseline':baseline,'identical_Session_initializer_fields':len(before),
          'Neo_shipped_fragment_barrier_bit_preserved_with_downstream_alias':True,
          'Neo_submit_admission_preserved_except_Max_gate':True,
          'Neo_parameter_parser_and_sampler_limit_preserved':True,
-         'Neo_permanent_BO_retention_preserved':True,
+         'shared_BO_enrollment_preserved_with_reclamation_accounting':True,
          'Neo_queue_create_destroy_preserved_except_Max_activity_owner':True,
          'Neo_async_worker_preserved_except_documented_adapters_and_shared_fast_retry':True,
          'source_sha256':{name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in ['asahi_neo.rs','g17p_boot.rs','g17p_drm.rs','g17p_schedule.rs','g17p_async.rs']}}

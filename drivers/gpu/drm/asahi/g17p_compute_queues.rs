@@ -286,6 +286,9 @@ impl Queues {
     pub(crate) fn pending(&self) -> bool {
         self.owners.iter().any(|q| !q.idle())
     }
+    pub(crate) fn reclaim_idle(&self) -> bool {
+        self.owners.iter().all(|q| q.idle() && q.reconfiguration.is_none())
+    }
     pub(crate) fn retain_dependency(&mut self, grid: u8, fence: &Fence) -> Result<bool> {
         let Some(queue) = self.owners.iter_mut().find(|queue| queue.generation.layout.grid == grid) else { return Ok(false); };
         queue.generation.leases.retain_dependency(fence)?;
