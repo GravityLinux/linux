@@ -80,6 +80,9 @@ impl Snapshot {
     }
 
     pub(super) fn materialize(&self, client: &mut Client, render: bool) -> Result {
+        self.materialize_view(client,render,false)
+    }
+    pub(super) fn materialize_view(&self, client: &mut Client, render: bool, readonly: bool) -> Result {
         // Generation was checked at admission and travels in the accepted
         // job's immutable Arc; Client itself does not carry a generation.
         // Check the paired metadata and engine view before copying any root.
@@ -98,7 +101,8 @@ impl Snapshot {
         }
         // Only the privately owned copy can acquire backend/private/growth
         // mappings. Cached tables and snapshots held by other jobs stay frozen.
-        client.root = self.client.root.clone_admission_tree()?;
+        client.root = if readonly {self.client.root.clone_admission_view()?}
+            else {self.client.root.clone_admission_tree()?};
         Ok(())
     }
 }

@@ -70,6 +70,7 @@ pub(super) struct ResourcesG16C {
     geometry_next: u64,
     block_page_ids: KVec<u32>,
     parameter_growth_next: u64,
+    parameter_growth_limit: u64,
     pub(super) sequence: u32,
     pub(super) sequence_base: u32,
 }
@@ -150,24 +151,24 @@ impl ResourcesG16C {
         for index in 0..additional {
             let mut address=(cursor+0x7fff)&!0x7fff;
             loop {
-                if address.checked_add(0x28000).ok_or(EOVERFLOW)?>0x1100000000 {return Err(ENOSPC);}
+                if address.checked_add(0x28000).ok_or(EOVERFLOW)?>self.parameter_growth_limit {return Err(ENOSPC);}
                 if let Some(end)=self.compact_conflict(address,0x28000) {
                     address=(end+0x7fff)&!0x7fff;
                     continue;
                 }
                 let mut conflict=None;
                 for offset in (0..0x28000).step_by(PAGE as usize) {
-                    if root.pte(address+offset)?!=0 {conflict=Some(address+offset+PAGE);break;}
+                    if root.private_pte(address+offset)?!=0 {conflict=Some(address+offset+PAGE);break;}
                 }
                 if let Some(end)=conflict {address=(end+0x7fff)&!0x7fff;continue;}
                 break;
             }
+            let id=u32::try_from((address-raw::CONTEXT_BASE)/0x8000).map_err(|_|EOVERFLOW)?;
             root.prepare(address,0x28000)?;
             // Retain allocation bookkeeping BEFORE publishing any leaf.
             private_span(memory,&mut self.compact,address-raw::CONTEXT_BASE,0x20000)?;
             map_private(memory,root,raw::CONTEXT_BASE,&self.compact[first..])?;
             first=self.compact.len();
-            let id=u32::try_from((address-raw::CONTEXT_BASE)/0x8000).map_err(|_|EOVERFLOW)?;
             entries[index*8..index*8+4].copy_from_slice(&id.to_le_bytes());
             cursor=address+0x28000;
         }
@@ -372,7 +373,8 @@ impl ResourcesG16C {
             geometry: [(0, 0); 3],
             geometry_next: 0x1001000000,
             block_page_ids,
-            parameter_growth_next: 0x1008000000,
+            parameter_growth_next: (private_end.max(raw::CONTEXT_BASE)+0x7fff)&!0x7fff,
+            parameter_growth_limit: limit,
             sequence: 0,
             sequence_base: 0,
         }))
@@ -623,6 +625,13 @@ impl ResourcesG16C {
         self.directory = directory;
         self.table = table;
         self.private_end = end;
+        if self.parameter.blocks == REGISTERED {
+            self.parameter_growth_next=(end.max(raw::CONTEXT_BASE)+0x7fff)&!0x7fff;
+            self.parameter_growth_limit=limit;
+        }
+        // Already-registered PB IDs keep their original compact VA and owned
+        // backing across a private-window move, as before. Do not rebase live
+        // firmware free-list IDs; the retained growth arena remains bounded.
         self.root = Some(root.lease()?);
         Ok(())
     }
@@ -655,7 +664,7 @@ impl ResourcesG16C {
                 let mut conflict = self.compact_conflict(address,span);
                 for offset in (0..span).step_by(PAGE as usize) {
                     if conflict.is_some() { break; }
-                    if root.pte(address + offset)? != 0 {
+                    if root.private_pte(address + offset)? != 0 {
                         conflict = Some(address + offset + PAGE);
                         break;
                     }

@@ -232,7 +232,9 @@ impl Schedule {
         }
         Ok(Self {nodes,tail,control_waiting:false,submission_started,profile_id: if submission_started.is_some() { SUBMISSION_PROFILE_ID.fetch_add(1,core::sync::atomic::Ordering::Relaxed) } else { 0 }})
     }
-    pub(super) fn control_waiting(&self) -> bool { self.control_waiting }
+    pub(super) fn fast_retry(&self) -> bool {
+        self.control_waiting || self.nodes.iter().any(|node| status(&node.point.completion) == 0)
+    }
     pub(super) fn tail(&self) -> History { self.tail.clone() }
     pub(super) fn callback_fences(&self) -> Result<KVec<Fence>> {
         let mut fences = KVec::new();
@@ -293,7 +295,7 @@ impl Schedule {
             considered[engine] = true;
             let snapshot = if engine == 0 { prepared.render_snapshot.as_ref() } else { prepared.compute_snapshot.as_ref() }
                 .ok_or(EIO)?;
-            let (needed, private, cache) = {
+            let (needed, private, readonly, cache) = {
                 let preparation_wait = RuntimeInterval::waiting();
                 let held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
@@ -314,22 +316,44 @@ impl Schedule {
                     parameters.queue_owner = Some(prepared.queue_key);
                     runtime.session.render_selected_client(snapshot.client(), &parameters)?
                 } else { old };
-                (!snapshot.same_client(old) || !snapshot.same_client(selected), private,
+                let readonly = if private {false} else {match command {
+                    Command::Render(p) => {
+                        let mut p=*p;p.queue_owner=Some(prepared.queue_key);
+                        runtime.session.render_rebind_size(snapshot.client(),&p)?.is_some()
+                    },
+                    Command::Compute(p) => runtime.session.compute_rebind_size(prepared.queue_key,
+                        snapshot.client(),p,prepared.queue_priority).is_some(),
+                }};
+                (!snapshot.same_client(old) || !snapshot.same_client(selected), private, readonly,
                     selected.map(|client| client.cpu_maps.clone()))
             };
             let slot = if engine == 0 { &mut prepared.render_client } else { &mut prepared.compute_client };
             if slot.is_none() && needed {
                 let mut client = snapshot.deferred_client()?;
-                snapshot.materialize(&mut client, engine == 0)?;
+                snapshot.materialize_view(&mut client, engine == 0, readonly)?;
                 let extra = match command {
                     Command::Render(p) => super::super::g17p_render_runtime::scratch_table_budget(p)?,
                     // The fixed Source private save-state shape, including
                     // an unaligned aperture and its upper parent table.
                     Command::Compute(_) => (256 * 0x78000 + (1 << 25) - 1) / (1 << 25) + 2,
                 };
-                client.root.prepare_spare_tables(client.root.table_count().checked_add(extra).ok_or(EOVERFLOW)?)?;
+                if !readonly {
+                    client.root.prepare_spare_tables(client.root.table_count().checked_add(extra).ok_or(EOVERFLOW)?)?;
+                }
                 client.cache(false)?;
                 *slot = Some(client);
+            }
+            // Selection can change while preparation is off-lock. A cheap
+            // retained-owner view must be rematerialized before a later pass
+            // uses this client to construct a new execution/private owner.
+            if needed && !readonly && slot.as_ref().is_some_and(|c|c.root.has_borrowed_tables()) {
+                let client=slot.as_mut().ok_or(EIO)?;
+                snapshot.materialize(client,engine==0)?;
+                let extra=match command {
+                    Command::Render(p)=>super::super::g17p_render_runtime::scratch_table_budget(p)?,
+                    Command::Compute(_)=>(256*0x78000+(1<<25)-1)/(1<<25)+2,
+                };
+                client.root.prepare_spare_tables(client.root.table_count().checked_add(extra).ok_or(EOVERFLOW)?)?;
             }
             if needed {
                 if let (Some(client), Some(cache)) = (slot.as_ref(), cache.as_ref()) {
@@ -447,7 +471,7 @@ impl Schedule {
                 (seed,rebind)
             };
             let rebind = if let Some(rebind) = rebind {
-                let Some(desired) = prepared.render_client.as_ref() else { continue; };
+                let desired = prepared.render_snapshot.as_ref()?.client();
                 if crate::module_parameters::cpu_prepare_pause_queue.value() == prepared.queue_key.1
                     && !PREPARATION_PAUSED.swap(true, core::sync::atomic::Ordering::AcqRel) {
                     pr_info!("G17P: CPU_PREPARE_PAUSE_BEGIN queue {:?} render_root_plan outside_runtime_lock\n",prepared.queue_key);
@@ -727,7 +751,11 @@ impl Schedule {
             runtime.session.fail_cpu_completion(error);
             self.fail_unstaged(error);
         }
+        let retired = !completions.is_empty();
         for completion in completions { completion.signal(); }
+        // Retirement releases shared render pools. Wake their waiting owners
+        // even when this job still has later commands and has not finished.
+        if retired { dev.events.wake(); }
         if matches!(dev.abi, super::super::GpuAbi::G16C) {
             runtime.session.reap_g16c_contexts()?;
         }

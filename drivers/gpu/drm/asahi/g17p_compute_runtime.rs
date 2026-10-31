@@ -111,6 +111,7 @@ impl Client {
         contexts: &[u16],
     ) -> Result {
         let end = start.checked_add(size).ok_or(EINVAL)?;
+        self.root.make_owned(contexts)?;
         let mut bindings = KVec::new();
         let mut buffers = KVec::new();
         let mut changes = KVec::new();
@@ -231,9 +232,9 @@ impl Client {
         // publication state. The sorted merge keeps every collision check.
         let mut rows: KVec<(u64, u8, u64, u64)> = KVec::new();
         for &(base, size, _, _) in &self.bindings {
-            for offset in (0..size).step_by(PAGE) {
-                let va = address(base) + offset;
-                let old = self.root.pte(va)?;
+            let entries = self.root.ptes(address(base), size)?;
+            for (index, &old) in entries.iter().enumerate() {
+                let va = address(base) + index as u64 * PAGE as u64;
                 if old == 0 { return Err(EIO); }
                 rows.push((va, 0, old, 0), GFP_KERNEL)?;
             }
@@ -246,11 +247,12 @@ impl Client {
         }
         for &(va, old, new) in private { rows.push((va, 1, old, new), GFP_KERNEL)?; }
         for &(base, size, _, _) in &next.bindings {
-            for offset in (0..size).step_by(PAGE) {
-                let va = address(base) + offset;
-                let new = next.root.pte(va)?;
+            let prior = self.root.ptes(address(base), size)?;
+            let incoming = next.root.ptes(address(base), size)?;
+            for (index, (&old, &new)) in prior.iter().zip(&incoming).enumerate() {
+                let va = address(base) + index as u64 * PAGE as u64;
                 if new == 0 { return Err(EIO); }
-                rows.push((va, 2, self.root.pte(va)?, new), GFP_KERNEL)?;
+                rows.push((va, 2, old, new), GFP_KERNEL)?;
             }
         }
         super::g17p_user_vm::sort_by_key(&mut rows, |row| (row.0, row.1));

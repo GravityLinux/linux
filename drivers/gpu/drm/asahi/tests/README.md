@@ -805,3 +805,62 @@ all GPU outputs and the return yet reject the stricter temporal guard when
 incoming work covers the final old command. Such a coverage rejection is
 different evidence from a firmware timeout or negative fence. Neither closes
 the full early-handoff requirement.
+
+### Shared render-context performance and DCP presentation
+
+`check_g17p_leaf_switch.py` compiles the actual complete `UserVm` and leaf
+switch implementation with host page/cache/TLBI doubles. It checks immutable
+input leaves, retained backing, mixed/private ranges, new top-level ranges,
+allocation failures, stale/cancelled plans, owned-copy fallback, bounded table
+ownership across repeated switches/fallbacks, batched reads, and index sorting
+without large-record recursion on the kernel stack.
+`check_scheduled_admission_view.py` executes the production preparation block
+for both engines, including a retained-owner selection changing to a cold
+owner while preparation is off-lock. Such a view must acquire owned tables
+before private mappings can be created. The test also executes the actual fast
+retry predicate. Use `--evidence DIRECTORY` for both tests. Existing rebind,
+growth-table and cold-rebind checks remain applicable.
+
+`dcp_present_bench.c` and its two local headers provide the hardware test.
+The Vulkan rendering body derives from Mesa's MIT-licensed
+`src/asahi/vulkan/tests/apple9-render-draw.c`; it uses that test's vertex and
+fragment SPIR-V, and checks a native G16G/G16C/G17P hardware renderer.
+Build with Vulkan and libdrm development headers/libraries:
+
+```
+cc -O2 -Wall -Wextra -Werror $(pkg-config --cflags libdrm vulkan) \
+    dcp_present_bench.c -o dcp-present-bench \
+    $(pkg-config --libs libdrm vulkan)
+PERF_FRAMES=16 ./dcp-present-bench apple9-render-draw.vert.spv \
+    apple9-render-draw.frag.spv
+```
+
+Run with a connected DCP display and exclusive KMS ownership. The parent
+selects the connected DCP's preferred mode and alternates two independent
+Vulkan clients. Each renders an optimal image, GPU-copies it into an exported
+DMA-BUF, and releases external queue ownership. The parent imports those exact
+allocations with PRIME/AddFB2 and waits for every DCP page-flip event. There is
+no CPU framebuffer copy. CPU fence waits precede display submission; this tests
+the normal DMA-BUF import/scanout path with legacy KMS compatibility calls,
+rather than a compositor's explicit-fence integration. Buffers are rewritten
+only after replacement on scanout. Pixels and guards are checked fully on the
+first/last frames and sparsely between them. The first three passes warm up;
+per-frame logging occurs after the timed loop. Rows must be 256-byte aligned.
+
+`PERF_OFFSCREEN=1` provides a control with the same Vulkan workload but no DCP
+presentation. Only in that mode may `PERF_CLIENTS=1` be used: the on-screen
+case requires two buffers so the renderer cannot write a current scanout.
+`PERF_FRAMES=64` is a final bounded recycling run; prefer 8 or 16 during changes.
+The `gpu_mean_us` output is CPU command recording/submission through Vulkan
+fence completion, not hardware GPU timestamp duration. `fps` includes IPC,
+oracle checks and DCP event waits. Do not compare it directly to glmark2,
+KWin or a game benchmark. Hypervisor-hosted measurements must be identified
+as such and compared using the same monitor/runtime/workload configuration.
+
+`asahi_neo.render_splice=0` selects the owned copying fallback for comparison.
+The shared fast path keeps the execution root/ASID, borrows immutable caller
+leaf tables for whole 32 MiB ranges, and retains private/mixed mappings. Window
+moves and primer aliases use the checked owned-copy path. Outgoing references
+survive both break-before-make invalidations; dead tables are pruned off-lock.
+The same scheduler/VM implementation serves G16C and G17P; hardware validation
+must name the devices actually tested.

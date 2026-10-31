@@ -202,7 +202,7 @@ impl Service {
             if end > (1u64 << 42) { return Err(ENOMEM); }
             let mut conflict = None;
             for address in (growth_base..end).step_by(g::PAGE as usize) {
-                if root.pte(address)? != 0 {
+                if root.private_pte(address)? != 0 {
                     conflict = Some(address);
                     break;
                 }

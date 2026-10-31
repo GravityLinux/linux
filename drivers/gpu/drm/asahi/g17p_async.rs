@@ -286,11 +286,13 @@ impl Job {
                 if this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
                     let _ = workqueue::system_dfl().enqueue::<_, 0>(this.clone());
                 }
-                if e.schedule.as_ref().is_some_and(|s| s.control_waiting()) {
-                    // These control receipts may have no mailbox notification.
-                    // Retry just this owner promptly; HZ=250 delayed work would
-                    // impose 4ms per receipt. The maintenance deadline remains
-                    // bounded and no worker spins or waits for GPU completion.
+                // Retained-pool admission can be blocked without a pending
+                // control receipt. Poll that case at the same bounded cadence
+                // so a missed/coalesced wake never adds a 10 ms client switch.
+                // Published work also needs this cadence: its retirement and
+                // growth receipts can coalesce without another mailbox IRQ.
+                // Input fences stay callback-only in the branch above.
+                if e.schedule.as_ref().is_some_and(|schedule| schedule.fast_retry()) {
                     e.control_timer_handle = Some(this.clone().start(Delta::from_micros(200)));
                 }
                 // Retain the bounded watchdog for genuinely absent/coalesced
