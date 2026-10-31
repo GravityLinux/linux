@@ -57,7 +57,7 @@ fn span(vm:&mut UserVm,va:u64,count:usize,pa:u64){vm.prepare(va,count as u64*PAG
 fn bindings(rows:&[(u64,u64)]) -> Vec<(u64,u64,u64,u32)> {rows.iter().map(|&(va,n)|(va,n*PAGE,0,0)).collect()}
 fn snapshot(vm:&UserVm)->RebindSnapshot{vm.capture_rebind(TableStorage::new(vm.table_count()).unwrap()).unwrap().unwrap()}
 fn words(vm:&UserVm)->Vec<(u64,Vec<u64>)>{vm.tables.iter().map(|p|(p.phys(),vm.read_table(p.phys()).unwrap().to_vec())).collect()}
-fn switch(vm:&mut UserVm,next:&UserVm,old:&[(u64,u64,u64,u32)]) {let mut plan=snapshot(vm).prepare_leaf_switch(next,old,&[],&[],&[1]).unwrap();plan.commit(vm).unwrap();}
+fn switch(vm:&mut UserVm,next:&UserVm,old:&[(u64,u64,u64,u32)]) {let mut plan=snapshot(vm).prepare_leaf_switch(next,old,&[],&[],&[1],true).unwrap();plan.commit(vm).unwrap();}
 pub fn run(){
  // A 64 MiB caller image with a partial leaf, a private mixed leaf, and a
  // new top-level range; the source admission trees contain caller leaves only.
@@ -73,7 +73,7 @@ pub fn run(){
  let mut installed=a.clone_admission_tree().unwrap();span(&mut installed,private,1,0x600000000);
  let root=installed.root();let initial_a=words(&a);let initial_b=words(&b);let private_pte=installed.pte(private).unwrap();
  let oldlease=installed.lease().unwrap();
- let mut first=snapshot(&installed).prepare_leaf_switch(&b,&ba,&[],&[],&[1]).unwrap();
+ let mut first=snapshot(&installed).prepare_leaf_switch(&b,&ba,&[],&[],&[1],true).unwrap();
  assert!(first.borrowed.len()>=3);assert!(first.stores.len()<20,"copied caller PTEs instead of splicing ranges");
  assert!(first.matches(&installed));let unchanged=words(&installed);drop(first);
  assert_eq!(words(&installed),unchanged,"cancelled splice modified live tables");
@@ -105,21 +105,34 @@ pub fn run(){
  installed.make_owned(&[1]).unwrap();
  // A late private collision rejects without modifying either tree.
  let mut bad=UserVm::new().unwrap();span(&mut bad,private,1,0x900000000);
- let before=words(&installed);assert!(snapshot(&installed).prepare_leaf_switch(&bad,&bb,&[],&[],&[1]).is_err());assert_eq!(words(&installed),before);
+ let before=words(&installed);assert!(snapshot(&installed).prepare_leaf_switch(&bad,&bb,&[],&[],&[1],true).is_err());assert_eq!(words(&installed),before);
  // A plan captured before another root generation cannot be committed.
- let mut stale=snapshot(&installed).prepare_leaf_switch(&a,&bb,&[],&[],&[1]).unwrap();
+ let mut stale=snapshot(&installed).prepare_leaf_switch(&a,&bb,&[],&[],&[1],true).unwrap();
  installed.rebind(&[(private,private_pte,private_pte)],&[1]).unwrap();assert_eq!(stale.commit(&mut installed),Err(EBUSY));
  // Allocation failure at each preparation boundary leaves live PTEs intact.
  let mut refusals=0;let mut successes=0;
- for budget in 0..200 {let snap=snapshot(&installed);let before=words(&installed);crate::BUDGET.with(|b|b.set(Some(budget)));let plan=snap.prepare_leaf_switch(&b,&bb,&[],&[],&[1]);crate::BUDGET.with(|b|b.set(None));match plan {Err(e)if e==ENOMEM=>refusals+=1,Ok(_)=>successes+=1,Err(e)=>panic!("unexpected {:?}",e)}assert_eq!(words(&installed),before);}
+ for budget in 0..200 {let snap=snapshot(&installed);let before=words(&installed);crate::BUDGET.with(|b|b.set(Some(budget)));let plan=snap.prepare_leaf_switch(&b,&bb,&[],&[],&[1],true);crate::BUDGET.with(|b|b.set(None));match plan {Err(e)if e==ENOMEM=>refusals+=1,Ok(_)=>successes+=1,Err(e)=>panic!("unexpected {:?}",e)}assert_eq!(words(&installed),before);}
  assert!(refusals>0&&successes>0);
  // Imported tables must outlive both the incoming snapshot and the plan.
  let ephemeral_va=0x6000000000;
  let mut ephemeral=UserVm::new().unwrap();span(&mut ephemeral,ephemeral_va,1,0xc00000000);
- let mut retained_plan=snapshot(&installed).prepare_leaf_switch(&ephemeral,&bb,&[],&[],&[1]).unwrap();
+ let mut retained_plan=snapshot(&installed).prepare_leaf_switch(&ephemeral,&bb,&[],&[],&[1],true).unwrap();
  drop(ephemeral);retained_plan.commit(&mut installed).unwrap();drop(retained_plan);
  assert_eq!(installed.pte(ephemeral_va).unwrap(),0xc00000000|FLAGS);
  assert_eq!(installed.pte(private).unwrap(),private_pte);
+ // Compute uses absolute addresses even below the render-context base.
+ let absolute=0x800000;let compute_private=absolute+3*PAGE;
+ let mut ca=UserVm::new().unwrap();span(&mut ca,absolute,2,0xd00000000);
+ let mut cb=UserVm::new().unwrap();span(&mut cb,absolute,1,0xe00000000);
+ let mut execution=ca.clone_admission_tree().unwrap();span(&mut execution,compute_private,1,0xf00000000);
+ let mut cp=snapshot(&execution).prepare_leaf_switch(&cb,&bindings(&[(absolute,2)]),&[],&[],&[4],false).unwrap();
+ cp.commit(&mut execution).unwrap();drop(cp);drop(cb);
+ assert_eq!(execution.pte(absolute).unwrap(),0xe00000000|FLAGS);
+ assert_eq!(execution.pte(absolute+PAGE).unwrap(),0);
+ assert_eq!(execution.pte(compute_private).unwrap(),0xf00000000|FLAGS);
+ assert_eq!(execution.pte(absolute+0x1000000000).unwrap(),0,"compute VA was incorrectly render-relative");
+ execution.make_owned(&[4]).unwrap();execution.rebind(&[(absolute,0xe00000000|FLAGS,0)],&[4]).unwrap();
+ assert_eq!(execution.pte(compute_private).unwrap(),0xf00000000|FLAGS);
  // Batched reads must match independent per-page queries, including holes,
  // 32 MiB crossings, a 64 GiB crossing, and invalid/overflow boundaries.
  let mut range=UserVm::new().unwrap();span(&mut range,0x2000000-PAGE,3,0xa00000000);span(&mut range,0x1000000000-PAGE,2,0xb00000000);

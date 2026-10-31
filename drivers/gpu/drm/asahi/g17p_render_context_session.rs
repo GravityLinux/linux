@@ -807,7 +807,7 @@ impl PoolRebindSeed {
         if crate::module_parameters::render_splice.value() != 0 && self.private.is_none()
             && self.primer_aliases.is_none() && desired.primer_aliases.is_none() {
             let root = self.snapshot.prepare_leaf_switch(&desired.root,&self.bindings,
-                &self.fallback,&self.foreign_growth,&[self.context])?;
+                &self.fallback,&self.foreign_growth,&[self.context],true)?;
             let mut new_bindings = KVec::new();new_bindings.extend_from_slice(&desired.bindings,GFP_KERNEL)?;
             let mut new_buffers = KVec::with_capacity(desired.buffers.len(),GFP_KERNEL)?;
             for bo in &desired.buffers {new_buffers.push(bo.clone(),GFP_KERNEL)?;}

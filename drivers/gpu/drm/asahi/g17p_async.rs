@@ -292,8 +292,8 @@ impl Job {
                 // Published work also needs this cadence: its retirement and
                 // growth receipts can coalesce without another mailbox IRQ.
                 // Input fences stay callback-only in the branch above.
-                if e.schedule.as_ref().is_some_and(|schedule| schedule.fast_retry()) {
-                    e.control_timer_handle = Some(this.clone().start(Delta::from_micros(200)));
+                if let Some(schedule) = e.schedule.as_ref().filter(|schedule| schedule.fast_retry()) {
+                    e.control_timer_handle = Some(this.clone().start(Delta::from_micros(schedule.fast_retry_us())));
                 }
                 // Retain the bounded watchdog for genuinely absent/coalesced
                 // notifications, even when the sequence change requeues work.

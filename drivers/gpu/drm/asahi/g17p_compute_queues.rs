@@ -947,59 +947,70 @@ pub(crate) struct PreparedComputeRebind {
 impl ComputeRebindSeed {
     pub(crate) fn prepare(self, client:&Client) -> Result<PreparedComputeRebind> {
         let started=kernel::time::Instant::<kernel::time::Monotonic>::now();
-        let (root,relocation)=self.snapshot.clone_tree()?;
-        let mut shadow=Client { root,buffers:self.buffers,bindings:self.bindings,owner:self.owner,
-            cpu_maps:self.cpu_maps,primer_aliases:self.primer_aliases };
-        let mut private: KVec<(u64, u64, u64)> = KVec::new();
-        if self.old_preempt != self.new_preempt {
-            let offsets=if let Some(private)=self.private {private.offsets()?} else {
-            let mut offsets = KVec::with_capacity(256 * 3 + 2, GFP_KERNEL)?;
-            for slot in 0..256u64 {
-                for page in [0, 0x4000, 0x8000] {
-                    offsets.push(slot * 0x78000 + page, GFP_KERNEL)?;
-                }
-            }
-            for offset in [0x100000, 0x108000] {offsets.push(offset, GFP_KERNEL)?;}
-                offsets
-            };
-            let mut leaves = KVec::with_capacity(offsets.len(), GFP_KERNEL)?;
-            for &offset in &offsets {
-                let old = self.old_preempt + offset;
-                let leaf = shadow.root.pte(old)?;
-                if leaf == 0 {
-                    pr_err!("G17P: compute rebind missing private leaf grid {} preempt {:#x} new {:#x} offset {:#x}\n",self.layout.grid,self.old_preempt,self.new_preempt,offset);
-                    return Err(EIO);
-                }
-                leaves.push(leaf, GFP_KERNEL)?;
-                private.push((old, leaf, 0), GFP_KERNEL)?;
-            }
-            for (&offset, &leaf) in offsets.iter().zip(leaves.iter()) {
-                let address = self.new_preempt + offset;
-                if let Some(row) = private.iter_mut().find(|r| r.0 == address) {
-                    row.2 = leaf;
-                } else {
-                    let old = shadow.root.pte(address)?;
-                    if old != 0
-                        && !shadow
-                            .bindings
-                            .iter()
-                            .any(|b| address >= b.0 && address < b.0 + b.1)
-                    {
-                        return Err(EBUSY);
+        let spliced = crate::module_parameters::render_splice.value() != 0
+            && self.old_preempt == self.new_preempt
+            && self.primer_aliases.is_none() && client.primer_aliases.is_none();
+        let root = if spliced {
+            // The frontend admission snapshot is immutable. Save-state moves
+            // and primer aliases retain the original owned-copy transaction.
+            self.snapshot.prepare_leaf_switch(&client.root,&self.bindings,
+                &[],&[],&[self.layout.asid],false)?
+        } else {
+            let (root,relocation)=self.snapshot.clone_tree()?;
+            let mut shadow=Client { root,buffers:self.buffers,bindings:self.bindings,owner:self.owner,
+                cpu_maps:self.cpu_maps,primer_aliases:self.primer_aliases };
+            let mut private: KVec<(u64, u64, u64)> = KVec::new();
+            if self.old_preempt != self.new_preempt {
+                let offsets=if let Some(private)=self.private {private.offsets()?} else {
+                let mut offsets = KVec::with_capacity(256 * 3 + 2, GFP_KERNEL)?;
+                for slot in 0..256u64 {
+                    for page in [0, 0x4000, 0x8000] {
+                        offsets.push(slot * 0x78000 + page, GFP_KERNEL)?;
                     }
-                    private.push((address, old, leaf), GFP_KERNEL)?;
+                }
+                for offset in [0x100000, 0x108000] {offsets.push(offset, GFP_KERNEL)?;}
+                    offsets
+                };
+                let mut leaves = KVec::with_capacity(offsets.len(), GFP_KERNEL)?;
+                for &offset in &offsets {
+                    let old = self.old_preempt + offset;
+                    let leaf = shadow.root.pte(old)?;
+                    if leaf == 0 {
+                        pr_err!("G17P: compute rebind missing private leaf grid {} preempt {:#x} new {:#x} offset {:#x}\n",self.layout.grid,self.old_preempt,self.new_preempt,offset);
+                        return Err(EIO);
+                    }
+                    leaves.push(leaf, GFP_KERNEL)?;
+                    private.push((old, leaf, 0), GFP_KERNEL)?;
+                }
+                for (&offset, &leaf) in offsets.iter().zip(leaves.iter()) {
+                    let address = self.new_preempt + offset;
+                    if let Some(row) = private.iter_mut().find(|r| r.0 == address) {
+                        row.2 = leaf;
+                    } else {
+                        let old = shadow.root.pte(address)?;
+                        if old != 0
+                            && !shadow
+                                .bindings
+                                .iter()
+                                .any(|b| address >= b.0 && address < b.0 + b.1)
+                        {
+                            return Err(EBUSY);
+                        }
+                        private.push((address, old, leaf), GFP_KERNEL)?;
+                    }
                 }
             }
-        }
 
-        shadow.prepare_rebind(client,false,&[self.layout.asid],&private)?.commit_unpublished();
+            shadow.prepare_rebind(client,false,&[self.layout.asid],&private)?.commit_unpublished();
+            relocation.prepare(&shadow.root,&[self.layout.asid])?
+        };
         let mut bindings=KVec::new();bindings.extend_from_slice(&client.bindings,GFP_KERNEL)?;
         let mut buffers=KVec::with_capacity(client.buffers.len(),GFP_KERNEL)?;
         for bo in &client.buffers { buffers.push(bo.clone(),GFP_KERNEL)?; }
-        let root=relocation.prepare(&shadow.root,&[self.layout.asid])?;
+
         if crate::module_parameters::submission_log.value() >= 3 {
-            pr_info!("G17P: COMPUTE_ROOT_PREPARED grid {} bindings {} elapsed_us {} outside_runtime_lock\n",
-                self.layout.grid,bindings.len(),started.elapsed().as_nanos()/1000);
+            pr_info!("G17P: COMPUTE_ROOT_PREPARED grid {} bindings {} elapsed_us {} spliced {} outside_runtime_lock\n",
+                self.layout.grid,bindings.len(),started.elapsed().as_nanos()/1000,spliced);
         }
         Ok(PreparedComputeRebind { layout:self.layout,old_key:self.old_key,old_preempt:self.old_preempt,
             new_preempt:self.new_preempt,old_priority:self.old_priority,root,new_key:self.new_key,
