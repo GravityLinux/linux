@@ -111,15 +111,18 @@ client_main(int argc, char **argv)
                             .pNext = &external,
                             .size = BYTES + GUARD,
                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-   VkBuffer buffer;
-   CHECK(vkCreateBuffer(dev, &bi, NULL, &buffer));
+   const unsigned slots = perf_pipeline ? 2 : 1;
+   VkBuffer buffers[2];
+   for (unsigned slot = 0; slot < slots; slot++)
+      CHECK(vkCreateBuffer(dev, &bi, NULL, &buffers[slot]));
+   VkBuffer buffer = buffers[0];
    VkPhysicalDeviceMemoryProperties mp;
    vkGetPhysicalDeviceMemoryProperties(phy, &mp);
-   VkDeviceMemory memory[2];
-   for (unsigned i = 0; i < 2; ++i) {
+   VkDeviceMemory memory[3];
+   for (unsigned i = 0; i < 1 + slots; ++i) {
       VkMemoryRequirements mr;
       if (i)
-         vkGetBufferMemoryRequirements(dev, buffer, &mr);
+         vkGetBufferMemoryRequirements(dev, buffers[i-1], &mr);
       else
          vkGetImageMemoryRequirements(dev, image, &mr);
       unsigned t;
@@ -138,7 +141,7 @@ client_main(int argc, char **argv)
          .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
       VkMemoryDedicatedAllocateInfo dedicated = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-         .pNext = &export, .buffer = buffer};
+         .pNext = &export, .buffer = i ? buffers[i-1] : VK_NULL_HANDLE};
       VkMemoryAllocateInfo ai = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
          .pNext = i ? &dedicated : NULL,
@@ -147,9 +150,13 @@ client_main(int argc, char **argv)
       CHECK(vkAllocateMemory(dev, &ai, NULL, &memory[i]));
    }
    CHECK(vkBindImageMemory(dev, image, memory[0], 0));
-   CHECK(vkBindBufferMemory(dev, buffer, memory[1], 0));
-   uint8_t *pixels;
-   CHECK(vkMapMemory(dev, memory[1], 0, VK_WHOLE_SIZE, 0, (void **)&pixels));
+   uint8_t *mapped[2];
+   for (unsigned slot = 0; slot < slots; slot++) {
+      CHECK(vkBindBufferMemory(dev, buffers[slot], memory[slot+1], 0));
+      CHECK(vkMapMemory(dev, memory[slot+1], 0, VK_WHOLE_SIZE, 0, (void **)&mapped[slot]));
+      memset(mapped[slot], 0xa5, BYTES + GUARD);
+   }
+   uint8_t *pixels = mapped[0];
    VkBuffer vertex_buffer = VK_NULL_HANDLE;
    VkDeviceMemory vertex_memory = VK_NULL_HANDLE;
    if (bounds) {
@@ -348,15 +355,17 @@ client_main(int argc, char **argv)
    CHECK(vkCreateFence(dev, &fence_info, NULL, &fence));
    PFN_vkGetMemoryFdKHR getfd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(dev,"vkGetMemoryFdKHR");
    if (!getfd) abort();
-   VkMemoryGetFdInfoKHR fd_info = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-      .memory = memory[1], .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-   int dma_fd;
-   CHECK(getfd(dev, &fd_info, &dma_fd));
-   send_dma_fd(client_socket, dma_fd); close(dma_fd);
-   memset(pixels, 0xa5, BYTES + GUARD);
+   for (unsigned slot = 0; slot < slots; slot++) {
+      VkMemoryGetFdInfoKHR fd_info = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+         .memory = memory[slot+1], .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+      int dma_fd;
+      CHECK(getfd(dev, &fd_info, &dma_fd));
+      send_dma_fd(client_socket, dma_fd); close(dma_fd);
+   }
    for (unsigned pass = 0; pass < perf_frames; ++pass) {
       unsigned token; exact_read(client_socket,&token,sizeof(token));
+      buffer = buffers[pass % slots]; pixels = mapped[pass % slots];
       const uint64_t started = now_ns();
       unsigned generation = pass % 3;
       const uint8_t expected[4] = {32 + generation * 31, 128 - generation * 17,
@@ -405,7 +414,7 @@ client_main(int argc, char **argv)
          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .dstQueueFamilyIndex = qi,
          .buffer = buffer, .size = VK_WHOLE_SIZE};
-      if (pass) vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      if (pass >= slots) vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
          VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,NULL,1,&acquire,0,NULL);
       vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                              buffer, 1, &copy);
@@ -431,7 +440,7 @@ client_main(int argc, char **argv)
       const uint64_t gpu_ns = now_ns() - started;
       for (unsigned i = 0; i < BYTES; ++i) {
          // Full oracle on first/last frames; sparse fresh-color checks otherwise.
-         if (pass && pass + 1 < perf_frames) {
+         if (pass >= slots && pass + slots < perf_frames) {
             const unsigned center = ((H/2)*W+W/2)*4;
             if (i == 64) i = center;
             if (i == center + 4) i = BYTES - 64;
@@ -461,10 +470,12 @@ client_main(int argc, char **argv)
       vkDestroyShaderModule(dev, modules[i], NULL);
    vkDestroyRenderPass(dev, render, NULL);
    vkDestroyImageView(dev, view, NULL);
-   vkUnmapMemory(dev, memory[1]);
-   vkDestroyBuffer(dev, buffer, NULL);
+   for (unsigned slot = 0; slot < slots; slot++) {
+      vkUnmapMemory(dev, memory[slot+1]);
+      vkDestroyBuffer(dev, buffers[slot], NULL);
+      vkFreeMemory(dev, memory[slot+1], NULL);
+   }
    vkDestroyImage(dev, image, NULL);
-   vkFreeMemory(dev, memory[1], NULL);
    vkFreeMemory(dev, memory[0], NULL);
    vkDestroyBuffer(dev, vertex_buffer, NULL);
    vkFreeMemory(dev, vertex_memory, NULL);
@@ -476,14 +487,26 @@ client_main(int argc, char **argv)
 static void flip_done(int fd,unsigned seq,unsigned sec,unsigned usec,void *data) {
  (void)fd;(void)seq;(void)sec;(void)usec;*(bool*)data=true;
 }
+static void wait_flip(int fd, drmEventContext *event, bool *done) {
+ while(!*done) {
+  struct pollfd p={.fd=fd,.events=POLLIN};int rc=poll(&p,1,5000);
+  if(rc<0&&errno==EINTR)continue;
+  if(rc<=0||p.revents&(POLLERR|POLLHUP)){fprintf(stderr,"PageFlip event timeout/error\n");exit(1);}
+  if(drmHandleEvent(fd,event)){perror("HandleEvent");exit(1);}
+ }
+}
 int main(int argc,char **argv) {
  setbuf(stdout,NULL);
  if(argc!=3){fprintf(stderr,"usage: %s vertex.spv fragment.spv\n",argv[0]);return 1;}
  perf_frames=getenv("PERF_FRAMES")?strtoul(getenv("PERF_FRAMES"),NULL,0):30;
- if(perf_frames<4||perf_frames>1000)abort();
+ if(perf_frames<5||perf_frames>1000)abort();
  bool offscreen=getenv("PERF_OFFSCREEN")!=NULL;
+ perf_pipeline=getenv("PERF_PIPELINE")!=NULL;
+ unsigned slots=perf_pipeline?2:1;
+ if(perf_pipeline&&perf_frames<6)abort();
  unsigned clients=getenv("PERF_CLIENTS")?strtoul(getenv("PERF_CLIENTS"),NULL,0):2;
  if(clients!=1&&clients!=2)abort();
+ if(!offscreen&&clients!=2){fprintf(stderr,"Presentation requires two clients/buffers\n");return 1;}
  int dcp=-1;drmModeRes *res=NULL;
  for(int i=0;i<8;i++) {char path[64];snprintf(path,sizeof(path),"/dev/dri/card%d",i);int fd=open(path,O_RDWR|O_CLOEXEC);if(fd<0)continue;
   drmVersionPtr ver=drmGetVersion(fd);bool apple=ver&&ver->name&&!strcmp(ver->name,"apple");if(ver)drmFreeVersion(ver);
@@ -501,44 +524,58 @@ int main(int argc,char **argv) {
  if(!crtc)abort();
  if(drmSetMaster(dcp)){perror("drmSetMaster");return 1;}
  drmModeCrtc *old=drmModeGetCrtc(dcp,crtc);
- printf("DCP_BENCH mode=%s %ux%u clock=%u connector=%u crtc=%u clients=%u frames=%u offscreen=%d dma_buf=1 cpu_copy=0\n",mode.name,perf_width,perf_height,mode.clock,conn->connector_id,crtc,clients,perf_frames,offscreen);
- int channels[2][2];pid_t children[2];uint32_t fbs[2]={0},handles[2]={0};
+ printf("DCP_BENCH mode=%s %ux%u clock=%u connector=%u crtc=%u clients=%u frames=%u offscreen=%d pipelined=%d dma_buf=1 cpu_copy=0\n",mode.name,perf_width,perf_height,mode.clock,conn->connector_id,crtc,clients,perf_frames,offscreen,perf_pipeline);
+ int channels[2][2];pid_t children[2];uint32_t fbs[4]={0},handles[4]={0};
  for(unsigned i=0;i<clients;i++) {
   if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,channels[i]))abort();
   children[i]=fork();if(children[i]<0)abort();
   if(!children[i]) {close(dcp);for(unsigned j=0;j<i;j++)close(channels[j][0]);close(channels[i][0]);client_socket=channels[i][1];int rc=client_main(argc,argv);close(client_socket);_exit(rc);}
   close(channels[i][1]);
  }
- for(unsigned i=0;i<clients;i++) {
-  int fd=recv_dma_fd(channels[i][0]);if(drmPrimeFDToHandle(dcp,fd,&handles[i])){perror("prime import");return 1;}close(fd);
-  uint32_t hs[4]={handles[i],0},pitches[4]={perf_width*4,0},offsets[4]={0};
-  if(drmModeAddFB2(dcp,perf_width,perf_height,DRM_FORMAT_ABGR8888,hs,pitches,offsets,&fbs[i],0)){perror("AddFB2");return 1;}
+ for(unsigned i=0;i<clients;i++) for(unsigned bank=0;bank<slots;bank++) {
+  unsigned index=i*slots+bank;
+  int fd=recv_dma_fd(channels[i][0]);if(drmPrimeFDToHandle(dcp,fd,&handles[index])){perror("prime import");return 1;}close(fd);
+  uint32_t hs[4]={handles[index],0},pitches[4]={perf_width*4,0},offsets[4]={0};
+  if(drmModeAddFB2(dcp,perf_width,perf_height,DRM_FORMAT_ABGR8888,hs,pitches,offsets,&fbs[index],0)){perror("AddFB2");return 1;}
  }
  uint64_t *samples=calloc(perf_frames*clients,sizeof(*samples));if(!samples)abort();
- uint64_t start=now_ns(),gpu_total=0;unsigned measured=0,flips=0;bool installed=false;drmEventContext event={.version=2,.page_flip_handler=flip_done};
+ uint64_t start=now_ns(),elapsed=0,gpu_total=0;unsigned measured=0,flips=0;bool installed=false,pending=false,done=false;drmEventContext event={.version=2,.page_flip_handler=flip_done};
  for(unsigned pass=0;pass<perf_frames;pass++)for(unsigned i=0;i<clients;i++) {
-  if(pass==3&&i==0){start=now_ns();gpu_total=0;measured=0;}
+  if(pass==3&&i==0) {
+   if(pending){wait_flip(dcp,&event,&done);pending=false;}
+   start=now_ns();gpu_total=0;measured=0;
+  }
+  // Drain the final measured flip before stopping the clock. The remaining
+  // passes still render/present and fully validate every allocation.
+  if(pass+slots==perf_frames&&i==0) {
+   if(pending){wait_flip(dcp,&event,&done);pending=false;}
+   elapsed=now_ns()-start;
+  }
+  // Each client owns two buffers in pipelined mode. Its next target has
+  // already retired from scanout, even while the other client's flip is pending.
   exact_write(channels[i][0],&pass,sizeof(pass));uint64_t gpu_ns;exact_read(channels[i][0],&gpu_ns,sizeof(gpu_ns));
   if(!offscreen) {
-   if(!installed){if(drmModeSetCrtc(dcp,crtc,fbs[i],0,0,&conn->connector_id,1,&mode)){perror("SetCrtc");return 1;}installed=true;}
+   unsigned index=i*slots+pass%slots;
+   if(!installed){if(drmModeSetCrtc(dcp,crtc,fbs[index],0,0,&conn->connector_id,1,&mode)){perror("SetCrtc");return 1;}installed=true;}
    else {
-    bool done=false;if(drmModePageFlip(dcp,crtc,fbs[i],DRM_MODE_PAGE_FLIP_EVENT,&done)){perror("PageFlip");return 1;}
-    while(!done){struct pollfd p={.fd=dcp,.events=POLLIN};int rc=poll(&p,1,5000);if(rc<0&&errno==EINTR)continue;if(rc<=0||p.revents&(POLLERR|POLLHUP)){fprintf(stderr,"PageFlip event timeout/error\n");return 1;}if(drmHandleEvent(dcp,&event)){perror("HandleEvent");return 1;}}
-    flips++;
+    if(pending){wait_flip(dcp,&event,&done);pending=false;}
+    done=false;if(drmModePageFlip(dcp,crtc,fbs[index],DRM_MODE_PAGE_FLIP_EVENT,&done)){perror("PageFlip");return 1;}
+    pending=true;flips++;
+    if(!perf_pipeline){wait_flip(dcp,&event,&done);pending=false;}
    }
   }
-  if(pass>=3){gpu_total+=gpu_ns;measured++;}
+  if(pass>=3&&pass+slots<perf_frames){gpu_total+=gpu_ns;measured++;}
   samples[pass*clients+i]=gpu_ns;
  }
- uint64_t elapsed=now_ns()-start;
+ if(pending){wait_flip(dcp,&event,&done);pending=false;}
  for(unsigned pass=0;pass<perf_frames;pass++)for(unsigned i=0;i<clients;i++)
   printf("DCP_SAMPLE pass=%u client=%u gpu_us=%.3f\n",pass,i,samples[pass*clients+i]/1000.0);
  free(samples);
  for(unsigned i=0;i<clients;i++){int status;if(waitpid(children[i],&status,0)<0||!WIFEXITED(status)||WEXITSTATUS(status)){fprintf(stderr,"Vulkan child failed\n");return 1;}close(channels[i][0]);}
  if(installed&&old&&old->mode_valid){if(drmModeSetCrtc(dcp,old->crtc_id,old->buffer_id,old->x,old->y,&conn->connector_id,1,&old->mode)){perror("restore crtc");return 1;}}
  else if(installed){if(drmModeSetCrtc(dcp,crtc,0,0,0,NULL,0,NULL)){perror("disable crtc");return 1;}}
- for(unsigned i=0;i<clients;i++){drmModeRmFB(dcp,fbs[i]);struct drm_gem_close c={.handle=handles[i]};drmIoctl(dcp,DRM_IOCTL_GEM_CLOSE,&c);}
- printf("DCP_RESULT frames=%u flips=%u measured=%u elapsed_ms=%.3f fps=%.3f gpu_mean_us=%.3f clients=%u offscreen=%d PASS\n",perf_frames*clients,flips,measured,elapsed/1e6,measured*1e9/elapsed,gpu_total/1000.0/measured,clients,offscreen);
+ for(unsigned i=0;i<clients*slots;i++){drmModeRmFB(dcp,fbs[i]);struct drm_gem_close c={.handle=handles[i]};drmIoctl(dcp,DRM_IOCTL_GEM_CLOSE,&c);}
+ printf("DCP_RESULT frames=%u flips=%u measured=%u elapsed_ms=%.3f fps=%.3f gpu_mean_us=%.3f clients=%u offscreen=%d timed_full_oracle=0 pipelined=%d PASS\n",perf_frames*clients,flips,measured,elapsed/1e6,measured*1e9/elapsed,gpu_total/1000.0/measured,clients,offscreen,perf_pipeline);
  if(old)drmModeFreeCrtc(old);
  drmModeFreeConnector(conn);drmModeFreeResources(res);drmDropMaster(dcp);close(dcp);return 0;
 }

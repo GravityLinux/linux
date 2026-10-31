@@ -845,7 +845,10 @@ the normal DMA-BUF import/scanout path with legacy KMS compatibility calls,
 rather than a compositor's explicit-fence integration. Buffers are rewritten
 only after replacement on scanout. Pixels and guards are checked fully on the
 first/last frames and sparsely between them. The first three passes warm up;
-per-frame logging occurs after the timed loop. Rows must be 256-byte aligned.
+the final pass still renders/presents and fully validates pixels, but its
+complete CPU oracle is outside the timing window. `timed_full_oracle=0` marks
+this corrected metric; older figures included that CPU scan. Per-frame logging
+occurs after all work. Rows must be 256-byte aligned.
 
 `PERF_OFFSCREEN=1` provides a control with the same Vulkan workload but no DCP
 presentation. Only in that mode may `PERF_CLIENTS=1` be used: the on-screen
@@ -864,3 +867,22 @@ moves and primer aliases use the checked owned-copy path. Outgoing references
 survive both break-before-make invalidations; dead tables are pruned off-lock.
 The same scheduler/VM implementation serves G16C and G17P; hardware validation
 must name the devices actually tested.
+
+The runtime's 200 us receipt retry requires `CONFIG_HIGH_RES_TIMERS=y` in
+the **running kernel**, not just an hrtimer API call in source. The ordinary
+arm64 defconfig already enables it; minimal lab kernels must retain it. At
+HZ=250 without high-resolution timers, every retry rounds to roughly 4 ms.
+An eight-receipt queue reassignment then costs about 32 ms before useful work.
+`check_scheduled_compute_admission.py --evidence DIRECTORY` executes the
+actual shared compute preparation method and verifies that blocked admission
+advances without allocating/copying a rebind tree on every control receipt.
+
+For a compositor-style throughput check use `PERF_PIPELINE=1`. Both Vulkan
+clients retain two exportable DMA-BUFs, so the next render can run while DCP
+presents the previous frame. A buffer is reused only after its earlier scanout
+has retired; this mode does not render into a scanned-out or pending buffer.
+Only one DCP flip is pending, and its event is drained before another is queued.
+The timing window drains the last measured event before stopping. Both buffers
+per client have complete first/last pixel oracles outside the timing window;
+all frames retain sparse color and guard checks. The mode changes buffering
+and overlap, so label it separately from the default serial latency test.
