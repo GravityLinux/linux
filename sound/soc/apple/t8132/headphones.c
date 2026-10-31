@@ -6,7 +6,7 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 
-#define J713_HEADPHONE_FMT (SND_SOC_DAIFMT_LEFT_J | SND_SOC_DAIFMT_NB_NF | \
+#define J713_HEADPHONE_FMT (SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_IB_IF | \
 			    SND_SOC_DAIFMT_CBC_CFC)
 
 struct j713_headphones {
