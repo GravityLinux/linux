@@ -30,6 +30,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
+#include <linux/suspend.h>
 #include <linux/time64.h>
 
 #include "nvme.h"
@@ -233,6 +234,7 @@ struct apple_nvme {
 	unsigned long flush_interval;
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
+	bool s2idle_retained;
 };
 
 unsigned int flush_interval = 1000;
@@ -1800,6 +1802,13 @@ static int apple_nvme_resume(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 
+	if (anv->s2idle_retained) {
+		nvme_unquiesce_io_queues(&anv->ctrl);
+		nvme_unfreeze(&anv->ctrl);
+		anv->s2idle_retained = false;
+		return 0;
+	}
+
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -1807,6 +1816,28 @@ static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret = 0;
+
+	if (of_machine_is_compatible("apple,j713") &&
+	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		if (nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE)
+			return -EBUSY;
+
+		/*
+		 * ANS already hardware-gates while idle on J713. Retain its
+		 * initialized state: the cold restart does not service I/O
+		 * reliably before tasks thaw. Drain deferred flushes first.
+		 */
+		flush_delayed_work(&anv->flush_dwork);
+		nvme_start_freeze(&anv->ctrl);
+		if (!nvme_wait_freeze_timeout(&anv->ctrl)) {
+			nvme_unfreeze(&anv->ctrl);
+			return -EBUSY;
+		}
+		nvme_quiesce_io_queues(&anv->ctrl);
+		device_set_wakeup_path(dev);
+		anv->s2idle_retained = true;
+		return 0;
+	}
 
 	apple_nvme_disable(anv, true);
 
