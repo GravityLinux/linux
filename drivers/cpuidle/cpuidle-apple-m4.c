@@ -165,6 +165,8 @@ static struct cpuidle_driver apple_m4_idle_driver = {
 		},
 		[STATE_PWRDOWN] = {
 			.enter			= apple_m4_enter_pwrdown,
+			/* tick_freeze() replaces the normal broadcast entry. */
+			.enter_s2idle		= apple_m4_enter_pwrdown,
 			.power_usage		= 0,
 			.name			= "CPU PD",
 			.desc			= "CPU powered down",
