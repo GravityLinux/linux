@@ -108,6 +108,7 @@
 
 &mtp_hid {
 	status = "okay";
+	wakeup-source;
 
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j713.bin";
