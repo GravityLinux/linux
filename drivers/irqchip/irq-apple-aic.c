@@ -1048,6 +1048,17 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 
 	irqc->info = *(struct aic_info *)match->data;
 
+	/*
+	 * T8132 currently uses suspend-to-idle with AIC still powered. There
+	 * is no separate hardware wake mask to program: generic IRQ PM keeps
+	 * only the IRQs selected by enable_irq_wake() unmasked and reports the
+	 * first one through pm_system_irq_wakeup(). Without this flag, the
+	 * absent irq_set_wake callback rejects those wake sources with ENXIO.
+	 * This does not unmask any IRQ or provide a deeper SoC sleep path.
+	 */
+	if (of_device_is_compatible(node, "apple,t8132-aic3"))
+		aic2_chip.flags |= IRQCHIP_SKIP_SET_WAKE;
+
 	aic_irqc = irqc;
 
 	switch (irqc->info.version) {
