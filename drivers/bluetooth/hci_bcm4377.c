@@ -17,6 +17,7 @@
 #include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -595,6 +596,8 @@ struct bcm4377_data {
 	dma_addr_t peripheral_info_dma;
 	bool rings_lost;
 	struct work_struct resume_work;
+	bool s2idle_retained;
+	bool s2idle_had_no_d3;
 
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
@@ -2504,6 +2507,22 @@ static int bcm4377_suspend(struct device *dev)
 	if (ret)
 		return ret;
 
+	if (of_machine_is_compatible("apple,j713") &&
+	    bcm4377->hw->reinit_on_resume &&
+	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		/*
+		 * Best-effort s2idle: stop HCI activity but retain firmware/rings.
+		 * PCI D3 loses this chip's firmware and requires the slow reset
+		 * path. Restore the pre-existing NO_D3 policy after bus resume.
+		 */
+		bcm4377->s2idle_had_no_d3 =
+			!!(pdev->dev_flags & PCI_DEV_FLAGS_NO_D3);
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+		bcm4377->s2idle_retained = true;
+		device_set_wakeup_path(dev);
+		return 0;
+	}
+
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 
@@ -2581,6 +2600,13 @@ static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+
+	if (bcm4377->s2idle_retained) {
+		bcm4377->s2idle_retained = false;
+		if (!bcm4377->s2idle_had_no_d3)
+			pdev->dev_flags &= ~PCI_DEV_FLAGS_NO_D3;
+		return hci_resume_dev(bcm4377->hdev);
+	}
 
 	if (bcm4377->hw->reinit_on_resume) {
 		/*
