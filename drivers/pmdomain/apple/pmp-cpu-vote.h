@@ -14,4 +14,6 @@ struct apple_pmp_cpu_vote *
 apple_pmp_cpu_vote_probe(struct platform_device *pdev, void __iomem *events);
 void apple_pmp_cpu_vote_start(struct apple_pmp_cpu_vote *vote);
 void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote);
+void apple_pmp_cpu_vote_suspend(struct apple_pmp_cpu_vote *vote);
+void apple_pmp_cpu_vote_resume(struct apple_pmp_cpu_vote *vote);
 #endif

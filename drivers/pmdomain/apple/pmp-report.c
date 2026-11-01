@@ -323,6 +323,25 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{}
 };
 
+static int apple_pmp_report_suspend(struct device *dev)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	apple_pmp_cpu_vote_suspend(rep->cpu_vote);
+	return 0;
+}
+
+static int apple_pmp_report_resume(struct device *dev)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	apple_pmp_cpu_vote_resume(rep->cpu_vote);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmp_report_pm_ops,
+			       apple_pmp_report_suspend, apple_pmp_report_resume);
+
 static struct platform_driver apple_pmp_report_driver = {
 	.probe = apple_pmp_report_probe,
 	.remove = apple_pmp_report_remove,
@@ -330,6 +349,7 @@ static struct platform_driver apple_pmp_report_driver = {
 	.driver = {
 		.name = "apple-pmp-report",
 		.of_match_table = apple_pmp_report_of_match,
+		.pm = pm_sleep_ptr(&apple_pmp_report_pm_ops),
 	},
 };
 

@@ -208,7 +208,7 @@ struct apple_pmp_cpu_vote {
 	unsigned int last_cpu, last_load, last_e_load;
 	u64 e_sample_ms;
 	bool e_sampling;
-	bool active, stopping, instance_added, stats_created;
+	bool active, stopping, instance_added, stats_created, suspended;
 };
 
 struct cpm_request {
@@ -747,6 +747,57 @@ void apple_pmp_cpu_vote_start(struct apple_pmp_cpu_vote *vote)
 		cpumask_pr_args(&vote->p_cpus), CPU_VOTE_INTERVAL_MS,
 		CPU_VOTE_THRESHOLD, cpumask_pr_args(&vote->e_cpus),
 		READ_ONCE(cpu_vote_e_threshold), CPU_VOTE_HOLD_MS);
+}
+
+void apple_pmp_cpu_vote_suspend(struct apple_pmp_cpu_vote *vote)
+{
+	unsigned int cpu;
+
+	if (!vote || !vote->active)
+		return;
+	mutex_lock(&vote->lock);
+	vote->suspended = true;
+	vote->stopping = true;
+	mutex_unlock(&vote->lock);
+	for_each_cpu(cpu, &vote->sample_cpus)
+		cancel_delayed_work_sync(&vote->samples[cpu].work);
+	cancel_delayed_work_sync(&vote->release_work);
+
+	/* Tick freeze must not retain a busy vote awaiting a future timer. */
+	cpus_read_lock();
+	mutex_lock(&vote->lock);
+	cpu_vote_write(vote, 0);
+	cpu_vote_cpm_apply(vote, false, false);
+	mutex_unlock(&vote->lock);
+	cpus_read_unlock();
+}
+
+void apple_pmp_cpu_vote_resume(struct apple_pmp_cpu_vote *vote)
+{
+	unsigned int cpu;
+
+	if (!vote || !vote->suspended)
+		return;
+	cpus_read_lock();
+	mutex_lock(&vote->lock);
+	vote->policy = (struct apple_pmp_vote_policy){0};
+	vote->e_run = (struct apple_pmp_vote_run){0};
+	vote->gpu_window = (struct apple_pmp_vote_gpu_window){0};
+	vote->e_sampling = false;
+	vote->suspended = false;
+	vote->stopping = false;
+	for_each_cpu(cpu, &vote->sample_cpus) {
+		struct cpu_sample *sample = &vote->samples[cpu];
+
+		sample->valid = false;
+		sample->e_time.valid = false;
+		sample->p_run = (struct apple_pmp_vote_run){0};
+		if (sample->enabled && cpu_online(cpu))
+			queue_delayed_work_on(cpu, system_wq, &sample->work,
+				msecs_to_jiffies(CPU_VOTE_INTERVAL_MS));
+	}
+	mutex_unlock(&vote->lock);
+	cpus_read_unlock();
 }
 
 void apple_pmp_cpu_vote_stop(struct apple_pmp_cpu_vote *vote)
