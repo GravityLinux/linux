@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 
 #include "glue.h"
 
@@ -675,6 +676,8 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	/* PM/remove must also work before the first cable starts the core. */
+	platform_set_drvdata(pdev, &appledwc->dwc);
 	mutex_init(&appledwc->lock);
 	dr_mode = usb_get_dr_mode(dev);
 	appledwc->dwc.dr_mode = dr_mode;
@@ -788,6 +791,30 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 		dwc3_core_remove(&appledwc->dwc);
 }
 
+static int dwc3_apple_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+
+	guard(mutex)(&appledwc->lock);
+
+	/*
+	 * No system-PM context save/restore exists in this glue yet. Letting
+	 * genpd cut power loses a configured gadget while its UDC still says
+	 * configured. Keep the controller and its PHY dependency powered for
+	 * J713 s2idle; hardware automatic gating remains available.
+	 */
+	if (of_machine_is_compatible("apple,j713") &&
+	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+	    (appledwc->state == DWC3_APPLE_HOST ||
+	     appledwc->state == DWC3_APPLE_DEVICE))
+		device_set_wakeup_path(dev);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dwc3_apple_pm_ops, dwc3_apple_suspend, NULL);
+
 static const struct of_device_id dwc3_apple_of_match[] = {
 	{ .compatible = "apple,t8103-dwc3" },
 	{}
@@ -800,6 +827,7 @@ static struct platform_driver dwc3_apple_driver = {
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
+		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
