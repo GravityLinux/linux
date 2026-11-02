@@ -62,10 +62,10 @@
 #include "internal.h"
 
 #include <trace/events/sched.h>
-#include <linux/p3s_user_pages.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/coredump.h>
+#include <linux/p3s_user_pages.h>
 
 static bool dump_vma_snapshot(struct coredump_params *cprm);
 static void free_vma_snapshot(struct coredump_params *cprm);
