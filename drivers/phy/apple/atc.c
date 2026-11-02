@@ -2577,6 +2577,8 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		target_mode = APPLE_ATCPHY_MODE_OFF;
 	} else if (state->mode == TYPEC_STATE_USB) {
 		target_mode = APPLE_ATCPHY_MODE_USB3;
+	} else if (!state->alt && state->mode == TYPEC_MODE_USB2) {
+		target_mode = APPLE_ATCPHY_MODE_USB2;
 	} else if (!state->alt && state->mode == TYPEC_MODE_USB4) {
 		struct enter_usb_data *data = state->data;
 		u32 eudo_usb_mode = FIELD_GET(EUDO_USB_MODE_MASK, data->eudo);
