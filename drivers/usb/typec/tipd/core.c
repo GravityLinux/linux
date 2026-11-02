@@ -645,6 +645,22 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.mode = mode;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		cd321x_mux_set(tps);
+	} else if (!cd321x->tbt_switch &&
+		   (st->data_status & (TPS_DATA_STATUS_TBT_CONNECTION |
+				       CD321X_DATA_STATUS_USB4_CONNECTION))) {
+		/*
+		 * The controller entered USB4 or Thunderbolt mode, but no USB4 host
+		 * is wired to this port, so nothing can use the lanes or a tunnel.
+		 * Keep the PHY out of USB4 mode, whose PIPE clock comes from that
+		 * missing controller, and leave USB2, which such devices still
+		 * provide on D+/D-.
+		 */
+		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB2)
+			return;
+		cd321x->state.alt = NULL;
+		cd321x->state.mode = TYPEC_MODE_USB2;
+		cd321x->state.data = NULL;
+		cd321x_mux_set(tps);
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
