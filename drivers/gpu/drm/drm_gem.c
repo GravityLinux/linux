@@ -1343,7 +1343,7 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
 	unsigned long ret;
 
 	obj = drm_gem_object_lookup_at_offset(filp,
-					      mm_mmap_pgoff(current->mm, pgoff),
+					      mm_mmap_pgoff(current->mm, filp, pgoff),
 					      DIV_ROUND_UP(len, PAGE_SIZE));
 	if (IS_ERR(obj))
 		obj = NULL;
