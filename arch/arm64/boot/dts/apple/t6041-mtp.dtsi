@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/gpio/gpio.h>
 /* J616c MTP. Addresses are resolved CPU physical addresses from the board ADT.
  * Raw arm-io addresses for these devices require a 0x200000000 translation.
  */
@@ -71,6 +72,8 @@
 			};
 			multi-touch {
 				firmware-name = "apple/tpmtfw-j616c.bin";
+				/* ADT function-afe-reset: SMC gp19, active-low AFE reset. */
+				reset-gpios = <&smc_gpio_low 0x19 GPIO_ACTIVE_LOW>;
 			};
 			stm {};
 			actuator {};
