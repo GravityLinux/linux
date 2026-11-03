@@ -2262,7 +2262,7 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 	inactive = lruvec_page_state(lruvec, NR_LRU_BASE + inactive_lru);
 	active = lruvec_page_state(lruvec, NR_LRU_BASE + active_lru);
 
-	gb = (inactive + active) >> (30 - PAGE_SHIFT);
+	gb = (inactive + active) >> (30 - PAGE_SHIFT_KERNEL);
 	if (gb)
 		inactive_ratio = int_sqrt(10 * gb);
 	else
@@ -7973,7 +7973,7 @@ int user_proactive_reclaim(char *buf,
 	buf = strstrip(buf);
 
 	old_buf = buf;
-	nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;
+	nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE_KERNEL;
 	if (buf == old_buf)
 		return -EINVAL;
 
