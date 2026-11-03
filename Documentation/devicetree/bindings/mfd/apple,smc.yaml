@@ -43,6 +43,9 @@ properties:
   gpio:
     $ref: /schemas/gpio/apple,smc-gpio.yaml
 
+  gpio-low:
+    $ref: /schemas/gpio/apple,smc-gpio.yaml
+
   reboot:
     $ref: /schemas/power/reset/apple,smc-reboot.yaml
 
