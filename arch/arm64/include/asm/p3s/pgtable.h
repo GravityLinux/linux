@@ -28,22 +28,22 @@ static inline unsigned long mm_ptrs_per_pte(const struct mm_struct *mm)
 
 static inline unsigned int mm_pmd_shift(const struct mm_struct *mm)
 {
-	return mm_pte_shift(mm) + mm_ptdesc_table_shift(mm);
+	return mm_is_p3s_4k(mm) ? PMD_SHIFT_4KB : PMD_SHIFT;
 }
 
 static inline unsigned long mm_ptrs_per_pmd(const struct mm_struct *mm)
 {
-	return mm_ptrs_per_pte(mm);
+	return mm_is_p3s_4k(mm) ? mm_ptrs_per_pte(mm) : PTRS_PER_PMD;
 }
 
 static inline unsigned int mm_pgdir_shift(const struct mm_struct *mm)
 {
-	return mm_pmd_shift(mm) + mm_ptdesc_table_shift(mm);
+	return mm_is_p3s_4k(mm) ? PGDIR_SHIFT_4KB : PGDIR_SHIFT;
 }
 
 static inline unsigned long mm_ptrs_per_pgd(const struct mm_struct *mm)
 {
-	return mm_ptrs_per_pte(mm);
+	return mm_is_p3s_4k(mm) ? mm_ptrs_per_pte(mm) : PTRS_PER_PGD;
 }
 
 static inline unsigned long mm_pgd_index(const struct mm_struct *mm,
