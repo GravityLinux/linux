@@ -157,7 +157,7 @@ struct dchid_iface {
 
 	int index;
 	const char *name;
-	const struct device_node *of_node;
+	struct device_node *of_node;
 
 	uint8_t tx_seq;
 	bool deferred;
@@ -169,6 +169,7 @@ struct dchid_iface {
 	size_t hid_desc_len;
 
 	struct gpio_desc *gpio;
+	struct gpio_desc *reset_gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
 
@@ -258,6 +259,19 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	if (!iface->of_node) {
 		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 		return NULL;
+	}
+
+	if (of_property_present(iface->of_node, "reset-gpios")) {
+		/* Keep AFE reset asserted until the provisioning release phase. */
+		iface->reset_gpio = devm_fwnode_gpiod_get_index(dchid->dev,
+			&iface->of_node->fwnode, "reset", 0, GPIOD_OUT_HIGH, name);
+		if (IS_ERR(iface->reset_gpio)) {
+			dev_err(dchid->dev, "Failed to request %s reset GPIO: %pe\n",
+				name, iface->reset_gpio);
+			destroy_workqueue(iface->wq);
+			of_node_put(iface->of_node);
+			return NULL;
+		}
 	}
 
 	dchid->ifaces[index] = iface;
@@ -389,6 +403,8 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 
 	if (!iface->dchid->use_ring)
 		return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (iface->reset_gpio && state != 0 && state != 2)
+		return -EINVAL;
 
 	/*
 	 * T8132 boot capture: state 0 then 2, each with byte 4 equal to 0
@@ -398,6 +414,16 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 	ret = dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
 	if (ret < 0)
 		return ret;
+	if (iface->reset_gpio) {
+		/* J616c macOS: prepare, change the SMC AFE reset, then commit.
+		 * Assertion includes a 50 ms hold; release is committed directly.
+		 */
+		ret = gpiod_set_value_cansleep(iface->reset_gpio, state == 0);
+		if (ret)
+			return ret;
+		if (state == 0)
+			msleep(50);
+	}
 	msg2[4] = 1;
 	return dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
 }
@@ -589,8 +615,12 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		dchid_reset_interface(iface, 0);
-		dchid_reset_interface(iface, 2);
+		ret = dchid_reset_interface(iface, 0);
+		if (ret < 0)
+			goto err;
+		ret = dchid_reset_interface(iface, 2);
+		if (ret < 0)
+			goto err;
 	}
 
 	return 0;
@@ -635,6 +665,7 @@ static int dchid_open(struct hid_device *hdev)
 
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
+			iface->starting = false;
 			return -ETIMEDOUT;
 		}
 	}
@@ -1286,12 +1317,15 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		for_each_property_of_node(child, prop) {
 			size_t len = strlen(prop->name);
 			struct gpio_desc *gpio;
+			const char *con_id = prop->name;
 
-			if (len < 12 || strncmp("apple,", prop->name, 6) ||
+			if (!strcmp(prop->name, "reset-gpios"))
+				con_id = "reset";
+			else if (len < 12 || strncmp("apple,", prop->name, 6) ||
 			    strcmp("-gpios", prop->name + len - 6))
 				continue;
 
-			gpio = fwnode_gpiod_get_index(&child->fwnode, prop->name, 0, GPIOD_ASIS,
+			gpio = fwnode_gpiod_get_index(&child->fwnode, con_id, 0, GPIOD_ASIS,
 						      prop->name);
 			if (IS_ERR_OR_NULL(gpio)) {
 				if (PTR_ERR(gpio) == -EPROBE_DEFER) {
