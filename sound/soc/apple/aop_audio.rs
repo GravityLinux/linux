@@ -873,6 +873,9 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         dev_err!(data.dev, "Unable to refine hwparams");
         return ret;
     }
+    // DMA width compatibility does not change the coprocessor's sample format.
+    // The helper adds integer formats too, but AOP always supplies float32 PCM.
+    hwparams.formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE;
     if let Err(e) = data.set_audio_power(POWER_STATE_ON, 1) {
         dev_err!(data.dev, "Unable to power mic on");
         return e.to_errno();
