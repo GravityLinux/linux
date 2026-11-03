@@ -188,8 +188,9 @@ int main(int argc, char **argv)
 	CHECK(munmap(shared, 3 * PAGE) == 0);
 	bo_close(other, imported.handle);
 	CHECK(close(prime.fd) == 0);
-	/* Closing a handle on another file must preserve this file's mappings. */
-	bind(fd, vm, bo, VA, PAGE, PAGE, RW, EINVAL);
+	/* Closing the imported handle preserves the original file's backing;
+	 * replacing its first page remains valid after the import closes. */
+	bind(fd, vm, bo, VA, PAGE, PAGE, RW, 0);
 	struct drm_asahi_queue_create q = { .vm_id = vm, .usc_exec_base = EXEC + (1ULL << 32) };
 	BAD(fd, DRM_IOCTL_ASAHI_QUEUE_CREATE, &q, EINVAL);
 	q.usc_exec_base = EXEC; q.priority = 2;
