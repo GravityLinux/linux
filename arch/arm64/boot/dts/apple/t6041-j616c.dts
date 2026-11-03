@@ -28,6 +28,8 @@
 		/* 3456 x 2234 at 254 ppi: 345.6 x 223.4 mm. */
 		width-mm = <346>;
 		height-mm = <223>;
+		/* The default mode excludes the 74-pixel notch area. */
+		adj-height-mm = <216>;
 	};
 };
 
