@@ -2,8 +2,6 @@
 #ifndef _LINUX_P3S_PERF_H
 #define _LINUX_P3S_PERF_H
 
-#include <linux/page_size_compat_defs.h>
-
 /*
  * Include after kernel/events/internal.h: helpers below use
  * struct perf_buffer, perf_data_size() and perf_mmap_to_page().
@@ -25,7 +23,7 @@ static inline u64 p3s_mmap_pgoff(const struct vm_area_struct *vma)
 /* Page size of the ring buffer layout that @mm maps. */
 static inline unsigned long p3s_perf_mm_page_size(struct mm_struct *mm)
 {
-	return mm_is_p3s_4k(mm) ? mm_pte_size(mm) : __PAGE_SIZE;
+	return mm_is_p3s_4k(mm) ? mm_pte_size(mm) : PAGE_SIZE_KERNEL;
 }
 
 /* Count the 4KB user page as the native page which backs it. */
@@ -116,14 +114,14 @@ static inline int p3s_perf_map_main(struct perf_buffer *rb,
 	ret = uaddr == vma->vm_end ? 0 : -EINVAL;
 out:
 	if (ret)
-		zap_page_range_single(vma, vma->vm_start,
-				      vma->vm_end - vma->vm_start, NULL);
+		zap_vma_range(vma, vma->vm_start,
+			      vma->vm_end - vma->vm_start);
 	return ret;
 }
 #else
 static inline unsigned long p3s_perf_mmap_page_size(struct perf_buffer *rb)
 {
-	return __PAGE_SIZE;
+	return PAGE_SIZE_KERNEL;
 }
 
 static inline void p3s_perf_set_mmap_page_size(struct perf_buffer *rb,

@@ -244,7 +244,7 @@ static inline pgoff_t vmg_pages(const struct vma_merge_struct *vmg)
 {
 	const unsigned long size = vmg->end - vmg->start;
 
-	return size >> PAGE_SHIFT;
+	return size >> mm_pte_shift(vmg->mm);
 }
 
 #ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
@@ -267,18 +267,16 @@ static inline bool vmg_can_merge_offsets(struct vma_merge_struct *vmg, bool merg
 	if (merge_next)
 		return vmg->next->vm_pgoff == vmg->pgoff + PHYS_PFN(vmg->end - vmg->start);
 
-	return vmg->prev->vm_pgoff + vma_pages(vmg->prev) == vmg->pgoff;
+	if (!vmg->prev)
+		return false;
+
+	return vmg->pgoff == vmg->prev->vm_pgoff + PHYS_PFN(vmg->start - vmg->prev->vm_start);
 }
 #endif
 
 static inline pgoff_t vmg_start_pgoff(const struct vma_merge_struct *vmg)
 {
 	return vmg->pgoff;
-}
-
-static inline pgoff_t vmg_end_pgoff(const struct vma_merge_struct *vmg)
-{
-	return vmg_start_pgoff(vmg) + vmg_pages(vmg);
 }
 
 static inline void assert_sane_pgoff(struct vm_area_struct *vma, pgoff_t pgoff)
@@ -300,7 +298,7 @@ static inline void assert_sane_pgoff(struct vm_area_struct *vma, pgoff_t pgoff)
 	if (vma->anon_vma)
 		return;
 	/* OK this is really an anon VMA - expect virtual page offset. */
-	VM_WARN_ON_ONCE(pgoff != vma->vm_start >> PAGE_SHIFT);
+	VM_WARN_ON_ONCE(pgoff != vma->vm_start >> mm_pte_shift(vma->vm_mm));
 }
 
 static inline void vma_set_pgoff(struct vm_area_struct *vma, pgoff_t pgoff)

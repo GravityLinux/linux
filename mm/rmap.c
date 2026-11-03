@@ -3070,7 +3070,7 @@ static void rmap_walk_anon(struct folio *folio,
 	p3s_anon_rmap_range(folio, anon_vma, &pgoff_start, &pgoff_end);
 	anon_rmap_tree_foreach(avc, anon_vma, pgoff_start, pgoff_end) {
 		struct vm_area_struct *vma = avc->vma;
-		const unsigned long address = vma_anon_address(vma, folio_pgoff(folio),
+		unsigned long address = vma_anon_address(vma, folio_pgoff(folio),
 				folio_nr_pages(folio));
 
 		if (p3s_anon_rmap_skip(vma, folio, &address))

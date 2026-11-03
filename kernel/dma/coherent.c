@@ -239,7 +239,6 @@ static int __dma_mmap_from_coherent(struct dma_coherent_mem *mem,
 		const pgoff_t pgoff_start = vma_start_pgoff(vma);
 		const pgoff_t pgoff_end = vma_end_pgoff(vma);
 		int start = (vaddr - mem->virt_base) >> PAGE_SHIFT;
-		unsigned long user_count = vma_kernel_pages(vma);
 		int count = PAGE_ALIGN(size) >> PAGE_SHIFT;
 
 		*ret = -ENXIO;

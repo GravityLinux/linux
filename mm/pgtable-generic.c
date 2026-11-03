@@ -314,11 +314,11 @@ nomap:
 	return NULL;
 }
 
-pte_t *___pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
+pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
 {
 	return __mm_pte_offset_map(p3s_current_mm(), pmd, addr, pmdvalp);
 }
-EXPORT_SYMBOL_GPL(___pte_offset_map);
+EXPORT_SYMBOL_GPL(__pte_offset_map);
 
 pte_t *pte_offset_map_ro_nolock(struct mm_struct *mm, pmd_t *pmd,
 				unsigned long addr, spinlock_t **ptlp)
