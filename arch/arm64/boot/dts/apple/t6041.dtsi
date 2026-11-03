@@ -248,8 +248,8 @@
             reg-names = "sgx", "asc";
             mboxes = <&agx_mbox>;
             mbox-names = "primary";
-            /* Enable explicitly in the probe test after powering both GPU and
-             * ASC through m1n1. Permanent PMGR ownership is still required. */
+            /* m1n1 enables this after reserving firmware memory, populating
+             * board configuration and powering the GPU and ASC. */
             status = "disabled";
         };
         agx_mbox: mailbox@28a608000 {

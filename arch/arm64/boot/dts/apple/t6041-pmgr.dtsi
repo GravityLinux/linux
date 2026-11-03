@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* Verified J616c power-state nodes needed by PMP, ISP and internal DCP. */
 &{/soc} {
+	pmgr_gpu: power-management@288e80000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x2 0x88e80000 0 0x30000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ps_afr: power-controller@100 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x100 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "afr";
+			apple,always-on;
+		};
+
+		ps_gfx: power-controller@110 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x110 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "gfx";
+			power-domains = <&ps_afr>;
+			/* Resident RTKit firmware cannot survive domain power-off. */
+			apple,always-on;
+		};
+	};
 	pmgr0: power-management@502280000 {
 		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		#address-cells = <1>;
@@ -87,6 +113,10 @@
 			power-domains = <&ps_afi>;
 		};
 	};
+};
+
+&gpu {
+	power-domains = <&ps_gfx>;
 };
 
 /* Native ISP virtual-domain implementation uses this six-register bank.
