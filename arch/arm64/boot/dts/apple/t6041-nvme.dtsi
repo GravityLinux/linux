@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J616c resources from its ADT. nvme-secure-bar is a present, zero-length
+ * boolean property. Use the M4 secure NVMe aperture (reg[9]), not reg[3].
+ */
+&pmgr0 {
+	ps_fab3_soc: power-controller@118 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x118 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab3_soc";
+		apple,always-on;
+	};
+	ps_ans: power-controller@370 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x370 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ans";
+		power-domains = <&ps_fab3_soc>;
+		/* Turning ANS off can trigger its watchdog. */
+		apple,always-on;
+	};
+	ps_apcie_st0: power-controller@108 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st0";
+	};
+	ps_apcie_st1: power-controller@110 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x110 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st1";
+	};
+	ps_apcie_sys_st0: power-controller@380 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x380 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_st0";
+		power-domains = <&ps_ans>, <&ps_apcie_st0>;
+	};
+	ps_apcie_sys_st1: power-controller@388 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x388 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_st1";
+		power-domains = <&ps_ans>, <&ps_apcie_st1>;
+	};
+};
+
+&{/soc} {
+	ans_mbox: mailbox@409608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <4 0x09608000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1530 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1531 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1532 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1533 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_ans>;
+	};
+	sart_ans: sart@40dc50000 {
+		compatible = "apple,t6041-sart", "apple,t6000-sart";
+		reg = <4 0x0dc50000 0 0xc000>;
+		power-domains = <&ps_ans>;
+	};
+	nvme: nvme@44dcc0000 {
+		compatible = "apple,t6041-nvme-ans2", "apple,t8132-nvme-ans2";
+		reg = <4 0x4dcc0000 0 0x60000>, <4 0x09600000 0 0x4000>;
+		reg-names = "nvme", "ans";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 2583 IRQ_TYPE_LEVEL_HIGH>;
+		mboxes = <&ans_mbox>;
+		power-domains = <&ps_ans>, <&ps_apcie_sys_st0>, <&ps_apcie_sys_st1>;
+		power-domain-names = "ans", "apcie0", "apcie1";
+		resets = <&ps_ans>;
+		apple,sart = <&sart_ans>;
+	};
+};

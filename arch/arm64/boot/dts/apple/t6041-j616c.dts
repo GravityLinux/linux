@@ -2,6 +2,7 @@
 /dts-v1/;
 #include "t6041.dtsi"
 #include "t6041-pmgr.dtsi"
+#include "t6041-nvme.dtsi"
 #include "t6041-pmp.dtsi"
 #include "t6041-isp.dtsi"
 #include "t6041-mtp.dtsi"
