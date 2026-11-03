@@ -10,6 +10,8 @@ description:
   The Apple System Management Controller (SMC) provides reboot functionality
   on Apple Silicon SoCs. It uses NVMEM cells to store and track various
   system state information related to boot, shutdown, and panic events.
+  These cells are optional when the platform does not expose this storage;
+  reboot commands can still be sent to the SMC without them.
 
 maintainers:
   - Sven Peter <sven@kernel.org>
@@ -34,7 +36,9 @@ properties:
 
 required:
   - compatible
-  - nvmem-cells
-  - nvmem-cell-names
+
+dependentRequired:
+  nvmem-cells: [ nvmem-cell-names ]
+  nvmem-cell-names: [ nvmem-cells ]
 
 additionalProperties: false
