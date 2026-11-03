@@ -56,8 +56,20 @@ impl Events {
     fn remove(&self, job: &Job) {
         let mut jobs = self.jobs.lock();
         if let Some(i) = jobs.iter().position(|held| core::ptr::eq(&**held, job)) {
-            jobs.swap_remove(i);
+            // Preserve submission order: the first live job for a queue is
+            // the only owner that needs periodic firmware progress polls.
+            let _ = jobs.remove(i);
+            // Retirement's firmware wake may have happened before this
+            // removal. Promote the successor explicitly, including a worker
+            // which previously ran as a non-head and armed no retry timer.
+            if let Some(next) = jobs.iter().find(|next| next.queue_key == job.queue_key) {
+                let _ = workqueue::system_dfl().enqueue::<_, 0>(next.clone());
+            }
         }
+    }
+    fn is_head(&self, job: &Job) -> bool {
+        self.jobs.lock().iter().find(|held| held.queue_key == job.queue_key)
+            .is_some_and(|held| core::ptr::eq(&**held, job))
     }
     pub(crate) fn wake(&self) {
         self.wake_backend(false);
@@ -74,8 +86,9 @@ impl Events {
         // pass. SC orders this handshake across both atomic locations.
         self.wake_sequence.fetch_add(1, Ordering::SeqCst);
         let jobs = self.jobs.lock();
-        for job in jobs.iter() {
-            if all || job.firmware_waiting.load(Ordering::SeqCst) {
+        for (index, job) in jobs.iter().enumerate() {
+            let head = !jobs[..index].iter().any(|held| held.queue_key == job.queue_key);
+            if all || (head && job.firmware_waiting.load(Ordering::SeqCst)) {
                 let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
             }
         }
@@ -106,6 +119,9 @@ pub(crate) struct Job {
     control_timer: HrTimer<Job>,
     committed: AtomicBool,
     firmware_waiting: AtomicBool,
+    // Immutable admission identity, readable in IRQ context without taking
+    // the sleeping execution lock. Queue IDs are scoped by their DRM file.
+    queue_key: super::super::g17p_compute_queues::Key,
     events: Arc<Events>,
 }
 struct Execution {
@@ -167,6 +183,7 @@ impl Job {
         let mut render_receipts = KVec::new();
         render_receipts.reserve(prepared.parameters.len(), GFP_KERNEL)?;
         let events = dev.events.clone();
+        let queue_key = prepared.queue_key;
         let job = Arc::pin_init(
             try_pin_init!(Self {
                 work<-new_work!("asahi_neo_event"),
@@ -174,7 +191,7 @@ impl Job {
                 execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,schedule,control_timer_handle:None,
                     initialized:false,cursor:0,waiting:false,work_gate:None,callbacks:KVec::new()})),
                 control_timer<-HrTimer::new(),
-                committed:AtomicBool::new(false),firmware_waiting:AtomicBool::new(false),events,
+                committed:AtomicBool::new(false),firmware_waiting:AtomicBool::new(false),queue_key,events,
             }),
             GFP_KERNEL,
         )?;
@@ -283,6 +300,13 @@ impl Job {
             }
             Ok(None) => {
                 this.firmware_waiting.store(true, Ordering::SeqCst);
+                // Non-head jobs keep their input/publication callbacks, but
+                // must not all contend for runtime on every firmware event.
+                // Head promotion and this check share the events lock, so a
+                // successor cannot miss both promotion and timer arming.
+                if !this.events.is_head(&this) {
+                    return;
+                }
                 if this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
                     let _ = workqueue::system_dfl().enqueue::<_, 0>(this.clone());
                 }
