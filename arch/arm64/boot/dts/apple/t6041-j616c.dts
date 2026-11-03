@@ -30,3 +30,24 @@
 		height-mm = <223>;
 	};
 };
+
+&smc {
+	reboot {
+		compatible = "apple,smc-reboot";
+	};
+
+	hwmon {
+		compatible = "apple,smc-hwmon";
+
+		/* Monitor the firmware-controlled fans without exposing overrides. */
+		fan-F0Ac {
+			apple,key-id = "F0Ac";
+			label = "Fan 1";
+		};
+
+		fan-F1Ac {
+			apple,key-id = "F1Ac";
+			label = "Fan 2";
+		};
+	};
+};
