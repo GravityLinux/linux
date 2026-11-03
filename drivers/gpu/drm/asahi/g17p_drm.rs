@@ -537,6 +537,26 @@ impl Vm {
         self.bindings = next;
         Ok(())
     }
+    fn unbind_range(&mut self, dev: &Device, owner: (u64, u32), start: u64, end: u64) -> Result {
+        let snapshots = scheduling::Schedule::enabled();
+        if !snapshots && self.pending.load(Ordering::Acquire) != 0 {
+            return Err(EBUSY);
+        }
+        if !snapshots {
+            let mut expected = KVec::new();
+            for address in (start..end).step_by(PAGE as usize) {
+                let pte = self.tree.pte(address)?;
+                if pte != 0 {
+                    expected.push((address, pte), GFP_KERNEL)?;
+                }
+            }
+            Option::as_mut(&mut *dev.runtime.lock()).ok_or(ENODEV)?
+                .session.unbind_vm(owner, start, end - start, &expected)?;
+        }
+        // Scheduled jobs retain immutable admission trees and BO references.
+        // A logical replacement must never modify those live execution roots.
+        self.unbind(start, end)
+    }
 }
 enum Command {
     Compute(super::g17p_compute_runtime::Parameters),
@@ -931,31 +951,10 @@ impl File {
                 return Err(EINVAL);
             }
             if op.flags & UNBIND != 0 {
-                let snapshots = scheduling::Schedule::enabled();
-                if !snapshots && vm.pending.load(Ordering::Acquire) != 0 {
-                    return Err(EBUSY);
-                }
                 if op.flags != UNBIND || op.handle != 0 || op.offset != 0 {
                     return Err(EINVAL);
                 }
-                if !snapshots {
-                    let mut expected = KVec::new();
-                    for address in (op.addr..end).step_by(PAGE as usize) {
-                        let pte = vm.tree.pte(address)?;
-                        if pte != 0 {
-                            expected.push((address, pte), GFP_KERNEL)?;
-                        }
-                    }
-                    Option::as_mut(&mut *dev.runtime.lock())
-                        .ok_or(ENODEV)?
-                        .session
-                        .unbind_vm((inner.id, vm.id), op.addr, op.range, &expected)?;
-                }
-                // Ordinary jobs own immutable admission trees and installed
-                // per-owner roots. Logical unbind must never edit those live
-                // roots. A later mapping generation replaces only its selected
-                // retired owner's caller leaves, with the normal ASID TLBI.
-                vm.unbind(op.addr, end)?;
+                vm.unbind_range(dev, (inner.id, vm.id), op.addr, end)?;
                 continue;
             }
             if op.flags & !(READ | WRITE | SINGLE) != 0
@@ -990,11 +989,6 @@ impl File {
             }) {
                 continue;
             }
-            // Replacing different live mappings is a separate operation;
-            // callers may explicitly unbind before installing new backing.
-            if vm.bindings.iter().any(|b| op.addr < b.end() && b.start < end) {
-                return Err(EINVAL);
-            }
             // Pin the real shmem pages, preserving their actual DMA addresses.
             let mut pages = KVec::new();
             pages.reserve((accessed / PAGE).try_into()?, GFP_KERNEL)?;
@@ -1016,6 +1010,13 @@ impl File {
                 return Err(EIO);
             }
             vm.bindings.reserve(1, GFP_KERNEL)?;
+            // GPUVM map operations replace overlaps, including Mesa's
+            // single-page scratch/zero mappings. Pin and validate the new
+            // backing first; preserve unaffected prefixes and suffixes using
+            // exactly the explicit-unbind path and its lifetime rules.
+            if vm.bindings.iter().any(|b| op.addr < b.end() && b.start < end) {
+                vm.unbind_range(dev, (inner.id, vm.id), op.addr, end)?;
+            }
             vm.invalidate_snapshots();
             vm.tree.prepare(op.addr, op.range)?;
             for index in 0..op.range / PAGE {
