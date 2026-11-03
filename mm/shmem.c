@@ -86,6 +86,7 @@ static struct vfsmount *shm_mnt __ro_after_init;
 #include <linux/uaccess.h>
 
 #include "internal.h"
+#include "p3s/truncate.h"
 
 #define VM_ACCT(size)    (PAGE_ALIGN(size) >> PAGE_SHIFT)
 
@@ -1371,6 +1372,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			if (oldsize > holebegin)
 				unmap_mapping_range(inode->i_mapping,
 							holebegin, 0, 1);
+			p3s_unmap_truncated_tail(inode->i_mapping, newsize);
 			if (info->alloced)
 				shmem_truncate_range(inode,
 							newsize, (loff_t)-1);
@@ -1378,6 +1380,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			if (oldsize > holebegin)
 				unmap_mapping_range(inode->i_mapping,
 							holebegin, 0, 1);
+			p3s_unmap_truncated_tail(inode->i_mapping, newsize);
 		}
 	}
 
