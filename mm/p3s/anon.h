@@ -744,8 +744,8 @@ static inline bool p3s_wp_reuse_zero_folio(struct folio *new_folio,
 	if (unlikely(unshare)) {
 		if (pte_soft_dirty(vmf->orig_pte))
 			entry = pte_mksoft_dirty(entry);
-		if (pte_uffd_wp(vmf->orig_pte))
-			entry = pte_mkuffd_wp(entry);
+		if (pte_uffd(vmf->orig_pte))
+			entry = pte_mkuffd(entry);
 	} else {
 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 	}

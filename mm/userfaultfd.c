@@ -2277,6 +2277,10 @@ static bool vma_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags,
 	if (!vma_is_anonymous(vma) && p3s_4k_unsupported(vma->vm_mm))
 		return false;
 
+	/* The 4KB slice helpers support missing and WP, not 7.3's RWP. */
+	if (vma_is_p3s_4k(vma) && (vm_flags & VM_UFFD_RWP))
+		return false;
+
 	vm_flags &= __VM_UFFD_FLAGS;
 
 	/*

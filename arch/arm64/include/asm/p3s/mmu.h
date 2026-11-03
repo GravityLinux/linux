@@ -107,7 +107,7 @@ do {									\
 		unsigned long __ttbr1 = read_sysreg(ttbr1_el1);		\
 									\
 		cpu_set_reserved_ttbr0_nosync();			\
-		write_sysreg(__ttbr1 & ~TTBR_ASID_MASK, ttbr1_el1);	\
+		write_sysreg(__ttbr1 & ~TTBRx_EL1_ASID_MASK, ttbr1_el1);	\
 		isb();							\
 		__cpu_set_tcr_geometry(mm_tcr_geometry(mm));		\
 	}								\

@@ -25,7 +25,7 @@ static inline void p3s_unmap_truncated_tail(struct address_space *mapping,
 		return;
 
 	i_mmap_lock_read(mapping);
-	vma_interval_tree_foreach(vma, &mapping->i_mmap, index, index) {
+	mapping_rmap_tree_foreach(vma, mapping, index, index) {
 		unsigned long start, end;
 		u64 offset;
 
@@ -39,7 +39,7 @@ static inline void p3s_unmap_truncated_tail(struct address_space *mapping,
 		end = vma->vm_start + min_t(u64, last - offset,
 					  vma->vm_end - vma->vm_start);
 		if (start < end)
-			zap_page_range_single(vma, start, end - start, NULL);
+			zap_vma_range(vma, start, end - start);
 	}
 	i_mmap_unlock_read(mapping);
 }
