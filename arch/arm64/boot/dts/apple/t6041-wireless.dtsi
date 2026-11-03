@@ -112,5 +112,10 @@
 			gpio-controller;
 			#gpio-cells = <2>;
 		};
+		smc_gpio_low: gpio-low {
+			compatible = "apple,smc-low-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
 	};
 };
