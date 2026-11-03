@@ -154,16 +154,17 @@ int main(int argc, char **argv)
 	bind(fd, vm, 0, VA + PAGE, PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0);
 	bind(fd, vm, bo, VA + PAGE, PAGE, 2 * PAGE, RW, 0);
 	bind(fd, vm, bo, VA, PAGE, 0, RW, 0);
-	bind(fd, vm, bo, VA + 2 * PAGE, PAGE, 0, RW, EINVAL);
+	bind(fd, vm, bo, VA + 2 * PAGE, PAGE, 0, RW, 0);
 	bind(fd, vm2, bo, VA, 3 * PAGE, 0, DRM_ASAHI_BIND_READ, 0);
 	/* Rebinding the read-only shadow is idempotent, including a matching
-	 * subrange. Different offsets/permissions/backing still conflict. */
+	 * subrange. Different offsets, permissions and backing replace the
+	 * overlapping range using normal GPUVM semantics. */
 	bind(fd, vm2, bo, VA, 3 * PAGE, 0, DRM_ASAHI_BIND_READ, 0);
 	bind(fd, vm2, bo, VA + PAGE, PAGE, PAGE, DRM_ASAHI_BIND_READ, 0);
-	bind(fd, vm2, bo, VA + PAGE, PAGE, 0, DRM_ASAHI_BIND_READ, EINVAL);
-	bind(fd, vm2, bo, VA, PAGE, 0, RW, EINVAL);
+	bind(fd, vm2, bo, VA + PAGE, PAGE, 0, DRM_ASAHI_BIND_READ, 0);
+	bind(fd, vm2, bo, VA, PAGE, 0, RW, 0);
 	uint32_t shadow_other = bo_new(fd, PAGE, 0, 0);
-	bind(fd, vm2, shadow_other, VA, PAGE, 0, DRM_ASAHI_BIND_READ, EINVAL);
+	bind(fd, vm2, shadow_other, VA, PAGE, 0, DRM_ASAHI_BIND_READ, 0);
 	bo_close(fd, shadow_other);
 	bind(fd, vm, bo, VA + 16 * PAGE, 8 * PAGE, PAGE,
 	     RW | DRM_ASAHI_BIND_SINGLE_PAGE, 0);
@@ -172,7 +173,7 @@ int main(int argc, char **argv)
 	bind(fd, vm, bo, VA + 16 * PAGE, 8 * PAGE, PAGE, RW | DRM_ASAHI_BIND_SINGLE_PAGE, 0);
 	bind(fd, vm, 0, VA + 18 * PAGE, 3 * PAGE, 0, DRM_ASAHI_BIND_UNBIND, 0);
 	bind(fd, vm, bo, VA + 18 * PAGE, 3 * PAGE, 0, RW, 0);
-	bind(fd, vm, bo, VA + 21 * PAGE, PAGE, 0, RW, EINVAL);
+	bind(fd, vm, bo, VA + 21 * PAGE, PAGE, 0, RW, 0);
 	uint32_t priv = bo_new(fd, PAGE, DRM_ASAHI_GEM_VM_PRIVATE, vm);
 	bind(fd, vm2, priv, VA + 32 * PAGE, PAGE, 0, RW, EINVAL);
 	bind(fd, vm, priv, VA + 32 * PAGE, PAGE, 0, RW, 0);
