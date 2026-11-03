@@ -27,6 +27,7 @@
 #include <linux/secretmem.h>
 
 #include "internal.h"
+#include "p3s/mlock.h"
 #include <linux/p3s_user_pages.h>
 
 struct mlock_fbatch {
@@ -390,6 +391,9 @@ static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
 		if (!folio || folio_is_zone_device(folio))
 			continue;
 
+		step = p3s_mlock_folio(folio, vma, pte, addr, end);
+		if (step)
+			goto next_entry;
 		step = folio_mlock_step(folio, pte, addr, end);
 		if (!allow_mlock_munlock(folio, vma, start, end, step))
 			goto next_entry;

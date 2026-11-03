@@ -91,6 +91,7 @@
 #include "p3s/anon.h"
 #include "p3s/memory.h"
 #include "swap.h"
+#include "p3s/mlock.h"
 #include <linux/p3s_user_pages.h>
 
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
@@ -5789,6 +5790,7 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
 		folio_add_file_rmap_ptes(folio, page, nr, vma);
 	}
 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr);
+	p3s_mlock_file_folio(folio, vma, vmf->pte, addr);
 
 	/* no need to invalidate: a not-present page won't be cached */
 	update_mmu_cache_range(vmf, vma, addr, vmf->pte, nr);
