@@ -466,6 +466,10 @@ impl Schedule {
                 let mut held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
                 let runtime = Option::as_mut(&mut *held)?;
+                // Respect the same engine handoff during preparation as at
+                // publication. Otherwise a competing client can repeatedly
+                // reserve the pool needed by the preferred client.
+                if !Self::preferred(runtime, 0, node) { continue; }
                 let snapshot = prepared.render_snapshot.as_ref()?;
                 if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
                 let Some(rebind) = runtime.session.capture_render_rebind(snapshot.client(),&parameters,storage).ok()? else { continue; };
