@@ -196,7 +196,7 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 		dev_err(smcgp->dev, "GPIO set failed %p4ch = 0x%x\n",
 			&key, value);
 
-	return ret;
+	return ret < 0 ? ret : 0;
 }
 
 static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
