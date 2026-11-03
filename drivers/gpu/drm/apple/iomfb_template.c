@@ -1093,6 +1093,17 @@ static void dcp_poweron_after_first_client(struct apple_dcp *dcp, void *out,
 static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
 					   void *cookie)
 {
+	/* Ordinary panel blanking retains the client opened during startup.
+	 * The J616c 26.6.2 display-sleep/wake capture goes from A414 directly
+	 * to the display query and A473(1), without A457/A474. Reopening the
+	 * client here is reserved for the external pipeline's full wake path.
+	 */
+	if (dcp_has_panel(dcp)) {
+		dcp_is_main_display(dcp, false, dcp_poweron_after_main_display,
+				    cookie);
+		return;
+	}
+
 	dcp_first_client_open(dcp, false, dcp_poweron_after_first_client,
 			      cookie);
 }
