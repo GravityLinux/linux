@@ -265,7 +265,9 @@ pub(crate) struct Bo {
 #[vtable]
 impl DriverObject for Bo {
     fn create_imported(_dev: &Device, _size: usize) -> impl PinInit<Self, Error> {
-        Err::<Self, Error>(EOPNOTSUPP)
+        // Foreign dma-bufs are shared objects, like exported shared GEM BOs.
+        // Their attachment owns the exporter and SG table until GEM release.
+        Ok(Self { owner_file: 0, owner_vm: 0 })
     }
 
     type Driver = Driver;

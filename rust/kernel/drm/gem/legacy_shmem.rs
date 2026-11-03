@@ -75,6 +75,8 @@ pub struct ObjectConfig<'a, T: DriverObject> {
 #[repr(C)]
 #[pin_data]
 pub struct Object<T: DriverObject> {
+    // The C shmem allocator frees this address on initialization failure.
+    // Keep the embedded object first, as required by the allocation callback.
     #[pin]
     obj: Opaque<bindings::drm_gem_shmem_object>,
     /// Parent object that owns this object's DMA reservation object.
@@ -120,6 +122,35 @@ impl<T: DriverObject> Object<T> {
     /// Return a raw pointer to the embedded drm_gem_shmem_object.
     fn as_raw_shmem(&self) -> *mut bindings::drm_gem_shmem_object {
         self.obj.get()
+    }
+
+    extern "C" fn gem_create_object_callback(
+        raw_dev: *mut bindings::drm_device,
+        size: usize,
+    ) -> *mut bindings::drm_gem_object {
+        const_assert!(core::mem::offset_of!(Self, obj) == 0);
+        // SAFETY: AllocOps belongs to T::Driver, so the C helper passes that
+        // driver's registered device here.
+        let dev = unsafe { device::Device::<T::Driver>::from_raw(raw_dev) };
+        let new: Pin<KBox<Self>> = match KBox::try_pin_init(
+            try_pin_init!(Self {
+                obj <- Opaque::init_zeroed(),
+                parent_resv_obj: None,
+                inner <- T::create_imported(dev, size),
+            }),
+            GFP_KERNEL,
+        ) {
+            Ok(new) => new,
+            Err(e) => return e.to_ptr(),
+        };
+        // SAFETY: The complete Rust payload is initialized, but GEM has not
+        // been published. The C helper initializes the embedded shmem object
+        // next and releases it through this vtable on normal destruction.
+        unsafe { (*new.as_raw()).funcs = &Self::VTABLE };
+        // SAFETY: Ownership passes to the C shmem helper; the allocation is
+        // never moved. Its initialization-error kfree is valid at offset zero.
+        let new = KBox::into_raw(unsafe { Pin::into_inner_unchecked(new) });
+        unsafe { &raw mut (*(*new).obj.get()).base }
     }
 
     /// Create a new shmem-backed DRM object of the given size.
@@ -337,13 +368,12 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
     type Driver = T::Driver;
 
     const ALLOC_OPS: driver::AllocOps = driver::AllocOps {
-        gem_create_object: None,
+        gem_create_object: Some(Self::gem_create_object_callback),
         prime_handle_to_fd: None,
         prime_fd_to_handle: None,
         gem_prime_import: None,
-        // The generic C allocators do not initialize the Rust object payload.
-        // Support native GEM allocation and export only.
-        gem_prime_import_sg_table: None,
+        // The allocation callback above initializes the complete Rust payload.
+        gem_prime_import_sg_table: Some(bindings::drm_gem_shmem_prime_import_sg_table),
         dumb_create: None,
         dumb_map_offset: None,
     };
