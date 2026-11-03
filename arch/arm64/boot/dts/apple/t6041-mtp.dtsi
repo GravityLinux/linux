@@ -5,6 +5,7 @@
 / {
 	aliases {
 		keyboard = &mtp_keyboard;
+		mtp = &mtp;
 	};
 };
 
