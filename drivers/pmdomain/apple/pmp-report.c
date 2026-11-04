@@ -8,6 +8,7 @@
 #include <linux/bitops.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/overflow.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
@@ -26,6 +27,23 @@
 #define PMP_SOC_DEVICE_FLAGS_OFFSET 8
 #define PMP_SOC_DEVICE_ACK BIT(1)
 
+/* PTD read records contain a value and a hardware stamp. The update window
+ * packs only the values. These strides are independently visible in the
+ * existing T6000/T6020/T8112 layouts below.
+ */
+#define PMP_PTD_READ_STRIDE 16
+#define PMP_PTD_WRITE_STRIDE 8
+#define PMP_PTD_WRITE_WINDOW 0x10000
+
+struct apple_pmp_ptd_range {
+	__le32 id;
+	__le32 start;
+	__le32 count;
+	__le32 flags;
+	char name[16];
+};
+static_assert(sizeof(struct apple_pmp_ptd_range) == 32);
+
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
 	u32 tgt_write;
@@ -38,6 +56,7 @@ struct apple_pmp_report_offsets {
 struct apple_pmp_report {
 	struct device *dev;
 	const struct apple_pmp_report_offsets *offsets;
+	struct apple_pmp_report_offsets ptd_offsets;
 	void __iomem *base;
 	void __iomem *event_config;
 	struct delayed_work finalize_work;
@@ -177,11 +196,73 @@ static void apple_pmp_report_finalize_work(struct work_struct *work)
 		       rep->event_config + 0x20);
 }
 
+static int apple_pmp_report_ptd_offsets(struct apple_pmp_report *rep,
+				       resource_size_t size)
+{
+	struct device_node *pmp __free(device_node) =
+		of_parse_phandle(rep->dev->of_node, "apple,pmp", 0);
+	const struct apple_pmp_ptd_range *ranges;
+	struct platform_device *supplier;
+	struct device_link *link;
+	bool status = false, request = false, ack = false;
+	int len;
+
+	if (!pmp)
+		return dev_err_probe(rep->dev, -EINVAL, "missing apple,pmp supplier\n");
+	supplier = of_find_device_by_node(pmp);
+	if (!supplier)
+		return -EPROBE_DEFER;
+	if (!device_is_bound(&supplier->dev)) {
+		put_device(&supplier->dev);
+		return -EPROBE_DEFER;
+	}
+	link = device_link_add(rep->dev, &supplier->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+	put_device(&supplier->dev);
+	if (!link)
+		return -ENOMEM;
+	ranges = of_get_property(pmp, "apple,tunable-ptd-range", &len);
+	if (!ranges || len <= 0 || len % sizeof(*ranges))
+		return dev_err_probe(rep->dev, -EINVAL, "invalid PMP PTD descriptors\n");
+
+	for (int i = 0; i < len / sizeof(*ranges); i++) {
+		u32 start = le32_to_cpu(ranges[i].start);
+		u32 offset, update;
+
+		if (!le32_to_cpu(ranges[i].count) ||
+		    check_mul_overflow(start, PMP_PTD_READ_STRIDE, &offset) ||
+		    check_mul_overflow(start, PMP_PTD_WRITE_STRIDE, &update) ||
+		    check_add_overflow(update, PMP_PTD_WRITE_WINDOW, &update) ||
+		    size < sizeof(u64) || offset > size - sizeof(u64) ||
+		    update > size - sizeof(u64))
+			return dev_err_probe(rep->dev, -EINVAL, "PTD range outside resource\n");
+
+		if (!strncmp(ranges[i].name, "PMP-STATUS", sizeof(ranges[i].name))) {
+			rep->ptd_offsets.status = offset;
+			status = true;
+		} else if (!strncmp(ranges[i].name, "SOC-DEV-PS-REQ", sizeof(ranges[i].name))) {
+			rep->ptd_offsets.tgt_read = offset;
+			rep->ptd_offsets.tgt_write = update;
+			request = true;
+		} else if (!strncmp(ranges[i].name, "SOC-DEV-PS-ACK", sizeof(ranges[i].name))) {
+			rep->ptd_offsets.actual = offset;
+			ack = true;
+		}
+	}
+	if (!status || !request || !ack)
+		return dev_err_probe(rep->dev, -EINVAL, "missing PMP power-state PTD range\n");
+	rep->offsets = &rep->ptd_offsets;
+	dev_info(rep->dev, "PTD power request %#x/%#x, ack %#x, status %#x\n",
+		 rep->offsets->tgt_read, rep->offsets->tgt_write,
+		 rep->offsets->actual, rep->offsets->status);
+	return 0;
+}
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
 	struct apple_pmp_report *rep;
+	struct resource *res;
 	int ret;
 
 	rep = devm_kzalloc(dev, sizeof(*rep), GFP_KERNEL);
@@ -191,10 +272,21 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	spin_lock_init(&rep->lock);
 	rep->dev = dev;
 	rep->probed = jiffies;
-	rep->base = devm_platform_ioremap_resource(pdev, 0);
+	rep->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	if (!rep->offsets) {
+		u64 status;
+
+		ret = apple_pmp_report_ptd_offsets(rep, resource_size(res));
+		if (ret)
+			return ret;
+		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
+					status & PMP_REPORT_READY, 100, 10000000);
+		if (ret)
+			return dev_err_probe(dev, ret, "PMP firmware did not become ready\n");
+	}
 	if (rep->offsets->has_event_config) {
 		rep->event_config = devm_platform_ioremap_resource_byname(pdev, "event-config");
 		if (IS_ERR(rep->event_config))
@@ -288,6 +380,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
+	{ .compatible = "apple,t8142-pmp-v2-report" },
 	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
 	{ .compatible = "apple,t6041-pmp-v2-report", .data = &apple_pmp_offsets_t6041 },
@@ -322,11 +415,12 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
 	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
 	u64 bit_val = BIT_ULL(ent->id);
-	u64 val;
+	u64 val, old;
+	int ret;
 	unsigned long flags;
 
 	spin_lock_irqsave(&rep->lock, flags);
-	val = readq(rep->base + rep->offsets->tgt_read);
+	old = val = readq(rep->base + rep->offsets->tgt_read);
 	val &= ~bit_val;
 	if (enable)
 		val |= bit_val;
@@ -338,12 +432,21 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	val = readq(rep->base + rep->offsets->status);
 	if ((val & PMP_REPORT_READY) == 0)
 		return 0;
-	return readq_poll_timeout_atomic(
+	ret = readq_poll_timeout_atomic(
 		rep->base + rep->offsets->actual,
 		val,
 		!!(val & bit_val) == !!enable,
 		100,
 		50000);
+	if (ret) {
+		/* Restore this failed consumer's vote without changing other votes. */
+		spin_lock_irqsave(&rep->lock, flags);
+		val = readq(rep->base + rep->offsets->tgt_read);
+		val = (val & ~bit_val) | (old & bit_val);
+		writeq(val, rep->base + rep->offsets->tgt_write);
+		spin_unlock_irqrestore(&rep->lock, flags);
+	}
+	return ret;
 }
 
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)

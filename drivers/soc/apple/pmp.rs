@@ -76,6 +76,7 @@ struct PmpAllocation {
     alloc: Coherent<[u8]>,
 }
 
+#[repr(C)]
 struct IovaTableEntry {
     _host_addr: u64,
     _pio_base: u64,
@@ -97,14 +98,30 @@ struct PmpState {
 
 struct PmpHwConfig {
     advertise_reply_index: bool,
+    pmc_bootstrap: bool,
+    shared_request_handles: bool,
+    display_monitor_defaults: bool,
 }
 
 const PMP_HW_T6000: PmpHwConfig = PmpHwConfig {
     advertise_reply_index: true,
+    pmc_bootstrap: false,
+    shared_request_handles: false,
+    display_monitor_defaults: true,
 };
 
 const PMP_HW_T8132: PmpHwConfig = PmpHwConfig {
     advertise_reply_index: false,
+    pmc_bootstrap: false,
+    shared_request_handles: false,
+    display_monitor_defaults: true,
+};
+
+const PMP_HW_T8142: PmpHwConfig = PmpHwConfig {
+    advertise_reply_index: false,
+    pmc_bootstrap: true,
+    shared_request_handles: true,
+    display_monitor_defaults: false,
 };
 
 impl PmpState {
@@ -135,6 +152,7 @@ impl PmpState {
 
 #[pin_data]
 struct PmpData {
+    hw: &'static PmpHwConfig,
     dev: ARef<device::Device>,
     advertise_reply_index: bool,
     pmp_mmio: DevresIoMem,
@@ -156,6 +174,7 @@ impl PmpData {
         Arc::pin_init(
             try_pin_init!(
                 PmpData {
+                    hw: cfg,
                     dev: dev.as_ref().into(),
                     advertise_reply_index: cfg.advertise_reply_index,
                     pmp_mmio,
@@ -362,7 +381,8 @@ impl PmpData {
                 size
             );
         }
-        if display_monitor && size == mem::size_of::<u32>() as u32 {
+        if self.hw.display_monitor_defaults && display_monitor
+            && size == mem::size_of::<u32>() as u32 {
             /* The monitor descriptors carry their initial value through the
              * shared value buffer.  Native T8132 publishes all four display
              * monitor properties as one; a zero-filled host buffer silently
@@ -455,6 +475,11 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
+    fn shared_request(&self, handle: u64) -> Result<u64> {
+        let state = self.state.lock();
+        let len = *state.ioreg_entries.get(handle as usize).ok_or(EIO)? as u64;
+        Ok(((OPC_ADVERTISE_DONE | OPC_ACK_MASK) << OPC_SHIFT) | len)
+    }
     fn advertise_done(&self, count: u64) -> u64 {
         let state = self.state.lock();
         if verbose() {
@@ -480,6 +505,9 @@ impl PmpData {
             // The low bits contain the number of properties advertised in
             // this batch.  Current firmware expects a fixed value of 8 in
             // the acknowledgement, rather than the count echoed back.
+            OPC_ADVERTISE_DONE if self.hw.shared_request_handles => {
+                self.shared_request(msg & SET_IOREG_INDEX_MASK)?
+            }
             OPC_ADVERTISE_DONE => self.advertise_done(msg & MSG_IOVA_MASK),
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
@@ -547,6 +575,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <PmpDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c"apple,t8142-pmp-v2"), &PMP_HW_T8142),
         (of::DeviceId::new(c"apple,t8132-pmp-v2"), &PMP_HW_T8132),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &PMP_HW_T8132),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &PMP_HW_T6000),
@@ -598,6 +627,16 @@ impl platform::Driver for PmpDriver {
                 &[(from_fourcc(b"BDID"), bdid), (from_fourcc(b"DVID"), dvid)],
             )?,
         };
+        if cfg.pmc_bootstrap {
+            // Scalar controls observed at T8142 CPU start. PMCM units remain
+            // unqualified; preserve the independently tested bootstrap value.
+            data.patch_bootargs(&[
+                (from_fourcc(b"PMC_"), 1),
+                (from_fourcc(b"PMCV"), 1),
+                (from_fourcc(b"PMCB"), 1),
+                (from_fourcc(b"PMCM"), 1_000_000),
+            ])?;
+        }
         let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
         data.rtkit.lock().as_mut().set(Some(rtkit));
         data.start_cpu()?;
