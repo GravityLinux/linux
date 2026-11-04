@@ -532,7 +532,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	 * use EPICProviderClass to match the service.
 	 */
 	if (props_size > 36) {
-		int ret = parse(props, props_size, &ctx);
+		int ret = parse(ep->dcp, props, props_size, &ctx);
 		if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: Failed to parse service init props for %s\n",

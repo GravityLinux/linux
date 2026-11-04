@@ -267,11 +267,13 @@ static int iterator_begin(struct dcp_parse_ctx *handle, struct iterator *it,
 #define dcp_parse_foreach_in_dict(handle, it)                                  \
 	for (iterator_begin(handle, &it, true); it.idx < it.len; ++it.idx)
 
-int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
+int parse(struct apple_dcp *dcp, const void *blob, size_t size,
+	  struct dcp_parse_ctx *ctx)
 {
 	const u32 *header;
 
 	*ctx = (struct dcp_parse_ctx) {
+		.dcp = dcp,
 		.blob = blob,
 		.len = size,
 		.pos = 0,

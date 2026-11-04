@@ -81,7 +81,7 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	if (type != EPIC_SUBTYPE_STD_SERVICE)
 		return 0;
 
-	ret = parse(data, data_size, &parse_ctx);
+	ret = parse(dcp, data, data_size, &parse_ctx);
 	if (ret) {
 		dev_warn(service->ep->dcp->dev, "systemep: failed to parse report: %d\n", ret);
 		return ret;

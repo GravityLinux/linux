@@ -771,10 +771,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
-	/* used just as opaque pointer for tracing */
-	ctx.dcp = dcp;
-
-	ret = parse(dcp->chunks.data, dcp->chunks.length, &ctx);
+	ret = parse(dcp, dcp->chunks.data, dcp->chunks.length, &ctx);
 
 	if (ret) {
 		dev_warn(dcp->dev, "bad header on dcpav props\n");
