@@ -42,7 +42,8 @@ class CentauriDeviceTreeTests(unittest.TestCase):
         self.assertEqual(describe_adt(adt)['ranges'][0], (0x43000000, 0xbc0000000, 0xbc0000000, 0x20000000))
 
     def test_generated_tree_describes_functions_and_reserved_handoffs(self):
-        text, blobs, loads = generate(self.info, self.wifi, self.bt, 0x10000500000, 0x10000508000)
+        text, blobs, loads = generate(self.info, self.wifi, self.bt, 0x10000500000, 0x10000508000,
+                                      base_dts='/dts-v1/;\n/ { };\n')
         self.assertIn('reg = <0x10100 0 0 0 0>', text)
         self.assertIn('bus-range = <1 1>', text)
         self.assertIn('<0x2000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>', text)

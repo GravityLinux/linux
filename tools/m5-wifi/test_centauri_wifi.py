@@ -30,11 +30,13 @@ class WiFiQueueWireTests(unittest.TestCase):
 
 
 class WiFiContextAndMessageTests(unittest.TestCase):
-    def test_fresh_context_matches_captured_header_and_zero_indices(self):
+    def test_fresh_context_has_generated_header_and_zero_indices(self):
         words = [0x680300, 0, 0x3cf8068, 0, 0x3cf8078, 0, 0x3cf824c, 0,
                  0x3cf83cc, 0, 0x3cf85a0, 0, 0xc000ea, 0x3cf8820, 0,
-                 0x3cf8720, 0, 0x100010, 0xffff0000, 0, 0, 0, 0x3cf8920, 0,
+                 0x3cf8720, 0, 0x100010, 0, 0, 0, 0, 0x3cf8920, 0,
                  0x500000, 0, 2, 2, 0, 0]
+        # Independent hardware experiment 222 qualified zero at +0x48;
+        # the older reference-header fixture retained 0xffff0000 there.
         context = make_wifi_context(0x3cf8000)
         self.assertEqual(context[:0x78], struct.pack('<30I', *words))
         self.assertEqual(context[0x78:], bytes(0x960 - 0x78))
