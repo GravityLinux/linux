@@ -57,6 +57,7 @@
 #define TAS2764_TDM_CFG0_44_1_48KHZ	BIT(3)
 #define TAS2764_TDM_CFG0_88_2_96KHZ	(BIT(3) | BIT(1))
 #define TAS2764_TDM_CFG0_FRAME_START	BIT(0)
+#define TAS2764_TDM_CFG0_CLASSD_SYNC	BIT(6)
 
 /* TDM Configuration Reg1 */
 #define TAS2764_TDM_CFG1		TAS2764_REG(0X0, 0x09)
@@ -109,6 +110,9 @@
 #define TAS2764_INT_MASK3               TAS2764_REG(0x0, 0x41)
 #define TAS2764_INT_MASK4               TAS2764_REG(0x0, 0x3d)
 
+/* Primary live fault status (page0, read-only). */
+#define TAS2764_INT_LIVE0 TAS2764_REG(0, 0x42)
+
 /* Latched Fault Registers */
 #define TAS2764_INT_LTCH0               TAS2764_REG(0x0, 0x49)
 #define TAS2764_INT_LTCH1               TAS2764_REG(0x0, 0x4a)
@@ -138,6 +142,15 @@
 #define TAS2764_SDOUT_HIZ_9_FORCE_0_EN BIT(7)
 
 struct snd_soc_component;
+struct tas2764_live_state {
+	unsigned int power, analog_gain, attenuation;
+	unsigned int tdm_rate, tdm_start, tdm_word, tdm_slots;
+	unsigned int live_faults;
+};
+int tas2764_read_live_state(struct snd_soc_component *component,
+			    struct tas2764_live_state *state);
+void tas2764_external_reset(struct snd_soc_component *component);
+int tas2764_external_restore(struct snd_soc_component *component);
 int tas2764_set_protected_attenuation(struct snd_soc_component *component,
 				    unsigned int attenuation);
 int tas2764_get_protected_attenuation(struct snd_soc_component *component);
