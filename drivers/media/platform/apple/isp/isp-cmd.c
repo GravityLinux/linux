@@ -6,6 +6,11 @@
 #include "isp-iommu.h"
 #include "isp-ipc.h"
 
+#include <linux/slab.h>
+
+/* Modern CISP module-calibration query size, observed on the 27.2 API. */
+#define CISP_FACTORY_LSC_GRID_SIZE 0x620
+
 #define CISP_OPCODE_SHIFT     32UL
 #define CISP_OPCODE(x)	      (((u64)(x)) << CISP_OPCODE_SHIFT)
 #define CISP_OPCODE_GET(x)    (((u64)(x)) >> CISP_OPCODE_SHIFT)
@@ -38,6 +43,7 @@ static int cisp_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 			"%s: failed to send OPCODE 0x%04llx: [0x%llx, 0x%llx, 0x%llx]\n",
 			chan->name, CISP_OPCODE_GET(opcode), req->arg0,
 			req->arg1, req->arg2);
+		isp_dump_boot_log(isp);
 	}
 
 	return err;
@@ -561,13 +567,14 @@ int isp_cmd_ch_buffer_pool_return(struct apple_isp *isp, u32 chan)
 	return CISP_SEND_IN(isp, args);
 }
 
-int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan, u32 arg)
+int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan,
+					 u32 fusion_type)
 {
 	struct cmd_apple_ch_temporal_filter_start args = {
 		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_START),
 		.chan = chan,
 		.unk_c = 1,
-		.unk_10 = arg,
+		.fusion_type = fusion_type,
 	};
 	return CISP_SEND_IN(isp, args);
 }
@@ -764,5 +771,50 @@ int isp_cmd_ch_property_read(struct apple_isp *isp, u32 chan, u32 prop, u32 *val
 
 	*val = args.val;
 
+	return ret;
+}
+
+int isp_cmd_ch_check_factory_lsc(struct apple_isp *isp, u32 chan)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 layout;
+		u32 info;
+	} __packed info = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET),
+		.chan = chan,
+	};
+	struct factory_lsc_grid {
+		u64 opcode;
+		u32 chan;
+		u32 info;
+		u8 payload[CISP_FACTORY_LSC_GRID_SIZE - 16];
+	} __packed *grid;
+	int ret;
+
+	/* This route uses firmware's sensor/module profile, not a captured blob.
+	 * Require a live, populated factory grid before attempting capture.
+	 * The upper layout fields remain firmware-format metadata.
+	 */
+	ret = CISP_SEND_OUT(isp, &info);
+	if (ret)
+		return ret;
+	if (!(info.layout & 0xff) || !(info.layout & 0xff00))
+		return -ENODATA;
+	grid = kzalloc(sizeof(*grid), GFP_KERNEL);
+	if (!grid)
+		return -ENOMEM;
+	grid->opcode = CISP_OPCODE(CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET);
+	grid->chan = chan;
+	ret = cisp_send_read(isp, grid, sizeof(*grid), sizeof(*grid));
+	if (!ret && (!grid->info ||
+		     !memchr_inv(grid->payload, 0, sizeof(grid->payload))))
+		ret = -ENODATA;
+	if (!ret)
+		dev_info(isp->dev, "factory LSC available: %ux%u, format %#x, info %#x\n",
+			 info.layout & 0xff, (info.layout >> 8) & 0xff,
+			 info.layout >> 16, info.info);
+	kfree(grid);
 	return ret;
 }

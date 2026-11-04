@@ -44,6 +44,7 @@ enum isp_firmware_version {
 	ISP_FIRMWARE_V_14_7,
 	ISP_FIRMWARE_V_26_6,
 	ISP_FIRMWARE_V_26_6_2,
+	ISP_FIRMWARE_V_27_2,
 };
 
 struct isp_surf {
@@ -103,6 +104,8 @@ struct isp_preset {
 };
 
 struct apple_isp_hw {
+	/* This profile obtains module processing tuning from board firmware. */
+	bool module_tuning;
 	enum isp_generation gen;
 	u64 pmu_base;
 
@@ -182,6 +185,7 @@ enum isp_sensor_id {
 	ISP_VD56G0_6221_01,
 	ISP_VD56G0_6222_01,
 	ISP_SENSOR_0958,
+	ISP_IMX958_FACTORY,
 };
 
 struct isp_format {
@@ -200,6 +204,7 @@ struct apple_isp {
 	enum isp_firmware_version fw_compat;
 	u32 platform_id;
 	u32 temporal_filter;
+	u32 frame_rate; /* Q8 frames per second, negotiated through V4L2. */
 	struct isp_preset *presets;
 	int num_presets;
 

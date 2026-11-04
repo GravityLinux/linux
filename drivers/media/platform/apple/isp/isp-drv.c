@@ -239,6 +239,8 @@ static const char * isp_fw2str(enum isp_firmware_version version)
 		return "26.6";
 	case ISP_FIRMWARE_V_26_6_2:
 		return "26.6.2";
+	case ISP_FIRMWARE_V_27_2:
+		return "27.2";
 	default:
 		return "unknown";
 	}
@@ -269,6 +271,8 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 			return ISP_FIRMWARE_V_26_6_2;
 		else if (ver[0] == 26 && ver[1] == 6)
 			return ISP_FIRMWARE_V_26_6;
+		else if (ver[0] == 27 && ver[1] == 2)
+			return ISP_FIRMWARE_V_27_2;
 
 		dev_warn(dev, "unknown %s: %d.%d.%d\n", name, ver[0], ver[1], ver[2]);
 		break;
@@ -686,7 +690,28 @@ static const struct apple_isp_hw apple_isp_hw_t6041 = {
 	.meta_size = ISP_META_SIZE_T6031,
 };
 
+/* T8142 revision 0x110001: common modern boot/mailbox protocol, with
+ * resources and control arguments observed on the J813 runtime interface.
+ */
+static const struct apple_isp_hw apple_isp_hw_t8142 = {
+	.module_tuning = true;
+	.gen = ISP_GEN_T8140,
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x220114000,
+	.dsid_clr_range0 = 0x2fc,
+	.clock_scratch = 0x3803d01d8,
+	.clock_size = 8,
+	.bandwidth_scratch = 0x382724000,
+	.bandwidth_size = 8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+	/* Pool 0 size returned by the firmware's buffer-configuration query. */
+	.meta_size = 0x4d00,
+	/* Runtime firmware requires AuxSclProc; the old BES path is absent. */
+	.scl1 = true,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
+	{ .compatible = "apple,t8142-isp", .data = &apple_isp_hw_t8142 },
 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6041 },
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },

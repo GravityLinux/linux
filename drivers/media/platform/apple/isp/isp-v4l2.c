@@ -2,6 +2,7 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/module.h>
+#include <linux/math64.h>
 
 #include <media/media-device.h>
 #include <media/v4l2-common.h>
@@ -544,9 +545,11 @@ static int isp_vidioc_enum_frameintervals(struct file *filp, void *priv,
 	if (interval->index != 0)
 		return -EINVAL;
 
-	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	interval->discrete.numerator = 1;
-	interval->discrete.denominator = 30;
+	interval->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
+	interval->stepwise = (struct v4l2_frmival_stepwise) {
+		.min = { 1, ISP_FRAME_RATE_DEN / ISP_FRAME_RATE_NUM },
+		.max = { 1, ISP_FRAME_RATE_DEN2 / ISP_FRAME_RATE_NUM },
+	};
 	return 0;
 }
 
@@ -734,7 +737,7 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
 	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_NUM;
-	a->parm.capture.timeperframe.denominator = ISP_FRAME_RATE_DEN;
+	a->parm.capture.timeperframe.denominator = isp->frame_rate;
 
 	return 0;
 }
@@ -749,13 +752,21 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
 	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
 		return -EINVAL;
 
-	/* Not supporting frame rate sets. No use. Plus floats. */
-	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
-	a->parm.capture.timeperframe.numerator = ISP_FRAME_RATE_NUM;
-	a->parm.capture.timeperframe.denominator = ISP_FRAME_RATE_DEN;
+	if (vb2_is_streaming(&isp->vbq))
+		return -EBUSY;
 
-	return 0;
+	if (!a->parm.capture.timeperframe.numerator ||
+	    !a->parm.capture.timeperframe.denominator) {
+		isp->frame_rate = ISP_FRAME_RATE_DEN;
+	} else {
+		u64 rate = DIV_ROUND_CLOSEST_ULL(
+			(u64)a->parm.capture.timeperframe.denominator * ISP_FRAME_RATE_NUM,
+			a->parm.capture.timeperframe.numerator);
+
+		isp->frame_rate = clamp_t(u64, rate, ISP_FRAME_RATE_DEN2,
+					 ISP_FRAME_RATE_DEN);
+	}
+	return isp_vidioc_get_param(file, fh, a);
 }
 
 static const struct v4l2_ioctl_ops isp_v4l2_ioctl_ops = {
@@ -809,6 +820,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	struct isp_format *fmt = isp_get_current_format(isp);
 	int err;
 
+	isp->frame_rate = ISP_FRAME_RATE_DEN;
 	err = isp_set_preset(isp, fmt, &isp->presets[0]);
 	if (err) {
 		dev_err(isp->dev, "failed to set default preset: %d\n", err);
@@ -823,6 +835,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
 			err = -ENOMEM;
 			goto surf_cleanup;
 		}
+		dev_dbg(isp->dev, "metadata surface %u: iova=%#llx size=%#llx\n",
+			i, isp->meta_surfs[i]->iova, isp->meta_surfs[i]->size);
 	}
 
 	media_device_init(&isp->mdev);

@@ -8,6 +8,42 @@
 
 #define ISP_IPC_FLAG_TERMINAL_ACK	0x3
 #define ISP_IPC_BUFEXC_STAT_META_OFFSET 0x10
+#define ISP_BOOT_LOG_ENTRY_SIZE 0x90
+#define ISP_BOOT_LOG_TEXT_OFFSET 16
+#define ISP_BOOT_LOG_RECENT_RECORDS 64
+
+void isp_dump_boot_log(struct apple_isp *isp)
+{
+	struct isp_surf *surf = isp->boot_log_surf;
+	u32 cursor, stride, last_sequence;
+	size_t offset;
+
+	/* Only the host allocation supplied in the modern boot arguments. */
+	if (!surf || !surf->virt || surf->size != 0x48000)
+		return;
+	dma_rmb();
+	memcpy(&cursor, surf->virt, sizeof(cursor));
+	memcpy(&stride, surf->virt + 4, sizeof(stride));
+	if (stride != ISP_BOOT_LOG_ENTRY_SIZE || cursor < stride ||
+	    cursor >= surf->size || cursor % stride)
+		return;
+	offset = cursor == stride ? surf->size - stride : cursor - stride;
+	memcpy(&last_sequence, surf->virt + offset + 12, sizeof(last_sequence));
+	for (size_t slot = 0; slot < surf->size / stride - 1; slot++) {
+		u32 sequence;
+		char text[ISP_BOOT_LOG_ENTRY_SIZE - ISP_BOOT_LOG_TEXT_OFFSET];
+
+		offset = stride + (cursor / stride - 1 + slot) %
+			 (surf->size / stride - 1) * stride;
+		memcpy(&sequence, surf->virt + offset + 12, sizeof(sequence));
+		if (!sequence || last_sequence - sequence >= ISP_BOOT_LOG_RECENT_RECORDS)
+			continue;
+		memcpy(text, surf->virt + offset + ISP_BOOT_LOG_TEXT_OFFSET,
+		       sizeof(text));
+		dev_err(isp->dev, "runtime-log[%u]: %.*s\n", sequence,
+			(int)sizeof(text), text);
+	}
+}
 
 struct isp_sm_deferred_work {
 	struct work_struct work;
@@ -198,21 +234,25 @@ int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
 	struct isp_message *rsp = &chan->rsp;
 
-#ifdef APPLE_ISP_DEBUG
 	struct isp_message *req = &chan->req;
 	char buf[512];
 	dma_addr_t iova = req->arg0 & ~ISP_IPC_FLAG_TERMINAL_ACK;
 	u32 size = req->arg1;
-	if (iova && size && size < sizeof(buf) &&
-	    isp->log_surf) {
-		void *p = apple_isp_translate(isp, isp->log_surf, iova, size);
+	struct isp_surf *surf = isp->log_surf;
+
+	/* Modern firmware receives its host log surface in the boot arguments. */
+	if (!surf)
+		surf = isp->boot_log_surf;
+	dev_dbg(isp->dev, "terminal message: iova=%#llx size=%u log=%#llx\n",
+		iova, size, surf ? surf->iova : 0);
+	if (iova && size && size < sizeof(buf) && surf) {
+		void *p = apple_isp_translate(isp, surf, iova, size);
 		if (p) {
 			size = min_t(u32, size, 512);
 			memcpy(buf, p, size);
-			isp_dbg(isp, "ISPASC: %.*s", size, buf);
+			dev_dbg(isp->dev, "ISPASC: %.*s", size, buf);
 		}
 	}
-#endif
 
 	rsp->arg0 = ISP_IPC_FLAG_ACK;
 	rsp->arg1 = 0x0;
