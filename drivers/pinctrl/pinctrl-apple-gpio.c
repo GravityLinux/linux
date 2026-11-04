@@ -222,7 +222,7 @@ static const struct pinmux_ops apple_gpio_pinmux_ops = {
 static int apple_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 {
 	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(chip);
-	unsigned int reg = apple_gpio_get_reg(pctl, offset);
+	unsigned int reg = readl_relaxed(pctl->base + REG_GPIO(offset));
 
 	if (FIELD_GET(REG_GPIOx_MODE, reg) == REG_GPIOx_OUT)
 		return GPIO_LINE_DIRECTION_OUT;
@@ -232,14 +232,8 @@ static int apple_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 static int apple_gpio_get(struct gpio_chip *chip, unsigned int offset)
 {
 	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(chip);
-	unsigned int reg = apple_gpio_get_reg(pctl, offset);
-
-	/*
-	 * If this is an input GPIO, read the actual value (not the
-	 * cached regmap value)
-	 */
-	if (FIELD_GET(REG_GPIOx_MODE, reg) != REG_GPIOx_OUT)
-		reg = readl_relaxed(pctl->base + REG_GPIO(offset));
+	/* Coprocessor power transitions can also change an output pin. */
+	unsigned int reg = readl_relaxed(pctl->base + REG_GPIO(offset));
 
 	return !!(reg & REG_GPIOx_DATA);
 }
@@ -248,9 +242,9 @@ static int apple_gpio_set(struct gpio_chip *chip, unsigned int offset, int value
 {
 	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(chip);
 
-	apple_gpio_set_reg(pctl, offset, REG_GPIOx_DATA, value ? REG_GPIOx_DATA : 0);
-
-	return 0;
+	/* Force the requested output even if regcache already has that value. */
+	return regmap_write_bits(pctl->map, REG_GPIO(offset), REG_GPIOx_DATA,
+				 value ? REG_GPIOx_DATA : 0);
 }
 
 static int apple_gpio_direction_input(struct gpio_chip *chip, unsigned int offset)
@@ -270,11 +264,10 @@ static int apple_gpio_direction_output(struct gpio_chip *chip,
 {
 	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(chip);
 
-	apple_gpio_set_reg(pctl, offset,
+	return regmap_write_bits(pctl->map, REG_GPIO(offset),
 			   REG_GPIOx_PERIPH | REG_GPIOx_MODE | REG_GPIOx_DATA,
 			   FIELD_PREP(REG_GPIOx_MODE, REG_GPIOx_OUT) |
 				   (value ? REG_GPIOx_DATA : 0));
-	return 0;
 }
 
 /* IRQ chip functions */
