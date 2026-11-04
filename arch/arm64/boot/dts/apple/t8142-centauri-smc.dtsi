@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* T8142 SMC resources from ADT; existing Linux SMC/GPIO drivers under test.
+ * Only container/shared-memory metadata is used. Firmware remains preloaded.
+ * No board identity or serial-number gate is used.
+ */
+/ {
+	soc {
+		centauri_smc: smc@38c600000 {
+			compatible = "apple,smc";
+			reg = <3 0x8c600000 0 0x4000>,
+			      <3 0x8de00000 0 0x120000>;
+			reg-names = "smc", "sram";
+			mboxes = <&centauri_smc_mbox>;
+
+			centauri_smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+		};
+
+		centauri_smc_mbox: mailbox@38c608000 {
+			compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <3 0x8c608000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			/* ADT lists not-empty then empty for each FIFO. */
+			interrupts = <0 633 4>, <0 634 4>, <0 635 4>, <0 636 4>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+	};
+};

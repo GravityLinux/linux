@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * T8142 core resources from the operator-device ADT.
+ * Standard timer/UART/AIC binding layout follows Linux v7.3 Apple bindings.
+ * No third-party M5 device tree or Apple executable was used.
+ * Firmware must leave the UART and interrupt controller powered.
+ * Subsystem descriptions are included by the board file.
+ * RAM geometry, CPU release addresses and reservations are loader fixups.
+ */
+
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	aliases {
+		serial0 = &serial0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		bootargs = "";
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 4 0>; /* Loader replaces RAM/reservation geometry. */
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu@0 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 0>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@1 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 1>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@2 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 2>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@3 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 3>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@4 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 4>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@5 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 5>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@10100 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 0x10100>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@10101 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 0x10101>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@10102 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 0x10102>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu@10103 { device_type = "cpu"; compatible = "arm,armv8"; reg = <0 0x10103>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <1 2 4>, <1 3 4>, <1 0 4>, <1 1 4>;
+	};
+
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		aic: interrupt-controller@381000000 {
+			compatible = "apple,t8142-aic3", "apple,t8122-aic3";
+			#interrupt-cells = <3>;
+			#address-cells = <0>;
+			interrupt-controller;
+			reg = <3 0x81000000 0 0x1cc000>, <3 0x81040000 0 4>;
+			reg-names = "core", "event";
+		};
+
+		serial0: serial@3a5200000 {
+			compatible = "apple,s5l-uart";
+			reg = <3 0xa5200000 0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <0 1231 4>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+		};
+	};
+};

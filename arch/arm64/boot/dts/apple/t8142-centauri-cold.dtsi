@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Experimental T8142/J813 cold image-transfer test.
+ * The loader powers/trains PCIe only. Linux owns MSI/RID routing and DART
+ * page tables and allocates every image/record/resource through DMA APIs.
+ * No wireless firmware, context, queue or retained mapping is supplied by the
+ * loader. Linux resets the port between image stages; initial host power/PHY
+ * initialization remains in the loader.
+ */
+
+/ {
+	aliases {
+		wifi0 = &centauri_wifi;
+		bluetooth0 = &centauri_bluetooth;
+	};
+
+	chosen {
+		linux,pci-probe-only = <1>;
+	};
+
+	soc {
+		centauri_dart: iommu@488000000 {
+			compatible = "apple,t8110-dart";
+			reg = <0x4 0x88000000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <0 1463 4>;
+		};
+		centauri_pcie: pcie@1cb0000000 {
+			compatible = "apple,t8142-pcie";
+			device_type = "pci";
+			reg = <0x1c 0xb0000000 0x0 0x10000000>,
+			      <0x4 0x8c000000 0x0 0x4000>,
+			      <0x4 0x88028000 0x0 0x8000>,
+			      <0x4 0x8f010000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "phy0";
+			interrupt-parent = <&aic>;
+			interrupts = <0 1462 4>;
+			msi-controller;
+			msi-parent = <&centauri_pcie>;
+			msi-ranges = <&aic 0 1741 1 32>;
+			bus-range = <0 8>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+			iommu-map = <0x100 &centauri_dart 1 3>;
+			iommu-map-mask = <0xffff>;
+			/* Bootstrap is 01:00.0; runtime functions retain RIDs0100..0102.
+			 * One control node describes both states of the physical function.
+			 */
+			centauri_port0: pci@0,0 {
+				device_type = "pci";
+				reg = <0 0 0 0 0>;
+				reset-gpios = <&pinctrl_ap 192 1>; /* active low */
+				bus-range = <1 1>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &centauri_port0 0 0 0 0>,
+						<0 0 0 2 &centauri_port0 0 0 0 1>,
+						<0 0 0 3 &centauri_port0 0 0 0 2>,
+						<0 0 0 4 &centauri_port0 0 0 0 3>;
+				centauri_control: control@0 {
+					compatible = "apple,t2026-centauri-control", "pci106b,1900",
+						     "pci106b,1901";
+					reg = <0x10000 0 0 0 0>;
+					/* Independent firmware inputs are prepared outside the driver. */
+					firmware-name = "apple/centauri/experimental-prepared.ftab";
+					apple,host-platform-id = <0x248142>;
+				};
+				centauri_wifi: wifi@0,1 {
+					compatible = "apple,t2026-centauri-wifi", "pci106b,1902";
+					reg = <0x10100 0 0 0 0>;
+					apple,control = <&centauri_control>;
+				};
+				centauri_bluetooth: bluetooth@0,2 {
+					compatible = "apple,t2026-centauri-bluetooth", "pci106b,1903";
+					reg = <0x10200 0 0 0 0>;
+					apple,control = <&centauri_control>;
+					/* Standard local-bd-address supplied by bluetooth0 fixup. */
+				};
+			};
+		};
+	};
+};

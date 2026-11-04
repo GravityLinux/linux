@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Include after t8142-speaker-dma.dtsi. Codec list order is the ADT's
+ * four MCA receive slots. One board-owned GPIO resets all four devices.
+ * Laboratory build: tas2764.legacy_apple_init=0 avoids unmeasured presets.
+ */
+&aop_speaker_dma {
+	audio-codecs = <&amp0>, <&amp1>, <&amp2>, <&amp3>;
+};

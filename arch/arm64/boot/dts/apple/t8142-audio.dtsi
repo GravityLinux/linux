@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* J813/T8142 live/saved ADT resources. Native three-channel AOP/PCM capture qualified.
+ * Opaque resident firmware is executed in place; no firmware body is parsed.
+ */
+&{/soc} {
+ aop_dart: iommu@390fc0000 {
+  compatible = "apple,t8142-dart", "apple,t8110-dart";
+  reg = <3 0x90fc0000 0 0xc000>;
+  #iommu-cells = <5>;
+  interrupt-parent = <&aic>;
+  interrupts = <0 528 4>;
+ };
+ aop_mbox: mailbox@390608000 {
+  compatible = "apple,asc-mailbox-v4";
+  reg = <3 0x90608000 0 0x4000>;
+  #mbox-cells = <0>;
+  interrupt-parent = <&aic>;
+  interrupts = <0 490 4>, <0 493 4>;
+  interrupt-names = "send-empty", "recv-not-empty";
+ };
+ aop_secure_mbox: mailbox@3d067c000 {
+  compatible = "apple,neo-aop-proxy-mailbox";
+  reg = <3 0xd067c000 0 0x4000>;
+  #mbox-cells = <0>;
+  interrupt-parent = <&aic>;
+  interrupts = <0 494 4>, <0 497 4>;
+  interrupt-names = "send-empty", "recv-not-empty";
+ };
+ aop_secure: aop-second-host {
+  compatible = "apple,t8142-aop-second-host";
+  /* Keep dynamic queues in the lower 64GiB of the second-host window.
+   * Reserve the resident EDATA_S mapping separately.
+   */
+  iommus = <&aop_dart 1 0x200 0 0x10 0>;
+  mboxes = <&aop_secure_mbox>;
+  mbox-names = "mbox";
+ };
+ aop_audio: aop@390600000 {
+  compatible = "apple,t8142-aop-audio";
+  reg = <3 0x90600000 0 0x1000>;
+  apple,second-host = <&aop_secure>;
+  apple,pmp = <&pmp>;
+  iommus = <&aop_dart 0 0x100 0x40000000 0x20 0>;
+  mboxes = <&aop_mbox>;
+  mbox-names = "mbox";
+ };
+ aop_mic: microphone@393200000 {
+  compatible = "apple,t8142-mic-capture";
+  num-channels = <3>;
+  reg = <3 0x93200000 0 0x34000>, <3 0xd3200000 0 0x34000>;
+  iommus = <&aop_dart 11 0x100 0x40000000 0 0xffff0000>;
+  apple,aop = <&aop_audio>;
+  interrupt-parent = <&aic>;
+  interrupts = <0 551 4>;
+ };
+};

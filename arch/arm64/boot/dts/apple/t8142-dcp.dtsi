@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* J813/T8142 ADT resources; 27.2 AP-visible D003 scratch reply.
+ * Laboratory fixture: the loader preserves opaque resident firmware mappings.
+ * Topology follows Gravity t8140-dcp-reference.dtsi (54a7a00e6bf5).
+ */
+/ {
+	aliases { dcp = &dcp; disp0 = &display; disp0_piodma = &disp0_piodma; };
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Existing loader fills geometry and derives the notch crop. */
+		framebuffer { compatible = "simple-framebuffer"; status = "disabled"; };
+	};
+	reserved-memory {
+		dcp_scanout: scanout-pool {
+			compatible = "shared-dma-pool";
+			no-map;
+			phandle = <&dcp_scanout>;
+			status = "disabled";
+		};
+	};
+};
+&{/soc} {
+	dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+	disp0_dart: iommu@286300000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <2 0x86300000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 800 4>;
+		apple,dma-range = <0x100 0 0x10 0>;
+	};
+	dcp_dart: iommu@286340000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <2 0x86340000 0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 800 4>;
+		apple,dma-range = <0x100 0 0x10 0>;
+	};
+	dcp_mbox: mailbox@286e08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <2 0x86e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 776 4>, <0 777 4>, <0 778 4>, <0 779 4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+	dcp_bw: bandwidth-registers@382700000 {
+		reg = <3 0x82700000 0 0x114000>;
+		#apple,bw-scratch-cells = <3>;
+	};
+	dcp: dcp@286e00000 {
+		compatible = "apple,t8142-dcp", "apple,dcp";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 23>;
+		power-domains = <&ps_disp_cpu>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <2 0x86e00000 0 0x4000>,
+		      <2 0x84000000 0 0xb1c000>,
+		      <2 0x86240000 0 0x10000>,
+		      <2 0x863ac000 0 0x4000>,
+		      <2 0x86800000 0 0x800000>;
+		apple,bw-scratch = <&dcp_bw 0 4 0x20000>;
+		/* Only the primary layer is qualified by the initial Linux probe. */
+		apple,iomfb-surfaces = <1 0 0 0>;
+		clocks = <&clkref>;
+		phandle = <&dcp>;
+		status = "disabled";
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+			phandle = <&disp0_piodma>;
+		};
+		panel {
+			compatible = "apple,panel";
+			/* ADT dot-pitch 224 dpi. Normal driver policy hides the notch. */
+			width-mm = <290>;
+			height-mm = <189>;
+			adj-height-mm = <181>;
+			/* Conservative laboratory cap, not a calibrated panel maximum. */
+			apple,max-brightness = <100>;
+		};
+	};
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
+		apple,scanout-memory-is-nomap;
+		phandle = <&display>;
+		status = "disabled";
+	};
+};
+&platform_pmgr {
+	ps_disp_sys: power-controller@290 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x290 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_sys";
+		apple,always-on;
+	};
+	ps_disp_fe: power-controller@318 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x318 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_disp_sys>;
+		label = "disp_fe";
+		apple,always-on;
+	};
+	ps_disp_cpu: power-controller@10000 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x10000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_disp_fe>;
+		label = "disp_cpu";
+		apple,always-on;
+	};
+};

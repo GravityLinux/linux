@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* J813/T8142 ADT topology and runtime ISP control observations.
+* Firmware/heap reservations are filled by the private development loader.
+* IMX958 streaming and daylight image comparison qualified.
+*/
+/ {
+	aliases { isp = &isp; };
+	reserved-memory {
+		isp_heap: isp-heap@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+		};
+	};
+};
+&{/soc} {
+	isp: isp@4a0000000 {
+		compatible = "apple,t8142-isp";
+		/* Opaque tuning matching the installed ISP firmware and camera module. */
+		firmware-name = "apple/isp/j813-imx958.dat";
+		/* The control window ends before the separate DART/mailbox blocks. */
+		reg = <4 0xa0000000 0 0x2000000>,
+			<4 0xa2920000 0 0x100>,
+			<4 0xa2921000 0 0x100>,
+			<4 0xa2920410 0 0x100>,
+			<4 0xa28a4000 0 0x1000>,
+			<4 0xe3b10000 0 0x10>;
+		reg-names = "coproc", "mbox", "gpio", "mbox2", "boot-control", "watchdog";
+		interrupt-parent = <&aic>;
+		interrupts = <0 425 4>;
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		power-domains = <&pmp_report_isp>, <&ps_isp_cpu>,
+			<&ps_isp_cpu_core0>, <&ps_isp_fe>, <&ps_isp_dprx>,
+			<&ps_isp_sts0>, <&ps_isp_be>, <&ps_isp_clr>;
+		memory-region = <&isp_heap>;
+		memory-region-names = "heap";
+		apple,dart-vm-size = <0 0xf0000000>;
+		apple,platform-id = <0x71>;
+		apple,aciphy-fuses = <18 16>;
+		/* Deliberately activated only after loader fills reserved regions. */
+		status = "disabled";
+		sensor-presets {
+			preset5 {
+				apple,config-index = <5>;
+				apple,input-size = <1920 2160>;
+				apple,output-size = <1920 1080>;
+				apple,crop = <0 0 1920 1080>;
+			};
+			/* Runtime config8: native 1520x1440 single-exposure capture. */
+			preset8 {
+				apple,config-index = <8>;
+				apple,input-size = <1520 1440>;
+				apple,output-size = <1520 1440>;
+				apple,crop = <0 0 1520 1440>;
+			};
+			preset0 {
+				apple,config-index = <0>;
+				apple,input-size = <3072 3024>;
+				apple,output-size = <1536 1512>;
+				apple,crop = <0 0 3072 3024>;
+			};
+		};
+	};
+	isp_dart0: iommu@4a28c0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0xa28c0000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 443 4>;
+		power-domains = <&pmp_report_isp>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		apple,dma-range = <0x100 0 1 0>;
+	};
+	isp_dart1: iommu@4a28e0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0xa28e0000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 443 4>;
+		power-domains = <&pmp_report_isp>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		apple,dma-range = <0x100 0 1 0>;
+	};
+	isp_dart2: iommu@4a2900000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0xa2900000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 443 4>;
+		power-domains = <&pmp_report_isp>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		apple,dma-range = <0x100 0 1 0>;
+	};
+};
+&platform_pmgr {
+	ps_isp_sys: power-controller@2f8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+	};
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
+		apple,no-auto-enable;
+	};
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
+		apple,no-auto-enable;
+	};
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
+		apple,no-auto-enable;
+	};
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
+		apple,no-auto-enable;
+	};
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
+		apple,no-auto-enable;
+	};
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
+		apple,no-auto-enable;
+	};
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
+		apple,no-auto-enable;
+	};
+};
+&pmp_report {
+	pmp_report_isp: report@e {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <14>;
+		label = "pmp-isp";
+		#power-domain-cells = <0>;
+		power-domains = <&ps_isp_sys>;
+	};
+};

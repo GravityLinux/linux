@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Experimental replacement of the raw speaker DMA resource. Include after
+ * t8142-speaker.dtsi. The shared ADMAC driver is its sole register owner.
+ * The speaker client verifies zero DMA/cutoff before exposing protected PCM.
+ */
+&aop_audio {
+	/* Domain0 supplies the speaker DMA register aperture (AOP pw0). */
+	#power-domain-cells = <1>;
+};
+
+/delete-node/ &aop_speaker;
+
+&{/soc} {
+	aop_admac_base: dma-controller@393800000 {
+		compatible = "apple,t8142-admac", "apple,t8132-admac";
+		reg = <3 0x93800000 0 0x34000>;
+		#dma-cells = <1>;
+		/* ADT has13 TX and13 RX channels; logical IDs alternate. */
+		dma-channels = <26>;
+		/* ADT irq-destination-index=0, IRQ549. Other outputs unconnected. */
+		interrupts-extended = <&aic 0 549 4>, <0>, <0>, <0>;
+		iommus = <&aop_dart 8 0x100 0x40000000 0 0xffff0000>;
+		power-domains = <&aop_audio 0>;
+	};
+};
+
+&{/} {
+	aop_speaker_dma: aop-speaker-dma {
+		compatible = "apple,t8142-speaker";
+		num-channels = <4>;
+		dmas = <&aop_admac_base 0>;
+		dma-names = "tx";
+		apple,aop = <&aop_audio>;
+		enable-gpios = <&pinctrl_ap 151 0>;
+	};
+};

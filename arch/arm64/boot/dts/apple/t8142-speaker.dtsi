@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* J813 ADT speaker resources. Four-channel playback is qualified with tones and music.
+ * Native codec ownership is selected by the board include order below.
+ */
+&{/soc} {
+	pinctrl_ap: pinctrl@39a000000 {
+		compatible = "apple,t8142-pinctrl", "apple,t8103-pinctrl";
+		reg = <3 0x9a000000 0 0x100000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_ap 0 0 224>;
+		gpio-reserved-ranges = <78 1 203 1>;
+		apple,npins = <224>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 347 4>, <0 348 4>, <0 349 4>, <0 350 4>,
+			     <0 351 4>, <0 352 4>, <0 353 4>;
+		i2c3_pins: i2c3-pins {
+			/* APPLE_PINMUX(pin, 1), SCL43 / SDA42 from J813 ADT. */
+			pinmux = <0x1002b>, <0x1002a>;
+		};
+	};
+	i2c3: i2c@3a501c000 {
+		compatible = "apple,t8142-i2c", "apple,t8103-i2c";
+		reg = <3 0xa501c000 0 0x4000>;
+		clocks = <&clkref>;
+		clock-frequency = <400000>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 1250 4>;
+		power-domains = <&ps_i2c3>;
+		pinctrl-0 = <&i2c3_pins>;
+		pinctrl-names = "default";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* The board sound card owns the common reset line. */
+		amp0: amplifier@38 {
+			compatible = "ti,sn012776";
+			reg = <0x38>;
+			#sound-dai-cells = <0>;
+			ti,vmon-slot-no = <0>;
+			ti,imon-slot-no = <2>;
+		};
+		amp1: amplifier@3b {
+			compatible = "ti,sn012776";
+			reg = <0x3b>;
+			#sound-dai-cells = <0>;
+			ti,vmon-slot-no = <4>;
+			ti,imon-slot-no = <6>;
+		};
+		amp2: amplifier@39 {
+			compatible = "ti,sn012776";
+			reg = <0x39>;
+			#sound-dai-cells = <0>;
+			ti,vmon-slot-no = <8>;
+			ti,imon-slot-no = <10>;
+		};
+		amp3: amplifier@3c {
+			compatible = "ti,sn012776";
+			reg = <0x3c>;
+			#sound-dai-cells = <0>;
+			ti,vmon-slot-no = <12>;
+			ti,imon-slot-no = <14>;
+		};
+	};
+	aop_speaker: speaker@393800000 {
+		compatible = "apple,t8142-speaker";
+		num-channels = <4>;
+		/* Provisional binding: byte offset in ADMAC TX SRAM. ADT base=256. */
+		apple,tx-sram-base = <256>;
+		reg = <3 0x93800000 0 0x34000>;
+		/* A bounded AP DMA window inside SID8's ADT aperture. */
+		iommus = <&aop_dart 8 0x100 0x40000000 0 0xffff0000>;
+		apple,aop = <&aop_audio>;
+		enable-gpios = <&pinctrl_ap 151 0>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 549 4>;
+	};
+};
+
+&platform_pmgr {
+	ps_i2c3: power-controller@360 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x360 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+		/* ADT ancestors SIO/AFISOCNI2 are virtual no_ps devices. */
+	};
+};

@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* J813 ADT power providers. Include after t8142-pmp.dtsi.
+ * Other PMGR providers are described by their subsystem includes.
+ * AVD_SYS's AFISOCNI5 parent is virtual (no_ps) and has no hardware PS op.
+ */
+/ {
+	soc {
+		platform_pmgr: power-management@380700000 {
+			compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			reg = <3 0x80700000 0 0x18000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ps_avd_sys: power-controller@310 {
+				compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x310 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "avd_sys";
+			};
+			ps_pmp: power-controller@598 {
+				compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x598 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "pmp";
+			};
+			ps_pms_sram: power-controller@5a0 {
+				compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x5a0 4>;
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				label = "pms_sram";
+				apple,always-on;
+			};
+		};
+
+		pmp_report: power-controller@3803c0000 {
+			compatible = "apple,t8142-pmp-v2-report";
+			reg = <3 0x803c0000 0 0x20000>;
+			apple,pmp = <&pmp>;
+			power-domains = <&ps_pms_sram>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* PMP vote bits index soc-device records; AVD is record 19. */
+			pmp_report_avd: report@13 {
+				compatible = "apple,t6000-pmp-v2-report-entry";
+				reg = <19>;
+				label = "pmp-avd";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_avd_sys>;
+			};
+		};
+
+	};
+
+};
+
+&pmp { power-domains = <&ps_pmp>; };
+&pmp_mbox { power-domains = <&ps_pmp>, <&ps_pms_sram>; };
+&pmp_dart { power-domains = <&ps_pmp>; };

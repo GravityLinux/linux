@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* PMP resources translated from the T8142/J813 ADT. Loader supplies tuning. */
+/ {
+	aliases {
+		pmp = &pmp;
+	};
+	soc {
+		pmp_dart: iommu@380300000 {
+			compatible = "apple,t8110-dart";
+			reg = <3 0x80300000 0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <0 1004 4>;
+		};
+
+		pmp: pmp@380500000 {
+			compatible = "apple,t8142-pmp-v2", "apple,t6000-pmp-v2";
+			reg = <3 0x80500000 0 0xd0000>,
+			      <3 0x80e00000 0 0x4000>;
+			reg-names = "pmp", "asc";
+			mboxes = <&pmp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&pmp_dart 0>;
+			/* dt_set_pmp populates per-device properties, then enables. */
+			status = "disabled";
+		};
+
+		pmp_mbox: mbox@380e08000 {
+			compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <3 0x80e08000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			/* ADT lists not-empty first; raw AIC state confirms even = empty. */
+			interrupts = <0 1000 4>, <0 1001 4>,
+			             <0 1002 4>, <0 1003 4>;
+			interrupt-names = "send-empty", "send-not-empty",
+			                  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+	};
+};

@@ -40,6 +40,9 @@ properties:
           - const: apple,t8122-admac
       - const: apple,t8122-admac
       - const: apple,t8132-admac
+      - items:
+          - const: apple,t8142-admac
+          - const: apple,t8132-admac
 
   reg:
     maxItems: 1

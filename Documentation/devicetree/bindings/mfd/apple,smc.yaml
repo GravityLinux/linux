@@ -16,6 +16,7 @@ description:
 properties:
   compatible:
     oneOf:
+      - const: apple,smc
       - items:
           - enum:
               - apple,t6020-smc

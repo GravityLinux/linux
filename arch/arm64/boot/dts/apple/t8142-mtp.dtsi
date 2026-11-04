@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* J813 ADT resources; existing M4 ring transport, qualified with keyboard and trackpad tests. */
+/ {
+	aliases {
+		mtp = &mtp;
+		keyboard = &mtp_keyboard;
+	};
+};
+&{/soc} {
+	mtp: mtp@394600000 {
+		compatible = "apple,t8142-mtp", "apple,rtk-helper-asc4";
+		/* SRAM span covers the ADT-declared contiguous TEXT/DATA segments. */
+		reg = <3 0x94600000 0 0x4000>, <3 0x94c00000 0 0xc4000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+		#helper-cells = <0>;
+	};
+	mtp_mbox: mbox@394608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x94608000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 1299 4>, <0 1300 4>, <0 1301 4>, <0 1302 4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		apple,reset-recv-fifo-on-start;
+	};
+	mtp_dart: iommu@394800000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0x94800000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <0 1275 4>;
+		#iommu-cells = <1>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>;
+		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+	};
+	mtp_dockchannel: fifo@394b14000 {
+		compatible = "apple,t8142-dockchannel", "apple,dockchannel";
+		reg = <3 0x94b14000 0 0x1000>;
+		reg-names = "irq";
+		interrupt-parent = <&aic>;
+		interrupts = <0 1277 4>;
+		ranges = <0 3 0x94b28000 0x10000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		mtp_hid: input@8000 {
+			compatible = "apple,t8142-dockchannel-hid", "apple,t8132-dockchannel-hid", "apple,dockchannel-hid";
+			reg = <0x8000 0x1000>, <0xc000 0x1000>, <0 0x1000>, <0x4000 0x1000>;
+			reg-names = "config", "data", "rmt-config", "rmt-data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 4>, <3 4>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+			multi-touch {
+				firmware-name = "apple/tpmtfw-j813.bin";
+			};
+			mtp { };
+			mtp_keyboard: keyboard {
+				hid-country-code = <0>;
+				apple,keyboard-layout-id = <0>;
+			};
+			stm { };
+			actuator { };
+			tp-accel { };
+		};
+	};
+};

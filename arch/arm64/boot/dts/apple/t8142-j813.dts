@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Apple MacBook Air (M5, J813).
+ *
+ * Experimental assembly of independently qualified subsystem descriptions.
+ * Loader firmware mappings and current-device resources remain prerequisites;
+ * this combined board description has not yet been hardware booted.
+ */
+/dts-v1/;
+
+/include/ "t8142.dtsi"
+/include/ "t8142-pmp.dtsi"
+/include/ "t8142-pmgr.dtsi"
+/include/ "t8142-audio.dtsi"
+/include/ "t8142-speaker.dtsi"
+/include/ "t8142-speaker-dma.dtsi"
+/include/ "t8142-speaker-codecs.dtsi"
+/include/ "t8142-isp.dtsi"
+/include/ "t8142-dcp.dtsi"
+/include/ "t8142-mtp.dtsi"
+/include/ "t8142-centauri-cold.dtsi"
+/include/ "t8142-centauri-smc.dtsi"
+
+/ {
+	model = "Apple MacBook Air (M5, 2026)";
+	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
+};

@@ -1,0 +1,58 @@
+{
+  "license": "GPL-2.0-only",
+  "audience": "For LLMs; integration evidence pending human review",
+  "base": "27f132b976805fa3c0aa4f5e2e09c36f852e8ac3",
+  "sources": [
+    {
+      "repository": "GravityLinux/linux",
+      "commit": "164ec1d605f5bdbee33b6410a7ba0bd0edb3c9aa",
+      "paths": [
+        "tools/m5-platform/t8142-*.dtsi",
+        "tools/m5-wifi/t8142-j813-minimal.dts"
+      ],
+      "use": "Operator-ADT-derived platform and MTP descriptions qualified separately in the recorded Linux tests"
+    },
+    {
+      "repository": "GravityLinux/linux",
+      "commit": "00f42a048a82",
+      "paths": [
+        "tools/m5-wifi/t8142-centauri-cold.dtsi",
+        "tools/m5-wifi/t8142-centauri-smc.dtsi"
+      ],
+      "use": "Qualified cold-radio and SMC resource descriptions; no retained-radio handoff"
+    }
+  ],
+  "assembly_changes": [
+    "Move DT sources into the normal Apple DTS directory and add a Kbuild target",
+    "Remove the synthetic PMP test consumer; retain its actual power-domain provider",
+    "Use the one AP GPIO controller for audio and Centauri reset",
+    "Retain all existing DT branch history, other boards and driver source"
+  ],
+  "prerequisites": [
+    "Matching M5 driver topic changes for PMP, audio, DCP, ISP and Centauri",
+    "Bootloader current-device firmware mappings, reserved-memory and identity fixups",
+    "Initial PCI host PHY training; firmware assets remain separate",
+    "Existing bootloader DAPF initialization for MTP and ISP"
+  ],
+  "limits": [
+    "This assembled board DT has not been hardware booted; the referenced tests qualify its component descriptions",
+    "DTC compilation passes with existing fixture warnings for virtual simple-bus children, DCP address cells and the legacy disp0_piodma alias",
+    "Complete binding validation and production board/power integration remain pending; no new hardware compatibility is inferred",
+    "CPU cache/topology/OPP and ANS/NVMe resources are not supplied by these subsystem fixtures; operator-confirmed standalone SSD boot used a separate setup."
+  ],
+  "dart": "No C driver change is included. The old imported early-exit TLB optimization is unproven as an M5 requirement and is excluded from the branch plan.",
+  "branch_ownership": {
+    "device_tree": "replacement/000-devicetree",
+    "pinctrl": "replacement/060-pinctrl, new superset of bits/060-pinctrl",
+    "audio": "bits/071-neo-aop, operator-maintained",
+    "isp": "bits/190-isp, operator-maintained",
+    "pmp": "replacement/115-pmp",
+    "display": "replacement/200-dcp",
+    "centauri": "new bits topic needed; no existing branch overwritten"
+  },
+  "validation": {
+    "dtc": "Combined J813 DT compiles; four existing fixture warning categories recorded in m5-dt-review-compile.json",
+    "dt_doc_validate": "All seven modified binding schemas pass with dependencies supplied; exit 0 and empty stderr",
+    "hardware": "No new hardware boot or probing performed"
+  }
+}
