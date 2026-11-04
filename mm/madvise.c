@@ -2003,6 +2003,7 @@ static int madvise_do_behavior(unsigned long start, size_t len_in,
  */
 int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int behavior)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	int error;
 	struct mmu_gather tlb;
 	struct madvise_behavior madv_behavior = {
