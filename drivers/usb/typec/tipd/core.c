@@ -629,16 +629,25 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			return;
 		}
 
-		/* Pin assignment can stay unchanged across HPD edges and IRQs.
-		 * DP_SID's IRQ bit is sticky; DATA_STATUS clears after event handling. */
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
-		dp_data.status &= ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
-		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
-			dp_data.status |= DP_STATUS_HPD_STATE;
-		if ((st->data_status & CD321X_DATA_STATUS_HPD_IRQ) &&
-		    !cd321x->hpd_irq_asserted)
-			dp_data.status |= DP_STATUS_IRQ_HPD;
-		cd321x->hpd_irq_asserted = !!(st->data_status & CD321X_DATA_STATUS_HPD_IRQ);
+		if (of_machine_is_compatible("apple,t8132")) {
+			/* T8132 sets its DP mux once per pin assignment. */
+			if (cd321x->state.alt == cd321x->port_altmode_dp &&
+			    cd321x->state.mode == mode)
+				return;
+		} else {
+			/* Pin assignment can stay unchanged across HPD edges and IRQs.
+			 * DP_SID's IRQ bit is sticky; DATA_STATUS clears after event
+			 * handling. */
+			dp_data.status &= ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
+			if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+				dp_data.status |= DP_STATUS_HPD_STATE;
+			if ((st->data_status & CD321X_DATA_STATUS_HPD_IRQ) &&
+			    !cd321x->hpd_irq_asserted)
+				dp_data.status |= DP_STATUS_IRQ_HPD;
+			cd321x->hpd_irq_asserted =
+				!!(st->data_status & CD321X_DATA_STATUS_HPD_IRQ);
+		}
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
 		cd321x->state.alt = cd321x->port_altmode_dp;
 		cd321x->state.data = &dp_data;
@@ -755,7 +764,11 @@ static void cd321x_update_work(struct work_struct *work)
 	enum typec_orientation orientation = TYPEC_ORIENTATION_NONE;
 
 	if (usb_connection) {
-		if (tps->data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
+		/* T8132 takes the data role from the queued status. */
+		u32 data_status = of_machine_is_compatible("apple,t8132") ?
+				  st.data_status : tps->data_status;
+
+		if (data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
 			new_role = USB_ROLE_DEVICE;
 		else
 			new_role = USB_ROLE_HOST;
@@ -792,7 +805,9 @@ static void cd321x_update_work(struct work_struct *work)
 		cd321x->state.data = NULL;
 		typec_set_mode(tps->port, TYPEC_STATE_SAFE);
 		cd321x->hpd_irq_asserted = false;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		/* T8132 leaves the mux to the next mode update. */
+		if (!of_machine_is_compatible("apple,t8132"))
+			typec_mux_set(cd321x->mux, &cd321x->state);
 	}
 
 	/* Update Type-C properties */
