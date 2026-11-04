@@ -694,7 +694,7 @@ static const struct apple_isp_hw apple_isp_hw_t6041 = {
  * resources and control arguments observed on the J813 runtime interface.
  */
 static const struct apple_isp_hw apple_isp_hw_t8142 = {
-	.module_tuning = true;
+	.module_tuning = true,
 	.gen = ISP_GEN_T8140,
 	.dsid_count = 1,
 	.dsid_clr_base0 = 0x220114000,
