@@ -77,6 +77,22 @@ static inline void vma_desc_set_slice_off(struct vm_area_desc *desc,
 {
 	desc->slice_off = slice_off;
 }
+/*
+ * p3s_adjust_unmapped_area_info - Align unmapped area allocations to host page
+ * @info: Pointer to struct vm_unmapped_area_info
+ *
+ * In a 4KB compatibility process, virtual memory is backed by 16KB host
+ * folios. When searching for an unmapped address range (mmap), aligning the
+ * allocation to 16KB host page boundaries (~PAGE_MASK_KERNEL) ensures new
+ * VMAs naturally start at slice 0 (folio boundary) unless the caller
+ * requested an explicit alignment. This prevents initial subpage slice offsets
+ * (vm_slice_off), avoids wasting the host folio at the start, and minimizes
+ * fragmentation.
+ */
+#define p3s_adjust_unmapped_area_info(info) do { \
+	if (!(info)->align_mask && current->mm && mm_is_p3s_4k(current->mm)) \
+		(info)->align_mask = ~PAGE_MASK_KERNEL; \
+} while (0)
 #else
 static inline unsigned short vma_slice_off(const struct vm_area_struct *vma)
 {
@@ -97,6 +113,7 @@ static inline void vma_desc_set_slice_off(struct vm_area_desc *desc,
 					  unsigned short slice_off)
 {
 }
+#define p3s_adjust_unmapped_area_info(info) ((void)(info))
 #endif
 
 /**
@@ -581,26 +598,7 @@ static inline void vma_set_split_offset(struct vm_area_struct *target,
 	vma_set_slice_off(target, vma_slice_offset(src, addr));
 }
 
-/*
- * p3s_adjust_unmapped_area_info - Align unmapped area allocations to host page
- * @info: Pointer to struct vm_unmapped_area_info
- *
- * In a 4KB compatibility process, virtual memory is backed by 16KB host
- * folios. When searching for an unmapped address range (mmap), aligning the
- * allocation to 16KB host page boundaries (~PAGE_MASK_KERNEL) ensures new
- * VMAs naturally start at slice 0 (folio boundary) unless the caller
- * requested an explicit alignment. This prevents initial subpage slice offsets
- * (vm_slice_off), avoids wasting the host folio at the start, and minimizes
- * fragmentation.
- */
-#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
-#define p3s_adjust_unmapped_area_info(info) do { \
-	if (!(info)->align_mask && current->mm && mm_is_p3s_4k(current->mm)) \
-		(info)->align_mask = ~PAGE_MASK_KERNEL; \
-} while (0)
-#else
-#define p3s_adjust_unmapped_area_info(info) ((void)(info))
-#endif
+
 
 /*
  * vma_folio_slices_exclusive - Small anon folio mapped only by this process
