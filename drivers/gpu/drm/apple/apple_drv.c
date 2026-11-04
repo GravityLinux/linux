@@ -552,6 +552,9 @@ static int apple_probe_per_dcp(struct device *dev,
 	u32 surf;
 	int zpos = 0;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
+	/* T8132 keeps its qualified plane formats and surface records. */
+	bool t8132 = of_device_is_compatible(dcp->dev.of_node, "apple,t8132-dcp") ||
+		     of_device_is_compatible(dcp->dev.of_node, "apple,t8132-dcpext");
 	enum drm_plane_type plane_type;
 
 	surface_count = bitmap_weight(iomfb_surfaces, DCP_MAX_PLANES);
@@ -599,8 +602,8 @@ static int apple_probe_per_dcp(struct device *dev,
 			plane_type = DRM_PLANE_TYPE_OVERLAY;
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 						supports_l10r,
-						plane_type,
-						(zpos <= 1 || surf != top_surf));
+						plane_type, !t8132,
+						!t8132 && (zpos <= 1 || surf != top_surf));
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
 

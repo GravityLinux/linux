@@ -864,8 +864,15 @@ static void afk_recv_compact_message(struct apple_dcp_afkep *ep, u16 intf_id,
 	}
 	if (sub->category == 0 && sub->type == EPIC_SUBTYPE_STD_SERVICE) {
 		service = afk_epic_find_service(ep, intf_id);
-		/* Reports carry the serialized object directly. Unlike calls and
-		 * replies, they have no compact command descriptor. */
+		/* Neo and Max reports carry the serialized object directly.
+		 * Unlike calls and replies, they have no compact command
+		 * descriptor. Keep the established T8132 parsing, which skips
+		 * a leading descriptor when one fits. */
+		if (dcp_is_t8132(ep->dcp) &&
+		    payload_size >= sizeof(struct epic_compact_desc)) {
+			payload += sizeof(struct epic_compact_desc);
+			payload_size -= sizeof(struct epic_compact_desc);
+		}
 		if (compact_trace) {
 			dev_info(ep->dcp->dev,
 				 "AFK-COMPACT report ep=%02x intf=%u service=%s size=%zu data=%*phN\n",

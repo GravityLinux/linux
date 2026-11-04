@@ -10,6 +10,7 @@
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/wait.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -349,6 +350,13 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+/* T8132 keeps the DCP protocol details it was qualified with. */
+static inline bool dcp_is_t8132(const struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcp") ||
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
+}
 
 static inline bool dcp_fw_is_26_6(const struct apple_dcp *dcp)
 {
