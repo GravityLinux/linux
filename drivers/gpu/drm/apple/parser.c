@@ -12,6 +12,7 @@
 #include <sound/pcm.h> // for sound format masks
 #endif
 
+#include "dcp-internal.h"
 #include "parser.h"
 #include "trace.h"
 
@@ -507,7 +508,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		}
 	}
 
-	if (is_preferred)
+	/* T8132 keeps its qualified mode ranking without the preferred bonus. */
+	if (is_preferred && !dcp_is_t8132(handle->dcp))
 		*score |= (1L << 32);
 
 	if (out->sdr_rgb.score >= 0)

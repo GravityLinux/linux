@@ -1200,14 +1200,18 @@ static void last_client_closed_poff(struct apple_dcp *dcp, void *out,
 
 static void aborted_swaps_dcp_poff(struct apple_dcp *dcp, void *out, void *cookie)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-	/* iomfb_last_client_close times out on 14.7 */
-	last_client_closed_poff(dcp, NULL, cookie);
-#else
 	struct iomfb_last_client_close_req last_client_req = {};
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/* iomfb_last_client_close times out on 14.7. T8132 26.6 firmware
+	 * still completes it. */
+	if (!dcp_is_t8132(dcp)) {
+		last_client_closed_poff(dcp, NULL, cookie);
+		return;
+	}
+#endif
 	iomfb_last_client_close(dcp, false, &last_client_req,
 				last_client_closed_poff, cookie);
-#endif
 }
 #endif
 
@@ -1612,10 +1616,16 @@ static void dcp_get_mode_info(struct apple_dcp *dcp,
 	struct dcp_get_mode_info_req_v26_6 req;
 
 	/* Native 26.6 requests on J616c clear the entire input record, including
-	 * the opaque word at 0x68. A364 fills the mode record before A413
-	 * consumes the selected timing/color pair.
+	 * the opaque word at 0x68. T8132 requests keep the 0xaa fill outside the
+	 * mode record. A364 fills the mode record before A413 consumes the
+	 * selected timing/color pair.
 	 */
-	memset(&req, 0, sizeof(req));
+	if (dcp_is_t8132(dcp)) {
+		memset(&req, 0xaa, sizeof(req));
+		memset(req.mode, 0, sizeof(req.mode));
+	} else {
+		memset(&req, 0, sizeof(req));
+	}
 	req.mode_null = 0;
 	req.timing_mode_id = mode->timing_mode_id;
 	req.color_mode_id = mode->color_mode_id;
@@ -1876,8 +1886,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -ENOMEM;
 	cookie = &modeset_cookie->wait;
 	modeset_cookie->actual = dcp->mode;
-	/* Use the range published by this firmware, not an EDID or ADT guess. */
-	if (dcp_has_panel(dcp) && dcp->main_display &&
+	/* Use the range published by this firmware, not an EDID or ADT guess.
+	 * T8132 panels keep their qualified fixed-rate mode sequence. */
+	if (!dcp_is_t8132(dcp) && dcp_has_panel(dcp) && dcp->main_display &&
 	    dcp->refresh_intervals.minimum &&
 	    dcp->refresh_intervals.maximum > dcp->refresh_intervals.minimum) {
 		modeset_cookie->set_adaptive_sync = true;
@@ -2108,7 +2119,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
 
-		req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
+		if (apl_plane->modern)
+			req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
 
 		if (dcp->notch_height > 0)
 			req->swap.dst_rect[l].y += dcp->notch_height;
@@ -2166,8 +2178,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
-		/* Restore the requested level, not transient firmware telemetry. */
-		int brightness = dcp->brightness.bl_dev ?
+		/* Restore the requested level, not transient firmware telemetry.
+		 * T8132 keeps sending its tracked level. */
+		int brightness = dcp->brightness.bl_dev && !dcp_is_t8132(dcp) ?
 			backlight_get_brightness(dcp->brightness.bl_dev) :
 			dcp->brightness.nits;
 
@@ -2254,7 +2267,8 @@ static void init_2(struct apple_dcp *dcp, void *out, void *cookie)
 	};
 
 	static_assert(sizeof(notifications) == 108);
-	if (dcp_has_panel(dcp) && dcp->refresh_intervals.minimum &&
+	if (!dcp_is_t8132(dcp) && dcp_has_panel(dcp) &&
+	    dcp->refresh_intervals.minimum &&
 	    dcp->refresh_intervals.maximum > dcp->refresh_intervals.minimum) {
 		dcp_push(dcp, false, &call, sizeof(notifications), 0,
 			 (void *)notifications, init_notifications_done, NULL);
