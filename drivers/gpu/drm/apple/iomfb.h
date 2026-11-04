@@ -242,6 +242,14 @@ struct dcp_allocate_buffer_resp {
 	u32 mem_desc_id;
 } __packed;
 
+/*27.2 D451 returns only the DVA, logical byte length and host handle.
+ * The physical-address result present in the older layout is absent. */
+struct dcp_allocate_buffer_resp_v27_2 {
+	u64 dva;
+	u64 dva_size;
+	u32 mem_desc_id;
+} __packed;
+
 struct dcp_map_physical_req {
 	u64 paddr;
 	u64 size;

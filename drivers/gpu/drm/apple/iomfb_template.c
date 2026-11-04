@@ -34,6 +34,12 @@
 #include "trace.h"
 #include "version_utils.h"
 
+#ifdef DCP_FW_T8142
+typedef struct dcp_allocate_buffer_resp_v27_2 dcp_allocate_buffer_resp_t;
+#else
+typedef struct dcp_allocate_buffer_resp dcp_allocate_buffer_resp_t;
+#endif
+
 enum dcp_power_transition {
 	DCP_POWER_TRANSITION_NONE,
 	DCP_POWER_TRANSITION_DISPLAY_OFF,
@@ -54,7 +60,11 @@ static dcp_power_state_req_t dcp_power_state_req(u64 state,
 {
 	dcp_power_state_req_t req = {
 		.state = state,
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+		.padding = { },
+#else
 		.padding = { 0xaa, 0xaa, 0xaa },
+#endif
 	};
 
 	switch (transition) {
@@ -79,7 +89,11 @@ static dcp_bool_arg_t dcp_bool_arg(bool value)
 {
 	return (dcp_bool_arg_t){
 		.value = value,
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+		.padding = { },
+#else
 		.padding = { 0xaa, 0xaa, 0xaa },
+#endif
 	};
 }
 
@@ -104,7 +118,7 @@ static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits
 {
 	swap->bl_update = 1;
 	swap->bl_flags[1] = 1;
-#ifdef DCP_FW_T8140
+#if defined(DCP_FW_T8140) || defined(DCP_FW_T8142)
 	/* Supply the complete linear-nits configuration. A zero gain or limit
 	 * can turn a valid requested level into zero physical backlight output. */
 	if (maximum) {
@@ -155,7 +169,11 @@ dcp_swap_start_request(struct apple_dcp *dcp)
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 	return (struct DCP_FW_NAME(dcp_swap_start_req)){
 		.client = dcp_iomfb_client(dcp),
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+		.padding = { },
+#else
 		.padding = { 0xaa, 0xaa, 0xaa },
+#endif
 	};
 #else
 	return (struct DCP_FW_NAME(dcp_swap_start_req)){ 0 };
@@ -229,7 +247,11 @@ DCP_THUNK_OUT(dcp_create_default_fb, dcpep_create_default_fb, u32);
 DCP_THUNK_OUT(dcp_start_signal, dcpep_start_signal, u32);
 DCP_THUNK_VOID(dcp_setup_video_limits, dcpep_setup_video_limits);
 DCP_THUNK_VOID(dcp_set_create_dfb, dcpep_set_create_dfb);
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+DCP_THUNK_OUT(dcp_first_client_open, dcpep_first_client_open, u32);
+#else
 DCP_THUNK_VOID(dcp_first_client_open, dcpep_first_client_open);
+#endif
 
 DCP_THUNK_INOUT(dcp_set_parameter_dcp, dcpep_set_parameter_dcp,
 		struct dcp_set_parameter_dcp, u32);
@@ -536,11 +558,11 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
  * physically contiguous, however we should save the sgtable in case the
  * buffer needs to be later mapped for PIODMA.
  */
-static struct dcp_allocate_buffer_resp
+static dcp_allocate_buffer_resp_t
 dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 			 struct dcp_allocate_buffer_req *req)
 {
-	struct dcp_allocate_buffer_resp resp = { 0 };
+	dcp_allocate_buffer_resp_t resp = { 0 };
 	struct dcp_mem_descriptor *memdesc;
 	size_t size;
 	u32 id;
@@ -1012,12 +1034,20 @@ static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out,
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 static const struct dcp_method_entry dcp_prepare_wake_method = {
 	.name = "dcpep_prepare_wake",
+#ifdef DCP_FW_T8142
+	.tag = { 'A', '4', '6', '4' },
+#else
 	.tag = { 'A', '4', '1', '4' },
+#endif
 };
 
 static const struct dcp_method_entry dcp_finish_wake_method = {
 	.name = "dcpep_finish_wake",
+#ifdef DCP_FW_T8142
+	.tag = { 'A', '5', '3', '5' },
+#else
 	.tag = { 'A', '4', '7', '4' },
+#endif
 };
 
 static const struct dcp_method_entry dcp_get_mode_info_method = {
@@ -1093,6 +1123,9 @@ static void dcp_poweron_after_first_client(struct apple_dcp *dcp, void *out,
 static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
 					   void *cookie)
 {
+#ifdef DCP_FW_T8142
+	dcp_poweron_after_first_client(dcp, out, cookie);
+#else
 	/* Ordinary panel blanking retains the client opened during startup.
 	 * The J616c 26.6.2 display-sleep/wake capture goes from A414 directly
 	 * to the display query and A473(1), without A457/A474. Reopening the
@@ -1106,6 +1139,7 @@ static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
 
 	dcp_first_client_open(dcp, false, dcp_poweron_after_first_client,
 			      cookie);
+#endif
 }
 #endif
 
@@ -1486,7 +1520,7 @@ TRAMPOLINE_INOUT(trampoline_sr_set_property_int, iomfbep_cb_sr_set_property_int,
 		 struct iomfb_sr_set_property_int_req, u8);
 TRAMPOLINE_INOUT(trampoline_allocate_buffer, dcpep_cb_allocate_buffer,
 		 struct dcp_allocate_buffer_req,
-		 struct dcp_allocate_buffer_resp);
+		 dcp_allocate_buffer_resp_t);
 TRAMPOLINE_INOUT(trampoline_map_physical, dcpep_cb_map_physical,
 		 struct dcp_map_physical_req, struct dcp_map_physical_resp);
 TRAMPOLINE_INOUT(trampoline_release_mem_desc, dcpep_cb_release_mem_desc, u32,
@@ -1882,6 +1916,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return 0;
 	}
 
+#ifdef DCP_FW_T8142
+	/* Only the advertised fixed internal timing is qualified. In particular,
+	 * A464 is a wake contract, not the old digital-output mode method. */
+	return -EOPNOTSUPP;
+#endif
+
 	modeset_cookie = kzalloc(sizeof(*modeset_cookie), GFP_KERNEL);
 	if (!modeset_cookie)
 		return -ENOMEM;
@@ -2221,6 +2261,13 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	dev_info(dcp->dev, "DCP is_main_display: %d\n", result);
 
 	dcp->main_display = result != 0;
+#ifdef DCP_FW_T8142
+	/* Preserve the boot level within the DT cap. Subsequent powerlog
+	 * feedback reports actual output without overwriting user requests. */
+	if (!dcp->brightness.initialized && dcp->brightness.actual_nits >= 0)
+		dcp->brightness.nits = min_t(u32, dcp->brightness.actual_nits,
+					    dcp->brightness.maximum);
+#endif
 
 	connector = dcp->connector;
 	if (connector) {
@@ -2253,6 +2300,10 @@ static void init_notifications_done(struct apple_dcp *dcp, void *out, void *cook
 
 static void init_2(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#ifdef DCP_FW_T8142
+	/* This version has already opened its client before the boot sequence. */
+	init_3(dcp, out, cookie);
+#else
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 	static const struct dcp_method_entry call = {
 		.name = "dcpep_update_notify_clients",
@@ -2273,6 +2324,7 @@ static void init_2(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 #endif
 	dcp_first_client_open(dcp, false, init_3, NULL);
+#endif
 }
 
 static void init_1(struct apple_dcp *dcp, void *out, void *cookie)

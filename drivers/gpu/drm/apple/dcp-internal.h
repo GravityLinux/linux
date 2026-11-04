@@ -24,6 +24,7 @@
 #include "iomfb_v14_7.h"
 #include "iomfb_v26_6.h"
 #include "iomfb_v26_6_t8140.h"
+#include "iomfb_v27_2_t8142.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -207,6 +208,7 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
 		struct dcp_swap_submit_req_v26_6_0 v26_6_0;
 		struct dcp_swap_submit_req_v26_6_t8140 v26_6_t8140;
+		struct dcp_swap_submit_req_v27_2_t8142 v27_2_t8142;
 	} swap;
 
 	/* swap id of the last completed swap */
@@ -353,7 +355,8 @@ bool dcp_has_panel(struct apple_dcp *dcp);
 static inline bool dcp_fw_is_26_6(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6 ||
-	       dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140;
+	       dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_2_T8142;
 }
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

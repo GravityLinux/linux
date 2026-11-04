@@ -1423,6 +1423,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_26_6_T8140:
 		iomfb_poweroff_v26_6_t8140(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		iomfb_poweroff_v27_2_t8142(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1497,6 +1500,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_26_6_T8140:
 		iomfb_sleep_v26_6_t8140(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		iomfb_sleep_v27_2_t8142(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -1538,6 +1544,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_V_26_6_T8140:
 		iomfb_poweron_v26_6_t8140(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		iomfb_poweron_v27_2_t8142(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1832,6 +1841,14 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	int ret;
 
 	ret = dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
+
+	/* The J81327.2 packet shape and method map are measured independently. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp")) {
+		if (ret >= 0 && !strcmp(fw_str, "27.2.0"))
+			return DCP_FIRMWARE_V_27_2_T8142;
+		dev_err(dev, "T8142 DCP requires qualified27.2.0 metadata (FW: %s)\n", fw_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
 
 	/* Neo has a distinct four-surface IOMFB ABI on the same OS release. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp") ||
@@ -2381,6 +2398,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_dcp, },
+	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_dcp, },
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_dcpext, },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },

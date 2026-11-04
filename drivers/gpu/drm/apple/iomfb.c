@@ -492,6 +492,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_26_6_T8140:
 		ret = iomfb_modeset_v26_6_t8140(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		ret = iomfb_modeset_v27_2_t8142(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -550,6 +553,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_26_6_T8140:
 		iomfb_flush_v26_6_t8140(dcp, crtc, commit);
 		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		iomfb_flush_v27_2_t8142(dcp, crtc, commit);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -573,6 +579,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6_T8140:
 		iomfb_start_v26_6_t8140(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		iomfb_start_v27_2_t8142(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -639,6 +648,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6_T8140:
 		iomfb_shutdown_v26_6_t8140(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_2_T8142:
+		iomfb_shutdown_v27_2_t8142(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

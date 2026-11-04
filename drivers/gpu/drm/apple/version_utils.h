@@ -19,6 +19,7 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_14_7,
 	DCP_FIRMWARE_V_26_6,
 	DCP_FIRMWARE_V_26_6_T8140,
+	DCP_FIRMWARE_V_27_2_T8142,
 };
 
 #endif /*__APPLE_VERSION_UTILS_H__*/
