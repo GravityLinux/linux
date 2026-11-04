@@ -812,10 +812,15 @@ int user_shm_lock(size_t size, struct ucounts *ucounts)
 	long memlock;
 	int allowed = 0;
 
-	locked = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	/*
+	 * P3S: the per-user count is shared by tasks of both page sizes, and
+	 * the segment may be unlocked by another task than the one that locked
+	 * it, so count kernel pages, as shmem allocates them.
+	 */
+	locked = (size + PAGE_SIZE_KERNEL - 1) >> PAGE_SHIFT_KERNEL;
 	lock_limit = rlimit(RLIMIT_MEMLOCK);
 	if (lock_limit != RLIM_INFINITY)
-		lock_limit >>= PAGE_SHIFT;
+		lock_limit >>= PAGE_SHIFT_KERNEL;
 	spin_lock(&shmlock_user_lock);
 	memlock = inc_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, locked);
 
@@ -837,7 +842,8 @@ out:
 void user_shm_unlock(size_t size, struct ucounts *ucounts)
 {
 	spin_lock(&shmlock_user_lock);
-	dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, (size + PAGE_SIZE - 1) >> PAGE_SHIFT);
+	dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK,
+			   (size + PAGE_SIZE_KERNEL - 1) >> PAGE_SHIFT_KERNEL);
 	spin_unlock(&shmlock_user_lock);
 	put_ucounts(ucounts);
 }
