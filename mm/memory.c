@@ -3221,7 +3221,12 @@ static int remap_pfn_range_internal(struct vm_area_struct *vma, unsigned long ad
 static int remap_pfn_range_notrack(struct vm_area_struct *vma, unsigned long addr,
 		unsigned long pfn, unsigned long size, pgprot_t prot)
 {
-	int error = remap_pfn_range_internal(vma, addr, pfn, size, prot);
+	int error = p3s_remap_pfn_range_size(vma, addr, &size);
+
+	if (error)
+		return error;
+
+	error = remap_pfn_range_internal(vma, addr, pfn, size, prot);
 
 	if (!error)
 		return 0;

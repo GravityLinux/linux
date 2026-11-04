@@ -5,6 +5,43 @@
 #include <linux/mm.h>
 
 /*
+ * remap_pfn_range() may discard only the unused slices of the last native
+ * page.  A request that reaches another native page is an invalid mapping,
+ * even if that page lies in an adjacent VMA.  Validate before changing any
+ * PTEs, so the failure path never has to zap beyond @vma.
+ */
+static inline int p3s_remap_pfn_range_size(struct vm_area_struct *vma,
+					   unsigned long addr,
+					   unsigned long *size)
+{
+	unsigned long available, rounded, tail;
+	unsigned int last_slice;
+
+	if (!vma_is_p3s_4k(vma))
+		return 0;
+
+	if (vma_slice_off(vma) && p3s_4k_unsupported(vma->vm_mm))
+		return -EINVAL;
+
+	if (addr < vma->vm_start || addr >= vma->vm_end ||
+	    !IS_ALIGNED(addr, PAGE_SIZE_4KB) ||
+	    !*size || *size > ULONG_MAX - (PAGE_SIZE_4KB - 1))
+		return -EINVAL;
+
+	rounded = PAGE_ALIGN_4KB(*size);
+	available = vma->vm_end - addr;
+	last_slice = vma_slice_offset(vma, vma->vm_end - PAGE_SIZE_4KB);
+	tail = (P3S_SLICE_MASK - last_slice) * PAGE_SIZE_4KB;
+	if (rounded > available) {
+		if (rounded - available > tail)
+			return -EINVAL;
+		rounded = available;
+	}
+	*size = rounded;
+	return 0;
+}
+
+/*
  * The insert helpers of mm/memory.c, the only file that includes this
  * header, so they can stay static there.
  */
