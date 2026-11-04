@@ -7,6 +7,7 @@
 #include "iomfb_v14_7.h"
 #include "iomfb_v26_6.h"
 #include "iomfb_v26_6_t8140.h"
+#include "iomfb_v27_2_t8142.h"
 #include "version_utils.h"
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {

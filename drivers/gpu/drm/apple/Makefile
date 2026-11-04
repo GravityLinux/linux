@@ -13,6 +13,7 @@ appledrm-y += iomfb_v13_3.o
 appledrm-y += iomfb_v14_7.o
 appledrm-y += iomfb_v26_6.o
 appledrm-y += iomfb_v26_6_t8140.o
+appledrm-y += iomfb_v27_2_t8142.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 

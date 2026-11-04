@@ -86,7 +86,8 @@ static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 &&
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ||
+	     dcp->fw_compat == DCP_FIRMWARE_V_27_2_T8142) &&
 	    dcp->brightness.actual_nits >= 0)
 		return min_t(int, dcp->brightness.actual_nits,
 			     bd->props.max_brightness);
@@ -169,8 +170,9 @@ retry:
 	}
 
 	crtc_state->color_mgmt_changed |= true;
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140) {
-		/* The Neo brightness swap needs the active surfaces even when
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ||
+	    dcp->fw_compat == DCP_FIRMWARE_V_27_2_T8142) {
+		/* These brightness swaps need the active surfaces even when
 		 * their contents are unchanged. Reuse their existing buffers. */
 		ret = drm_atomic_add_affected_planes(commit, crtc);
 		if (ret)

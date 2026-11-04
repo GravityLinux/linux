@@ -62,7 +62,7 @@ struct DCP_FW_NAME(dcp_swap) {
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 	u8 bl_flags[6];
 	__le64 bl_nits; /* IEEE-754 binary64, unaligned at 0x35e */
-#ifdef DCP_FW_T8140
+#if defined(DCP_FW_T8140) || defined(DCP_FW_T8142)
 	u8 unk_366[0x10];
 	__le64 bl_limit_nits;
 	__le64 bl_scale;
@@ -86,7 +86,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8 unk_2f3[0x2d];
 #endif
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#ifdef DCP_FW_T8140
+#if defined(DCP_FW_T8140) || defined(DCP_FW_T8142)
 	u8 unk_391[0x55];
 	__le64 bl_scale_inverse;
 	u8 unk_3ee[0xea];
@@ -101,15 +101,28 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 unk_flags;
 	u32 unk_flags2;
 #endif
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	/* Native27.2 preserves the earlier rectangle/brightness offsets but
+	 * adds eight bytes before this tail. Their role remains unknown. */
+	u8 reserved_27_2_prefix[8];
+#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
 	/* Added after the 14.7 swap record.  Native 26.6 sets both bytes for
 	 * ordinary visible swaps; the remaining bytes have always been zero in
 	 * traces. */
 	u8 unk_26_6[0x16];
 	u8 presents_surface;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	/* The two marker positions follow native frame captures; their names
+	 * inherit the older interface and still require controlled probing. */
+	u8 reserved_27_2_middle[0x192];
+	u8 has_completion;
+	u8 reserved_27_2_tail[0x1e];
+#else
 	u8 unk_26_6_17[0x51];
 	u8 has_completion;
 	u8 unk_26_6_69[0x17];
+#endif
 #endif
 #endif
 } __packed;
