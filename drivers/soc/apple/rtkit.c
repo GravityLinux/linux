@@ -88,8 +88,7 @@ struct apple_rtkit_rx_work {
 static bool apple_rtkit_has_quirk(struct apple_rtkit *rtk,
 				 enum apple_rtkit_quirks quirk)
 {
-	return (rtk->ops->quirks & quirk) ||
-	       (quirk == APPLE_RTKIT_QUIRK_EARLY_CRASHLOG && rtk->early_crashlog);
+	return (rtk->ops->quirks | rtk->compat_quirks) & quirk;
 }
 
 bool apple_rtkit_is_running(struct apple_rtkit *rtk)
@@ -733,7 +732,6 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
-	rtk->boot_ap_power = true;
 	init_completion(&rtk->crashlog_completion);
 
 	init_completion(&rtk->epmap_completion);
@@ -850,13 +848,13 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 
 void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable)
 {
-	rtk->boot_ap_power = enable;
+	rtk->skip_boot_ap_power = !enable;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_boot_ap_power);
 
 void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
 {
-	rtk->early_crashlog = true;
+	rtk->compat_quirks |= APPLE_RTKIT_QUIRK_EARLY_CRASHLOG;
 	reinit_completion(&rtk->crashlog_completion);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
@@ -1012,8 +1010,8 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			return ret;
 		}
 	}
-	if (!rtk->boot_ap_power) {
-		dev_dbg(rtk->dev, "RTKit: reusing boot AP power ownership\n");
+
+	if (rtk->skip_boot_ap_power) {
 		rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
 		return 0;
 	}

@@ -132,6 +132,17 @@ void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
  */
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
 
+/* Per-instance compatibility APIs retained for the original M4 PMP clients. */
+void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable);
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
+			      size_t n_endpoints);
+int apple_rtkit_reuse_syslog_buffer(struct apple_rtkit *rtk, dma_addr_t iova,
+				    size_t size, size_t n_entries,
+				    size_t msg_size);
+int apple_rtkit_reuse_crashlog_buffer(struct apple_rtkit *rtk,
+				      dma_addr_t iova, size_t size);
+
 /*
  * Select whether apple_rtkit_boot() should request AP power ownership. Some
  * bootloader handoffs retain that ownership for the next RTKit client.
