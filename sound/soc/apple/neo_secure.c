@@ -12,6 +12,13 @@
 #include "neo_secure.h"
 
 #define NEO_SECURE_ENDPOINTS 0x40
+struct neo_secure_hw {
+	bool canonical_16byte_address;
+};
+static const struct neo_secure_hw neo_secure_t8140_hw;
+static const struct neo_secure_hw neo_secure_t8142_hw = {
+	.canonical_16byte_address = true,
+};
 struct neo_secure_buffer {
 	void *rx, *tx;
 	dma_addr_t rx_iova, tx_iova;
@@ -19,10 +26,12 @@ struct neo_secure_buffer {
 };
 struct neo_secure {
 	struct device *dev;
+	const struct neo_secure_hw *hw;
 	struct apple_mbox *mbox;
 	struct workqueue_struct *wq;
 	struct completion ready;
 	struct neo_secure_buffer buffers[NEO_SECURE_ENDPOINTS];
+	u64 endpoints;
 	int error;
 };
 struct neo_secure_message {
@@ -53,10 +62,15 @@ static int neo_secure_allocate(struct neo_secure *s, u8 ep, size_t size)
 		return -ENOMEM;
 	if ((b->rx_iova >> 36) != 0x20 || (b->tx_iova >> 36) != 0x20)
 		return -ERANGE;
-	/* This protocol encodes a 36-bit offset and a host window selector,
-	 * rather than the canonical 42-bit SID-1 IOVA used by DART. */
-	rx = 0x2000000000ULL | (b->rx_iova & GENMASK_ULL(35, 0));
-	tx = 0x2000000000ULL | (b->tx_iova & GENMASK_ULL(35, 0));
+	if (s->hw->canonical_16byte_address) {
+		/* T8142's declared runtime error reports address units of 16 bytes. */
+		rx = b->rx_iova >> 4;
+		tx = b->tx_iova >> 4;
+	} else {
+		/* T8140 uses a 36-bit offset and a host window selector. */
+		rx = 0x2000000000ULL | (b->rx_iova & GENMASK_ULL(35, 0));
+		tx = 0x2000000000ULL | (b->tx_iova & GENMASK_ULL(35, 0));
+	}
 	dev_info(s->dev, "Second-host queue ep=%x size=%zx rx=%pad tx=%pad\n",
 		 ep, size, &b->rx_iova, &b->tx_iova);
 	error = neo_secure_send(s, ep, 0x1200ULL << 48);
@@ -83,6 +97,8 @@ static void neo_secure_work(struct work_struct *work)
 			error = neo_secure_send(s, 0, 0x200000000c000cULL);
 			break;
 		case 8: /* Unlike normal RTKit, this host echoes the endpoint map. */
+			if (((value >> 32) & 7) > 1) { error = -EPROTO; break; }
+			s->endpoints |= (value & 0xffffffffULL) << (32 * ((value >> 32) & 7));
 			error = neo_secure_send(s, 0, value);
 			if (!error && (value & BIT_ULL(51)))
 				error = neo_secure_send(s, 0, 0xb0000000000220ULL);
@@ -94,7 +110,7 @@ static void neo_secure_work(struct work_struct *work)
 		default:
 			error = -EPROTO;
 		}
-	} else if (ep >= 0x20 && ep < NEO_SECURE_ENDPOINTS) {
+	} else if (ep < NEO_SECURE_ENDPOINTS && (s->endpoints & BIT_ULL(ep))) {
 		switch (type) {
 		case 0x1200:
 			error = neo_secure_allocate(s, ep, value & 0xffffffff);
@@ -172,6 +188,8 @@ static int neo_secure_probe(struct platform_device *pdev)
 	int error;
 	if (!s) return -ENOMEM;
 	s->dev = &pdev->dev;
+	s->hw = of_device_get_match_data(s->dev);
+	if (!s->hw) return -ENODEV;
 	init_completion(&s->ready);
 	error = dma_set_mask_and_coherent(s->dev, DMA_BIT_MASK(42));
 	if (error) return error;
@@ -190,7 +208,8 @@ static int neo_secure_probe(struct platform_device *pdev)
 	return 0;
 }
 static const struct of_device_id neo_secure_of_match[] = {
-	{ .compatible = "apple,t8140-neo-aop-second-host" }, {}
+	{ .compatible = "apple,t8142-aop-second-host", .data = &neo_secure_t8142_hw },
+	{ .compatible = "apple,t8140-neo-aop-second-host", .data = &neo_secure_t8140_hw }, {}
 };
 MODULE_DEVICE_TABLE(of, neo_secure_of_match);
 static struct platform_driver neo_secure_driver = {

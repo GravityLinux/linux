@@ -29,6 +29,7 @@ struct neo_pcm {
 	bool running, powered, irq_enabled;
 	int irq;
 	u32 descriptor_id;
+	u32 channels;
 };
 
 static const struct snd_pcm_hardware neo_capture_hw = {
@@ -118,6 +119,8 @@ static int neo_pcm_open(struct snd_pcm_substream *stream)
 {
 	struct neo_pcm *p = snd_pcm_substream_chip(stream);
 	stream->runtime->hw = neo_capture_hw;
+	stream->runtime->hw.channels_min = p->channels;
+	stream->runtime->hw.channels_max = p->channels;
 	WRITE_ONCE(p->stream, stream);
 	return snd_pcm_hw_constraint_integer(stream->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 }
@@ -245,6 +248,11 @@ static int neo_pcm_probe(struct platform_device *pdev)
 	p = card->private_data;
 	p->dev = &pdev->dev;
 	p->card = card;
+	/* Microphone wiring belongs to the board, not its serial or SoC ID. */
+	p->channels = 2;
+	of_property_read_u32(p->dev->of_node, "num-channels", &p->channels);
+	if (!p->channels || p->channels > 8)
+		return dev_err_probe(p->dev, -EINVAL, "Invalid microphone channel count\n");
 	p->mic = neo_mic_get(p->dev);
 	if (IS_ERR(p->mic)) return PTR_ERR(p->mic);
 	spin_lock_init(&p->lock);
@@ -274,6 +282,7 @@ static int neo_pcm_probe(struct platform_device *pdev)
 	return snd_card_register(card);
 }
 static const struct of_device_id neo_pcm_of_match[] = {
+	{ .compatible = "apple,t8142-mic-capture" },
 	{ .compatible = "apple,t8140-neo-mic-capture" }, {}
 };
 MODULE_DEVICE_TABLE(of, neo_pcm_of_match);

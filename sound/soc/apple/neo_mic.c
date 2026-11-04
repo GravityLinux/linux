@@ -4,6 +4,8 @@
  * ALSA capture is exposed by the companion neo_pcm.c RX0 driver. */
 #include <linux/completion.h>
 #include <linux/atomic.h>
+#include <linux/debugfs.h>
+#include <linux/fs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -13,7 +15,9 @@
 #include <linux/clocksource.h>
 #include <clocksource/arm_arch_timer.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
 #include "neo_secure.h"
@@ -21,9 +25,12 @@
 
 #define NEO_EP_FIRST 0x20
 #define NEO_EP_COUNT 16
-#define NEO_AF_LIMIT 0x10000
+/* Software allocation ceiling; T8142 advertises a 0x88000-byte AFK buffer. */
+#define NEO_AF_LIMIT SZ_1M
 #define NEO_CALL_TIMEOUT msecs_to_jiffies(5000)
 #define NEO_HPAI 0x68706169
+#define NEO_AUDIO_UNSUPPORTED 0xe00002c7
+#define NEO_AUDIO_NOT_FOUND 0xe00002f0
 
 struct neo_ring {
 	u32 offset, size, capacity, block;
@@ -45,6 +52,11 @@ struct neo_mic {
 	struct neo_ep ep[NEO_EP_COUNT];
 	struct completion announced, replied;
 	struct mutex call_lock;
+	struct mutex power_lock;
+	struct generic_pm_domain speaker_domain;
+	struct generic_pm_domain *domains[1];
+	struct genpd_onecell_data domain_data;
+	bool speaker_warm_held;
 	u8 audio_ep;
 	u32 audio_channel;
 	u16 seq, pending_tag;
@@ -54,6 +66,7 @@ struct neo_mic {
 	u8 reply[256];
 	size_t reply_size;
 	bool crashed;
+	struct dentry *debugfs;
 };
 
 static int neo_send(struct neo_mic *mic, u8 ep, u64 value)
@@ -240,7 +253,8 @@ static void neo_free_rings(void *cookie)
 					  mic->ep[i].buffer, mic->ep[i].iova);
 }
 
-static int neo_call(struct neo_mic *mic, const u8 *body, size_t length, u32 inline_size)
+static int neo_call_full(struct neo_mic *mic, const u8 *body, size_t length,
+			u32 inline_size, u8 *reply, size_t *reply_size, u32 *status)
 {
 	struct neo_ep *ep = &mic->ep[mic->audio_ep - NEO_EP_FIRST];
 	struct neo_ring *ring = &ep->tx;
@@ -291,15 +305,84 @@ static int neo_call(struct neo_mic *mic, const u8 *body, size_t length, u32 inli
 	if (!error && !wait_for_completion_timeout(&mic->replied, NEO_CALL_TIMEOUT))
 		error = -ETIMEDOUT;
 	if (!error && mic->retcode) {
-		dev_err(mic->dev, "Audio call returned %08x\n", mic->retcode);
-		error = -EIO;
+		if (mic->retcode == NEO_AUDIO_UNSUPPORTED)
+			error = -EOPNOTSUPP;
+		else if (mic->retcode == NEO_AUDIO_NOT_FOUND)
+			error = -ENOENT;
+		else
+			error = -EIO;
+		dev_info(mic->dev, "Audio call returned %08x\n", mic->retcode);
+	}
+	if (status)
+		*status = mic->retcode;
+	if (reply && reply_size) {
+		*reply_size = min(*reply_size, mic->reply_size);
+		memcpy(reply, mic->reply, *reply_size);
 	}
 out:
 	mutex_unlock(&mic->call_lock);
 	return error;
 }
 
-static int neo_query_state(struct neo_mic *mic)
+static int neo_call(struct neo_mic *mic, const u8 *body, size_t length, u32 inline_size)
+{
+	return neo_call_full(mic, body, length, inline_size, NULL, NULL, NULL);
+}
+
+/* Development-only, read-only firmware properties. Each open owns one
+ * transaction and a bounded reply. This is not a stable userspace ABI.
+ */
+static ssize_t neo_query_write(struct file *file, const char __user *input,
+			       size_t count, loff_t *position)
+{
+	struct neo_mic *mic = file_inode(file)->i_private;
+	u8 body[52] = {0}, reply[256];
+	size_t reply_size = sizeof(reply);
+	u32 device, property, inline_size, status = ~0U;
+	char *transaction;
+	int error;
+
+	if (!READ_ONCE(mic->ready) || READ_ONCE(mic->crashed))
+		return -ENODEV;
+	if (!count || count >= 64)
+		return -EINVAL;
+	transaction = simple_transaction_get(file, input, count);
+	if (IS_ERR(transaction))
+		return PTR_ERR(transaction);
+	if (sscanf(transaction, "%x %u %u", &device, &property, &inline_size) != 3 ||
+	    inline_size > sizeof(reply))
+		return -EINVAL;
+	put_unaligned_le32(~0U, body + 4);
+	put_unaligned_le32(0xc3000004, body + 8);
+	put_unaligned_le32(0x30, body + 32);
+	put_unaligned_le32(device, body + 40);
+	put_unaligned_le32(property, body + 44);
+	put_unaligned_le32(1, body + 48);
+	error = neo_call_full(mic, body, sizeof(body), inline_size,
+			      reply, &reply_size, &status);
+	if (error && status == ~0U)
+		return error;
+	put_unaligned_le32(status, transaction);
+	put_unaligned_le32(reply_size, transaction + 4);
+	memcpy(transaction + 8, reply, reply_size);
+	simple_transaction_set(file, 8 + reply_size);
+	return count;
+}
+
+static const struct file_operations neo_query_fops = {
+	.owner = THIS_MODULE,
+	.write = neo_query_write,
+	.read = simple_transaction_read,
+	.release = simple_transaction_release,
+};
+
+static void neo_remove_debugfs(void *cookie)
+{
+	struct neo_mic *mic = cookie;
+	debugfs_remove_recursive(mic->debugfs);
+}
+
+static int neo_query_boot_status(struct neo_mic *mic)
 {
 	u8 body[52] = {0};
 	int error;
@@ -314,7 +397,7 @@ static int neo_query_state(struct neo_mic *mic)
 	if (!error) {
 		if (mic->reply_size < 8 || get_unaligned_le32(mic->reply) != 4)
 			return -EPROTO;
-		dev_info(mic->dev, "HPAI state %08x; audio control transport verified\n",
+		dev_info(mic->dev, "HPAI property401=%08x; audio control transport verified\n",
 			 get_unaligned_le32(mic->reply + 4));
 	}
 	return error;
@@ -341,7 +424,7 @@ int neo_audio_set(struct neo_mic *mic, u32 device, u32 property,
 	return neo_call(mic, body, 52 + ALIGN(length, 4), 0);
 }
 
-int neo_audio_power(struct neo_mic *mic, u32 device, u32 state, u32 active)
+static int neo_audio_power_locked(struct neo_mic *mic, u32 device, u32 state, u32 active)
 {
 	u8 body[100] = {0};
 	u64 ticks = mul_u64_u32_div(arch_timer_read_counter(), 24000000,
@@ -363,6 +446,99 @@ int neo_audio_power(struct neo_mic *mic, u32 device, u32 state, u32 active)
 	dev_info(mic->dev, "Audio device=%08x power state=%08x active=%u result=%d\n",
 		 device, state, active, error);
 	return error;
+}
+
+int neo_audio_power(struct neo_mic *mic, u32 device, u32 state, u32 active)
+{
+	int error;
+
+	mutex_lock(&mic->power_lock);
+	/* A DMA supplier may still own the AP register aperture after PCM stops.
+	 * Keep it warm until that supplier releases its generic power domain.
+	 */
+	if (device == NEO_SPEAKER_DEVICE && state == NEO_MIC_OFF && mic->speaker_warm_held) {
+		state = NEO_MIC_WARM;
+		active = 0;
+	}
+	error = neo_audio_power_locked(mic, device, state, active);
+	mutex_unlock(&mic->power_lock);
+	return error;
+}
+
+static int neo_speaker_domain_on(struct generic_pm_domain *domain)
+{
+	struct neo_mic *mic = container_of(domain, struct neo_mic, speaker_domain);
+	int error;
+
+	mutex_lock(&mic->power_lock);
+	error = neo_audio_power_locked(mic, NEO_SPEAKER_DEVICE, NEO_MIC_WARM, 0);
+	if (!error)
+		mic->speaker_warm_held = true;
+	mutex_unlock(&mic->power_lock);
+	return error;
+}
+
+static int neo_speaker_domain_off(struct generic_pm_domain *domain)
+{
+	struct neo_mic *mic = container_of(domain, struct neo_mic, speaker_domain);
+	int error;
+
+	mutex_lock(&mic->power_lock);
+	error = neo_audio_power_locked(mic, NEO_SPEAKER_DEVICE, NEO_MIC_OFF, 0);
+	if (!error)
+		mic->speaker_warm_held = false;
+	mutex_unlock(&mic->power_lock);
+	return error;
+}
+
+static void neo_remove_power_domain(void *cookie)
+{
+	struct neo_mic *mic = cookie;
+
+	of_genpd_del_provider(mic->dev->of_node);
+	if (!pm_genpd_remove(&mic->speaker_domain) && mic->speaker_warm_held)
+		neo_speaker_domain_off(&mic->speaker_domain);
+}
+
+static int neo_register_power_domain(struct neo_mic *mic)
+{
+	u32 cells;
+	int error;
+
+	if (!of_find_property(mic->dev->of_node, "#power-domain-cells", NULL))
+		return 0;
+	error = of_property_read_u32(mic->dev->of_node, "#power-domain-cells", &cells);
+	if (error || cells != 1)
+		return -EINVAL;
+	mic->speaker_domain.name = devm_kasprintf(mic->dev, GFP_KERNEL, "%s-speaker-dma",
+						dev_name(mic->dev));
+	if (!mic->speaker_domain.name)
+		return -ENOMEM;
+	mic->speaker_domain.power_on = neo_speaker_domain_on;
+	mic->speaker_domain.power_off = neo_speaker_domain_off;
+	/* ADMAC currently has no runtime PM. Keep the register aperture warm
+	 * while it is bound, including IRQ handling; amplifier power is separate.
+	 * Remove this constraint once ADMAC runtime PM is implemented and tested.
+	 */
+	mic->speaker_domain.flags = GENPD_FLAG_ALWAYS_ON;
+	error = neo_speaker_domain_on(&mic->speaker_domain);
+	if (error)
+		return error;
+	error = pm_genpd_init(&mic->speaker_domain, NULL, false);
+	if (error) {
+		neo_speaker_domain_off(&mic->speaker_domain);
+		return error;
+	}
+	mic->domains[0] = &mic->speaker_domain;
+	mic->domain_data.domains = mic->domains;
+	mic->domain_data.num_domains = ARRAY_SIZE(mic->domains);
+	error = of_genpd_add_provider_onecell(mic->dev->of_node, &mic->domain_data);
+	if (error) {
+		pm_genpd_remove(&mic->speaker_domain);
+		neo_speaker_domain_off(&mic->speaker_domain);
+		return error;
+	}
+	return devm_add_action_or_reset(mic->dev, neo_remove_power_domain, mic);
 }
 
 int neo_mic_power(struct neo_mic *mic, u32 state, u32 active)
@@ -405,7 +581,28 @@ static int neo_mic_channels(struct neo_mic *mic)
 static int neo_mic_probe(struct platform_device *pdev)
 {
 	struct neo_mic *mic;
+	struct device_node *pmp;
 	int error, i;
+
+	/* PMP owns SoC power policy on systems which declare this supplier. */
+	pmp = of_parse_phandle(pdev->dev.of_node, "apple,pmp", 0);
+	if (pmp) {
+		struct platform_device *supplier = of_find_device_by_node(pmp);
+		struct device_link *link;
+
+		of_node_put(pmp);
+		if (!supplier)
+			return -EPROBE_DEFER;
+		if (!device_is_bound(&supplier->dev)) {
+			put_device(&supplier->dev);
+			return -EPROBE_DEFER;
+		}
+		link = device_link_add(&pdev->dev, &supplier->dev,
+				       DL_FLAG_AUTOREMOVE_CONSUMER);
+		put_device(&supplier->dev);
+		if (!link)
+			return -ENOMEM;
+	}
 
 	mic = devm_kzalloc(&pdev->dev, sizeof(*mic), GFP_KERNEL);
 	if (!mic) return -ENOMEM;
@@ -415,6 +612,7 @@ static int neo_mic_probe(struct platform_device *pdev)
 	init_completion(&mic->announced);
 	init_completion(&mic->replied);
 	mutex_init(&mic->call_lock);
+	mutex_init(&mic->power_lock);
 	platform_set_drvdata(pdev, mic);
 	error = dma_set_mask_and_coherent(mic->dev, DMA_BIT_MASK(42));
 	if (error) return error;
@@ -442,15 +640,27 @@ static int neo_mic_probe(struct platform_device *pdev)
 	}
 	if (!wait_for_completion_timeout(&mic->announced, NEO_CALL_TIMEOUT) || mic->crashed)
 		return dev_err_probe(mic->dev, -ETIMEDOUT, "Audio service absent\n");
-	error = neo_query_state(mic);
+	error = neo_query_boot_status(mic);
 	if (error) return dev_err_probe(mic->dev, error, "Microphone state query failed\n");
 	error = neo_mic_channels(mic);
-	if (error) return dev_err_probe(mic->dev, error, "Microphone channel setup failed\n");
+	if (error == -EOPNOTSUPP)
+		dev_info(mic->dev, "LPAI channel configuration is unsupported; retaining HPAI transport\n");
+	else if (error)
+		return dev_err_probe(mic->dev, error, "Microphone channel setup failed\n");
+	error = neo_register_power_domain(mic);
+	if (error)
+		return dev_err_probe(mic->dev, error, "Audio power domain registration failed\n");
 	mic->ready = true;
+	mic->debugfs = debugfs_create_dir(dev_name(mic->dev), NULL);
+	debugfs_create_file("query", 0600, mic->debugfs, mic, &neo_query_fops);
+	error = devm_add_action_or_reset(mic->dev, neo_remove_debugfs, mic);
+	if (error)
+		return error;
 	return 0;
 }
 
 static const struct of_device_id neo_mic_of_match[] = {
+	{ .compatible = "apple,t8142-aop-audio" },
 	{ .compatible = "apple,t8140-neo-mic" },
 	{}
 };

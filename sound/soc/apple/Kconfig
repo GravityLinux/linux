@@ -64,20 +64,29 @@ config SND_SOC_APPLE_T8132_SPEAKER
 	  the kernel or as the snd-t8132-speaker module.
 
 config SND_SOC_APPLE_NEO_MIC
-	bool "Apple T8140 AOP microphone capture"
+	bool "Apple T8140/T8142 AOP microphone capture"
 	depends on ARCH_APPLE
 	select APPLE_RTKIT
 	select APPLE_MAILBOX
 	select SND_PCM
+	select PM_GENERIC_DOMAINS if PM
 	help
-	  Microphone capture on the MacBook Neo using the resident AOP firmware.
+	  Microphone capture on T8140/T8142 using the resident AOP firmware.
 	  This also supplies the transport used by the protected speaker driver.
 
 config SND_SOC_APPLE_NEO_SPEAKER
-	bool "Apple T8140 protected speaker playback"
+	bool "Apple T8140/T8142 protected speaker playback"
 	depends on SND_SOC_APPLE_NEO_MIC && GPIOLIB
 	help
 	  Neo speaker PCM with a fixed 3/256 gain cap, thermal admission and
 	  amplifier-first cutoff. The cap remains deliberately conservative.
+
+config SND_SOC_APPLE_AOP_SPEAKER_CODECS
+	bool "ASoC codecs for protected AOP speaker playback"
+	depends on SND_SOC_APPLE_NEO_SPEAKER && I2C
+	select SND_SOC_TAS2764
+	help
+	  Connect DT-described SN012776 codecs to the protected AOP PCM.
+	  Boards without audio-codecs retain the existing raw PCM card.
 
 endmenu
