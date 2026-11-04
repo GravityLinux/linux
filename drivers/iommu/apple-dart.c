@@ -1611,8 +1611,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
 		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, dart_params[3]);
 		dart->four_level = dart->ias > 36;
+		/* T8132 keeps the established error-register handling. */
 		dart->sid_exceptions = resource_size(res) >= 0x4004 &&
-			(dart_params[2] & 0xffff) >= 0x202;
+			(dart_params[2] & 0xffff) >= 0x202 &&
+			!of_device_is_compatible(dev->of_node, "apple,t8132-dart");
 		break;
 	}
 
