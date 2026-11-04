@@ -2620,6 +2620,7 @@ static int __mmap_new_file_vma(struct mmap_state *map,
 
 	/* Drivers cannot alter the address of the VMA. */
 	WARN_ON_ONCE(map->addr != vma->vm_start);
+	VM_WARN_ON_ONCE(vma_slice_off_stale(vma, map->pgoff));
 	/*
 	 * Drivers should not permit writability when previously it was
 	 * disallowed.

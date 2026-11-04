@@ -75,7 +75,43 @@
 })
 #define vma_pages(vma) ({ \
 	p3s_assert_matching_pte_shift((vma)->vm_mm); \
-	(vma_pages)(vma); \
+	vma_nr_ptes(vma); \
+})
+#define vma_page_size(vma) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_page_size)(vma); \
+})
+#define vma_page_mask(vma) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_page_mask)(vma); \
+})
+#define vma_offset_in_page(vma, addr) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_offset_in_page)((vma), (addr)); \
+})
+#define vma_slice_off(vma) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_slice_off)(vma); \
+})
+#define vma_slice_offset(vma, addr) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_slice_offset)((vma), (addr)); \
+})
+#define vma_folio_offset(vma, addr) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_folio_offset)((vma), (addr)); \
+})
+#define vma_file_offset(vma) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_file_offset)(vma); \
+})
+#define vma_linear_page_index(vma, addr) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_linear_page_index)((vma), (addr)); \
+})
+#define vma_folio_slice_bounds(vma, addr, nr_slices, start_addr) ({ \
+	p3s_assert_matching_pte_shift((vma)->vm_mm); \
+	(vma_folio_slice_bounds)((vma), (addr), (nr_slices), (start_addr)); \
 })
 
 #endif /* CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */

@@ -24,6 +24,10 @@ static inline unsigned long mm_tcr_geometry(const struct mm_struct *mm)
 	return TCR_TG0_KERNEL | TCR_T0SZ(vabits_actual);
 }
 
+static inline u64 mm_va_bits(const struct mm_struct *mm)
+{
+	return mm_is_p3s_4k(mm) ? VA_BITS_4KB : vabits_actual;
+}
 
 static inline unsigned long mm_task_size(const struct mm_struct *mm)
 {

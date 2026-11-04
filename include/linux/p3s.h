@@ -13,6 +13,7 @@
 #include <asm/p3s/mmu.h>
 #include <asm/p3s.h>
 #else
+#define mm_pgd_offset(mm, addr)			pgd_offset(mm, addr)
 #define mm_pmd_offset(mm, pud, addr)		pmd_offset(pud, addr)
 #define mm_pte_offset_kernel(mm, pmd, addr)	pte_offset_kernel(pmd, addr)
 #define pte_advance_phys(pte, bytes)		(pte)

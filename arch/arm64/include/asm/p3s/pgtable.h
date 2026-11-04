@@ -3,6 +3,7 @@
 #define _ASM_ARM64_P3S_PGTABLE_H
 
 #include <linux/p3s/mm.h>
+#include <linux/mmdebug.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/memory.h>
 
@@ -76,7 +77,10 @@ static inline pgd_t *mm_pgd_offset(const struct mm_struct *mm,
  * In opt-in translation units, override standard pgd_offset() to use the
  * per-MM PGD indexing helper.
  */
-#define pgd_offset(mm, addr) mm_pgd_offset((mm), (addr))
+#define pgd_offset(mm, addr) ({ \
+	VM_WARN_ON_ONCE(mm_is_p3s_4k(mm)); \
+	mm_pgd_offset((mm), (addr)); \
+})
 
 /* Expand after the architecture's descriptor decoding helpers are defined. */
 #ifdef __PAGETABLE_PMD_FOLDED

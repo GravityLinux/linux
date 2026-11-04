@@ -2669,7 +2669,7 @@ static int unuse_vma(struct vm_area_struct *vma, unsigned int type)
 	addr = vma->vm_start;
 	end = vma->vm_end;
 
-	pgd = pgd_offset(vma->vm_mm, addr);
+	pgd = mm_pgd_offset(vma->vm_mm, addr);
 	do {
 		next = mm_pgd_addr_end(vma->vm_mm, addr, end);
 		if (pgd_none_or_clear_bad(pgd))

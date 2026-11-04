@@ -378,6 +378,12 @@ static inline unsigned short vma_slice_off(const struct vm_area_struct *vma)
 	return 0;
 }
 
+static inline bool vma_slice_off_stale(const struct vm_area_struct *vma,
+				       pgoff_t pgoff)
+{
+	return false;
+}
+
 static inline void vma_set_slice_off(struct vm_area_struct *vma,
 				     unsigned short slice_off)
 {

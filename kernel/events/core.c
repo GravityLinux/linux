@@ -8551,7 +8551,7 @@ static u64 perf_get_pgtable_size(struct mm_struct *mm, unsigned long addr)
 	pmd_t *pmdp, pmd;
 	pte_t *ptep, pte;
 
-	pgdp = pgd_offset(mm, addr);
+	pgdp = mm_pgd_offset(mm, addr);
 	pgd = pgdp_get(pgdp);
 	if (pgd_none(pgd))
 		return 0;

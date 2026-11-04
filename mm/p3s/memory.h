@@ -82,9 +82,9 @@ static inline vm_fault_t p3s_insert_pfn_prot(struct vm_area_struct *vma,
 		pte_unmap_unlock(table[1], ptl[1]);
 
 		/* Both tables exist; pin their mappings, then lock in pointer order. */
-		pud = pud_offset(p4d_offset(pgd_offset(mm, first), first), first);
+		pud = pud_offset(p4d_offset(mm_pgd_offset(mm, first), first), first);
 		pmd[0] = mm_pmd_offset(mm, pud, first);
-		pud = pud_offset(p4d_offset(pgd_offset(mm, second), second), second);
+		pud = pud_offset(p4d_offset(mm_pgd_offset(mm, second), second), second);
 		pmd[1] = mm_pmd_offset(mm, pud, second);
 		table[0] = pte_offset_map_rw_nolock(mm, pmd[0], first,
 						  &pmdval[0], &ptl[0]);

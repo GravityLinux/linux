@@ -4,6 +4,7 @@
 
 #include <linux/p3s/mm.h>
 #include <linux/minmax.h>
+#include <linux/mmdebug.h>
 
 struct vm_area_struct;
 
@@ -26,6 +27,18 @@ struct vm_area_struct;
 static inline unsigned long vma_size(const struct vm_area_struct *vma)
 {
 	return vma->vm_end - vma->vm_start;
+}
+
+/*
+ * vma_nr_ptes - Number of PTEs that map @vma
+ * @vma: Pointer to struct vm_area_struct
+ *
+ * Counts pages of vma_page_size(), so 4KB pages for a 4KB VMA. Code that
+ * indexes kernel pages wants vma_kernel_pages() instead.
+ */
+static inline unsigned long vma_nr_ptes(const struct vm_area_struct *vma)
+{
+	return vma_size(vma) >> mm_pte_shift(vma->vm_mm);
 }
 
 static inline unsigned long vma_page_size(const struct vm_area_struct *vma)
@@ -115,6 +128,34 @@ static inline void vma_desc_set_slice_off(struct vm_area_desc *desc,
 }
 #define p3s_adjust_unmapped_area_info(info) ((void)(info))
 #endif
+
+/*
+ * p3s_assert_native_vma - Warn if code that counts native pages sees a 4KB VMA
+ * @vma: Pointer to struct vm_area_struct
+ *
+ * Translation units that don't include <linux/p3s_user_pages.h>, such as
+ * drivers, allocate and index native kernel pages. A 4KB VMA has 4KB pages,
+ * so they should size it with vma_kernel_pages() or vma_size() instead.
+ */
+static inline void p3s_assert_native_vma(const struct vm_area_struct *vma)
+{
+	VM_WARN_ON_ONCE(vma_is_p3s_4k(vma));
+}
+
+/*
+ * vma_slice_off_stale - Check whether ->mmap() rewrote vm_pgoff under a slice
+ * @vma: VMA after the driver's ->mmap()
+ * @pgoff: Page offset that @vma was created with
+ *
+ * A 4KB VMA that starts at a nonzero slice of a kernel page records that
+ * slice for its original vm_pgoff. A driver that rewrites vm_pgoff leaves
+ * the slice offset stale. Native VMAs always have slice offset 0.
+ */
+static inline bool vma_slice_off_stale(const struct vm_area_struct *vma,
+				       pgoff_t pgoff)
+{
+	return vma_slice_off(vma) && vma->vm_pgoff != pgoff;
+}
 
 /**
  * vma_starts_at_kernel_page - Check alignment for native-page insertion
@@ -337,7 +378,7 @@ static inline loff_t vma_file_offset_at(const struct vm_area_struct *vma,
  * vma_pages() is defined after this header is included.
  */
 #define vma_kernel_pages(vma)						\
-	mm_kernel_pages((vma)->vm_mm, vma_slice_off(vma) + vma_pages(vma))
+	mm_kernel_pages((vma)->vm_mm, vma_slice_off(vma) + vma_nr_ptes(vma))
 
 /* vma_kernel_pages() for the VMA that .mmap_prepare() describes. */
 #define vma_desc_kernel_pages(desc)					\
@@ -432,7 +473,7 @@ static inline pgoff_t vma_mmap_pgoff(const struct vm_area_struct *vma,
  */
 static inline pgoff_t vma_pgoff_pages(const struct vm_area_struct *vma)
 {
-	unsigned long nr_slices = vma_size(vma) >> mm_pte_shift(vma->vm_mm);
+	unsigned long nr_slices = vma_nr_ptes(vma);
 
 	if (!vma_is_p3s_4k(vma) || (!vma->vm_ops && !vma->vm_file))
 		return nr_slices;

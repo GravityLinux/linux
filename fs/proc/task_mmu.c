@@ -503,6 +503,7 @@ static void show_vma_header_prefix(struct seq_file *m,
 static void
 show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	const struct path *path;
 	const char *name_fmt, *name;
 	vm_flags_t flags = vma->vm_flags;
@@ -692,6 +693,7 @@ no_vma:
 
 static int do_procmap_query(struct mm_struct *mm, void __user *uarg)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	struct proc_maps_locking_ctx lock_ctx = { .mm = mm };
 	struct procmap_query karg;
 	struct vm_area_struct *vma;
