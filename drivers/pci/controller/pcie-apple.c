@@ -60,13 +60,21 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PHY_LANE_CFG_REFCLK1REQ	BIT(1)
 #define   PHY_LANE_CFG_REFCLK0ACK	BIT(2)
 #define   PHY_LANE_CFG_REFCLK1ACK	BIT(3)
+#define   PHY_LANE_CFG_RESET		BIT(4)
 #define   PHY_LANE_CFG_REFCLKEN		(BIT(9) | BIT(10))
 #define   PHY_LANE_CFG_REFCLKCGEN	(BIT(30) | BIT(31))
+/* Only bit31 of the legacy gate-control pair is qualified on T8142.
+ * Its individual gate function remains unqualified; preserve that limit.
+ */
+#define   PHY_LANE_CFG_T8142_CONTROL	BIT(31)
 #define PHY_LANE_CTL			0x00004
 #define   PHY_LANE_CTL_CFGACC		BIT(15)
 
 #define PORT_LTSSMCTL			0x00080
 #define   PORT_LTSSMCTL_START		BIT(0)
+#define PORT_QUIESCE			0x00088
+#define   PORT_QUIESCE_REQUEST		BIT(0)
+#define   PORT_QUIESCE_COMPLETE		BIT(4) /* W1C */
 #define PORT_INTSTAT			0x00100
 #define   PORT_INT_TUNNEL_ERR		31
 #define   PORT_INT_CPL_TIMEOUT		23
@@ -156,6 +164,10 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
  */
 #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
 
+struct apple_pcie_port;
+static int apple_pcie_t8142_reset_port(struct apple_pcie_port *port,
+				      struct pci_dev *root);
+
 struct hw_info {
 	bool tunneled;
 	u32 phy_lane_ctl;
@@ -166,6 +178,8 @@ struct hw_info {
 	u32 port_rid2sid;
 	u32 port_msimap;
 	u32 max_rid2sid;
+	bool preserve_link;
+	int (*reset_port)(struct apple_pcie_port *port, struct pci_dev *root);
 };
 
 static const struct hw_info t8103_hw = {
@@ -202,6 +216,21 @@ static const struct hw_info t8132_tunnel_hw = {
 	.max_rid2sid = 256,
 };
 
+/* T8142 retains the T602x MSI and requester-routing register layout.
+ * Firmware prepares the initial link; Linux owns subsequent port resets,
+ * MSI allocation, interrupt handling and RID/SID routing.
+ */
+static const struct hw_info t8142_hw = {
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi		= PORT_T602X_MSIADDR_HI,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.preserve_link		= true,
+	.reset_port		= apple_pcie_t8142_reset_port,
+};
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -227,6 +256,7 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
+	struct gpio_desc	*reset;
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
@@ -244,6 +274,119 @@ static void rmw_set(u32 set, void __iomem *addr)
 static void rmw_clear(u32 clr, void __iomem *addr)
 {
 	writel_relaxed(readl_relaxed(addr) & ~clr, addr);
+}
+
+static int apple_pcie_t8142_reset_port(struct apple_pcie_port *port,
+				      struct pci_dev *root)
+{
+	void __iomem *base = port->base, *phy = port->phy + PHY_LANE_CFG;
+	u32 stat, buses, mask;
+	int ret;
+
+	/* Firmware personality changes must remove the old endpoint first.
+	 * No live consumer may retain DMA or a requester mapping during reset.
+	 */
+	if (!bitmap_empty(port->sid_map, port->sid_map_sz))
+		return -EBUSY;
+
+	pci_read_config_dword(root, PCI_PRIMARY_BUS, &buses);
+	pci_write_config_word(root, PCI_COMMAND, 0);
+	pci_write_config_dword(root, PCI_PRIMARY_BUS, 0);
+	mask = readl(base + PORT_INTMSK);
+	writel(~0, base + PORT_INTMSK);
+	readl(base + PORT_INTMSK);
+	synchronize_irq(port->parent_irq);
+
+	rmw_set(PORT_APPCLK_CGDIS, base + PORT_APPCLK);
+	/* Request/status handshake isolated by direct211; no opaque preset.
+	 * Bit8 is unnecessary. Exact in-flight traffic gating is unqualified.
+	 */
+	writel(PORT_QUIESCE_COMPLETE, base + PORT_QUIESCE);
+	writel(PORT_QUIESCE_REQUEST, base + PORT_QUIESCE);
+	ret = readl_poll_timeout(base + PORT_QUIESCE, stat,
+				 stat & PORT_QUIESCE_COMPLETE, 100, 250000);
+	if (ret)
+		goto out;
+	ret = gpiod_direction_output(port->reset, 1);
+	if (ret)
+		goto out;
+	rmw_clear(PHY_LANE_CFG_T8142_CONTROL, phy);
+	rmw_clear(PORT_PERST_OFF, base + PORT_T602X_PERST);
+	rmw_clear(PHY_LANE_CFG_REFCLKEN, phy);
+	rmw_set(PHY_LANE_CFG_RESET, phy);
+	rmw_clear(PHY_LANE_CFG_REFCLK0REQ, phy);
+	ret = readl_poll_timeout(phy, stat, !(stat & PHY_LANE_CFG_REFCLK0ACK),
+				 100, 250000);
+	if (ret)
+		goto out;
+	rmw_clear(PHY_LANE_CFG_REFCLK1REQ, phy);
+	ret = readl_poll_timeout(phy, stat, !(stat & PHY_LANE_CFG_REFCLK1ACK),
+				 100, 250000);
+	if (ret)
+		goto out;
+	rmw_clear(PORT_APPCLK_EN, base + PORT_APPCLK);
+	ret = readl_poll_timeout(base + PORT_STATUS, stat,
+				 !(stat & PORT_STATUS_READY), 100, 250000);
+	if (ret)
+		goto out;
+	rmw_set(PORT_APPCLK_EN, base + PORT_APPCLK);
+	rmw_set(PORT_PERST_OFF, base + PORT_T602X_PERST);
+	ret = readl_poll_timeout(base + PORT_STATUS, stat,
+				 stat & PORT_STATUS_READY, 100, 250000);
+	if (ret)
+		goto out;
+	rmw_clear(PORT_APPCLK_CGDIS, base + PORT_APPCLK);
+	ret = readl_poll_timeout(base + PORT_LINKSTS, stat,
+				 !(stat & PORT_LINKSTS_BUSY), 100, 250000);
+	if (ret)
+		goto out;
+	writel(PORT_QUIESCE_COMPLETE, base + PORT_QUIESCE);
+	pci_write_config_dword(root, PCI_PRIMARY_BUS, buses);
+	msleep(100);
+	rmw_set(PHY_LANE_CFG_REFCLK0REQ, phy);
+	ret = readl_poll_timeout(phy, stat, stat & PHY_LANE_CFG_REFCLK0ACK,
+				 100, 250000);
+	if (ret)
+		goto out;
+	rmw_set(PHY_LANE_CFG_REFCLK1REQ, phy);
+	ret = readl_poll_timeout(phy, stat, stat & PHY_LANE_CFG_REFCLK1ACK,
+				 100, 250000);
+	if (ret)
+		goto out;
+	rmw_clear(PHY_LANE_CFG_RESET, phy);
+	rmw_set(PHY_LANE_CFG_REFCLKEN, phy);
+	gpiod_set_value_cansleep(port->reset, 0);
+	rmw_set(PORT_LTSSMCTL_START, base + PORT_LTSSMCTL);
+	rmw_set(PHY_LANE_CFG_T8142_CONTROL, phy);
+	/* UP remains latched in failed GPIO-only resets; BUSY must clear too. */
+	ret = readl_poll_timeout(base + PORT_LINKSTS, stat,
+				 (stat & (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)) ==
+				 PORT_LINKSTS_UP, 100, 3000000);
+	if (!ret)
+		msleep(100);
+out:
+	/* These resets preserve all MSI/RID register contents (Linux207/216).
+	 * Keep their software ownership and only clear transient port events.
+	 */
+	writel(~0, base + PORT_INTSTAT);
+	writel(mask, base + PORT_INTMSK);
+	if (ret)
+		dev_err(port->pcie->dev, "%pOF reset failed: %d\n", port->np, ret);
+	return ret;
+}
+
+static int apple_pcie_reset_root_port(struct pci_host_bridge *bridge,
+				      struct pci_dev *root)
+{
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct apple_pcie_port *port;
+
+	guard(mutex)(&pcie->lock);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->idx == PCI_SLOT(root->devfn))
+			return pcie->hw->reset_port(port, root);
+	}
+	return -ENODEV;
 }
 
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
@@ -802,6 +945,12 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	port->idx = idx >> 11;
 	port->pcie = pcie;
 	port->np = np;
+	if (pcie->hw->preserve_link) {
+		port->reset = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np),
+						  "reset", GPIOD_ASIS, "PERST#");
+		if (IS_ERR(port->reset))
+			return PTR_ERR(port->reset);
+	}
 
 	raw_spin_lock_init(&port->lock);
 
@@ -819,8 +968,21 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
 		if (res)
 			port->phy = devm_ioremap_resource(&platform->dev, res);
-		else
+		else {
+			if (pcie->hw->preserve_link)
+				return dev_err_probe(pcie->dev, -EINVAL,
+						     "missing %s resource\n", name);
 			port->phy = pcie->base + CORE_PHY_DEFAULT_BASE(port->idx);
+		}
+		if (IS_ERR(port->phy))
+			return PTR_ERR(port->phy);
+	}
+	if (pcie->hw->preserve_link) {
+		link_stat = readl_relaxed(port->base + PORT_LINKSTS);
+		if ((link_stat & (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)) != PORT_LINKSTS_UP)
+			return dev_err_probe(pcie->dev, -ENOLINK,
+					     "%pOF requires a firmware-trained link\n", np);
+		goto setup_irq;
 	}
 
 	/* link might be already brought up by u-boot, skip setup then */
@@ -1076,6 +1238,9 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 
 	// Ensure all ports can be powered on before attempting initialization
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
+		/* Preserve the trained T8142 link until its first owned reset. */
+		if (pcie->hw->preserve_link)
+			continue;
 		ret = pci_pwrctrl_create_device(of_port, pcie->dev);
 		if (ret) {
 			dev_err(pcie->dev, "Failed to create pwrctrl device: %pe\n", ERR_PTR(ret));
@@ -1261,6 +1426,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+	if (pcie->hw->reset_port)
+		bridge->reset_root_port = apple_pcie_reset_root_port;
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);

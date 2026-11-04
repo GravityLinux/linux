@@ -48,18 +48,24 @@ properties:
     maxItems: 10
 
   reg-names:
-    minItems: 3
-    items:
-      - const: config
-      - const: rc
-      - const: port0
-      - const: port1
-      - const: port2
-      - const: port3
-      - const: phy0
-      - const: phy1
-      - const: phy2
-      - const: phy3
+    oneOf:
+      - minItems: 3
+        items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: port1
+          - const: port2
+          - const: port3
+          - const: phy0
+          - const: phy1
+          - const: phy2
+          - const: phy3
+      - items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: phy0
 
   ranges:
     minItems: 2
@@ -138,6 +144,21 @@ allOf:
       properties:
         reg-names:
           minItems: 10
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-pcie
+    then:
+      properties:
+        reg:
+          minItems: 4
+          maxItems: 4
+        reg-names:
+          contains:
+            const: phy0
+        interrupts:
+          maxItems: 1
 
 examples:
   - |
