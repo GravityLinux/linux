@@ -110,6 +110,8 @@ static inline void cpu_uninstall_idmap(void)
 
 	if (mm != &init_mm && !system_uses_ttbr0_pan())
 		cpu_switch_mm(mm->pgd, mm);
+	else if (mm != &init_mm)
+		mm_switch_tcr(mm);	/* SW PAN sets TTBR0 on uaccess */
 }
 
 static inline void cpu_install_idmap(void)
