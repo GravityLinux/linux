@@ -14,21 +14,6 @@ struct task_struct;
 
 #define VM_COMMIT_SHIFT PAGE_SHIFT_4KB
 
-/*
- * Boot-time command-line 4KB mode (p3s=):
- * P3S_4K_MODE_OFF:       Standard behavior (controlled via personality)
- * P3S_4K_MODE_ON:        Force 4KB pages for all processes after boot
- * P3S_4K_MODE_ALTERNATE: Alternate 4KB (odd PIDs) and 16KB (even PIDs)
- *                        for stress testing
- */
-enum p3s_4k_mode {
-	P3S_4K_MODE_OFF = 0,
-	P3S_4K_MODE_ON = 1,
-	P3S_4K_MODE_ALTERNATE = 2,
-};
-
-extern enum p3s_4k_mode p3s_4k_mode;
-
 static inline bool personality_4kb_pages(unsigned long pers)
 {
 	return !!(pers & ADDR_PAGE_SIZE_4KB);
@@ -62,20 +47,9 @@ static inline void mm_init_pte_shift(struct mm_struct *mm,
 		return;
 	}
 
-	/*
-	 * In ALTERNATE mode, assign 4KB to odd PIDs and 16KB to even PIDs
-	 * based strictly on PID parity rather than inheriting parent pte_shift,
-	 * ensuring child tasks alternate regardless of what init or parent ran.
-	 */
-	if (system_state >= SYSTEM_RUNNING) {
-		if (tsk && personality_4kb_pages(tsk->personality))
-			use_4kb = true;
-		else if (p3s_4k_mode == P3S_4K_MODE_ON)
-			use_4kb = true;
-		else if (p3s_4k_mode == P3S_4K_MODE_ALTERNATE &&
-			 tsk && (tsk->pid & 1))
-			use_4kb = true;
-	}
+	if (system_state >= SYSTEM_RUNNING && tsk &&
+	    personality_4kb_pages(tsk->personality))
+		use_4kb = true;
 
 	mm_set_pte_shift(mm, use_4kb ? PAGE_SHIFT_4KB : PAGE_SHIFT_KERNEL);
 }

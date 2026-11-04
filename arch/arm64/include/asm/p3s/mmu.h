@@ -61,7 +61,7 @@ static inline unsigned long mm_task_unmapped_base(const struct mm_struct *mm)
  * @mm: New mm_struct being initialized
  *
  * Called from init_new_context() to set mm->context.pte_shift based on the
- * task personality and boot-time configuration.
+ * task personality, or on the parent's page size on fork().
  */
 static inline void mm_init_new_context(const struct task_struct *tsk,
 				       struct mm_struct *mm)
