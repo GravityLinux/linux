@@ -41,6 +41,123 @@ static inline int p3s_remap_pfn_range_size(struct vm_area_struct *vma,
 	return 0;
 }
 
+/* Insert or verify the slices of a native PFN that lie in this VMA. */
+static inline vm_fault_t p3s_insert_pfn_prot(struct vm_area_struct *vma,
+					      unsigned long addr,
+					      unsigned long pfn,
+					      pgprot_t prot)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long offset, first, end;
+	unsigned int first_slice, count, first_count, present = 0, i;
+	spinlock_t *ptl[2], *low_ptl, *high_ptl;
+	pte_t *table[2], *pte;
+	pmd_t *pmd[2], pmdval[2];
+	vm_fault_t ret = VM_FAULT_SIGBUS;
+	bool split;
+
+	/* Clip the native PFN window to the VMA at either edge. */
+	addr &= PAGE_MASK_4KB;
+	offset = (unsigned long)vma_slice_offset(vma, addr) << PAGE_SHIFT_4KB;
+	first = addr - min(offset, addr - vma->vm_start);
+	end = addr + min(PAGE_SIZE_KERNEL - offset, vma->vm_end - addr);
+	first_slice = vma_slice_offset(vma, first);
+	count = (end - first) >> PAGE_SHIFT_4KB;
+	first_count = min_t(unsigned int, count,
+		(PMD_SIZE_4KB - (first & (PMD_SIZE_4KB - 1))) >>
+		PAGE_SHIFT_4KB);
+	split = first_count != count;
+
+	table[0] = get_locked_pte(mm, first, &ptl[0]);
+	if (!table[0])
+		return VM_FAULT_OOM;
+	if (split) {
+		unsigned long second = first + first_count * PAGE_SIZE_4KB;
+		pud_t *pud;
+
+		pte_unmap_unlock(table[0], ptl[0]);
+		table[1] = get_locked_pte(mm, second, &ptl[1]);
+		if (!table[1])
+			return VM_FAULT_OOM;
+		pte_unmap_unlock(table[1], ptl[1]);
+
+		/* Both tables exist; pin their mappings, then lock in pointer order. */
+		pud = pud_offset(p4d_offset(pgd_offset(mm, first), first), first);
+		pmd[0] = mm_pmd_offset(mm, pud, first);
+		pud = pud_offset(p4d_offset(pgd_offset(mm, second), second), second);
+		pmd[1] = mm_pmd_offset(mm, pud, second);
+		table[0] = pte_offset_map_rw_nolock(mm, pmd[0], first,
+						  &pmdval[0], &ptl[0]);
+		if (!table[0])
+			return VM_FAULT_NOPAGE;
+		table[1] = pte_offset_map_rw_nolock(mm, pmd[1], second,
+						  &pmdval[1], &ptl[1]);
+		if (!table[1]) {
+			pte_unmap(table[0]);
+			return VM_FAULT_NOPAGE;
+		}
+		low_ptl = ptl[0];
+		high_ptl = ptl[1];
+		if (low_ptl > high_ptl)
+			swap(low_ptl, high_ptl);
+		spin_lock(low_ptl);
+		if (high_ptl != low_ptl)
+			spin_lock_nested(high_ptl, SINGLE_DEPTH_NESTING);
+		if (!pmd_same(pmdval[0], pmdp_get_lockless(pmd[0])) ||
+		    !pmd_same(pmdval[1], pmdp_get_lockless(pmd[1]))) {
+			ret = VM_FAULT_NOPAGE;
+			goto out;
+		}
+	}
+
+	/* Preflight under the PTE lock(s): never fill a partial/wrong map. */
+	for (i = 0; i < count; i++) {
+		pte_t entry;
+
+		pte = i < first_count ? table[0] + i :
+					table[1] + i - first_count;
+		entry = ptep_get(pte);
+
+		if (pte_none(entry))
+			continue;
+		if (!pte_present(entry) ||
+		    __pte_to_phys(entry) != PFN_PHYS(pfn) +
+					    (first_slice + i) * PAGE_SIZE_4KB)
+			goto out;
+		present++;
+	}
+	if (present == count) {
+		ret = VM_FAULT_NOPAGE;
+		goto out;
+	}
+	if (present)
+		goto out;
+
+	for (i = 0; i < count; i++) {
+		unsigned long page_addr = first + i * PAGE_SIZE_4KB;
+		pte_t entry = pte_mkspecial(mm_frame_pte(mm,
+				(pfn << P3S_SLICE_SHIFT) + first_slice + i,
+				prot));
+
+		pte = i < first_count ? table[0] + i :
+					table[1] + i - first_count;
+		set_pte_at(mm, page_addr, pte, entry);
+		update_mmu_cache(vma, page_addr, pte);
+	}
+	ret = VM_FAULT_NOPAGE;
+out:
+	if (split) {
+		if (high_ptl != low_ptl)
+			spin_unlock(high_ptl);
+		spin_unlock(low_ptl);
+		pte_unmap(table[1]);
+		pte_unmap(table[0]);
+	} else {
+		pte_unmap_unlock(table[0], ptl[0]);
+	}
+	return ret;
+}
+
 /*
  * The insert helpers of mm/memory.c, the only file that includes this
  * header, so they can stay static there.
