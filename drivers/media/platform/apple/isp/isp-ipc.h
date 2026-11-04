@@ -20,6 +20,7 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 		  unsigned long timeout);
 
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan);
+void isp_dump_boot_log(struct apple_isp *isp);
 int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan);
 
 #endif /* __ISP_IPC_H__ */

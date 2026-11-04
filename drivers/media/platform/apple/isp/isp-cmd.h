@@ -552,7 +552,8 @@ struct cmd_apple_ch_temporal_filter_start {
 	u64 opcode;
 	u32 chan;
 	u32 unk_c;
-	u32 unk_10;
+	/* T8142 runtime identifies 0x10 as the requested YUV/RAW fusion type. */
+	u32 fusion_type;
 } __packed;
 static_assert(sizeof(struct cmd_apple_ch_temporal_filter_start) == 0x14);
 
@@ -586,7 +587,8 @@ struct cmd_apple_ch_temporal_filter_disable {
 } __packed;
 static_assert(sizeof(struct cmd_apple_ch_temporal_filter_disable) == 0xc);
 
-int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan, u32 arg);
+int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan,
+					 u32 fusion_type);
 int isp_cmd_apple_ch_temporal_filter_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_motion_history_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_motion_history_stop(struct apple_isp *isp, u32 chan);
@@ -691,5 +693,6 @@ int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
 int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
 
 int isp_cmd_t6041_start(struct apple_isp *isp);
+int isp_cmd_ch_check_factory_lsc(struct apple_isp *isp, u32 chan);
 
 #endif /* __ISP_CMD_H__ */
