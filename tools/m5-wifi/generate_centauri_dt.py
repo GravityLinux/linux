@@ -53,7 +53,7 @@ def describe_adt(adt):
     return info
 
 
-def generate(info, wifi, bluetooth, wifi_address, bluetooth_address):
+def generate(info, wifi, bluetooth, wifi_address, bluetooth_address, *, base_dts=None):
     if wifi['handoff_nonce'] != bluetooth['handoff_nonce'] or wifi['dart_base'] != bluetooth['dart_base'] or wifi['dart_base'] != info['dart'][0]:
         raise ValueError('Handoffs are from different boots or DART resources')
     # The host-owned TX arena uses only offsets below 0x60000 for packet slots.
@@ -89,7 +89,8 @@ def generate(info, wifi, bluetooth, wifi_address, bluetooth_address):
         if not wifi['dram_base'] <= address < address + length <= wifi['dram_base'] + wifi['dram_size']:
             raise ValueError('Retained reservation outside DRAM')
         reservations.append(f'/memreserve/ 0x{address:x} 0x{length:x};')
-    base = Path(__file__).with_name('t8142-j813-minimal.dts').read_text()
+    base = (Path(__file__).with_name('t8142-j813-minimal.dts').read_text()
+            if base_dts is None else base_dts)
     base = base.replace('/dts-v1/;', '/dts-v1/;\n' + '\n'.join(reservations), 1)
     source = f'''// SPDX-License-Identifier: GPL-2.0-only
 /* Generated from ADT and current-boot host metadata. Firmware owns reset/DART.
