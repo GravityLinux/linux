@@ -41,4 +41,6 @@ source "drivers/net/wireless/quantenna/Kconfig"
 
 source "drivers/net/wireless/virtual/Kconfig"
 
+source "drivers/net/wireless/apple/Kconfig"
+
 endif # WLAN

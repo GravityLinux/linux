@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: GPL-2.0-only
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/apple,centauri-control.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T2026 Centauri shared control PCI function
+
+maintainers:
+  - Cody Ho <codyho@stanford.edu>
+
+description: |
+  Centauri's physical control function changes its PCI device identity from
+  106b:1900 during bootstrap to 106b:1901 after loading the first image and
+  restarting the link. The same firmware node describes both states. The
+  runtime endpoint also exposes separate Wi-Fi and Bluetooth functions.
+
+  The control function loads an external signed FTAB container. MSI routing
+  and IOMMU translation are described by the PCI host. It does not consume a
+  reserved-memory firmware or queue handoff from an earlier wireless driver.
+
+allOf:
+  - $ref: /schemas/pci/pci-device.yaml
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,t2026-centauri-control
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - const: apple,t2026-centauri-control
+      - const: pci106b,1900
+      - const: pci106b,1901
+
+  reg:
+    maxItems: 1
+
+  firmware-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: External signed FTAB image with the required device inputs.
+
+  apple,host-platform-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description: |
+      Host platform identity published to the bootstrap interface. Bits31:16
+      encode the host board ID and bits15:0 encode the host chip ID, matching
+      the image manifest's ApBoardID and ApChipID. This is the host platform,
+      not the separate wireless chip/board identity exposed by the endpoint.
+
+required:
+  - compatible
+  - reg
+  - firmware-name
+  - apple,host-platform-id
+
+unevaluatedProperties: false

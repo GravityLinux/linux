@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config CENTAURI
+	tristate "Apple Centauri Wi-Fi/Bluetooth Rust bring-up driver"
+	depends on RUST && ARM64 && OF && PCI && PCI_MSI && BT && CFG80211
+	help
+	  Rust hardware and DMA queue driver for Apple Centauri PCI functions
+	  described by enabled device-tree nodes. The cold path owns firmware
+	  image transfer, port reset/removal/rescan, radio queues and interface
+	  activation using normal Linux PCI/DMA APIs. Passive 2.4GHz scanning,
+	  WPA2/CCMP association with an ordinary supplicant supplying the PMK,
+	  SAE/default-PWE or H2E-only with required PMF, and native Ethernet
+	  traffic work. H2E-only checks peer RSNXE and rejects observed legacy
+	  commits; forced hunting/pecking is unsupported. passive_scan is required
+	  for this experimental scan path.
+	  Cold Bluetooth generates its own HCI command/event and ACL rings.
+	  Firmware inputs are prepared independently outside the driver. Wider
+	  protocol coverage, automatic chip-power sequencing and initial host PHY
+	  integration remain incomplete.
+
+	  Separate experimental warm Wi-Fi nodes can register Ethernet
+	  transports from current-boot typed loader metadata. That older path
+	  requires a stopped previous owner and reserved DMA pages, and does not
+	  prove independent cold startup or association.
