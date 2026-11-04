@@ -15,6 +15,8 @@
 struct apple_plane {
 	struct drm_plane base;
 	u32 iomfb_surf;
+	/* Surface IDs and compression records in swap requests */
+	bool modern;
 };
 
 #define to_apple_plane(x) container_of(x, struct apple_plane, base)
@@ -34,6 +36,6 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
 				   enum drm_plane_type type,
-				   bool interchange);
+				   bool modern_formats, bool interchange);
 
 #endif /* __APPLE_PLANE_H__ */

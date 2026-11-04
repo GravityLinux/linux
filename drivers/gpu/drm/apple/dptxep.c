@@ -171,7 +171,8 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 			       sizeof(resp), 12);
 	if (ret)
 		return ret;
-	if (le32_to_cpu(resp.unk) != hpd)
+	/* T8132 firmware answers 1 for both HPD states. */
+	if (le32_to_cpu(resp.unk) != (dcp_is_t8132(service->ep->dcp) ? 1 : hpd))
 		return -EINVAL;
 	return 0;
 }
@@ -523,7 +524,8 @@ dptxport_call_activate(struct apple_epic_service *service,
 	dev_info(dcp->dev, "DPTXPort: activating PHY\n");
 	if (!dcp->typec_mux && !dptx_bypass_phy) {
 		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP,
-				       dcp->dptx_phy > 3 ? dcp->index : 0);
+				       dcp_is_t8132(dcp) || dcp->dptx_phy > 3 ?
+				       dcp->index : 0);
 		if (ret)
 			dev_err(dcp->dev, "DPTXPort: PHY activation failed: %d\n",
 				ret);
