@@ -1024,6 +1024,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
 
+setup_irq:
 	ret = apple_pcie_port_setup_irq(port);
 	if (ret)
 		return ret;
