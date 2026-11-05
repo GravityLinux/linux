@@ -145,6 +145,10 @@ SYM_FUNC_START(cpu_do_resume)
 	mrs	x7, tcr_el1
 	bfi	x8, x7, TCR_EL1_T0SZ_SHIFT, TCR_EL1_T0SZ_WIDTH
 
+	/* Nor tg0: TTBR0 still holds tables with the kernel granule */
+	lsr	x7, x7, #TCR_TG0_SHIFT
+	bfi	x8, x7, #TCR_TG0_SHIFT, #2
+
 	msr	tcr_el1, x8
 	msr	vbar_el1, x9
 	msr	mdscr_el1, x10
