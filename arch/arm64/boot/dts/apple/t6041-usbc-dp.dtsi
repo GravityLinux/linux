@@ -1,0 +1,169 @@
+#ifndef _T6041_USBC_DP_DTSI
+#define _T6041_USBC_DP_DTSI
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* EXPERIMENTAL: J616c right-hand port (ATC2), DP alt mode, native ADT resources.
+ * Keep HPM1/ATC1 unbound: it carries the development USB transport.
+ */
+#include <dt-bindings/spmi/spmi.h>
+
+&pmgr3 {
+	ps_nub_spmi_a1: power-controller@70 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x70 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi_a1";
+		apple,always-on;
+	};
+};
+
+&{/soc} {
+	nub_spmi_a1: spmi@509198000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <5 0x09198000 0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		/* ADT IRQ256 is local notify; IRQ868 is its AIC aggregate. */
+		interrupts = <AIC_IRQ 868 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_nub_spmi_a1>;
+
+		hpm2: usb-pd@c {
+			compatible = "apple,sn201202x";
+			reg = <0xc SPMI_USID>;
+			interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+				     <13 IRQ_TYPE_EDGE_RISING>,
+				     <17 IRQ_TYPE_EDGE_RISING>,
+				     <19 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "irq", "select", "sleep", "wake";
+
+			typec2: connector {
+				label = "USB-C Right";
+				compatible = "usb-c-connector";
+				power-role = "dual";
+				data-role = "dual";
+				try-power-role = "sink";
+			};
+		};
+	};
+};
+
+&pmgr1 {
+	ps_atc2_common: power-controller@3e0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_common";
+		power-domains = <&ps_fab2_soc>;
+	};
+};
+
+&pmp_report {
+	pmp_report_atc2: report@20 {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <32>;
+		label = "pmp-atc2-common";
+		/* The attached cable can leave PHYMXWRAP active in iBoot. */
+		apple,boot-on;
+		#power-domain-cells = <0>;
+		power-domains = <&ps_atc2_common>;
+	};
+};
+
+&pmgr3 {
+	ps_atc2_usb_aon: power-controller@d8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xd8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_usb_aon";
+	};
+	ps_atc2_phymxwrap: power-controller@160 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x160 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_phymxwrap";
+		power-domains = <&pmp_report_atc2>, <&ps_atc2_usb_aon>;
+	};
+	ps_atc2_common_dp: power-controller@b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xb0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_common_dp";
+	};
+};
+
+&{/aliases} {
+	atcphy2 = &atcphy2;
+};
+
+&{/soc} {
+	acio_phy2_mbox: mailbox@393148000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x93148000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 958 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 959 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 960 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 961 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	atcphy2: phy@393000000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <3 0x93000000 0 0x30000>,
+		      <3 0x93200000 0 0x4000>,
+		      <3 0x93244000 0 0x4000>,
+		      <3 0x93250000 0 0x4000>,
+		      <3 0x93140000 0 0x4000>,
+		      <3 0x930c0000 0 0x10000>;
+		reg-names = "core", "power", "fabric", "common", "coproc", "sram";
+		#phy-cells = <1>;
+		mode-switch;
+		orientation-switch;
+		mboxes = <&acio_phy2_mbox>;
+		power-domains = <&ps_atc2_usb_aon>, <&pmp_report_atc2>,
+				<&ps_atc2_phymxwrap>, <&ps_atc2_common_dp>;
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				atcphy2_typec_lanes: endpoint {
+					remote-endpoint = <&typec2_connector_ss>;
+				};
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@1 {
+			reg = <1>;
+			typec2_connector_ss: endpoint {
+				remote-endpoint = <&atcphy2_typec_lanes>;
+			};
+		};
+	};
+};
+
+&{/soc} {
+	atcphy2_dpxbar: mux@39324c000 {
+		compatible = "apple,t6040-display-crossbar", "apple,t6020-display-crossbar";
+		reg = <3 0x9324c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc2_phymxwrap>;
+	};
+};
+
+#endif
