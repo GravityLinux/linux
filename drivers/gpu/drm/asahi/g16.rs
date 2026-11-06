@@ -771,26 +771,8 @@ impl Bootstrap {
             }
             opening_client.write_low(0x70_0000_0000 + (first * 8) as u64, &row)?;
         }
-        for (base, size) in compute::private_ranges() {
-            opening_client.alloc_low(base, size, crate::pgtable::prot::PROT_GPU_SHARED_RW)?;
-        }
-        for buffer in 0..compute::BUFFER_COUNT {
-            for first in (0..compute::BUFFER_SIZE / 0x1000).step_by(32) {
-                let mut row = [0; 256];
-                for i in 0..32 {
-                    let va = compute::BUFFER_BASE
-                        + buffer as u64 * compute::BUFFER_STRIDE
-                        + (first + i) as u64 * 0x1000;
-                    row[i * 8..i * 8 + 8].copy_from_slice(&va.to_le_bytes());
-                }
-                opening_client.write_low(
-                    compute::DIRECTORY
-                        + (buffer * (compute::BUFFER_SIZE / 0x1000) + first) as u64 * 8,
-                    &row,
-                )?;
-            }
-        }
-        firmware_space.write_live(compute::SUPPORT, &compute::support())?;
+        // Compute has no device pool: each VM's compute root gets its own
+        // at its first compute command (map_compute_work).
         opening_client.sync();
         dev_info!(
             dev,
