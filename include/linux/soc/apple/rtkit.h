@@ -217,6 +217,9 @@ bool apple_rtkit_is_crashed(struct apple_rtkit *rtk);
  */
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint);
 
+/* Start a client-known application endpoint omitted by the firmware epmap. */
+int apple_rtkit_start_ep_implicit(struct apple_rtkit *rtk, u8 endpoint);
+
 /*
  * Send a message to the given endpoint.
  *

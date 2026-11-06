@@ -715,6 +715,26 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
+int apple_rtkit_start_ep_implicit(struct apple_rtkit *rtk, u8 endpoint)
+{
+	u64 msg;
+	int ret;
+
+	/* Some firmware application endpoints are absent from the boot epmap. */
+	if (endpoint < APPLE_RTKIT_APP_ENDPOINT_START ||
+	    !apple_rtkit_is_running(rtk))
+		return -EINVAL;
+
+	msg = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, endpoint) |
+	      APPLE_RTKIT_MGMT_STARTEP_FLAG;
+	set_bit(endpoint, rtk->endpoints);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+	if (ret)
+		clear_bit(endpoint, rtk->endpoints);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_start_ep_implicit);
+
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
