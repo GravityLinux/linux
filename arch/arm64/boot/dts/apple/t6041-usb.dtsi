@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* EXPERIMENTAL: J616c right-hand Type-C USB host, ADT controller 2.
+ * Controller 1 remains reserved for the development transport.
+ */
+#include <dt-bindings/phy/phy.h>
+#include "t6041-usbc-dp.dtsi"
+
+&{/aliases} {
+	usb2 = &dwc3_2;
+};
+
+&pmgr3 {
+	ps_atc2_usb: power-controller@140 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_usb";
+		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+	};
+};
+
+&atcphy2 {
+	reg = <3 0x93000000 0 0x30000>,
+	      <3 0x93200000 0 0x4000>,
+	      <3 0x93244000 0 0x4000>,
+	      <3 0x93250000 0 0x4000>,
+	      <3 0x93140000 0 0x4000>,
+	      <3 0x930c0000 0 0x10000>,
+	      <3 0x92a90000 0 0x4000>,
+	      <3 0x92a84000 0 0x4000>,
+	      <3 0x92080000 0 0x4000>;
+	reg-names = "core", "power", "fabric", "common", "coproc", "sram",
+		    "usb2phy", "pipehandler", "pipe-clocks";
+	#reset-cells = <0>;
+	power-domains = <&ps_atc2_usb_aon>, <&pmp_report_atc2>,
+			<&ps_atc2_phymxwrap>, <&ps_atc2_common_dp>, <&ps_atc2_usb>;
+	ports {
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@0 {
+			reg = <0>;
+			typec2_connector_hs: endpoint {
+				remote-endpoint = <&dwc3_2_hs>;
+			};
+		};
+	};
+};
+
+&{/soc} {
+	dwc3_2: usb@392280000 {
+		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
+		reg = <3 0x92280000 0 0xcd00>,
+		      <3 0x9228cd00 0 0x300>,
+		      <3 0x9228d000 0 0x4000>,
+		      <3 0x92200000 0 0x4000>,
+		      <3 0x92980000 0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "dwc3-cfg", "link", "bulk";
+		interrupt-parent = <&aic>;
+		/* ADT lists four xHCI event IRQs, then the peripheral IRQ. */
+		interrupts = <AIC_IRQ 1683 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 953 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "host", "peripheral";
+		iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_1 1>;
+		power-domains = <&ps_atc2_usb>;
+		resets = <&atcphy2>;
+		phys = <&atcphy2 PHY_TYPE_USB2>, <&atcphy2 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+		dr_mode = "otg";
+		usb-role-switch;
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				dwc3_2_hs: endpoint {
+					remote-endpoint = <&typec2_connector_hs>;
+				};
+			};
+			port@1 {
+				reg = <1>;
+				dwc3_2_ss: endpoint {
+					remote-endpoint = <&atcphy2_usb3>;
+				};
+			};
+		};
+	};
+
+	dwc3_2_dart_0: iommu@392f00000 {
+		compatible = "apple,t6040-dart", "apple,t8110-dart";
+		reg = <3 0x92f00000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc2_usb>;
+	};
+
+	dwc3_2_dart_1: iommu@392f80000 {
+		compatible = "apple,t6040-dart", "apple,t8110-dart";
+		reg = <3 0x92f80000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc2_usb>;
+	};
+};

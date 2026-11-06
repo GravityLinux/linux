@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* EXPERIMENTAL: reserve DCPEXT0 for the right-hand USB-C port. */
+#include "t6041-j616c.dts"
+#include "t6041-usbc-dp.dtsi"
+
+&atcphy3 { status = "disabled"; };
+&atcphy3_dp { /delete-property/ remote-endpoint; };
+&dcpext0 {
+	apple,connector-type = "DP";
+	apple,dptx-phy = <2>;
+	apple,typec-connector = <&typec2>;
+	phys = <&atcphy2 PHY_TYPE_DP>;
+	mux-controls = <&atcphy2_dpxbar 0>;
+	mode-switch;
+	/delete-property/ hdmi-hpd-gpios;
+	/delete-property/ hdmi-pwren-gpios;
+	/delete-property/ dp2hdmi-pwren-gpios;
+};
+&dcpext0_dp { remote-endpoint = <&typec2_hpd>; };
+&typec2 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec2_hpd: endpoint { remote-endpoint = <&dcpext0_dp>; };
+		};
+	};
+};

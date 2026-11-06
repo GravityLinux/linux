@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* EXPERIMENTAL: right-port USB3/USB4 orientation and hotplug validation.
+ * Controller 0 is reserved exclusively for the verified development transport.
+ */
+#include "t6041-j616c.dts"
+#include "t6041-usb4-right.dtsi"
+#include "t6041-usb.dtsi"
+&hpm0 { status = "disabled"; };
+&atcphy0 { status = "disabled"; };
+&usb4_0_acio { status = "disabled"; };
