@@ -192,7 +192,11 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         dumb_create: T::Object::ALLOC_OPS.dumb_create,
         dumb_map_offset: T::Object::ALLOC_OPS.dumb_map_offset,
 
-        show_fdinfo: None,
+        show_fdinfo: if <T::File as drm::file::DriverFile>::HAS_SHOW_FDINFO {
+            Some(drm::File::<T::File>::show_fdinfo_callback)
+        } else {
+            None
+        },
         fbdev_probe: None,
 
         major: T::INFO.major,
