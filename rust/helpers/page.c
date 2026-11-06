@@ -52,3 +52,8 @@ bool rust_helper_pfn_valid(unsigned long pfn)
 {
 	return pfn_valid(pfn);
 }
+
+__rust_helper pg_data_t *rust_helper_page_pgdat(const struct page *page)
+{
+	return page_pgdat(page);
+}
