@@ -303,6 +303,7 @@ impl File {
                             // Compute scratch stays clear of the pool VAs.
                             space.init_compute_private(start..vm.kernel.end);
                             space.sync();
+                            space.report_compute_pool("render-shared");
                         })
                 } else {
                     let buffers =

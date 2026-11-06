@@ -23,6 +23,7 @@ impl Bootstrap {
         space.set_compute_support(support)?;
         space.init_compute_private(private);
         space.sync();
+        space.report_compute_pool("private");
         Ok(())
     }
 
