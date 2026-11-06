@@ -138,6 +138,11 @@ impl Session {
             resources.regions[0].base,
             events.clone(),
         )?;
+        session.automatic_render_parallel=super::super::g17p_render_runtime::auto_parallel_enabled(image.profile.chip());
+        if session.automatic_render_parallel {
+            kernel::dev_info!(dev,"G16C: automatic independent retained render pools enabled through common scheduler
+");
+        }
         session.g16c_sgx = Some(sgx);
         let data = Arc::new(
             Data {

@@ -174,7 +174,10 @@ with tempfile.TemporaryDirectory(prefix='scheduled-work-') as directory:
     legacy.write_bytes(subprocess.check_output(['git', 'show',
         baseline + ':drivers/gpu/drm/asahi/g17p_compute.rs'], cwd=linux))
     harness = tmp / 'main.rs'
+    # Current compute encoders also lower through the shared SoC profile.
+    profile = '#[path=' + json.dumps(str(tests.parent / 'scheduled_profile.rs')) + '] mod scheduled_profile;'
     harness.write_text((tests / 'scheduled_work.rs').read_text()
+        .replace('mod current;', 'mod current;\n' + profile)
         .replace('"LEGACY_COMPUTE"', json.dumps(str(legacy)))
         .replace('"../g17p_compute.rs"', json.dumps(str(tests.parent / 'g17p_compute.rs'))))
     binary = tmp / 'gate'

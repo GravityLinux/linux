@@ -43,6 +43,7 @@ prelude=host_fdt.rust_prelude().replace('pub type KVec<T> = Vec<T>;', '''
     impl<T> std::ops::DerefMut for KVVec<T>{fn deref_mut(&mut self)->&mut[T]{&mut self.0}}
 ''')
 code=prelude+'\nuse prelude::*;\n'
+code+=f'#[path={json.dumps(str(tests.parent/"scheduled_profile.rs"))}]mod scheduled_profile;\n'
 code+=f'#[path={json.dumps(str(tests.parent/"g17p_compute.rs"))}]mod g17p_compute;\n'
 code+='mod queues {use super::*;type Key=(u64,u32);\n'
 code+='const CONTEXTS:usize=60;const FIRST_GRID:u8=32;const FW_BASE:u64=0xfffffc20e0000000;const LOW_BASE:u64=0x7200000000;const STRIDE:u64=0x200000;\n'
@@ -111,7 +112,7 @@ pub fn run()->Result<usize>{let mut cases=0;
       save:base+0x2000000,robustness:base+0x2100000,operand_state:base+0x2200000,save_slot:3};
    let dependencies=[(1,5),(126,7),(127,3)];
    let seed=PreparationSeed{layout,key:(19,3),ordinal:sequence,
-      parameters:Parameters{preempt:base,kernel_end:base+0x20000000,cdm:0x2000000000,end:0x2000001000,
+      parameters:Parameters{chip_id:0x6041,preempt:base,kernel_end:base+0x20000000,cdm:0x2000000000,end:0x2000001000,
          sampler:0x2000400000,sampler_count:29,timestamps:[layout.status(0),layout.status(0)+8]},
       priority,dependencies,dependency_count:deps,optional:false,first:sequence==0,wrapped:Some(x)};
    let mut neo_seed=seed;neo_seed.wrapped=None;neo_seed.layout=Layout::new((context-1)as usize%60,context)?;

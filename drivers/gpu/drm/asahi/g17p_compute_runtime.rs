@@ -38,22 +38,36 @@ const OPERAND_TABLE: u64 = 0x7000208000;
 const STATE: u64 = 0x7000220000;
 const ROBUSTNESS: u64 = 0x1000018000;
 
+/// Unique immutable admission identity. The token owns no BO or VM, so a
+/// cached identity cannot retain backing or form a cycle. A live Arc prevents
+/// address reuse, including when the frontend generation counter wraps.
+#[derive(Clone)]
+pub(crate) struct MappingIdentity(Arc<u8>);
+impl MappingIdentity {
+    pub(crate) fn new() -> Result<Self> { Ok(Self(Arc::new(0, GFP_KERNEL)?)) }
+    pub(crate) fn same(a: &Option<Self>, b: &Option<Self>) -> bool {
+        matches!((a, b), (Some(a), Some(b)) if Arc::ptr_eq(&a.0, &b.0))
+    }
+}
 /// CPU mappings are created only by execution-time cache maintenance. The
 /// retained cache lives outside GEM Objects, avoiding an Object/ARef cycle.
 /// Entries own their exact Object identity, so addresses cannot be recycled
 /// while a mapping remains cached. Only the most recently maintained buffer
 /// set is cached; roots and execution leases own backing independently.
+struct CpuMapState {
+    maps: RBTree<usize, shmem::VMap<super::g17p_drm::Bo, u8>>,
+    identity: Option<MappingIdentity>,
+}
 #[derive(Clone)]
-pub(crate) struct CpuMaps(
-    Arc<Mutex<RBTree<usize, shmem::VMap<super::g17p_drm::Bo, u8>>>>,
-);
+pub(crate) struct CpuMaps(Arc<Mutex<CpuMapState>>);
 impl CpuMaps {
     pub(crate) fn new() -> Result<Self> {
-        Ok(Self(Arc::pin_init(kernel::new_mutex!(RBTree::new()), GFP_KERNEL)?))
+        Ok(Self(Arc::pin_init(kernel::new_mutex!(CpuMapState { maps: RBTree::new(), identity: None }), GFP_KERNEL)?))
     }
 }
 
 pub(crate) struct Client {
+    pub(crate) identity: Option<MappingIdentity>,
     pub(crate) root: UserVm,
     pub(crate) buffers: KVec<ARef<Object>>,
     pub(crate) cpu_maps: CpuMaps,
@@ -66,6 +80,7 @@ pub(crate) struct Client {
 /// Immutable caller ownership for one publication, independent of later
 /// retained Client binding generations. Physical pages stay Session-owned.
 pub(crate) struct ClientLease {
+    identity: Option<MappingIdentity>,
     pub(crate) owner: (u64, u32),
     pub(crate) root: super::g17p_user_vm::RootLease,
     buffers: KVec<ARef<Object>>,
@@ -73,17 +88,29 @@ pub(crate) struct ClientLease {
 }
 impl ClientLease {
     pub(crate) fn matches_lease(&self, other: &Self) -> bool {
-        self.buffers.len() == other.buffers.len()
-            && self.buffers.iter().zip(&other.buffers).all(|(a,b)| core::ptr::eq(&**a, &**b))
+        MappingIdentity::same(&self.identity, &other.identity)
+            || (self.buffers.len() == other.buffers.len()
+                && self.buffers.iter().zip(&other.buffers).all(|(a,b)| core::ptr::eq(&**a, &**b)))
     }
     pub(crate) fn buffers(&self) -> &[ARef<Object>] { &self.buffers }
     pub(crate) fn matches_buffers(&self, owner: &Client) -> bool {
-        self.buffers.len() == owner.buffers.len() && self.buffers.iter()
-            .zip(owner.buffers.iter()).all(|(left, right)|
-                core::ptr::eq(&**left, &**right))
+        MappingIdentity::same(&self.identity, &owner.identity)
+            || (self.buffers.len() == owner.buffers.len() && self.buffers.iter()
+                .zip(owner.buffers.iter()).all(|(left, right)| core::ptr::eq(&**left, &**right)))
+    }
+    pub(crate) fn matches_mapping(&self, client: &Client, bindings: &[(u64,u64,u64,u32)]) -> bool {
+        self.owner == client.owner && if self.identity.is_some() && client.identity.is_some() {
+            MappingIdentity::same(&self.identity, &client.identity)
+        } else { bindings == client.bindings && self.matches_buffers(client) }
+    }
+    pub(crate) fn matches_mapping_lease(&self, other: &Self,
+        bindings: &[(u64,u64,u64,u32)], incoming: &[(u64,u64,u64,u32)]) -> bool {
+        self.owner == other.owner && if self.identity.is_some() && other.identity.is_some() {
+            MappingIdentity::same(&self.identity, &other.identity)
+        } else { bindings == incoming && self.matches_lease(other) }
     }
     pub(crate) fn cache(&self, invalidate: bool) -> Result {
-        cache_buffers(&self.buffers, invalidate, &self.cpu_maps)
+        cache_buffers(&self.buffers, &self.identity, invalidate, &self.cpu_maps)
     }
     pub(crate) fn refresh_root(&mut self, owner: &Client) -> Result {
         if self.owner != owner.owner { return Err(EIO); }
@@ -91,10 +118,19 @@ impl ClientLease {
     }
 }
 impl Client {
+    pub(crate) fn same_mapping(&self, other: &Self) -> bool {
+        if self.owner != other.owner { return false; }
+        if self.identity.is_some() && other.identity.is_some() {
+            return MappingIdentity::same(&self.identity, &other.identity);
+        }
+        self.bindings == other.bindings && self.buffers.len() == other.buffers.len()
+            && self.buffers.iter().zip(&other.buffers).all(|(a,b)| core::ptr::eq(&**a, &**b))
+    }
     pub(crate) fn lease(&self) -> Result<ClientLease> {
         let mut buffers = KVec::with_capacity(self.buffers.len(), GFP_KERNEL)?;
         for bo in &self.buffers { buffers.push(bo.clone(), GFP_KERNEL)?; }
         Ok(ClientLease {
+            identity: self.identity.clone(),
             owner: self.owner,
             root: self.root.lease()?,
             buffers,
@@ -154,6 +190,7 @@ impl Client {
             }
         }
         self.root.rebind(&changes, contexts)?;
+        self.identity = None;
         self.bindings = bindings;
         self.buffers = buffers;
         Ok(())
@@ -186,6 +223,7 @@ impl Client {
             changes.push((va, expected, 0), GFP_KERNEL)?;
         }
         self.root.rebind(&changes, &[2, 3])?;
+        self.identity = None;
         self.bindings.clear();
         self.primer_aliases = None;
         Ok(())
@@ -203,6 +241,7 @@ impl Client {
         Ok(())
     }
     pub(crate) fn adopt_rebound(&mut self, next: Self) {
+        self.identity = next.identity;
         self.buffers = next.buffers;
         self.bindings = next.bindings;
         self.owner = next.owner;
@@ -314,15 +353,24 @@ impl Client {
         self.cache_with(invalidate, &self.cpu_maps)
     }
     pub(crate) fn cache_with(&self, invalidate: bool, retained: &CpuMaps) -> Result {
-        cache_buffers(&self.buffers, invalidate, retained)
+        cache_buffers(&self.buffers, &self.identity, invalidate, retained)
     }
 }
-fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps) -> Result {
+fn cache_buffers(buffers: &[ARef<Object>], identity: &Option<MappingIdentity>, _invalidate: bool, retained: &CpuMaps) -> Result {
         // Native caller shmem leaves use AP_GPU/OS1/AttrIndex2, equivalent
         // to Asahi PROT_GPU_SHARED_* coherent mappings. Keep caller ownership
         // and vmap validation plus ordering; no per-submit DC sweep is needed.
         // Firmware/private/table/status/timestamp maintenance uses other paths.
-        let mut maps = retained.0.lock();
+        let mut held = retained.0.lock();
+        if MappingIdentity::same(identity, &held.identity) {
+            drop(held);
+            super::g17p_memory::sync();
+            return Ok(());
+        }
+        // Invalidate before any fallible insertion. A partial failure must
+        // never make an old identity certify a modified membership tree.
+        held.identity = None;
+        let maps = &mut held.maps;
         for bo in buffers {
             // The retained identity tree already deduplicates mappings. An
             // additional scan of every preceding binding made large queued
@@ -362,8 +410,9 @@ fn cache_buffers(buffers: &[ARef<Object>], _invalidate: bool, retained: &CpuMaps
                 current.insert(node);
             }
         }
-        core::mem::swap(&mut *maps, &mut current);
-        drop(maps);
+        core::mem::swap(maps, &mut current);
+        held.identity = identity.clone();
+        drop(held);
         // Vunmap and the associated GEM puts must run without the tree lock.
         drop(current);
         super::g17p_memory::sync();

@@ -9,6 +9,7 @@ use super::{
     g17p_platform::Platform, g17p_topology as topology,
 };
 use kernel::{device, prelude::*};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const PAGE: u64 = 0x4000;
 const ADDRESS: u64 = 0x0000_ffff_ffff_c000;
@@ -31,6 +32,8 @@ pub(crate) struct Vm {
     g16c_graph_started: bool,
     roots: [u64; 3],
     tables: KVec<u64>,
+    /// Set before uncleaned PTE stores; mutations require exclusive Vm access.
+    tables_dirty: AtomicBool,
     claims: KVec<(u64, usize)>,
     leaves: usize,
 }
@@ -78,6 +81,7 @@ impl Vm {
             g16c_graph_started: false,
             roots,
             tables: KVec::new(),
+            tables_dirty: AtomicBool::new(true),
             claims: KVec::new(),
             leaves: 0,
         };
@@ -183,6 +187,7 @@ impl Vm {
                 target(2, &[]).ok_or(EINVAL)?,
             ],
             tables: KVec::new(),
+            tables_dirty: AtomicBool::new(true),
             claims: KVec::new(),
             leaves: 0,
         };
@@ -571,10 +576,15 @@ impl Vm {
     }
 
     pub(crate) fn flush_tables(&self, memory: &Memory) -> Result {
+        // Retained queues publish work many times without changing this VM.
+        // Clean only after a table mutation, rather than cleaning every table
+        // for every render. Keep dirty set on failure so a retry is complete.
+        if !self.tables_dirty.load(Ordering::Relaxed) { return Ok(()); }
         for &table in &self.tables {
             memory.clean(table, PAGE as usize)?;
         }
         super::g17p_memory::sync();
+        self.tables_dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -980,6 +990,7 @@ impl Vm {
                 if pte & 1 == 0 {
                     let child = self.table(memory, group, &indices[..level + 1])?;
                     pte = child | 3;
+                    self.tables_dirty.store(true, Ordering::Relaxed);
                     memory.write64(at, pte)?;
                 }
                 if pte & 3 != 3 {
@@ -996,7 +1007,10 @@ impl Vm {
             if !replace && prior & 1 != 0 && prior != expected {
                 return Err(EEXIST);
             }
-            memory.write64(at, expected)?;
+            if prior != expected {
+                self.tables_dirty.store(true, Ordering::Relaxed);
+                memory.write64(at, expected)?;
+            }
             if memory.read64(at)? != expected {
                 return Err(EIO);
             }

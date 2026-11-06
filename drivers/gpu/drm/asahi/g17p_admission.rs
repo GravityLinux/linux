@@ -5,7 +5,7 @@
 //! changes. Every accepted job retains its exact ordered snapshot and GEMs.
 
 use super::super::{g17p_compute_runtime::Client, g17p_user_vm::UserVm};
-use super::{Binding, Object};
+use super::Object;
 use kernel::{
     prelude::*,
     sync::{aref::ARef, Arc},
@@ -18,7 +18,8 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn new(generation: u64, render: bool, client: Client) -> Result<Arc<Self>> {
+    pub(super) fn new(generation: u64, render: bool, mut client: Client) -> Result<Arc<Self>> {
+        client.identity = Some(super::super::g17p_compute_runtime::MappingIdentity::new()?);
         Ok(Arc::new(
             Self {
                 generation,
@@ -32,11 +33,7 @@ impl Snapshot {
     pub(super) fn client(&self) -> &Client { &self.client }
 
     pub(super) fn same_client(&self, old: Option<&Client>) -> bool {
-        old.is_some_and(|old| old.owner == self.client.owner
-            && old.bindings == self.client.bindings
-            && old.buffers.len() == self.client.buffers.len()
-            && old.buffers.iter().zip(&self.client.buffers)
-                .all(|(a,b)| core::ptr::eq(&**a,&**b)))
+        old.is_some_and(|old| self.client.same_mapping(old))
     }
 
     pub(super) fn matches(
@@ -44,18 +41,10 @@ impl Snapshot {
         owner: (u64, u32),
         generation: u64,
         render: bool,
-        bindings: &[Binding],
     ) -> bool {
         self.generation == generation
             && self.render == render
             && self.client.owner == owner
-            && self.client.bindings.len() == bindings.len()
-            && self.client.buffers.len() == bindings.len()
-            && bindings.iter().enumerate().all(|(index, binding)| {
-                self.client.bindings[index]
-                    == (binding.start, binding.size, binding.offset, binding.flags)
-                    && core::ptr::eq(&*self.client.buffers[index], &*binding.bo)
-            })
     }
 
     /// Metadata is sufficient for frontend range validation and backend
@@ -69,7 +58,7 @@ impl Snapshot {
         }
         let mut bindings = KVec::new();
         bindings.extend_from_slice(&self.client.bindings, GFP_KERNEL)?;
-        Ok(Client {
+        Ok(Client { identity: self.client.identity.clone(),
             root: UserVm::new()?,
             buffers,
             bindings,
@@ -83,19 +72,10 @@ impl Snapshot {
         self.materialize_view(client,render,false)
     }
     pub(super) fn materialize_view(&self, client: &mut Client, render: bool, readonly: bool) -> Result {
-        // Generation was checked at admission and travels in the accepted
-        // job's immutable Arc; Client itself does not carry a generation.
-        // Check the paired metadata and engine view before copying any root.
-        if self.render != render
-            || client.owner != self.client.owner
-            || client.bindings != self.client.bindings
-            || client.buffers.len() != self.client.buffers.len()
+        // The token certifies owner, engine view and immutable binding/BO
+        // metadata. It is invalidated by every destructive mapping mutation.
+        if self.render != render || !self.client.same_mapping(client)
             || client.primer_aliases.is_some()
-            || !client
-                .buffers
-                .iter()
-                .zip(&self.client.buffers)
-                .all(|(left, right)| core::ptr::eq(&**left, &**right))
         {
             return Err(EIO);
         }

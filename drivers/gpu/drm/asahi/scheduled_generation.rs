@@ -14,7 +14,7 @@ use kernel::{
 
 #[path = "scheduled_generation_select.rs"]
 mod selection;
-pub(crate) use selection::{select, Candidate};
+pub(crate) use selection::{select, select_retained, Candidate};
 
 pub(crate) struct Leases {
     fences: KVec<Fence>,

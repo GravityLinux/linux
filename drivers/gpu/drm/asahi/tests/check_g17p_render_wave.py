@@ -12,6 +12,11 @@ source=Path(__file__).resolve().parents[1]/'g17p_render_wave.rs';body=source.rea
 life=source.with_name('g17p_render_lifecycle.rs').read_text();start=life.index('pub(crate) fn select_storage(');end=life.index('\n}',start)+2;selection=life[start:end]
 start=life.index('pub(crate) fn select_pool(');end=life.index('\n}',start)+2;selection+='\n'+life[start:end]
 boot=source.with_name('g17p_boot.rs').read_text();start=boot.index('    fn render_pool_available(');end=boot.index('    fn retained_render_idle(',start);availability=boot[start:end]
+def item(text,marker):
+ start=text.index(marker);end=text.index('{',start)+1;depth=1
+ while depth:depth+=(text[end]=='{')-(text[end]=='}');end+=1
+ return text[start:end]
+availability+='\n'+item(boot,'    pub(crate) fn live_render_count(')+'\n'+item(boot,'    fn retained_render_idle(')
 runtime=source.with_name('g17p_render_runtime.rs').read_text()
 start=runtime.rindex('#[derive',0,runtime.index('pub(crate) enum PreparationKey'))
 lease_types=runtime[start:runtime.index('pub(crate) struct PreparedAppend',start)]
@@ -49,13 +54,13 @@ struct RenderReceipt{fence:Fence}
 impl RenderReceipt{fn fail(&self,error:i32){if self.fence.status()==0{self.fence.set_error(error);self.fence.signal();}}}
 struct Completion{id:u32,fence:Fence,owner:Arc<()>,error:Option<i32>}
 enum PendingWork{Render(RenderWave<RenderPending>),WrappedRender(RenderWave<RenderPending>),Control}
-mod render{LEASE_TYPES}
-struct Session{leases:Vec<(render::PreparationKey,Arc<std::sync::atomic::AtomicBool>)>,pending:Option<PendingWork>,preparing:Vec<u32>,defer_cache:bool,completions:KVec<Completion>,render_cpu_leases:KVec<(u32,Fence)>}
+mod render{pub fn serialized_cache_enabled()->bool{false}LEASE_TYPES}
+struct Session{automatic_render_parallel:bool,leases:Vec<(render::PreparationKey,Arc<std::sync::atomic::AtomicBool>)>,pending:Option<PendingWork>,preparing:Vec<u32>,defer_cache:bool,completions:KVec<Completion>,render_cpu_leases:KVec<(u32,Fence)>}
 impl Session{
 LEASE_CHECK
 AVAILABILITY
 fn render_preparing(&self,pool:u32)->bool{self.preparing.contains(&pool)}
-fn new(defer_cache:bool)->Self{Self{leases:Vec::new(),pending:None,preparing:Vec::new(),defer_cache,completions:KVec::new(),render_cpu_leases:KVec::new()}}
+fn new(defer_cache:bool)->Self{Self{automatic_render_parallel:false,leases:Vec::new(),pending:None,preparing:Vec::new(),defer_cache,completions:KVec::new(),render_cpu_leases:KVec::new()}}
 fn cpu(&mut self,error:Option<i32>){while !self.completions.is_empty(){let c=self.completions.remove(0).unwrap();trace(c.id,"cpu");if let Some(e)=error.or(c.error){c.fence.set_error(e);}c.fence.signal();}}
 fn busy(&self,pool:u32)->bool{self.render_cpu_leases.iter().any(|(p,f)|*p==pool&&f.status()==0)}
 }

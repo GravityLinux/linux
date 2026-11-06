@@ -13,7 +13,7 @@ pub(crate) const INITIAL_BUFFERS: u32 = 20;
 pub(crate) struct ComputeSupportG16C {
     header: [u8; 4],
     pad_04: [u8; 4],
-    active: [u8; 4],
+    bank: [u8; 4],
     pad_0c: [u8; 4],
     resource_class: [u8; 4],
     directory: [u8; 8],
@@ -46,6 +46,10 @@ impl Default for ComputeSupportG16C {
     }
 }
 impl ComputeSupportG16C {
+    // Native support DATA +8 selects the operand dispatch bank. It is input
+    // state, not a firmware-owned active flag or an ASID.
+    pub(crate) const BANK_OFFSET: u64 = core::mem::offset_of!(Self, bank) as u64;
+
     pub(crate) fn for_render(directory:u64,table:u64,auxiliary:u64,
                             allocated:u32,registered:u32,entries:u32)->Option<Self>{
         if registered>entries || entries>allocated {return None;}
@@ -93,7 +97,7 @@ const _: () = {
     }
     at!(header, 0);
     at!(pad_04, 4);
-    at!(active, 8);
+    at!(bank, 8);
     at!(pad_0c, 0xc);
     at!(resource_class, 0x10);
     at!(directory, 0x14);

@@ -55,6 +55,9 @@ impl Receipt {
     fn fence(&self) -> &Fence {
         match self { Self::Render(r) => &r.fence, Self::Compute(r) => &r.fence }
     }
+    fn publication_fence(&self) -> &Fence {
+        match self {Self::Render(r)=>&r.publication_fence,Self::Compute(r)=>&r.publication_fence}
+    }
     fn published(&self) -> bool {
         match self { Self::Render(r) => r.is_published(), Self::Compute(r) => r.is_published() }
     }
@@ -186,6 +189,13 @@ impl Point {
     }
 }
 
+/// A firmware wake is serviced once across queue workers. The watchdog also
+/// detects coalesced notifications; pending control receipts use 20 us and
+/// ordinary execution 200 us, retaining the existing retry bounds.
+fn poll_due(previous: u64, epoch: u64, elapsed_ns: i64, control: bool) -> bool {
+    previous != epoch || elapsed_ns >= if control { 20_000 } else { 200_000 }
+}
+
 struct Node {
     point: Arc<Point>,
     previous: Option<Arc<Point>>,
@@ -251,6 +261,14 @@ impl Schedule {
         }
         Ok(fences)
     }
+    pub(super) fn receipt_fence(&self, index: usize, publication: bool) -> Option<Fence> {
+        let held = self.nodes[index].point.receipt.lock();
+        let receipt = held.as_ref()?;
+        // Register even if publication already happened: it may have raced
+        // the last Point refresh. The callback's ENOENT path requeues its
+        // owner, covering that boundary without another global broadcast.
+        Some(if publication {receipt.publication_fence()} else {receipt.fence()}.clone())
+    }
     pub(super) fn fail_unstaged(&self, error: Error) {
         for node in &self.nodes {
             if !node.staged { node.point.finish(Some(error)); }
@@ -302,9 +320,21 @@ impl Schedule {
                 .ok_or(EIO)?;
             let (needed, private, readonly, cache) = {
                 let preparation_wait = RuntimeInterval::waiting();
-                let held = dev.runtime.lock();
+                let mut held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
-                let runtime = Option::as_ref(&*held).ok_or(ENODEV)?;
+                let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
+                if let Command::Render(p) = command {
+                    let mut p = *p;
+                    p.queue_owner = Some(prepared.queue_key);
+                    // Keep resource waiters out of retained CPU-map caches.
+                    // Prewarming a busy pool for every competing snapshot
+                    // makes those jobs repeatedly prune/remap one another's
+                    // working sets before any of them can be installed.
+                    if !Self::preferred(runtime, 0, node)
+                        || !runtime.session.can_stage_render(Some(snapshot.client()), &p)? {
+                        continue;
+                    }
+                }
                 let (old, private) = match command {
                     Command::Render(p) if matches!(dev.abi, super::super::GpuAbi::G16C) => {
                         let mut p=*p;p.queue_owner=Some(prepared.queue_key);
@@ -450,9 +480,17 @@ impl Schedule {
             parameters.vdm_dependency=dependencies[0];
             parameters.cdm_dependency=dependencies[1];
             let count = {
-                let held = dev.runtime.lock();
-                let runtime = Option::as_ref(&*held)?;
-                runtime.session.render_rebind_size(prepared.render_snapshot.as_ref()?.client(),&parameters).ok()?
+                let mut held = dev.runtime.lock();
+                let runtime = Option::as_mut(&mut *held)?;
+                // A blocked head can be revisited on every firmware wake.
+                // Test admission before allocating/zeroing a full table
+                // snapshot. In particular, an idle alternate pool does not
+                // permit a rebind while serialized render work is live.
+                // Selection is checked again after the off-lock allocation.
+                if !Self::preferred(runtime, 0, node) { continue; }
+                let snapshot = prepared.render_snapshot.as_ref()?;
+                if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
+                runtime.session.render_rebind_size(snapshot.client(),&parameters).ok()?
             };
             let storage = match count {
                 Some(count) => match super::super::g17p_user_vm::TableStorage::new(count) {
@@ -534,12 +572,13 @@ impl Schedule {
         if preference.as_ref().is_some_and(|f| status(f)!=0) { *preference=None; }
         preference.as_ref().is_none_or(|f| f.raw()==node.point.publication.raw())
     }
-    fn handoff(runtime: &mut Runtime, engine: usize, node: &Node, replacing: bool) {
+    fn handoff(dev: &Device, runtime: &mut Runtime, engine: usize, node: &Node, replacing: bool, key: super::super::g17p_compute_queues::Key) {
         // Stop extending only the engine whose installed ASID must change.
         // This preference is taken after dependency resolution, so a job
         // waiting on caller work cannot reserve an otherwise usable engine.
         if replacing && runtime.engine_handoff[engine].is_none() {
             runtime.engine_handoff[engine]=Some(node.point.publication.clone());
+            dev.events.prefer_queue(engine, key);
         }
     }
     fn prepare_compute(&self, dev: &Device, prepared: &Prepared)
@@ -707,6 +746,7 @@ impl Schedule {
     pub(super) fn progress(&mut self, dev: &Device, prepared: &mut Prepared,
         sync: &g17p_sync::Plan, initialized: &mut bool, cursor: &mut usize,
         publication: &Fence) -> Result<Option<Option<Error>>> {
+        let was_control_waiting = self.control_waiting;
         self.control_waiting = false;
         let profile_started = (crate::module_parameters::submission_log.value() >= 3)
             .then(kernel::time::Instant::<kernel::time::Monotonic>::now);
@@ -753,10 +793,20 @@ impl Schedule {
             // clones only when the installed engine root actually changes.
         }
         let poll_started = profile_started.as_ref().map(|_| kernel::time::Instant::<kernel::time::Monotonic>::now());
-        let (poll_result, mut completions) = match &runtime.image {
-            super::RuntimeImage::G16C(_) => runtime.session.poll_scheduled_g16c_work(dev.as_ref().as_ref()),
-            super::RuntimeImage::G17P(image) => runtime.session.poll_work_deferred(dev.as_ref().as_ref(), image),
-        };
+        let epoch = dev.events.sequence();
+        let control = was_control_waiting || runtime.session.backing_waiting();
+        let due = runtime.backend_poll.as_ref().is_none_or(|(previous, at)|
+            poll_due(*previous, epoch, at.elapsed().as_nanos(), control));
+        let (poll_result, mut completions) = if due {
+            let result = match &runtime.image {
+                super::RuntimeImage::G16C(_) => runtime.session.poll_scheduled_g16c_work(dev.as_ref().as_ref()),
+                super::RuntimeImage::G17P(image) => runtime.session.poll_work_deferred(dev.as_ref().as_ref(), image),
+            };
+            // Record the observed epoch, not a later IRQ racing this poll.
+            // The next worker must service that later notification itself.
+            runtime.backend_poll = Some((epoch, kernel::time::Instant::now()));
+            result
+        } else { (Ok(false), KVec::new()) };
         self.control_waiting |= runtime.session.backing_waiting();
         if let Err(error) = poll_result {
             runtime.session.notify_failure(error);
@@ -808,6 +858,11 @@ impl Schedule {
                     let Command::Render(mut parameters)=prepared.parameters[index] else {unreachable!()};
                     parameters.queue_owner=Some(prepared.queue_key);
                     let snapshot=prepared.render_snapshot.as_ref().ok_or(EIO)?;
+                    // Cold off-lock owner/template construction needs one
+                    // admission leader so concurrent workers cannot keep
+                    // invalidating one another's pool choice. Warm independent
+                    // pools need no global engine handoff for ordinary waits.
+                    let replacing=runtime.session.render_handoff_required(snapshot.client(),&parameters)?;
                     let slot=&mut prepared.render_client;
                     // Revalidate the physical pool chosen now, just as in
                     // off-lock preparation. A matching logical queue may
@@ -817,7 +872,7 @@ impl Schedule {
                     let installed=if snapshot.same_client(current) {selected} else {current};
                     let (ready, replacement) = Self::replacement(snapshot,installed,slot)?;
                     if !ready {
-                        Self::handoff(runtime,0,node,true);
+                        Self::handoff(dev,runtime,0,node,replacing,prepared.queue_key);
                         return Ok(None);
                     }
                     if let Some(client) = replacement { *slot = Some(client); }
@@ -825,7 +880,7 @@ impl Schedule {
                     // Establish admission before pinning producer pools. A
                     // deferred consumer must not reserve the pool it needs.
                     if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters)? {
-                        Self::handoff(runtime,0,node,true);return Ok(None);
+                        Self::handoff(dev,runtime,0,node,replacing,prepared.queue_key);return Ok(None);
                     }
                     if crate::module_parameters::firmware_dependencies.value()!=1 {
                         for point in node.dependencies.iter().flatten() {
@@ -843,7 +898,7 @@ impl Schedule {
                         &mut prepared.render_transport,&mut prepared.render_work,objects,
                         prepared_rebind.as_mut().filter(|(i,_)|*i==index).map(|(_,plan)|plan))?.map(Receipt::Render);
                     if receipt.is_none() {
-                        Self::handoff(runtime,0,node,true);
+                        Self::handoff(dev,runtime,0,node,replacing,prepared.queue_key);
                     }
                     return Ok(receipt);
                 }
@@ -856,8 +911,8 @@ impl Schedule {
                     let snapshot = prepared.render_snapshot.as_ref().ok_or(EIO)?;
                     if !Self::preferred(runtime,0,node) { return Ok(None); }
                     if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters)? {
-                        let replacing = !snapshot.same_client(runtime.session.render_client()?);
-                        Self::handoff(runtime,0,node,replacing);
+                        let replacing=runtime.session.render_handoff_required(snapshot.client(),&parameters)?;
+                        Self::handoff(dev,runtime,0,node,replacing,prepared.queue_key);
                         return Ok(None);
                     }
                     if runtime.session.render_scratch_seed(&parameters)?.is_some() {
@@ -962,7 +1017,7 @@ impl Schedule {
                     if !Self::preferred(runtime,1,node) { return Ok(None); }
                     if !runtime.session.can_stage_compute(Some(snapshot.client()),parameters)? {
                         let replacing = !snapshot.same_client(runtime.session.compute_client()?);
-                        Self::handoff(runtime,1,node,replacing);
+                        Self::handoff(dev,runtime,1,node,replacing,prepared.queue_key);
                         return Ok(None);
                     }
                     let mut waits = KVec::with_capacity(3,GFP_KERNEL)?;
@@ -989,9 +1044,12 @@ impl Schedule {
                     }
                     *node.point.receipt.lock() = Some(receipt);
                     node.staged = true;
+                    dev.events.release_queue(if matches!(prepared.parameters[index],Command::Render(_)) {0} else {1}, prepared.queue_key);
                     *cursor += 1;
                     node.point.refresh();
-                    dev.events.wake();
+                    // Publication callbacks wake exact dependents. Shared
+                    // capacity becomes available at retirement, which wakes
+                    // resource waiters above.
                 }
                 Ok(None) => (),
                 Err(error) => {

@@ -120,6 +120,21 @@ pub fn run(){
  drop(ephemeral);retained_plan.commit(&mut installed).unwrap();drop(retained_plan);
  assert_eq!(installed.pte(ephemeral_va).unwrap(),0xc00000000|FLAGS);
  assert_eq!(installed.pte(private).unwrap(),private_pte);
+ // Private-only 32 MiB ranges need no leaf DATA scan at a caller switch.
+ // Keep ownership but omit that copied row to detect accidental inspection.
+ let untouched=0x1100000000;span(&mut installed,untouched,1,0xf10000000);
+ let private_word=installed.pte(untouched).unwrap();
+ let middle=installed.read(installed.root(),(untouched>>36)as usize).unwrap()&ADDRESS;
+ let leaf=installed.read(middle,((untouched>>25)&2047)as usize).unwrap()&ADDRESS;
+ let mut snap=snapshot(&installed);snap.snapshot.rows.iter_mut().find(|row|row.0==leaf).unwrap().1=KVec::new();
+ let mut keep=snap.prepare_leaf_switch(&a,&[],&[],&[],&[1],true).unwrap();
+ keep.commit(&mut installed).unwrap();assert_eq!(installed.pte(untouched).unwrap(),private_word);
+ // Boundary overlap is not private-only: preserve the caller removal and
+ // collision checks even when a binding covers only the final page.
+ let edge=untouched+(1<<25)-PAGE;span(&mut installed,edge,1,0xf20000000);
+ let mut next=UserVm::new().unwrap();span(&mut next,base,1,0xf30000000);
+ switch(&mut installed,&next,&bindings(&[(edge,1)]));assert_eq!(installed.pte(edge).unwrap(),0);
+ assert_eq!(installed.pte(untouched).unwrap(),private_word);
  // Compute uses absolute addresses even below the render-context base.
  let absolute=0x800000;let compute_private=absolute+3*PAGE;
  let mut ca=UserVm::new().unwrap();span(&mut ca,absolute,2,0xd00000000);

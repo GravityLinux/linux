@@ -28,13 +28,48 @@ pub(crate) fn select_storage(next:u32,available:impl Fn(&u32)->bool)->Option<u32
 }
 
 /// Original independent render policy: prefer a free exact caller snapshot,
-/// then another free pool in the same round-robin order.
+/// then another free pool in the same round-robin order. Test identity first:
+/// availability checks walk live GPU/CPU leases and retained queue fences.
 pub(crate) fn select_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
     matches:impl Fn(&u32)->bool)->Option<u32> {
     if count==0 {return None;}
     let next=next%count;
-    (0..count).map(|offset|(next+offset)%count).find(|pool|available(pool)&&matches(pool))
+    (0..count).map(|offset|(next+offset)%count).find(|pool|matches(pool)&&available(pool))
         .or_else(||(0..count).map(|offset|(next+offset)%count).find(available))
+}
+
+/// Bounded serialized cache: exact immutable callers win, otherwise reuse
+/// the least recently published free context. Unused entries have age zero.
+/// The caller's availability predicate includes GPU, CPU and control leases.
+pub(crate) fn select_cached_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
+    matches:impl Fn(&u32)->bool,last_used:&[u64])->Option<u32> {
+    if count==0 || count as usize>last_used.len() {return None;}
+    let next=next%count;
+    let order=|| (0..count).map(|offset|(next+offset)%count);
+    order().find(|pool|matches(pool)&&available(pool))
+        .or_else(||order().filter(available).min_by_key(|pool|last_used[*pool as usize]))
+}
+
+/// Keep each logical VM on its retained pool across binding generations.
+/// A fully constructed resident keeps its pool while a prior lease retires.
+/// Exact snapshots still win; availability always includes GPU and CPU leases.
+pub(crate) fn select_affine_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
+    matches:impl Fn(&u32)->bool,related:impl Fn(&u32)->bool,hits:&[u8],last_used:&[u64])->Option<u32> {
+    if count==0 || count as usize>hits.len() || count as usize>last_used.len() {return None;}
+    let order=|| (0..count).map(|offset|(next%count+offset)%count);
+    if let Some(pool)=order().find(|pool|matches(pool)&&available(pool)) {return Some(pool);}
+    if let Some(pool)=order().find(|pool|related(pool)&&available(pool)) {return Some(pool);}
+    if order().any(|pool|related(&pool)) {return None;}
+    // A small stream of cache misses must not displace every hot desktop
+    // context when the working set exceeds the finite PB count. Recency
+    // breaks ties between equally frequent retired owners.
+    let clock=last_used[..count as usize].iter().copied().max().unwrap_or(0);
+    order().filter(available).min_by_key(|pool| {
+        let index=*pool as usize;let age=last_used[index];
+        // A previously hot but now inactive application must yield promptly.
+        let frequency=if clock.saturating_sub(age)>u64::from(count)*4 {0}else{hits[index]};
+        (frequency,age)
+    })
 }
 
 /// Physical render roots use the bootstrap slot for pool zero and grow
@@ -73,7 +108,7 @@ pub(crate) fn extra_pool(pool: u32) -> Result<Layout> {
                  base + 0x70000, base + 0x78000, base + 0x80000],
         contexts: [(base + 0x90000, low), (base + 0xb0000, low + 0x20000)],
         control: base + 0xf0000,
-        grids, pair: pool, ..SECOND
+        grids, pair: pool, event_slot: pool as u8, ..SECOND
     })
 }
 
@@ -152,6 +187,9 @@ pub(crate) struct Layout {
     pub(crate) pair: u32,
     pub(crate) independent: bool,
     pub(crate) context: u32,
+    /// Completion namespace belongs to the retained queue, independently of
+    /// the parameter-buffer pool. Existing pools keep their original value.
+    pub(crate) event_slot: u8,
 }
 pub(crate) const ORDINARY: Layout = Layout {
     queues: QUEUES,
@@ -172,6 +210,7 @@ pub(crate) const ORDINARY: Layout = Layout {
     pair: 0,
     independent: false,
     context: 1,
+    event_slot: 0,
 };
 pub(crate) const NATIVE: Layout = {
     use super::g17p_dependency as d;
@@ -197,6 +236,7 @@ pub(crate) const NATIVE: Layout = {
         pair: 0,
         independent: false,
         context: 1,
+        event_slot: 0,
     }
 };
 
@@ -251,6 +291,7 @@ pub(crate) const SECOND: Layout = Layout {
     pair: 1,
     independent: true,
     context: 1,
+    event_slot: 1,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,7 +577,7 @@ impl Item {
             } else {
                 Some(&points[..count])
             },
-            event_slot: Some(self.layout.pair as u8),
+            event_slot: Some(self.layout.event_slot),
             completion: None,
         }
         .build(out)

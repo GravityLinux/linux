@@ -2,6 +2,8 @@
 #![allow(dead_code)]
 #[path = "../g17p_compute.rs"]
 mod g17p_compute;
+#[path = "../scheduled_profile.rs"]
+mod scheduled_profile;
 #[path = "../g17p_compute_memory.rs"]
 mod g17p_compute_memory;
 #[path = "../g17p_dependency.rs"]
@@ -16,6 +18,7 @@ mod g17p_render;
 mod g17p_render_graph;
 #[path = "../g17p_render_lifecycle.rs"]
 mod life;
+use life as g17p_render_lifecycle;
 use g17p_render::{Kind, Parameters};
 use std::io::Write;
 fn emit(body: &[u8]) {
@@ -87,7 +90,7 @@ fn main() {
             item.optional(kind, &mut optional).unwrap();
             emit(&optional);
             let mut context = [0xa5; 0x180];
-            item.context(kind, &mut context).unwrap();
+            item.context(kind, &p, &mut context).unwrap();
             emit(&context);
         }
         let reset = item.tilemap_reset(&p);
@@ -130,7 +133,7 @@ fn main() {
             layout.pair = pair;
             layout.independent = true;
             let item = life::Item::retained(1, index, layout).unwrap();
-            let reset = item.tilemap_reset(&Parameters { tilemap: 0x10001b0000, ..Default::default() });
+            let reset = item.tilemap_reset(&Parameters { width:128,height:128,tilemap: 0x10001b0000, ..Default::default() });
             emit(&[u8::from(reset.is_some())]);
             if let Some(address) = reset { emit(&address.to_le_bytes()); }
         }

@@ -652,15 +652,7 @@ fn flight_allocation_checkpoint(fired: &mut bool) -> StageResult<()> {
     Ok(())
 }
 
-fn same(a: &compute::Client, b: &compute::Client) -> bool {
-    a.owner == b.owner
-        && a.bindings == b.bindings
-        && a.buffers.len() == b.buffers.len()
-        && a.buffers
-            .iter()
-            .zip(&b.buffers)
-            .all(|(x, y)| core::ptr::eq(&**x, &**y))
-}
+fn same(a: &compute::Client, b: &compute::Client) -> bool { a.same_mapping(b) }
 
 fn owner_layout(base:u64,limit:u64)->Result<[u64;5]> {
     if limit.checked_sub(base).is_none_or(|span|span==0) || (base|limit)&(PAGE-1)!=0 || limit>1<<42 {return Err(EINVAL);}

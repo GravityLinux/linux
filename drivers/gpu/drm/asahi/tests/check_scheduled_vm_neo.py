@@ -45,7 +45,7 @@ fn main(){
 '''
     for profile,source in [('baseline',old),('current',tests.parent/'g17p_vm.rs')]:
         code=host_vm.prelude()
-        for name in ['scheduled_initdata','scheduled_boot_records','scheduled_hwdata',
+        for name in ['scheduled_profile','scheduled_initdata','scheduled_boot_records','scheduled_hwdata',
                      'g17p_abi','g17p_layout','g17p_initgraph','g17p_opening','g17p_topology']:
             code+=f'#[path={json.dumps(str(tests.parent/(name+".rs")))}] mod {name};\n'
         code+=f'#[path={json.dumps(str(source))}] mod g17p_vm;\n'+main
