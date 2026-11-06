@@ -129,7 +129,7 @@ impl State {
             &&o.private_next.checked_sub(o.directory).and_then(|span|p.kernel_start.checked_add(span))
                 .is_some_and(|end|end<=p.kernel_end));
         super::super::super::g17p_render_lifecycle::select_affine_pool(life,count,available,matching,related,
-            &session.render_cache_hits,&session.render_cache_used)
+            &session.render_cache_hits,&session.render_cache_cost,&session.render_cache_used)
     }
     fn retained_render_index(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<usize> {
         let key=p.queue_owner?;p.firmware_priority?;
@@ -590,7 +590,8 @@ impl State {
                 first_event,first_event+1,wire.milestone+1,n,wire.lanes[0].scratch_high,wire.lanes[1].scratch_high);
         }
         self.queues[qi].generation.leases.published(receipt.fence.clone())?;
-        session.touch_render_cache(slot,self.owners[oi].client.as_ref().ok_or(EIO)?.owner);
+        let installed=self.owners[oi].client.as_ref().ok_or(EIO)?;
+        session.touch_render_cache(slot,installed.owner,installed.buffers.len());
         receipt.retained_pool.store(slot,Ordering::Relaxed);
         for (stored,grid)in receipt.milestones.iter().zip([first_event,first_event+1]) {
             stored.store((u64::from(grid)<<32)|u64::from(wire.milestone+1),Ordering::Relaxed);

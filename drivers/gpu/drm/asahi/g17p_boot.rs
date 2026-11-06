@@ -192,6 +192,7 @@ pub(crate) struct Session {
     automatic_render_parallel: bool,
     render_cache_clock: u64,
     render_cache_used: [u64; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+    render_cache_cost: [u16; super::g17p_render_lifecycle::POOL_SLOTS as usize],
     render_cache_hits: [u8; super::g17p_render_lifecycle::POOL_SLOTS as usize],
     render_cache_owner: [Option<(u64,u32)>; super::g17p_render_lifecycle::POOL_SLOTS as usize],
     render_pool_asids: [u16; super::g17p_render_lifecycle::POOL_SLOTS as usize],
@@ -506,6 +507,7 @@ impl Session {
                 automatic_render_parallel: false,
                 render_cache_clock: 0,
                 render_cache_used: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+                render_cache_cost: [1; super::g17p_render_lifecycle::POOL_SLOTS as usize],
                 render_cache_hits: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
                 render_cache_owner: [None; super::g17p_render_lifecycle::POOL_SLOTS as usize],
                 render_pool_asids: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
@@ -1129,7 +1131,7 @@ impl Session {
         }
         Ok(self.render.as_ref().map(|work| &work.client))
     }
-    fn touch_render_cache(&mut self,pool:u32,owner:(u64,u32)) {
+    fn touch_render_cache(&mut self,pool:u32,owner:(u64,u32),buffers:usize) {
         let index=pool as usize;
         if index>=self.render_cache_used.len() {return;}
         self.render_cache_clock=self.render_cache_clock.saturating_add(1);
@@ -1141,6 +1143,7 @@ impl Session {
         self.render_cache_hits[index]=if self.render_cache_owner[index]==Some(owner) {
             self.render_cache_hits[index].saturating_add(1)
         } else {1};
+        self.render_cache_cost[index]=buffers.clamp(1,u16::MAX as usize) as u16;
         self.render_cache_owner[index]=Some(owner);
         self.render_cache_used[index]=self.render_cache_clock;
     }
@@ -1396,7 +1399,7 @@ impl Session {
             desired.owner==work.client.owner
         } else {self.render_pool_clients.iter().any(|(pool,client)|pool==pair&&desired.owner==client.owner)};
         Ok(super::g17p_render_lifecycle::select_affine_pool(next,count,available,matching,related,
-            &self.render_cache_hits,&self.render_cache_used))
+            &self.render_cache_hits,&self.render_cache_cost,&self.render_cache_used))
     }
 
     fn next_render_pool_for_geometry(&self, incoming: Option<&compute::Client>,
@@ -2016,7 +2019,7 @@ impl Session {
         // Source Item values were validated before publication during staging.
         // Native receipts stay conservative and do not expose ordinary points.
         if !ticket.item.layout.native {
-            self.touch_render_cache(ticket.item.layout.pair,ticket.client.owner);
+            self.touch_render_cache(ticket.item.layout.pair,ticket.client.owner,ticket.client.buffers().len());
             receipt.retained_pool.store(ticket.item.layout.pair,Ordering::Relaxed);
             for (stored, grid) in receipt.milestones.iter().zip(ticket.item.layout.grids) {
                 stored.store(((ticket.item.layout.pair as u64) << 40)

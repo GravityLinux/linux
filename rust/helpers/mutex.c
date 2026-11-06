@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/mutex.h>
+#include <linux/rtmutex.h>
 
 __rust_helper void rust_helper_mutex_lock(struct mutex *lock)
 {
@@ -27,4 +28,9 @@ __rust_helper void rust_helper_mutex_assert_is_held(struct mutex *mutex)
 __rust_helper void rust_helper_mutex_destroy(struct mutex *lock)
 {
 	mutex_destroy(lock);
+}
+
+__rust_helper void rust_helper_rt_mutex_assert_is_held(struct rt_mutex *mutex)
+{
+	lockdep_assert_held(mutex);
 }

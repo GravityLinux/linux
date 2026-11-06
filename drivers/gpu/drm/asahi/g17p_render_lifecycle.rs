@@ -54,8 +54,8 @@ pub(crate) fn select_cached_pool(next:u32,count:u32,available:impl Fn(&u32)->boo
 /// A fully constructed resident keeps its pool while a prior lease retires.
 /// Exact snapshots still win; availability always includes GPU and CPU leases.
 pub(crate) fn select_affine_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
-    matches:impl Fn(&u32)->bool,related:impl Fn(&u32)->bool,hits:&[u8],last_used:&[u64])->Option<u32> {
-    if count==0 || count as usize>hits.len() || count as usize>last_used.len() {return None;}
+    matches:impl Fn(&u32)->bool,related:impl Fn(&u32)->bool,hits:&[u8],cost:&[u16],last_used:&[u64])->Option<u32> {
+    if count==0 || count as usize>hits.len() || count as usize>cost.len() || count as usize>last_used.len() {return None;}
     let order=|| (0..count).map(|offset|(next%count+offset)%count);
     if let Some(pool)=order().find(|pool|matches(pool)&&available(pool)) {return Some(pool);}
     if let Some(pool)=order().find(|pool|related(pool)&&available(pool)) {return Some(pool);}
@@ -68,7 +68,10 @@ pub(crate) fn select_affine_pool(next:u32,count:u32,available:impl Fn(&u32)->boo
         let index=*pool as usize;let age=last_used[index];
         // A previously hot but now inactive application must yield promptly.
         let frequency=if clock.saturating_sub(age)>u64::from(count)*4 {0}else{hits[index]};
-        (frequency,age)
+        // Binding walks/cache warming scale with the installed mapping set.
+        // Preserve expensive active roots rather than letting cheap clients
+        // repeatedly evict a compositor at the same publication frequency.
+        (u32::from(frequency)*u32::from(cost[index].max(1)),age)
     })
 }
 

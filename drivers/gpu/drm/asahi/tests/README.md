@@ -950,3 +950,16 @@ retention, key removal, invalidation before final puts, and a blocked pass
 remaining armed until retirement. This is a host ownership test, not firmware
 qualification. See `QUALIFICATION.bo-reclamation-20261031.md` for Max hardware
 results and remaining idle/batch limitations.
+
+Shared runtime contention checks:
+
+```sh
+python3 check_completion_lock.py --evidence /path/to/new-completion-evidence
+python3 check_render_support.py --evidence /path/to/new-support-evidence
+python3 check_serial_render_cache.py --evidence /path/to/new-cache-evidence
+```
+
+These compile the actual guard transition, support preparation and retained
+pool selection against ownership/allocation models. Native Sway/DCP DMA-BUF,
+Vulkan and muted browser validation is recorded in
+`QUALIFICATION.runtime-contention-20261106.rst`.

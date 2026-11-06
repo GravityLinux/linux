@@ -29,7 +29,7 @@ struct Fence(AtomicI32);impl Fence{fn raw(&self)->*const AtomicI32{&self.0}}
 mod kernel{pub mod bindings{pub unsafe fn dma_fence_get_status(p:*const super::super::AtomicI32)->i32{unsafe{(*p).load(super::super::Ordering::Acquire)}}}}
 struct Wave(Vec<u32>);impl Wave{fn pool_busy(&self,p:u32)->bool{self.0.contains(&p)}}
 enum PendingWork{Render(Wave),WrappedRender(Wave),Control}
-struct Session{automatic_render_parallel:bool,render_cache_clock:u64,render_cache_used:[u64;15],render_cache_hits:[u8;15],render_cache_owner:[Option<(u64,u32)>;15],pending:Option<PendingWork>,render_cpu_leases:Vec<(u32,Fence)>,preparing:u32}
+struct Session{automatic_render_parallel:bool,render_cache_clock:u64,render_cache_used:[u64;15],render_cache_hits:[u8;15],render_cache_cost:[u16;15],render_cache_owner:[Option<(u64,u32)>;15],pending:Option<PendingWork>,render_cpu_leases:Vec<(u32,Fence)>,preparing:u32}
 impl Session{
  fn render_preparing(&self,p:u32)->bool{self.preparing&(1<<p)!=0}
  fn live_render_count(&self)->usize{match &self.pending{Some(PendingWork::Render(w)|PendingWork::WrappedRender(w))=>w.0.len(),_=>0}}
@@ -68,10 +68,10 @@ fn main(){
     .or_else(||if owned!=0 {None}else {order.iter().copied().filter(|p|free&(1<<p)!=0)
       .min_by_key(|p|(hits[*p as usize],ages[*p as usize]))});
    assert_eq!(select_affine_pool(next,4,|p|free&(1<<p)!=0,|p|exact&(1<<p)!=0,
-    |p|owned&(1<<p)!=0,&hits,&ages),expected);
+    |p|owned&(1<<p)!=0,&hits,&[1;4],&ages),expected);
   }
  }}}}
- let mut s=Session{automatic_render_parallel:false,render_cache_clock:0,render_cache_used:[0;15],render_cache_hits:[0;15],render_cache_owner:[None;15],pending:None,render_cpu_leases:vec![],preparing:0};
+ let mut s=Session{automatic_render_parallel:false,render_cache_clock:0,render_cache_used:[0;15],render_cache_hits:[0;15],render_cache_cost:[1;15],render_cache_owner:[None;15],pending:None,render_cpu_leases:vec![],preparing:0};
  assert!(s.render_pool_available(0)&&s.render_pool_available(1));
  for wrapped in [false,true]{
   s.pending=Some(if wrapped{PendingWork::WrappedRender(Wave(vec![0]))}else{PendingWork::Render(Wave(vec![0]))});
@@ -82,23 +82,32 @@ fn main(){
  s.preparing=2;assert!(!s.render_pool_available(1));assert!(s.render_pool_available(0));
  // Protect a hot working set from a short oversubscribed stream, then
  // decay inactive history so new long-lived workloads can take its place.
- for pool in 0..14 {for _ in 0..30{s.touch_render_cache(pool,(1,pool));}}
- s.touch_render_cache(14,(1,14));
+ for pool in 0..14 {for _ in 0..30{s.touch_render_cache(pool,(1,pool),1);}}
+ s.touch_render_cache(14,(1,14),1);
  for i in 0..600 {
-  for pool in 0..14{s.touch_render_cache(pool,(1,pool));}
+  for pool in 0..14{s.touch_render_cache(pool,(1,pool),1);}
   let owner=(1,14+i%3);
   let selected=select_affine_pool(i,15,|_|true,|p|s.render_cache_owner[*p as usize]==Some(owner),
-    |p|s.render_cache_owner[*p as usize]==Some(owner),&s.render_cache_hits,&s.render_cache_used).unwrap();
-  assert_eq!(selected,14);s.touch_render_cache(selected,owner);
+    |p|s.render_cache_owner[*p as usize]==Some(owner),&s.render_cache_hits,&s.render_cache_cost,&s.render_cache_used).unwrap();
+  assert_eq!(selected,14);s.touch_render_cache(selected,owner,1);
  }
- assert_eq!(select_affine_pool(0,4,|_|true,|_|false,|_|false,&[255,8,8,8],&[1,90,99,100]),Some(0));
+ assert_eq!(select_affine_pool(0,4,|_|true,|_|false,|_|false,&[255,8,8,8],&[1;4],&[1,90,99,100]),Some(0));
  for pool in 0..14{assert_eq!(s.render_cache_owner[pool],Some((1,pool as u32)));}
- for _ in 0..8192{s.touch_render_cache(14,(1,99));}
+ for _ in 0..8192{s.touch_render_cache(14,(1,99),1);}
  assert!(s.render_cache_hits[..14].iter().all(|&n|n==0));
- let victim=select_affine_pool(0,15,|_|true,|_|false,|_|false,&s.render_cache_hits,&s.render_cache_used).unwrap();
- assert!(victim<14);s.touch_render_cache(victim,(2,1));assert_eq!(s.render_cache_hits[victim as usize],1);
- let clock=s.render_cache_clock;s.touch_render_cache(15,(9,9));assert_eq!(s.render_cache_clock,clock);
- s.render_cache_clock=u64::MAX-1;s.touch_render_cache(14,(1,99));s.touch_render_cache(14,(1,99));assert_eq!(s.render_cache_clock,u64::MAX);
+ let victim=select_affine_pool(0,15,|_|true,|_|false,|_|false,&s.render_cache_hits,&s.render_cache_cost,&s.render_cache_used).unwrap();
+ assert!(victim<14);s.touch_render_cache(victim,(2,1),1);assert_eq!(s.render_cache_hits[victim as usize],1);
+ let clock=s.render_cache_clock;s.touch_render_cache(15,(9,9),1);assert_eq!(s.render_cache_clock,clock);
+ s.render_cache_clock=u64::MAX-1;s.touch_render_cache(14,(1,99),1);s.touch_render_cache(14,(1,99),1);assert_eq!(s.render_cache_clock,u64::MAX);
+ // Equal-frequency active roots retain their accumulated binding-walk
+ // cost. A large compositor must not be the cheapest victim merely because
+ // it published slightly earlier than small clients. Inactive roots yield.
+ assert_eq!(select_affine_pool(0,4,|_|true,|_|false,|_|false,&[8;4],&[1,1,1,64],&[94,91,99,90]),Some(1));
+ assert_eq!(select_affine_pool(0,4,|_|true,|_|false,|_|false,&[8;4],&[1,1,1,64],&[94,91,99,0]),Some(3));
+ assert_eq!(select_affine_pool(0,4,|p|*p==3,|_|false,|_|false,&[8;4],&[1,1,1,64],&[94,91,99,90]),Some(3));
+ assert_eq!(select_affine_pool(0,4,|_|true,|_|false,|_|false,&[8;4],&[1;3],&[94,91,99,90]),None);
+ s.touch_render_cache(0,(1,0),usize::MAX);assert_eq!(s.render_cache_cost[0],u16::MAX);
+ s.touch_render_cache(1,(1,1),0);assert_eq!(s.render_cache_cost[1],1);
  // Legacy overlap is still separately opted into. Cached contexts cannot
  // enable it or alter native/diagnostic profiles.
  for slots in [0,1,2,4,15,16,u32::MAX]{

@@ -197,7 +197,7 @@ impl<'bound> ScheduledGpu<'bound> {
             pdev.dma_set_mask_and_coherent(kernel::dma::DmaMask::try_new(42)?)?;
         }
         let runtime = kernel::sync::Arc::pin_init(
-            kernel::new_mutex!(Some(g17p_drm::Runtime {
+            g17p_drm::RuntimeMutex::new(Some(g17p_drm::Runtime {
                 backend_poll: None,
                 session,
                 image: g17p_drm::RuntimeImage::G16C(image),
@@ -205,7 +205,7 @@ impl<'bound> ScheduledGpu<'bound> {
                 exclusive: false,
                 engine_handoff: [None, None],
                 admission_handoff: None
-            })),
+            }), kernel::c_str!("agx_runtime"), kernel::static_lock_class!()),
             GFP_KERNEL,
         )?;
         let drm = g17p_drm::register_g16c(pdev, version, max_mhz, board.profile, runtime.clone())?;
@@ -252,7 +252,7 @@ impl<'bound> ScheduledGpu<'bound> {
             .max()
             .ok_or(EINVAL)?;
         let runtime = kernel::sync::Arc::pin_init(
-            kernel::new_mutex!(Some(g17p_drm::Runtime {
+            g17p_drm::RuntimeMutex::new(Some(g17p_drm::Runtime {
                 backend_poll: None,
                 session,
                 image: g17p_drm::RuntimeImage::G17P(image),
@@ -260,7 +260,7 @@ impl<'bound> ScheduledGpu<'bound> {
                 exclusive: false,
                 engine_handoff: [None, None],
                 admission_handoff: None
-            })),
+            }), kernel::c_str!("agx_runtime"), kernel::static_lock_class!()),
             GFP_KERNEL,
         )?;
         let drm = g17p_drm::register(
