@@ -103,7 +103,38 @@ impl Runtime {
         }
     }
 }
-pub(crate) type RuntimeRef = Arc<Mutex<Option<Runtime>>>;
+/// Runtime critical sections include firmware cache maintenance. Sleeping
+/// waiters preserve parallel off-lock preparation without optimistic spin
+/// consuming several CPUs behind this one serial publication point.
+pub(crate) struct RuntimeMutexBackend;
+// SAFETY: The kernel rt_mutex APIs provide exclusive sleeping ownership.
+unsafe impl kernel::sync::lock::Backend for RuntimeMutexBackend {
+    type State = bindings::rt_mutex;
+    type GuardState = ();
+    unsafe fn init(ptr: *mut Self::State, name: *const kernel::ffi::c_char,
+        key: *mut bindings::lock_class_key) {
+        // SAFETY: Backend::init guarantees live pinned storage and static keys.
+        unsafe { bindings::__rt_mutex_init(ptr, name, key); }
+    }
+    unsafe fn lock(ptr: *mut Self::State) {
+        // SAFETY: Backend::lock guarantees initialized pinned storage.
+        unsafe { bindings::rt_mutex_lock(ptr); }
+    }
+    unsafe fn try_lock(ptr: *mut Self::State) -> Option<()> {
+        // SAFETY: Same initialized lock; a successful try acquires ownership.
+        if unsafe { bindings::rt_mutex_trylock(ptr) } != 0 { Some(()) } else { None }
+    }
+    unsafe fn unlock(ptr: *mut Self::State, _: &()) {
+        // SAFETY: Backend::unlock requires the current caller to own the lock.
+        unsafe { bindings::rt_mutex_unlock(ptr); }
+    }
+    unsafe fn assert_is_held(ptr: *mut Self::State) {
+        // SAFETY: Backend guarantees a live initialized lock.
+        unsafe { bindings::rt_mutex_assert_is_held(ptr); }
+    }
+}
+pub(crate) type RuntimeMutex = kernel::sync::lock::Lock<Option<Runtime>, RuntimeMutexBackend>;
+pub(crate) type RuntimeRef = Arc<RuntimeMutex>;
 
 pub(crate) struct Driver;
 #[pin_data]

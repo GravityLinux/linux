@@ -318,7 +318,7 @@ impl Schedule {
             considered[engine] = true;
             let snapshot = if engine == 0 { prepared.render_snapshot.as_ref() } else { prepared.compute_snapshot.as_ref() }
                 .ok_or(EIO)?;
-            let (needed, private, readonly, cache) = {
+            let (needed, private, readonly, cache, storage_needed) = {
                 let preparation_wait = RuntimeInterval::waiting();
                 let mut held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
@@ -359,8 +359,14 @@ impl Schedule {
                     Command::Compute(p) => runtime.session.compute_rebind_size(prepared.queue_key,
                         snapshot.client(),p,prepared.queue_priority).is_some(),
                 }};
+                let storage_needed = match command {
+                    Command::Render(p) if matches!(dev.abi, super::super::GpuAbi::G16C) =>
+                        Some(runtime.session.g16c_render_storage_needed(snapshot.client(),p,
+                            prepared.queue_key,prepared.queue_priority)),
+                    _ => None,
+                };
                 (!snapshot.same_client(old) || !snapshot.same_client(selected), private, readonly,
-                    selected.map(|client| client.cpu_maps.clone()))
+                    selected.map(|client| client.cpu_maps.clone()), storage_needed)
             };
             let slot = if engine == 0 { &mut prepared.render_client } else { &mut prepared.compute_client };
             if slot.is_none() && needed {
@@ -399,11 +405,10 @@ impl Schedule {
                 }
             }
             if engine==0 && matches!(dev.abi,super::super::GpuAbi::G16C) {
-                let Command::Render(p)=command else {return Err(EIO);};
-                let (queue_needed,work_needed)={
-                    let held=dev.runtime.lock();let runtime=Option::as_ref(&*held).ok_or(ENODEV)?;
-                    runtime.session.g16c_render_storage_needed(snapshot.client(),p,prepared.queue_key,prepared.queue_priority)
-                };
+                // Speculative off-lock backing follows the same selection
+                // snapshot as the caller view. Publication rechecks all queue
+                // identities and retries if a different owner won meanwhile.
+                let (queue_needed,work_needed)=storage_needed.ok_or(EIO)?;
                 if !queue_needed {drop(prepared.render_transport.take());}
                 if !work_needed {drop(prepared.render_work.take());}
                 if queue_needed && prepared.render_transport.is_none() {
@@ -648,17 +653,27 @@ impl Schedule {
         }
         Ok(None)
     }
-    fn prepare_render_scratch(&self, dev: &Device, prepared: &Prepared) -> Result {
+    fn prepare_render_support(&self, dev: &Device, prepared: &Prepared) -> Result {
         for (index, node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
-            let Command::Render(parameters) = &prepared.parameters[index] else { continue; };
+            let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
+            let scratch_parameters = parameters;
+            parameters.queue_owner = Some(prepared.queue_key);
             if !matches!(Self::dependencies(node, &prepared.parameters[index]), Ok(Some(_))) { continue; }
-            let seed = {
+            let snapshot = prepared.render_snapshot.as_ref().ok_or(EIO)?;
+            let (seed, mut count) = {
                 let preparation_wait = RuntimeInterval::waiting();
                 let held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
-                Option::as_ref(&*held).ok_or(ENODEV)?.session.render_scratch_seed_for(
-                    prepared.render_snapshot.as_ref().ok_or(EIO)?.client(),parameters,prepared.queue_key)?
+                let session = &Option::as_ref(&*held).ok_or(ENODEV)?.session;
+                let seed = session.render_scratch_seed_for(snapshot.client(),
+                    &scratch_parameters, prepared.queue_key)?;
+                // A warm owner needs only one shared-state read pass. Cold
+                // template sizing follows scratch commit under that guard.
+                let count = if seed.is_none() {
+                    session.render_template_size(snapshot.client(), &parameters)?
+                } else { None };
+                (seed, count)
             };
             if let Some(seed) = seed {
                 let scratch = match seed.prepare() {
@@ -668,24 +683,10 @@ impl Schedule {
                 let preparation_wait = RuntimeInterval::waiting();
                 let mut held = dev.runtime.lock();
                 let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
-                Option::as_mut(&mut *held).ok_or(ENODEV)?.session.commit_render_scratch(scratch)?;
+                let session = &mut Option::as_mut(&mut *held).ok_or(ENODEV)?.session;
+                session.commit_render_scratch(scratch)?;
+                count = session.render_template_size(snapshot.client(), &parameters)?;
             }
-        }
-        Ok(())
-    }
-    fn prepare_render_templates(&self, dev: &Device, prepared: &Prepared) -> Result {
-        for (index, node) in self.nodes.iter().enumerate() {
-            if node.staged || status(&node.point.completion) != 0 { continue; }
-            let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
-            parameters.queue_owner = Some(prepared.queue_key);
-            if !matches!(Self::dependencies(node, &prepared.parameters[index]), Ok(Some(_))) { continue; }
-            let snapshot = prepared.render_snapshot.as_ref().ok_or(EIO)?;
-            let count = {
-                let preparation_wait = RuntimeInterval::waiting();
-                let held = dev.runtime.lock();
-                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
-                Option::as_ref(&*held).ok_or(ENODEV)?.session.render_template_size(snapshot.client(), &parameters)?
-            };
             let Some(count) = count else { continue; };
             let storage = super::super::g17p_user_vm::TableStorage::new(count)?;
             let seed = {
@@ -755,10 +756,8 @@ impl Schedule {
         let backing_us = phase_us();
         self.prepare_clients(dev, prepared)?;
         let clients_us = phase_us();
-        self.prepare_render_scratch(dev, prepared)?;
-        let scratch_us = phase_us();
-        self.prepare_render_templates(dev, prepared)?;
-        let templates_us = phase_us();
+        self.prepare_render_support(dev, prepared)?;
+        let support_us = phase_us();
         self.prepare_clients(dev, prepared)?;
         let clients2_us = phase_us();
         let (mut prepared_compute, mut prepared_compute_rebind)=match self.prepare_compute(dev,prepared)? {
@@ -772,9 +771,9 @@ impl Schedule {
         };
         let seed_us = profile_started.as_ref().map(|s| s.elapsed().as_nanos()/1000).unwrap_or(0);
         if crate::module_parameters::submission_log.value() >= 4 && seed_us >= 500 {
-            pr_info!("G17P: SWITCH_PHASE queue {:?} id {} backing_us {} clients_us {} scratch_us {} templates_us {} clients2_us {} compute_us {} render_us {}\n",
+            pr_info!("G17P: SWITCH_PHASE queue {:?} id {} backing_us {} clients_us {} support_us {} clients2_us {} compute_us {} render_us {}\n",
                 prepared.queue_key, self.profile_id, backing_us, clients_us-backing_us,
-                scratch_us-clients_us,templates_us-scratch_us,clients2_us-templates_us,
+                support_us-clients_us,clients2_us-support_us,
                 compute_us-clients2_us,seed_us-compute_us);
         }
         let lock_started = RuntimeInterval::waiting();
@@ -812,17 +811,21 @@ impl Schedule {
             runtime.session.notify_failure(error);
             self.fail_unstaged(error);
         }
-        // An independent worker can publish and retire while this worker is
-        // mapping caller BOs or making timestamp writes visible to the CPU.
-        // Owned roots/BOs/alias fences survive both unlock and logical unbind.
+        // CPU cache completion may allocate/map and must run off-lock.
+        // When there is no such work, retain the guard instead of making
+        // every retry contend for the same mutex twice.
         drop(interval);
-        drop(held);
         let mut cache_error = None;
-        for completion in &mut completions {
-            if let Err(error) = completion.cache() { cache_error.get_or_insert(error); }
-        }
-        let lock_started = RuntimeInterval::waiting();
-        let mut held = dev.runtime.lock();
+        let (mut held, lock_started) = if completions.is_empty() {
+            (held, RuntimeInterval::waiting())
+        } else {
+            drop(held);
+            for completion in &mut completions {
+                if let Err(error) = completion.cache() { cache_error.get_or_insert(error); }
+            }
+            let lock_started = RuntimeInterval::waiting();
+            (dev.runtime.lock(), lock_started)
+        };
         let _interval = RuntimeInterval::acquired(lock_started, prepared.queue_key, "publication");
         let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
         // Release only this worker's private preparation claim under the
