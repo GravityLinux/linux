@@ -198,6 +198,7 @@ impl<'bound> ScheduledGpu<'bound> {
         }
         let runtime = kernel::sync::Arc::pin_init(
             kernel::new_mutex!(Some(g17p_drm::Runtime {
+                backend_poll: None,
                 session,
                 image: g17p_drm::RuntimeImage::G16C(image),
                 active: 0,
@@ -252,6 +253,7 @@ impl<'bound> ScheduledGpu<'bound> {
             .ok_or(EINVAL)?;
         let runtime = kernel::sync::Arc::pin_init(
             kernel::new_mutex!(Some(g17p_drm::Runtime {
+                backend_poll: None,
                 session,
                 image: g17p_drm::RuntimeImage::G17P(image),
                 active: 0,
@@ -366,6 +368,10 @@ kernel::module_platform_driver! {
             default: 1,
             description: "Use independently owned ordinary compute queues (0: legacy diagnostic path)",
         },
+        compute_cache_mb: u32 {
+            default: 512,
+            description: "Private/transport backing budget in MiB for retaining idle compute queues; 0 selects immediate foreign reuse, busy owners retain full concurrency",
+        },
         native_render_vms: u32 {
             default: 0,
             description: "Source G17P_NATIVE_RENDER_VMS: retain two standalone render VM roots",
@@ -377,6 +383,16 @@ kernel::module_platform_driver! {
         release_backing: u32 {
             default: 1,
             description: "Reclaim sole-referenced caller BOs after idle global UAT invalidation; 0 retains backing until shutdown",
+        },
+        render_cache_slots: u32 {
+            // Each retained context selects its own operand bank. Pool use
+            // remains serialized; this does not enable overlapping renders.
+            default: 2,
+            description: "Bounded retained render contexts (default 2; serialized pool use, 1..15)",
+        },
+        parallel_render_auto: u32 {
+            default: 1,
+            description: "Use independent retained render pools on qualified chips; 0 keeps the serialized diagnostic fallback",
         },
         partial_independent_owner: u32 {
             default: 0,

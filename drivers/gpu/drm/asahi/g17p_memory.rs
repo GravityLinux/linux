@@ -73,6 +73,9 @@ pub(crate) struct Memory {
     // session is live. Retiring objects or reusing ring slots never removes
     // allocations here. Pages are released only after session shutdown.
     allocations: KVec<Arc<Allocation>>,
+    // Physical backing, including allocator order padding. Update only when
+    // ownership changes; queue selection must not walk the session heap.
+    allocated_bytes: u64,
     // Exclusive physical ends index the permanently retained, disjoint
     // allocations. Access checks remain exact while avoiding a heap scan.
     allocation_ends: RBTree<u64, usize>,
@@ -159,7 +162,7 @@ impl Memory {
     /// Retained physical high-water mark, including allocator order padding.
     /// Used by native lifetime receipts to establish bounded backing reuse.
     pub(crate) fn allocation_stats(&self) -> (usize, u64) {
-        (self.allocations.len(), self.allocations.iter().map(|a| a.size as u64).sum())
+        (self.allocations.len(), self.allocated_bytes)
     }
 
     fn owns_allocation(&self, address: u64, end: u64) -> bool {
@@ -213,7 +216,7 @@ impl Memory {
     /// Private, unpublished storage can be constructed by an independent
     /// worker without borrowing the session heap or its shared mappings.
     pub(crate) fn detached() -> Self {
-        Self { mappings: KVec::new(), allocations: KVec::new(), allocation_ends: RBTree::new(),
+        Self { mappings: KVec::new(), allocations: KVec::new(), allocated_bytes: 0, allocation_ends: RBTree::new(),
             prepared_blocks: KVec::new(), prepared_growth: false, growth_refused: false, growth_waiting: false }
     }
     /// Transfer all backing before publishing a root that references it.
@@ -221,6 +224,7 @@ impl Memory {
     /// GPU allocations. Reuse the detached ownership-index nodes verbatim.
     pub(crate) fn absorb(&mut self, mut other: Self) -> Result {
         if !other.mappings.is_empty() { return Err(EINVAL); }
+        let allocated_bytes = self.allocated_bytes.checked_add(other.allocated_bytes).ok_or(EOVERFLOW)?;
         self.prepared_blocks.reserve(other.prepared_blocks.len(), GFP_KERNEL)?;
         let offset = self.allocations.len();
         offset.checked_add(other.allocations.len()).ok_or(EOVERFLOW)?;
@@ -228,6 +232,7 @@ impl Memory {
         for allocation in other.allocations.drain(..) {
             self.allocations.push(allocation, GFP_KERNEL).expect("reserved allocation transfer");
         }
+        self.allocated_bytes = allocated_bytes;
         for block in other.prepared_blocks.drain(..) {
             self.prepared_blocks.push(block, GFP_KERNEL).expect("reserved prepared-block transfer");
         }
@@ -244,6 +249,7 @@ impl Memory {
         let mut memory = Self {
             mappings: KVec::new(),
             allocations: KVec::new(),
+            allocated_bytes: 0,
             allocation_ends: RBTree::new(),
             prepared_blocks: KVec::new(), prepared_growth: false, growth_refused: false, growth_waiting: false,
         };
@@ -373,6 +379,8 @@ impl Memory {
             return Err(EINVAL);
         }
         let pages = (size / PAGE).checked_next_power_of_two().ok_or(EINVAL)?;
+        let bytes = pages.checked_mul(PAGE).ok_or(EOVERFLOW)?;
+        let allocated_bytes = self.allocated_bytes.checked_add(bytes as u64).ok_or(EOVERFLOW)?;
         let order = pages.trailing_zeros();
         self.allocations.reserve(1, GFP_KERNEL)?;
         let node = RBTreeNodeReservation::new(GFP_KERNEL)?;
@@ -393,15 +401,16 @@ impl Memory {
             Arc::new(Allocation {
                 page: ptr,
                 base,
-                size: pages * PAGE,
+                size: bytes,
                 order,
             }, GFP_KERNEL)?,
             GFP_KERNEL,
         )?;
+        self.allocated_bytes = allocated_bytes;
         // Node and vector capacity were reserved before acquiring pages;
         // installing this ownership index cannot fail or release backing.
-        self.allocation_ends.insert(node.into_node(base + (pages * PAGE) as u64, self.allocations.len() - 1));
-        self.zero(base, pages * PAGE)?;
+        self.allocation_ends.insert(node.into_node(base + bytes as u64, self.allocations.len() - 1));
+        self.zero(base, bytes)?;
         Ok(base)
     }
 

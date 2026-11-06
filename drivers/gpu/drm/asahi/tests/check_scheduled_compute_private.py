@@ -71,7 +71,7 @@ mod g17p_compute_runtime{
 '''+item((tests.parent/'g17p_compute_runtime.rs').read_text(),'pub(crate) fn client_storage(')+'''
 }
 '''
-for name in ['g17p_queue','scheduled_dispatch','scheduled_operands','scheduled_lifetime']:
+for name in ['scheduled_profile','g17p_queue','scheduled_dispatch','scheduled_operands','scheduled_lifetime']:
  code+=f'#[path={json.dumps(str(tests.parent/(name+".rs")))}]mod {name};\n'
 source=(tests.parent/'scheduled_compute_preparation.rs').read_text()
 params=item((tests.parent/'g17p_compute_runtime.rs').read_text(),'pub(crate) struct Parameters')
@@ -86,11 +86,16 @@ pub fn run()->Result<usize>{
  use std::collections::BTreeSet;
  let mut memory=Memory::new();let mut previous=BTreeSet::new();let mut leaves=0;
  for base in [0x7000000000,0x7100000000] {
-  let p=Parameters{preempt:base,kernel_end:base+0x20000000,cdm:0,end:4,sampler:0,sampler_count:0,timestamps:[0;2]};
+  let before:usize=memory.allocations.iter().map(|(_,size)|*size).sum();
+  let p=Parameters{chip_id:0x6041,preempt:base,kernel_end:base+0x20000000,cdm:0,end:4,sampler:0,sampler_count:0,timestamps:[0;2]};
   let layout=wire::PrivateLayout::new(&p)?;
   assert_eq!((layout.table,layout.state,layout.buffers,layout.save,layout.robustness,layout.end),
    (base+0x1008000,base+0x1020000,base+0x10a0000,base+0xb1c0000,base+0x129c0000,base+0x129c4000));
   let mut client=Client{root:g17p_user_vm::UserVm::new()};layout.build(&mut memory,&mut client)?;
+  let after:usize=memory.allocations.iter().map(|(_,size)|*size).sum();
+  // 256 three-page save allocations each round up to four pages, and the
+  // 0x7c000 operand state rounds up to 0x80000. Charge real backing, not VAs.
+  assert_eq!(after-before,0xc094000);
   let offsets=layout.offsets()?;let unique:BTreeSet<_>=offsets.iter().copied().collect();assert_eq!(unique.len(),offsets.len());
   let mapped:BTreeSet<_>=client.root.pages.keys().map(|a|a-base).collect();assert_eq!(unique,mapped);
   assert_eq!(client.root.pte(base+0x109c000)?,0); // Last state page is followed by its guard.
@@ -123,6 +128,7 @@ with tempfile.TemporaryDirectory(prefix='scheduled-compute-private-')as d:
  (a.evidence/'summary.json').write_text(json.dumps(dict(disjoint_roots=2,exact_relocation_leaves=leaves,
   all_directory_and_table_bytes_checked=True,all256_sparse_save_guards_checked=True,
   physical_aliases_absent=True,largest_contiguous_allocation=0x200000,
+  physical_bytes_per_Max_owner=0xc094000,
   actual_production_private_builder_and_client_storage=True,native_GPU_execution=False,
   source_sha256={n:hashlib.sha256((tests.parent/n).read_bytes()).hexdigest()for n in ['scheduled_compute_queue.rs','g17p_compute_runtime.rs']}),indent=2)+'\n')
 print('PASS: two disjoint compute roots,',leaves,'exact relocation leaves, full directory/table bytes, all256 sparse save guards')

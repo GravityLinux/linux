@@ -114,8 +114,35 @@ struct Deferred {
     body: KVVec<u8>,
     previous: Option<KVVec<u8>>,
 }
+/// Host policy only: enable automatically where the native mixed-client
+/// qualification is available. G16S keeps its known discard-sensitive guard;
+/// explicit legacy/native experiments and a one-slot cache retain old policy.
+pub(crate) fn auto_parallel_enabled(chip:u32)->bool {
+    chip==0x6041 && crate::module_parameters::parallel_render_auto.value()==1
+        && crate::module_parameters::render_cache_slots.value()>1
+        && crate::module_parameters::compute_queues.value()==1
+        && crate::module_parameters::native_compute_vms.value()==0
+        && crate::module_parameters::native_render_vms.value()==0
+        && crate::module_parameters::native_barriers.value()==0
+        && crate::module_parameters::partial_independent_owner.value()==0
+        && crate::module_parameters::alternate_queue_pairs.value()==0
+}
+/// Keep private contexts/rings warm while retaining one exclusive hardware
+/// render lease. The legacy independent-owner experiment separately controls
+/// overlap; none of its concurrency switches is enabled by this cache.
+pub(crate) fn serialized_cache_enabled() -> bool {
+    crate::module_parameters::render_cache_slots.value() > 1
+        && crate::module_parameters::compute_queues.value() == 1
+        && crate::module_parameters::native_compute_vms.value() == 0
+        && crate::module_parameters::native_render_vms.value() == 0
+        && crate::module_parameters::native_barriers.value() == 0
+        && crate::module_parameters::partial_independent_owner.value() == 0
+}
+
 pub(crate) fn pool_count() -> u64 {
-    if crate::module_parameters::partial_independent_owner.value() != 1 { 1 }
+    if serialized_cache_enabled() {
+        u64::from(crate::module_parameters::render_cache_slots.value().min(life::POOL_SLOTS))
+    } else if crate::module_parameters::partial_independent_owner.value() != 1 { 1 }
     else if crate::module_parameters::alternate_queue_pairs.value() != 1
         || crate::module_parameters::native_render_vms.value() == 1 { 2 }
     else { life::POOL_SLOTS as u64 }
@@ -247,12 +274,20 @@ impl PreparationSeed {
 }
 impl PreparedAppend {
     pub(crate) fn matches_wrapped(&self,wire:WrappedSeed,p:&Parameters,client:&Client)->bool {
-        self.seed.wrapped==Some(wire) && self.seed.parameters==*p
-            && self.seed.client.owner==client.owner && self.seed.bindings==client.bindings
-            && self.seed.client.matches_buffers(client)
+        let Some(mut expected) = self.seed.wrapped else {return false;};
+        // Global publication order is finalized under the runtime mutex.
+        // Every queue/pool/geometry/storage identity must still match.
+        expected.ordinal = wire.ordinal;
+        expected == wire && self.seed.parameters==*p
+            && self.seed.client.matches_mapping(client, &self.seed.bindings)
     }
-    pub(crate) fn write_wrapped(&self,memory:&mut Memory,vm:&Vm)->Result {
-        if self.seed.wrapped.is_none() {return Err(EINVAL);}
+    pub(crate) fn wrapped_storage(&self) -> Option<u32> {self.seed.wrapped.map(|wire|wire.storage)}
+    pub(crate) fn write_wrapped(&mut self,memory:&mut Memory,vm:&Vm,wire:WrappedSeed)->Result {
+        let previous = self.seed.wrapped.ok_or(EINVAL)?;
+        if previous.ordinal != wire.ordinal {
+            previous.rebase_ordinal(&mut self.objects, wire.ordinal)?;
+            self.seed.wrapped = Some(wire);
+        }
         for stage in 0..2 {for object in &self.objects[stage] {vm.write(memory,2,object.address,&object.body)?;}}
         Ok(())
     }
@@ -267,9 +302,7 @@ impl PreparedAppend {
         expected.layout.pointers = current.item.layout.pointers;
         expected.layout.rings = current.item.layout.rings;
         expected == current.item && self.seed.parameters == current.parameters
-            && self.seed.client.owner == current.client.owner
-            && self.seed.bindings.as_slice() == current.bindings.as_slice()
-            && self.seed.client.matches_lease(&current.client)
+            && self.seed.client.matches_mapping_lease(&current.client, &self.seed.bindings, &current.bindings)
     }
     fn matches(&self, work: &Submission, item: life::Item, p: &Parameters) -> bool {
         // Finite transport rotation changes only pointer/ring backing.
@@ -279,9 +312,7 @@ impl PreparedAppend {
         expected.layout.pointers = item.layout.pointers;
         expected.layout.rings = item.layout.rings;
         expected == item && self.seed.parameters == *p
-            && self.seed.client.owner == work.client.owner
-            && self.seed.bindings.as_slice() == work.client.bindings.as_slice()
-            && self.seed.client.matches_buffers(&work.client)
+            && self.seed.client.matches_mapping(&work.client, &self.seed.bindings)
     }
 }
 
@@ -297,8 +328,8 @@ pub(crate) fn milestones(item: life::Item) -> Result<[Milestone; 2]> {
     if item.layout.native {
         return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
     }
-    let event_slot: u8 = item.layout.pair.try_into().map_err(|_| EINVAL)?;
-    if u32::from(event_slot) >= life::POOL_SLOTS { return Err(EINVAL); }
+    let event_slot = item.layout.event_slot;
+    if item.layout.pair >= life::POOL_SLOTS || u32::from(event_slot) >= life::POOL_SLOTS { return Err(EINVAL); }
     let value = item.index.checked_add(1).ok_or(EOVERFLOW)?;
     if value >= (1 << 30) { return Err(EOVERFLOW); }
     let mut result = [Milestone { event_slot, grid: 0, value }; 2];
@@ -640,7 +671,7 @@ fn overlap(client: &Client, address: u64, size: u64) -> bool {
 
 pub(crate) fn validate_client(client: &Client, p: &Parameters) -> Result {
     p.validate().map_err(|_| EINVAL)?;
-    if crate::module_parameters::partial_independent_owner.value() == 1 {
+    if pool_count() > 1 {
         for (address, size) in super::g17p_partial_runtime::private_ranges() {
             if overlap(client, address, size as u64) {
                 return Err(EINVAL);
@@ -835,7 +866,7 @@ pub(crate) fn build(
     let configured = p.with_geometry_scratch().map_err(|_| EINVAL)?;
     let p = &configured;
     validate_client(&client, p)?;
-    if crate::module_parameters::partial_independent_owner.value() == 1 {
+    if pool_count() > 1 {
         for (base, size) in super::g17p_partial_runtime::private_ranges() {
             let pa = memory.allocate(size)?;
             if base == 0x1001004000 {
@@ -1399,7 +1430,8 @@ impl Submission {
     /// firmware counters are still quiescent. Physical backing is retained.
     pub(crate) fn create_render_pools(&mut self, memory: &mut Memory, vm: &mut Vm) -> Result {
         self.create_second_pair(memory, vm)?;
-        for pool in self.pool_count()..life::POOL_SLOTS {
+        let count = if serialized_cache_enabled() { pool_count() as u32 } else { life::POOL_SLOTS };
+        for pool in self.pool_count()..count {
             self.create_extra_pool(memory, vm, pool)?;
         }
         Ok(())
@@ -1590,6 +1622,7 @@ impl Submission {
         }
         client.cache_with(false, &self.client.cpu_maps)?;
         self.client.root.rebind(&changes, &[1])?;
+        self.client.identity = client.identity;
         self.client.buffers = client.buffers;
         self.client.bindings = client.bindings;
         self.client.owner = client.owner;

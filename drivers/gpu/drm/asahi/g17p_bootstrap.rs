@@ -103,7 +103,7 @@ impl Session {
             return Err(EBUSY);
         }
         let result = (|| {
-            let mut client = compute::Client {
+            let mut client = compute::Client { identity: None,
                 root: UserVm::new()?,
                 buffers: KVec::new(),
                 bindings: KVec::new(),

@@ -220,7 +220,7 @@ impl Session {
             }
             let mut bindings = KVec::with_capacity(work.client.bindings.len(), GFP_KERNEL)?;
             bindings.extend_from_slice(&work.client.bindings, GFP_KERNEL)?;
-            let mut next = compute::Client {
+            let mut next = compute::Client { identity: None,
                 root,
                 buffers,
                 bindings,
@@ -230,7 +230,7 @@ impl Session {
             };
             let caller = match client {
                 Some(client) => client,
-                None => compute::Client {
+                None => compute::Client { identity: None,
                     root: super::super::g17p_user_vm::UserVm::new()?,
                     buffers: KVec::new(),
                     bindings: KVec::new(),
@@ -281,8 +281,10 @@ impl Session {
             self.phase = Phase::Failed;
         }
         result?;
-        dev_info!(dev, "G17P: logical render VM handoff {:?} -> {:?}, root {:#x}\n",
+        if crate::module_parameters::submission_log.value() != 0 {
+            dev_info!(dev, "G17P: logical render VM handoff {:?} -> {:?}, root {:#x}\n",
                   previous_owner, owner, work.client.root.root());
+        }
         Ok(())
     }
     pub(super) fn prepare_native_render_context(
@@ -339,7 +341,7 @@ impl Session {
                     for &binding in &work.client.bindings {
                         bindings.push(binding, GFP_KERNEL)?;
                     }
-                    let mut next = compute::Client {
+                    let mut next = compute::Client { identity: None,
                         root,
                         buffers: previous,
                         bindings,
@@ -466,7 +468,7 @@ fn clone_render_client(client: &compute::Client) -> Result<compute::Client> {
     for bo in &client.buffers { buffers.push(bo.clone(), GFP_KERNEL)?; }
     let mut bindings = KVec::new();
     bindings.extend_from_slice(&client.bindings, GFP_KERNEL)?;
-    Ok(compute::Client { root, buffers, bindings, owner: client.owner,
+    Ok(compute::Client { identity: client.identity.clone(), root, buffers, bindings, owner: client.owner,
         cpu_maps: crate::g17p_compute_runtime::CpuMaps::new()?, primer_aliases: None })
 }
 /// The pool's own retirement was checked before this owner transfer. Preserve
@@ -496,6 +498,7 @@ impl PoolTemplateSeed {
     }
 }
 pub(crate) struct PoolTemplateSeedG17P {
+    identity: Option<compute::MappingIdentity>,
     pair: u32,
     snapshot: super::super::g17p_user_vm::TableSnapshot,
     buffers: KVec<kernel::sync::aref::ARef<super::super::g17p_drm::Object>>,
@@ -515,7 +518,7 @@ impl PoolTemplateSeedG17P {
         if crate::module_parameters::submission_log.value() >= 3 {
             pr_info!("G17P: RENDER_TEMPLATE_PREPARED pair {} outside_runtime_lock\n", self.pair);
         }
-        let client = compute::Client { root, buffers: self.buffers,
+        let client = compute::Client { identity: self.identity, root, buffers: self.buffers,
             bindings: self.bindings, owner: self.owner,
             cpu_maps: crate::g17p_compute_runtime::CpuMaps::new()?, primer_aliases: None };
         Ok(PreparedPoolTemplateG17P { pair: self.pair, snapshot: self.snapshot, client })
@@ -558,7 +561,7 @@ impl Session {
         bindings.extend_from_slice(&work.client.bindings, GFP_KERNEL)?;
         let table_budget = work.client.root.table_count()
             .checked_add(render::scratch_table_budget(p)?).ok_or(EOVERFLOW)?;
-        Ok(Some(PoolTemplateSeed::G17P(PoolTemplateSeedG17P { pair, snapshot, buffers, bindings, owner: work.client.owner, table_budget })))
+        Ok(Some(PoolTemplateSeed::G17P(PoolTemplateSeedG17P { identity:work.client.identity.clone(), pair, snapshot, buffers, bindings, owner: work.client.owner, table_budget })))
     }
     pub(crate) fn commit_render_template(&mut self, incoming: &compute::Client, p: &Parameters,
         prepared: PreparedPoolTemplate) -> Result<bool> {
@@ -578,11 +581,21 @@ impl Session {
         Ok(true)
     }
     pub(super) fn render_pipelining_enabled(&self) -> bool {
-        crate::module_parameters::partial_independent_owner.value() == 1
-            && crate::module_parameters::alternate_queue_pairs.value() == 1
+        self.automatic_render_parallel || (crate::module_parameters::partial_independent_owner.value() == 1
+            && crate::module_parameters::alternate_queue_pairs.value() == 1)
+    }
+    /// Cold owner/template construction needs a single admission leader;
+    /// ordinary waits on independent retained roots must not reserve every
+    /// render pool. Both backends use this same scheduler policy.
+    pub(crate) fn render_handoff_required(&self,incoming:&compute::Client,p:&Parameters)->Result<bool> {
+        Ok(!self.render_pipelining_enabled()
+            || self.g16c_compute.as_ref().map_or(self.render.is_none(),
+                |state|state.render_needs_private(self,incoming,p))
+            || self.render_template_size(incoming,p)?.is_some())
     }
     pub(super) fn independent_render_roots(&self) -> bool {
-        self.independent_compute_enabled() && self.render_pipelining_enabled()
+        self.independent_compute_enabled()
+            && (self.render_pipelining_enabled() || render::serialized_cache_enabled())
     }
     pub(super) fn prepare_pool_render_context(
         &mut self, dev: &kernel::device::Device, pair: u32,
@@ -716,6 +729,7 @@ impl Session {
 /// All reachable table DATA is pinned and copied before leaving locking.
 /// The installed root identity remains unchanged across the final commit.
 pub(crate) struct PoolRebindSeed {
+    identity: Option<compute::MappingIdentity>,
     pair: u32,
     context: u16,
     snapshot: super::super::g17p_user_vm::RebindSnapshot,
@@ -730,6 +744,8 @@ pub(crate) struct PoolRebindSeed {
     private: Option<PrivateRebind>,
 }
 pub(crate) struct PreparedPoolRebind {
+    old_identity: Option<compute::MappingIdentity>,
+    new_identity: Option<compute::MappingIdentity>,
     pair: u32,
     context: u16,
     root: super::super::g17p_user_vm::PreparedRebind,
@@ -792,7 +808,7 @@ impl PoolRebindSeed {
         let mut buffers=KVec::with_capacity(client.buffers.len(),GFP_KERNEL)?;
         for bo in &client.buffers {buffers.push(bo.clone(),GFP_KERNEL)?;}
         let mut bindings=KVec::new();bindings.extend_from_slice(&client.bindings,GFP_KERNEL)?;
-        Ok(Some(Self {pair,context,snapshot,buffers,bindings,owner:client.owner,
+        Ok(Some(Self {identity:client.identity.clone(),pair,context,snapshot,buffers,bindings,owner:client.owner,
             cpu_maps:client.cpu_maps.clone(),primer_aliases:client.primer_aliases,
             fallback,own_growth,foreign_growth,private:None}))
     }
@@ -816,13 +832,13 @@ impl PoolRebindSeed {
                 pr_info!("G17P: RENDER_ROOT_SPLICED pair {} context {} bindings {} elapsed_us {} outside_runtime_lock\n",
                     self.pair,self.context,new_bindings.len(),started.elapsed().as_nanos()/1000);
             }
-            return Ok(PreparedPoolRebind {pair:self.pair,context:self.context,root,
+            return Ok(PreparedPoolRebind {old_identity:self.identity,new_identity:desired.identity.clone(),pair:self.pair,context:self.context,root,
                 old_owner:self.owner,old_bindings:self.bindings,old_buffers:self.buffers,
                 new_owner:desired.owner,new_bindings,new_buffers,primer_aliases:desired.primer_aliases,
                 private:None});
         }
         let (root, relocation) = self.snapshot.clone_tree()?;
-        let mut shadow = compute::Client { root, buffers: self.buffers, bindings: self.bindings,
+        let mut shadow = compute::Client { identity: None, root, buffers: self.buffers, bindings: self.bindings,
             owner: desired.owner, cpu_maps: self.cpu_maps, primer_aliases: self.primer_aliases };
         let moved=if let Some(private)=&self.private {Some(private.remove(&mut shadow.root,self.context)?)} else {None};
         let address = |va:u64| if va < 0x1000000000 { va + 0x1000000000 } else { va };
@@ -862,7 +878,7 @@ impl PoolRebindSeed {
             pr_info!("G17P: RENDER_ROOT_PREPARED pair {} context {} bindings {} elapsed_us {} outside_runtime_lock\n",
                 self.pair,self.context,new_bindings.len(),started.elapsed().as_nanos()/1000);
         }
-        Ok(PreparedPoolRebind { pair:self.pair,context:self.context,root,
+        Ok(PreparedPoolRebind { old_identity:self.identity,new_identity:desired.identity.clone(),pair:self.pair,context:self.context,root,
             old_owner:self.owner,old_bindings:shadow.bindings,old_buffers:shadow.buffers,
             new_owner:desired.owner,new_bindings,new_buffers,primer_aliases:desired.primer_aliases,
             private:self.private.map(|p|(p.old,p.new)) })
@@ -879,14 +895,17 @@ impl PreparedPoolRebind {
     }
     pub(crate) fn matches(&self, installed:&compute::Client, incoming:&compute::Client) -> bool {
         self.root.matches(&installed.root) && self.old_owner == installed.owner
-            && self.old_bindings == installed.bindings && Self::same_buffers(&self.old_buffers,&installed.buffers)
-            && self.new_owner == incoming.owner && self.new_bindings == incoming.bindings
-            && Self::same_buffers(&self.new_buffers,&incoming.buffers)
+            && (compute::MappingIdentity::same(&self.old_identity,&installed.identity)
+                || (self.old_bindings == installed.bindings && Self::same_buffers(&self.old_buffers,&installed.buffers)))
+            && self.new_owner == incoming.owner
+            && (compute::MappingIdentity::same(&self.new_identity,&incoming.identity)
+                || (self.new_bindings == incoming.bindings && Self::same_buffers(&self.new_buffers,&incoming.buffers)))
     }
     pub(crate) fn commit(&mut self, client:&mut compute::Client) -> Result {
         self.root.commit(&mut client.root)?;
         core::mem::swap(&mut client.bindings,&mut self.new_bindings);
         core::mem::swap(&mut client.buffers,&mut self.new_buffers);
+        client.identity=self.new_identity.clone();
         client.owner=self.new_owner;
         client.primer_aliases=self.primer_aliases;
         Ok(())

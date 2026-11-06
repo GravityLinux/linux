@@ -189,6 +189,11 @@ pub(crate) struct Session {
     // Each ordinary pool has an independently installed root and ASID.
     // The selected pool's client is in render.client; others stay parked.
     render_pool_clients: KVec<(u32, compute::Client)>,
+    automatic_render_parallel: bool,
+    render_cache_clock: u64,
+    render_cache_used: [u64; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+    render_cache_hits: [u8; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+    render_cache_owner: [Option<(u64,u32)>; super::g17p_render_lifecycle::POOL_SLOTS as usize],
     render_pool_asids: [u16; super::g17p_render_lifecycle::POOL_SLOTS as usize],
     render_fallback_leaves: Option<Arc<KVec<(u64, u64)>>>,
     render_gate: Option<kernel::dma_fence::Fence>,
@@ -251,15 +256,22 @@ pub(crate) struct RenderReceipt {
     pub(crate) ordinal: u32,
     pub(crate) fence: kernel::dma_fence::Fence,
     publication_ready: AtomicBool,
+    pub(crate) publication_fence: kernel::dma_fence::Fence,
     milestones: [core::sync::atomic::AtomicU64; 2],
     retained_pool: AtomicU32,
 }
 impl RenderReceipt {
     fn new(ordinal: u32) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { ordinal, fence: super::g17p_sync::work_fence()?,
-            publication_ready: AtomicBool::new(false),
+            publication_ready: AtomicBool::new(false), publication_fence: super::g17p_sync::work_fence()?,
             milestones: [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)],
             retained_pool:AtomicU32::new(u32::MAX) }, GFP_KERNEL)?)
+    }
+    fn mark_published(&self) {
+        // Receipt-only control handshakes can finish before GPU execution.
+        // Publish their state first, then wake this command's exact owner.
+        self.publication_ready.store(true, Ordering::Release);
+        self.publication_fence.signal();
     }
     pub(crate) fn is_published(&self) -> bool {
         self.publication_ready.load(Ordering::Acquire)
@@ -289,13 +301,20 @@ pub(crate) struct ComputeReceipt {
     pub(crate) ordinal: u32,
     pub(crate) fence: kernel::dma_fence::Fence,
     publication_ready: AtomicBool,
+    pub(crate) publication_fence: kernel::dma_fence::Fence,
     point: core::sync::atomic::AtomicU64,
 }
 impl ComputeReceipt {
     fn new(ordinal: u32) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { ordinal, fence: super::g17p_sync::work_fence()?,
-            publication_ready: AtomicBool::new(false),
+            publication_ready: AtomicBool::new(false), publication_fence: super::g17p_sync::work_fence()?,
             point: core::sync::atomic::AtomicU64::new(0) }, GFP_KERNEL)?)
+    }
+    fn mark_published(&self) {
+        // Receipt-only control handshakes can finish before GPU execution.
+        // Publish their state first, then wake this command's exact owner.
+        self.publication_ready.store(true, Ordering::Release);
+        self.publication_fence.signal();
     }
     pub(crate) fn is_published(&self) -> bool { self.publication_ready.load(Ordering::Acquire) }
     pub(crate) fn milestone(&self) -> Option<render::Milestone> {
@@ -484,6 +503,11 @@ impl Session {
                 render_contexts: None,
                 render_clients: KVec::new(),
                 render_pool_clients: KVec::new(),
+                automatic_render_parallel: false,
+                render_cache_clock: 0,
+                render_cache_used: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+                render_cache_hits: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
+                render_cache_owner: [None; super::g17p_render_lifecycle::POOL_SLOTS as usize],
                 render_pool_asids: [0; super::g17p_render_lifecycle::POOL_SLOTS as usize],
                 render_fallback_leaves: None,
                 render_gate: None,
@@ -879,6 +903,7 @@ impl Session {
                 contexts.publish_roots(self.memory.as_ref().ok_or(EINVAL)?, self.ttbs)?;
                 // Contexts retain every GEM reachable from any installed root.
                 // This view supplies only the current command's cache work.
+                work.client.identity = client.identity;
                 work.client.buffers = client.buffers;
                 work.client.bindings = client.bindings;
                 work.client.owner = client.owner;
@@ -951,8 +976,10 @@ impl Session {
                 work.client.adopt_rebound(client);
                 work.adopt_private_carveout(parameters.preempt, new_aliases[0].0);
                 work.compatibility_aliases = [None; 2];
-                dev_info!(dev, "G17P: retained compute private carveout {:#x} -> {:#x}; eight physical pages retained\n",
+                if crate::module_parameters::submission_log.value() != 0 {
+                    dev_info!(dev, "G17P: retained compute private carveout {:#x} -> {:#x}; eight physical pages retained\n",
                     old_base, work.preempt);
+                }
             } else {
                 // The source's compute mirror uses this same low root in
                 // native slots 2/3. Flush before releasing old GEM references.
@@ -962,8 +989,10 @@ impl Session {
                 work.client.adopt_rebound(client);
                 work.compatibility_aliases = [None; 2];
             }
-            dev_info!(dev, "G17P: retained compute caller mappings refreshed\n");
-            if previous_owner != work.client.owner {
+            if crate::module_parameters::submission_log.value() != 0 {
+                dev_info!(dev, "G17P: retained compute caller mappings refreshed\n");
+            }
+            if crate::module_parameters::submission_log.value() != 0 && previous_owner != work.client.owner {
                 dev_info!(
                     dev,
                     "G17P: synchronous compute VM handoff {:?} -> {:?}\n",
@@ -983,7 +1012,7 @@ impl Session {
             pending,
             dependencies,
         );
-        if staged.is_ok() && old_pointers != work.pointers {
+        if crate::module_parameters::submission_log.value() != 0 && staged.is_ok() && old_pointers != work.pointers {
             dev_info!(
                 dev,
                 "G17P: retained compute transport handoff at ordinal {}: {:#x} -> {:#x}\n",
@@ -1036,7 +1065,7 @@ impl Session {
             // Source compute-first partial startup owns an empty render graph.
             // Construct it before firmware can cache a queue identity. There
             // are no caller programs or resources and no render publication.
-            let client = compute::Client {
+            let client = compute::Client { identity: None,
                 root: super::g17p_user_vm::UserVm::new()?,
                 buffers: KVec::new(),
                 bindings: KVec::new(),
@@ -1100,8 +1129,27 @@ impl Session {
         }
         Ok(self.render.as_ref().map(|work| &work.client))
     }
+    fn touch_render_cache(&mut self,pool:u32,owner:(u64,u32)) {
+        let index=pool as usize;
+        if index>=self.render_cache_used.len() {return;}
+        self.render_cache_clock=self.render_cache_clock.saturating_add(1);
+        // Aging lets inactive contexts relinquish protection; saturation and
+        // owner reset prevent lifetime history or a reused slot dominating.
+        if self.render_cache_clock%1024==0 {
+            for hits in &mut self.render_cache_hits {*hits/=2;}
+        }
+        self.render_cache_hits[index]=if self.render_cache_owner[index]==Some(owner) {
+            self.render_cache_hits[index].saturating_add(1)
+        } else {1};
+        self.render_cache_owner[index]=Some(owner);
+        self.render_cache_used[index]=self.render_cache_clock;
+    }
     fn render_pool_available(&self,pool:u32)->bool {
-        !self.render_preparing(pool)
+        // Cached identities do not grant parallel pool use. Both firmware
+        // retirement and CPU visibility must finish before another context
+        // can acquire the shared hardware lease, regardless of its PB slot.
+        (!render::serialized_cache_enabled() || self.automatic_render_parallel || self.retained_render_idle())
+            && !self.render_preparing(pool)
             && !match &self.pending {
                 Some(PendingWork::Render(wave))=>wave.pool_busy(pool),
                 Some(PendingWork::WrappedRender(wave))=>wave.pool_busy(pool),
@@ -1304,7 +1352,8 @@ impl Session {
         self.can_append_render_for(None,p)
     }
     fn can_append_render_for(&self, incoming: Option<&compute::Client>, p: &super::g17p_render::Parameters) -> Result<bool> {
-        if self.phase != Phase::Running || self.render_control.is_some() { return Ok(false); }
+        if self.phase != Phase::Running || self.render_control.is_some()
+            || (render::serialized_cache_enabled() && !self.retained_render_idle()) { return Ok(false); }
         if matches!(self.pending, Some(PendingWork::Control(_) | PendingWork::Native)) {
             return Ok(false);
         }
@@ -1324,7 +1373,7 @@ impl Session {
         let work = self.render.as_ref().ok_or(EINVAL)?;
         let next = work.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let count = if work.layout.independent && !work.layout.native
-            && crate::module_parameters::alternate_queue_pairs.value() == 1 {
+            && (render::serialized_cache_enabled() || crate::module_parameters::alternate_queue_pairs.value() == 1) {
             work.pool_count()
         } else { return Ok(Some(work.layout.pair)); };
         let desired=incoming.unwrap_or(&work.client);
@@ -1336,19 +1385,24 @@ impl Session {
             && (!self.independent_render_roots() || *pair==0
                 || self.render_pool_asids[*pair as usize]!=0
                 || self.independent_compute.asid_mask()!=u64::MAX);
-        Ok(super::g17p_render_lifecycle::select_pool(next,count,available,|pair|
-            self.independent_render_roots() && if *pair==work.layout.pair {
-                Self::same_client(desired,&work.client)
-            } else {
-                self.render_pool_clients.iter().any(|(pool,client)|
-                    pool==pair && Self::same_client(desired,client))
-            }))
+        let matching=|pair:&u32| self.independent_render_roots() && if *pair==work.layout.pair {
+            Self::same_client(desired,&work.client)
+        } else { self.render_pool_clients.iter().any(|(pool,client)|
+            pool==pair && Self::same_client(desired,client)) };
+        let related=|pair:&u32| self.independent_render_roots()
+            && work.pair_queue_owner(*pair).is_some()
+            && work.growth.as_ref().is_none_or(|service|service.caller_compatible(*pair,&desired.bindings))
+            && if *pair==work.layout.pair {
+            desired.owner==work.client.owner
+        } else {self.render_pool_clients.iter().any(|(pool,client)|pool==pair&&desired.owner==client.owner)};
+        Ok(super::g17p_render_lifecycle::select_affine_pool(next,count,available,matching,related,
+            &self.render_cache_hits,&self.render_cache_used))
     }
 
     fn next_render_pool_for_geometry(&self, incoming: Option<&compute::Client>,
         p: &super::g17p_render::Parameters) -> Result<Option<u32>> {
         let idle = self.next_render_pool_for(incoming)?;
-        if !self.independent_render_roots() { return Ok(idle); }
+        if !self.independent_render_roots() || render::serialized_cache_enabled() { return Ok(idle); }
         let work = self.render.as_ref().ok_or(EIO)?;
         let frames = match &self.pending {
             Some(PendingWork::Render(wave)) => &wave.frames[wave.next..], _ => &[],
@@ -1478,7 +1532,9 @@ impl Session {
                 dev_err!(dev,"G17P: render fail site prepare_pool pair {} error {:?}\n",pair,e))?;
         } else if let Some(client) = replacement {
             self.prepare_logical_render_context(dev, client, p)?;
-            dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
+            if crate::module_parameters::submission_log.value() != 0 {
+                dev_info!(dev, "G17P: retained render caller mappings refreshed\n");
+            }
         }
         let root_us = prep_started.as_ref().map(|start| start.elapsed().as_nanos() / 1000).unwrap_or(0);
         let ordinal = self
@@ -1490,7 +1546,7 @@ impl Session {
             .ok_or(EOVERFLOW)?;
         if self.native.is_none()
             && crate::module_parameters::native_render_vms.value() == 0
-            && crate::module_parameters::partial_independent_owner.value() == 1
+            && render::pool_count() > 1
         {
             let pair = match private_pair {
                 Some(pair) => pair,
@@ -1901,8 +1957,8 @@ impl Session {
         if self.native.is_none()
             && ((self.independent_render_roots() && self.bootstrapped)
                 || self.render_compute_owner_compatible()?)
-            && crate::module_parameters::partial_independent_owner.value() == 1
-            && crate::module_parameters::alternate_queue_pairs.value() == 1
+            && (render::serialized_cache_enabled() || (crate::module_parameters::partial_independent_owner.value() == 1
+                && crate::module_parameters::alternate_queue_pairs.value() == 1))
         {
             self.render.as_mut().ok_or(EINVAL)?.create_render_pools(
                 self.memory.as_mut().ok_or(EINVAL)?, self.vm.as_mut().ok_or(EINVAL)?)?;
@@ -1960,6 +2016,7 @@ impl Session {
         // Source Item values were validated before publication during staging.
         // Native receipts stay conservative and do not expose ordinary points.
         if !ticket.item.layout.native {
+            self.touch_render_cache(ticket.item.layout.pair,ticket.client.owner);
             receipt.retained_pool.store(ticket.item.layout.pair,Ordering::Relaxed);
             for (stored, grid) in receipt.milestones.iter().zip(ticket.item.layout.grids) {
                 stored.store(((ticket.item.layout.pair as u64) << 40)
@@ -1990,7 +2047,7 @@ impl Session {
             first_frames.push(frame, GFP_KERNEL)?;
             self.pending = Some(PendingWork::Render(RenderWave { frames: first_frames, next: 0 }));
         }
-        receipt.publication_ready.store(true, Ordering::Release);
+        receipt.mark_published();
         Ok(())
     }
 
@@ -2613,7 +2670,7 @@ impl Session {
                         receipt.point.store((u64::from(point.event_slot) << 40) |
                             (u64::from(point.grid) << 32) | u64::from(point.value), Ordering::Relaxed);
                     }
-                    receipt.publication_ready.store(true, Ordering::Release);
+                    receipt.mark_published();
                     published += 1;
                 }
                 if published == 0 {
@@ -2844,9 +2901,7 @@ impl Session {
     /// Join only the exact installed caller snapshot, with an available private
     /// pool. Deferred admission clients need not materialize another root.
     fn same_client(next: &compute::Client, old: &compute::Client) -> bool {
-        next.owner == old.owner && next.bindings == old.bindings
-            && next.buffers.len() == old.buffers.len()
-            && next.buffers.iter().zip(&old.buffers).all(|(a,b)| core::ptr::eq(&**a, &**b))
+        next.same_mapping(old)
     }
 
     /// Read-only capacity and mapping ownership test. A blocked render does
@@ -2990,16 +3045,7 @@ impl Session {
             return false;
         }
         match (next, self.compute.as_ref()) {
-            (Some(next), Some(old)) => {
-                next.owner == old.client.owner
-                    && next.bindings == old.client.bindings
-                    && next.buffers.len() == old.client.buffers.len()
-                    && next
-                        .buffers
-                        .iter()
-                        .zip(&old.client.buffers)
-                        .all(|(a, b)| core::ptr::eq(&**a, &**b))
-            }
+            (Some(next), Some(old)) => Self::same_client(next, &old.client),
             _ => false,
         }
     }
@@ -3548,9 +3594,9 @@ impl Session {
         storage: Option<Memory>, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
         prepared: KBox<super::g17p_compute_queues::PreparedWork>,
         p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
-        let private_prepared = storage.is_some();
+        let private_bytes = storage.as_ref().map(|memory| memory.allocation_stats().1);
         if let Some(storage) = storage { self.memory.as_mut().ok_or(EIO)?.absorb(storage)?; }
-        let result=self.stage_independent_compute_inner(dev,image,key,reference,client,private_prepared,rebind,prepared,p,priority,dependencies);
+        let result=self.stage_independent_compute_inner(dev,image,key,reference,client,private_bytes,rebind,prepared,p,priority,dependencies);
         if let Err(error)=result.as_ref() {
             dev_err!(dev,"G17P: compute stage key {:?} failed {:?}\n",key,error);
             self.phase=Phase::Failed;self.fail_owned_receipts(*error);self.events.fail(*error);
@@ -3559,7 +3605,7 @@ impl Session {
     }
     fn stage_independent_compute_inner(&mut self,dev:&kernel::device::Device,image:&super::g17p_drm::RuntimeImage,
         key:super::g17p_compute_queues::Key,reference:&compute::Client,client:Option<compute::Client>,
-        private_prepared: bool, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
+        private_bytes: Option<u64>, rebind: Option<&mut super::g17p_compute_queues::PreparedComputeRebind>,
         prepared: KBox<super::g17p_compute_queues::PreparedWork>, p:&compute::Parameters,priority:u32,dependencies:&[(u8,u32)]) -> Result<Arc<ComputeReceipt>> {
         self.independent_pending.reserve(1,GFP_KERNEL)?;
         let ordinal=self.independent_count.checked_add(1).ok_or(EOVERFLOW)?;
@@ -3586,7 +3632,7 @@ impl Session {
         }
         let ticket=self.independent_compute.stage(self.memory.as_mut().ok_or(EIO)?,
             self.vm.as_mut().ok_or(EIO)?,self.ttbs,image.compute_channel(priority),
-            key,client,private_prepared,rebind,prepared,reference,p,priority,dependencies,receipt.fence.clone())?;
+            key,client,private_bytes,rebind,prepared,reference,p,priority,dependencies,receipt.fence.clone())?;
         for bo in ticket.client.buffers() {self.retain_source_backing(bo)?;}
         if neo.is_some() {        self.render.as_mut().or(self.dormant_render.as_mut()).ok_or(EIO)?.growth.as_mut().ok_or(EIO)?
             .register_independent_compute(self.independent_compute.grid_mask()); }
@@ -3611,7 +3657,7 @@ impl Session {
         let (address,producer)=publication.deferred_outer.ok_or(EIO)?;
         vm.write(memory,2,address,&producer.to_le_bytes())?;g17p_memory::sync();
         receipt.point.store((if binding.is_some() {u64::from(grid)} else {2}<<40)|(u64::from(grid)<<32)|u64::from(value),Ordering::Relaxed);
-        receipt.publication_ready.store(true,Ordering::Release);
+        receipt.mark_published();
         let doorbell=if binding.is_some() {0x0083000000000000|(u64::from(priority)<<2)|2} else {queue::COMPUTE_DOORBELL};
         self.peers[0].rtkit.as_mut().ok_or(EIO)?.as_mut().send_message(0x21,doorbell)?;
         if binding.is_some() {self.g16c_send(0x21,0x0083000000000010)?;}

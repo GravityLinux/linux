@@ -15,6 +15,7 @@ pub(crate) struct WrapperParameters {
     pub(crate) item: u16,
     pub(crate) ordinal: u16,
     pub(crate) context: u16,
+    /// Zero-based UAT context index, independent of PB slot/operand bank.
     pub(crate) support_id: u16,
     pub(crate) uuid: u16,
     pub(crate) scheduler: u16,

@@ -17,6 +17,10 @@ import host_versions
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--evidence',type=Path,required=True)
+p.add_argument('--native-operand-banks',type=Path,help='Native warm-A/B/C and triple/A/B/C render DATA')
+p.add_argument('--configured-source',type=Path,help='Saved render lowering for negative control')
+p.add_argument('--wrapped-source',type=Path,help='Saved production encoder for regression control')
+p.add_argument('--counter-width-native',type=Path,help='Output-verified native submission65536 DATA directory')
 p.add_argument('--counter-reference',type=Path,help='Native child/parent DATA: independent lifecycle, milestone and render event slot')
 p.add_argument('--retained-native',type=Path,help='Native warm-A/warm-B/pair DATA: retained queue entry fields')
 a=p.parse_args();tests=Path(__file__).resolve().parent;root=tests.parents[4]
@@ -37,6 +41,7 @@ prelude=host_fdt.rust_prelude().replace('pub type KVec<T> = Vec<T>;', '''
     impl<T>std::ops::DerefMut for KVec<T>{fn deref_mut(&mut self)->&mut[T]{&mut self.0}}
 ''')
 code=prelude+'\nuse prelude::*;\n'
+code+=f'#[path={json.dumps(str(tests.parent/"scheduled_profile.rs"))}]mod scheduled_profile;\n'
 for name in ['g17p_compute','g17p_compute_memory','g17p_render','g17p_render_graph']:
  code+=f'#[path={json.dumps(str(tests.parent/(name+".rs")))}]mod {name};\n'
 life=(tests.parent/'g17p_render_lifecycle.rs').read_text();start=life.index('pub(crate) fn pool_grids(');end=life.index('\n}',start)+2
@@ -45,7 +50,7 @@ code+='''mod render_runtime {
 use super::*;use g17p_render::{self as command,Parameters,program,wire as body};use g17p_compute::work;
 struct Deferred{address:u64,body:KVVec<u8>,previous:Option<KVVec<u8>>}
 '''
-code+=f'#[path={json.dumps(str(tests.parent/"scheduled_render_preparation.rs"))}]mod wrapped;\n'
+code+=f'#[path={json.dumps(str(a.wrapped_source or tests.parent/"scheduled_render_preparation.rs"))}]mod wrapped;\n'
 code+='''
 struct Resource{sequence:u32,parameter:Parameter}struct Parameter{slot:u32}
 struct Storage{lanes:[wrapped::Lane;3],context:u64,uuid:u16}struct Queue{storage:Storage}
@@ -72,7 +77,7 @@ fn original(&self,wire:wrapped::WrappedSeed,p:&Parameters)->Result<Vec<(u64,Vec<
 }
 }
 pub fn run()->Result<usize>{let mut cases=0;
- for n in [0,1,2,78,79,255,256,65535,65536] {for local in [n,n%3] {
+ for n in [0u32,1,2,78,79,255,256,65535,65536,65537] {for local in [n,n%3,n.saturating_sub(1)] {
   for storage in [0,1,17,255] {for context in [1,63] {for priority in [0,3] {for layers in [1,2] {
    let base=0x1000000000;
    let p=Parameters{width:64,height:32,layers,context_base:base,tilemap:base+0x200000,tpc:base+0x300000,
@@ -82,10 +87,63 @@ pub fn run()->Result<usize>{let mut cases=0;
    let lanes=std::array::from_fn(|i|wrapped::Lane{queue:0xfffffc2208000000+i as u64*0x2c000,
      scratch_low:0x7400000000+i as u64*0x2c000,scratch_high:0xfffffc220800c000+i as u64*0x2c000,priority});
    let state=State{queues:vec![Queue{storage:Storage{lanes,context:0xfffffc2208000140,uuid:17}}]};
-   let wire=wrapped::WrappedSeed {base:wrapped::storage_base(storage)?,storage,ordinal:n,local,sequence:n%99,milestone:n,grids:[0,1],context,slot:u32::from(context%15),
+   let wire=wrapped::WrappedSeed {base:wrapped::storage_base(storage)?,storage,ordinal:n,local,sequence:n%99,milestone:n,grids:[0,1],context,slot:u32::from(context%15),event_slot:(context%15) as u8,
     support:0xfffffc2207000000,manager:0xfffffc2209000000,scene:0xfffffc2209100000,
     empty:0xfffffc2209200000,layermeta:base+0x400000,queue_control:state.queues[0].storage.context,uuid:17,lanes:[lanes[0],lanes[1]]};
    let mut old=state.original(wire,&p)?;let actual=wire.build(&p)?;
+   // A concurrent publication changes only its global identity. Reuse every
+   // prepared byte/address after the actual late patch and compare the full
+   // result against a fresh actual encoder invocation at the final ordinal.
+   for final_ordinal in [n,n+1,n+17,65536,65537] {
+    let mut prepared=wire.build(&p)?;
+    wire.rebase_ordinal(&mut prepared,final_ordinal)?;
+    let final_wire=wrapped::WrappedSeed{ordinal:final_ordinal,..wire};
+    let rebuilt=final_wire.build(&p)?;
+    for stage in 0..2 {for (got,want)in prepared[stage].iter().zip(rebuilt[stage].iter()) {
+     assert_eq!(got.address,want.address);assert_eq!(got.body.as_ref(),want.body.as_ref(),
+       "late identity differs from rebuilding: old={n} final={final_ordinal} local={local} stage={stage}");
+    }}
+   }
+   if cases==0 {
+    let flatten=|rows:&[KVec<Deferred>;2]|rows.iter().flat_map(|v|v.iter())
+      .map(|d|(d.address,d.body.to_vec())).collect::<Vec<_>>();
+    // Bounds failures must not partly patch an unpublished image.
+    let mut invalid=wire.build(&p)?;let before=flatten(&invalid);
+    assert!(wire.rebase_ordinal(&mut invalid,0x3fffffff).is_err());
+    assert_eq!(flatten(&invalid),before);
+    invalid[1].iter_mut().find(|d|d.address==wire.base+0x9b40).unwrap().body.resize(1,0,GFP_KERNEL)?;
+    let before=flatten(&invalid);assert!(wire.rebase_ordinal(&mut invalid,n+1).is_err());
+    assert_eq!(flatten(&invalid),before);
+
+    // The native-desktop failure used PB/event slot1 with retained ASID63.
+    // Check the actual constructors with those distinct identity domains.
+    let observed=wrapped::WrappedSeed{context:63,slot:1,event_slot:1,grids:[2,3],..wire};
+    let images=observed.build(&p)?;
+    for stage in 0..2 {
+     let address=wire.base+if stage==0{0x4000}else{0xc000};
+     let wrapper=&images[stage].iter().find(|row|row.address==address).unwrap().body;
+     assert_eq!(u16::from_le_bytes(wrapper[0x32..0x34].try_into().unwrap()),63);
+     assert_eq!(u16::from_le_bytes(wrapper[0x56..0x58].try_into().unwrap()),62,"PB1 must not encode context index1 for ASID63");
+    }
+    // Independent queue event identity must change only completion metadata,
+    // never the PB manager, support identity or shader register programs.
+    let separated=wrapped::WrappedSeed {event_slot:(wire.event_slot+1)%15,..wire};
+    let changed=separated.build(&p)?;
+    for stage in 0..2 {
+     for (before,after) in actual[stage].iter().zip(changed[stage].iter()) {
+      assert_eq!(before.address,after.address);
+      let mut expected=before.body.to_vec();
+      if before.address==wire.base+if stage==0{0x4000}else{0xc000} {
+       if stage==0 {expected[0x7e..0x80].copy_from_slice(&u16::from(separated.event_slot).to_le_bytes());}
+       assert_eq!(u16::from_le_bytes(after.body[0x56..0x58].try_into().unwrap()),wire.context-1);
+      }
+      if before.address==wire.lanes[stage].scratch_high+u64::from((wire.milestone+1)&255)*0x200 {
+       expected[0x24..0x26].copy_from_slice(&((if stage==0{0xc00u16}else{0x1800u16})|u16::from(separated.event_slot)).to_le_bytes());
+      }
+      assert_eq!(after.body.as_ref(),expected);
+     }
+    }
+   }
    // The saved single-pool encoder always wrote event slot zero. Neo's
    // points(kind, event_slot, ...) and independent native Max records use
    // the physical render pool. Adjust only that byte in the saved oracle.
@@ -96,6 +154,9 @@ pub fn run()->Result<usize>{let mut cases=0;
      // the global render ordinal. The saved multi-owner branch did neither.
      body[0x52..0x54].copy_from_slice(&u16::from(wire.local==0).to_le_bytes());
      body[0x62..0x64].copy_from_slice(&u16::from(wire.local==0).to_le_bytes());
+     // The wrapper carries a zero-based UAT context. PB/event identity can
+     // differ when an ordinary cached root uses a non-bootstrap ASID.
+     body[0x56..0x58].copy_from_slice(&(wire.context-1).to_le_bytes());
      body[0x2e..0x30].copy_from_slice(&(((wire.milestone&255)<<8)as u16).to_le_bytes());
     }
     if lanes.iter().any(|lane|*address==lane.scratch_high+u64::from((n+1)&255)*0x200) {
@@ -105,6 +166,11 @@ pub fn run()->Result<usize>{let mut cases=0;
      // The saved first-context template also fixed the context identity to1.
      // Native UUID/lifecycle DATA identifies the selected UAT context here.
      let fragment=body.len()==0x2240;let uuid_at=if fragment{0x2168}else{0x8ce};
+     // Captured retained submission65536 wraps the secondary stamp and
+     // fragment work index even with different global/queue counters.
+     let secondary=if fragment{0x2164}else{0x8ca};
+     body[secondary..secondary+4].copy_from_slice(&((wire.local.wrapping_add(1)<<8)&65535).to_le_bytes());
+     if fragment {body[0x90..0x94].copy_from_slice(&((wire.local+1)&255).to_le_bytes());}
      body[uuid_at+3]=wire.context as u8;
      // Native retained TA keeps descriptor ordinal zero; fragment advances
      // its queue-local ordinal. Both retain the same tail flag as first use.
@@ -165,7 +231,7 @@ if a.counter_reference:
  extra="""
    if cases==0 {
     for (ordinal,milestone,native_lifecycle,slot,context,native_controls,ta_targets,fr_targets) in [ROWS] {
-     let probe=wrapped::WrappedSeed {ordinal,milestone,local:0,slot,context,..wire};
+     let probe=wrapped::WrappedSeed {ordinal,milestone,local:0,slot,event_slot:slot as u8,context,..wire};
      let objects=probe.build(&p)?;
      let entry=objects[0].iter().find(|object|object.address==probe.base+0x4000).unwrap();
      assert_eq!(u16::from_le_bytes(entry.body[0x76..0x78].try_into().unwrap()),native_lifecycle,
@@ -237,7 +303,7 @@ if a.retained_native:
  extra='''
    if cases==0 {
     for (ordinal,item,slot,context,stage,first,shifted,init52,init62,descriptor_ordinal,tail,stamp) in [ROWS] {
-     let probe=wrapped::WrappedSeed {ordinal,local:item,sequence:item,milestone:item,slot,context,..wire};
+     let probe=wrapped::WrappedSeed {ordinal,local:item,sequence:item,milestone:item,slot,event_slot:slot as u8,context,..wire};
      let objects=probe.build(&p)?;
      let address=probe.base+if stage==0 {0x4000}else{0xc000};
      let body=&objects[stage].iter().find(|object|object.address==address).unwrap().body;
@@ -261,18 +327,120 @@ if a.retained_native:
  needle='   let mut old=state.original(wire,&p)?;let actual=wire.build(&p)?;';assert needle in code
  code=code.replace(needle,extra+needle)
 
+operand_bank_references={}
+if a.native_operand_banks:
+ import struct
+ rows=[]
+ for phase in ['warm-A','warm-B','warm-C','triple/A','triple/B','triple/C']:
+  banks=[]
+  for stage in (0,1):
+   root=a.native_operand_banks/phase
+   support_path=root/f'stage-{stage}-support.bin';support=support_path.read_bytes()
+   bank=struct.unpack_from('<I',support,8)[0]
+   descriptor_path=root/f'stage-{stage}-descriptor.bin';descriptor=descriptor_path.read_bytes()
+   regs=dict(struct.unpack_from('<IQ',descriptor,(0x60 if stage==0 else 0xa0)+i*12)
+     for i in range(83 if stage==0 else 91))
+   assert regs[0x14308 if stage==0 else 0x14048]==bank
+   banks.append(bank)
+   for path in [support_path,descriptor_path]:operand_bank_references[str(path)]=hashlib.sha256(path.read_bytes()).hexdigest()
+  assert banks[0]==banks[1];rows.append(str(banks[0])+'u64')
+ cfg_source=(a.configured_source or tests.parent/'scheduled_render_submit.rs').read_text()
+ begin=cfg_source.index('    fn configured_render(');end=cfg_source.index('    fn render_seed(',begin)
+ cfg=cfg_source[begin:end].replace('super::super::super::','crate::')
+ code=code.replace('impl State {\nfn original','impl State {\n'+cfg+'\nfn original')
+ code=code.replace('mod render_runtime {',"""#[path=DISPATCH]mod scheduled_dispatch;
+mod module_parameters {
+ pub struct Param;impl Param{pub fn value(&self)->u32{u32::MAX}}
+ #[allow(non_upper_case_globals)]pub static g16c_parameter_oom_test:Param=Param;
+}
+mod render_runtime {
+use crate::scheduled_dispatch::DispatchStateG16C;
+""".replace('DISPATCH',json.dumps(str(tests.parent/'scheduled_dispatch.rs'))))
+ begin=life.index('pub(crate) fn scratch_offset(');end=life.index('\n}',begin)+2
+ code=code.replace('pub const POOL_SLOTS:u32=15;',
+   'pub const POOL_SLOTS:u32=15;const SCRATCH_SLOTS:u32=8;'+life[begin:end])
+ call='State::configured_render(profile,&input,0,0,[p.tilemap,p.tpc,p.heapmeta]'+(',context' if ',context:u16' in cfg else '')+')?'
+ extra=r"""
+   if cases==0 {
+    // Captured bank numbers vary independently of application ASID and PB.
+    // Compile the actual program encoders and locate their register DATA.
+    for bank in [BANKS] {for emit_uapi_fields in [false,true] {
+     let configured=Parameters{completion_control:bank,emit_uapi_fields,..p};
+     let images=wire.build(&configured)?;
+     for stage in 0..2 {
+      let address=wire.base+if stage==0{0x2940}else{0x9b40};
+      let descriptor=&images[stage].iter().find(|row|row.address==address).unwrap().body;
+      let start=if stage==0{0x60}else{0xa0};let count=(if stage==0{83}else{91})+if configured.emit_uapi_fields{4}else{0};
+      let number=if stage==0{0x14308u32}else{0x14048u32};
+      let register=descriptor[start..start+count*12].chunks_exact(12)
+       .find(|row|u32::from_le_bytes(row[..4].try_into().unwrap())==number).unwrap();
+      assert_eq!(u64::from_le_bytes(register[4..12].try_into().unwrap()),bank,"native operand bank register");
+     }
+    }}
+    // Execute the actual runtime lowering: a nonzero reserved bank must
+    // reach both program registers, not merely an isolated serializer input.
+    for context in [1u16,4,63] {for profile in [scheduled_profile::Profile::G16S,scheduled_profile::Profile::G16C] {for emit_uapi_fields in [false,true] {
+     let input=Parameters{emit_uapi_fields,..p};
+     let configured=CALL;
+     let expected=u64::from(context-1);
+     assert_eq!(configured.completion_control,expected,"runtime must select its registered operand bank");
+     let probe=wrapped::WrappedSeed{context,slot:1,event_slot:1,..wire};
+     let images=probe.build(&configured)?;
+     for stage in 0..2 {
+      let address=wire.base+if stage==0{0x2940}else{0x9b40};
+      let descriptor=&images[stage].iter().find(|row|row.address==address).unwrap().body;
+      let start=if stage==0{0x60}else{0xa0};let count=(if stage==0{83}else{91})+if configured.emit_uapi_fields{4}else{0};
+      let number=if stage==0{0x14308u32}else{0x14048u32};
+      let register=descriptor[start..start+count*12].chunks_exact(12)
+       .find(|row|u32::from_le_bytes(row[..4].try_into().unwrap())==number).unwrap();
+      assert_eq!(u64::from_le_bytes(register[4..12].try_into().unwrap()),expected);
+     }
+    }}}
+   }
+ """.replace('BANKS',','.join(rows)).replace('CALL',call)
+ needle='   let mut old=state.original(wire,&p)?;let actual=wire.build(&p)?;';assert needle in code
+ code=code.replace(needle,extra+needle)
+
+counter_width_references={}
+if a.counter_width_native:
+ import struct
+ rows=[]
+ for stage in (0,1):
+  path=a.counter_width_native/f'stage-{stage}-descriptor.bin';body=path.read_bytes()
+  at=0x2164 if stage else 0x8ca
+  value=struct.unpack_from('<I',body,at)[0];assert value==0x100
+  assert struct.unpack_from('<I',body,0x4)[0]==0x20001-stage
+  rows.append(f'({stage}usize,{at}usize,{value}u32)')
+  counter_width_references[str(path)]=hashlib.sha256(body).hexdigest()
+ extra=r"""
+   if cases==0 {
+    // A scheduling interleave changes only the global ordinal. Queue-local
+    // rotation must still match the same native submission65536 metadata.
+    for (stage,offset,native_stamp) in [ROWS] {
+     let probe=wrapped::WrappedSeed {ordinal:65541,local:65536,sequence:65536,milestone:65536,context:1,slot:0,event_slot:0,grids:[0,1],..wire};
+     let images=probe.build(&p)?;
+     let address=probe.base+if stage==0{0x2940}else{0x9b40};
+     let descriptor=&images[stage].iter().find(|row|row.address==address).unwrap().body;
+     assert_eq!(u32::from_le_bytes(descriptor[offset..offset+4].try_into().unwrap()),native_stamp,"native secondary stamp wrap is independent of global ordinal");
+     if stage==1 {assert_eq!(u32::from_le_bytes(descriptor[0x90..0x94].try_into().unwrap()),1);}
+    }
+   }
+ """.replace('ROWS',','.join(rows))
+ needle='   let mut old=state.original(wire,&p)?;let actual=wire.build(&p)?;';assert needle in code
+ code=code.replace(needle,extra+needle)
+
 with tempfile.TemporaryDirectory(prefix='scheduled-render-preparation-')as d:
  tmp=Path(d);flags=host_versions.build(tmp);main=tmp/'main.rs';main.write_text(code)
  subprocess.run(['rustc','--edition=2021',*flags,str(main),'-o',str(tmp/'gate')],check=True)
- count=int(subprocess.check_output([str(tmp/'gate')],text=True));assert count==576
+ count=int(subprocess.check_output([str(tmp/'gate')],text=True));assert count==960
  a.evidence.mkdir(parents=True,exist_ok=False);(a.evidence/'harness.rs').write_text(code)
- (a.evidence/'summary.json').write_text(json.dumps(dict(cases=count,full_images_per_case=10,
-    all_packet_bytes_and_addresses_match=True,reference_allows_only_coherent_body_relocation=False,reference_revision=revision,
-    reference_adjustments=['coherent descriptor body relocation','native render event slot in record byte0x24','native UAT context in UUID/lifecycle bits24..31','native queue initialization fields0x52/0x62 and shifted milestone0x2e','native retained descriptor ordinal and tail flag','native queue-local completion stamp'],
+ (a.evidence/'summary.json').write_text(json.dumps(dict(cases=count,full_images_per_case=10,late_ordinal_full_image_cases=count*5,late_ordinal_failures_transactional=True,native_operand_bank_cases=24 if operand_bank_references else 0,actual_runtime_bank_cases=24 if operand_bank_references else 0,native_operand_bank_reference_sha256=operand_bank_references,native_counter_width_reference_sha256=counter_width_references,
+    all_packet_bytes_and_addresses_match=True,desktop_regression_asid=63,desktop_regression_pb_slot=1,desktop_regression_context_index=62,reference_allows_only_coherent_body_relocation=False,reference_revision=revision,
+    reference_adjustments=['coherent descriptor body relocation','native render event slot in record byte0x24','native UAT context in UUID/lifecycle bits24..31','native queue initialization fields0x52/0x62 and shifted milestone0x2e','native retained descriptor ordinal and tail flag','native queue-local completion stamp','wrapper UAT context index independent of PB slot','native secondary stamp/fragment index wrap independent of global ordinal'],
     reference_source_sha256=hashlib.sha256(old.encode()).hexdigest(),
     current_source_sha256=hashlib.sha256((tests.parent/'scheduled_render_preparation.rs').read_bytes()).hexdigest(),
     reference_render_event_slots_corrected_from_native=True,
     actual_GPU_execution=False,native_counter_domain_cases=2 if counter_references else 0,
     native_render_event_slot_cases=4 if counter_references else 0,native_counter_reference_sha256=counter_references,
     native_retained_wrapper_cases=8 if retained_references else 0,native_retained_reference_sha256=retained_references),indent=2)+'\n')
-print('PASS: 576 Max render preparation cases, ten complete images/addresses; saved encoder with relocated bodies and native render event slots')
+print('PASS: 960 Max render preparation cases plus 4800 late-publication cases; ten complete images/addresses, transactional invalid staging, saved/native DATA oracle')

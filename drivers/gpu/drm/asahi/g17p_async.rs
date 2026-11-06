@@ -23,17 +23,35 @@ use kernel::{
     },
 };
 
+/// Queue heads are maintained at admission/retirement, never rediscovered
+/// quadratically in IRQ context. Membership owns each Job through enqueue.
+struct JobSet {
+    jobs: KVec<Arc<Job>>,
+    heads: KVec<Arc<Job>>,
+    next: usize,
+    preferred: [Option<(u64, u32)>; 2],
+}
+impl JobSet {
+    fn new() -> Self { Self { jobs: KVec::new(), heads: KVec::new(), next: 0, preferred: [None; 2] } }
+    fn poll_head(&self) -> Option<&Arc<Job>> {
+        let ready=|h: &&Arc<Job>|h.firmware_waiting.load(Ordering::SeqCst);
+        self.preferred.iter().flatten().find_map(|key|
+            self.heads.iter().filter(ready).find(|h|h.queue_key==*key))
+            .or_else(||self.heads.iter().find(ready))
+    }
+}
+
 #[pin_data]
 pub(crate) struct Events {
     error: AtomicI32,
     wake_sequence: AtomicU64,
     #[pin]
-    jobs: kernel::sync::lock::Lock<KVec<Arc<Job>>, IrqLock>,
+    jobs: kernel::sync::lock::Lock<JobSet, IrqLock>,
 }
 impl Events {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
-            pin_init!(Self {error:AtomicI32::new(0),wake_sequence:AtomicU64::new(0),jobs<-kernel::sync::lock::Lock::new(KVec::new(),kernel::c_str!("neo_events"),kernel::static_lock_class!())}),
+            pin_init!(Self {error:AtomicI32::new(0),wake_sequence:AtomicU64::new(0),jobs<-kernel::sync::lock::Lock::new(JobSet::new(),kernel::c_str!("neo_events"),kernel::static_lock_class!())}),
             GFP_KERNEL,
         )
     }
@@ -50,27 +68,68 @@ impl Events {
         self.wake_all();
     }
     fn add(&self, job: Arc<Job>) -> Result {
-        self.jobs.lock().push(job, GFP_ATOMIC)?;
+        let mut held = self.jobs.lock();
+        let head = !held.heads.iter().any(|h| h.queue_key == job.queue_key);
+        // Reserve both collections before publishing either membership.
+        held.jobs.reserve(1, GFP_ATOMIC)?;
+        if head { held.heads.reserve(1, GFP_ATOMIC)?; }
+        held.jobs.push(job.clone(), GFP_ATOMIC)?;
+        if head { held.heads.push(job, GFP_ATOMIC)?; }
         Ok(())
     }
     fn remove(&self, job: &Job) {
-        let mut jobs = self.jobs.lock();
-        if let Some(i) = jobs.iter().position(|held| core::ptr::eq(&**held, job)) {
-            // Preserve submission order: the first live job for a queue is
-            // the only owner that needs periodic firmware progress polls.
-            let _ = jobs.remove(i);
-            // Retirement's firmware wake may have happened before this
-            // removal. Promote the successor explicitly, including a worker
-            // which previously ran as a non-head and armed no retry timer.
-            if let Some(next) = jobs.iter().find(|next| next.queue_key == job.queue_key) {
-                let _ = workqueue::system_dfl().enqueue::<_, 0>(next.clone());
+        let mut held = self.jobs.lock();
+        if let Some(i) = held.jobs.iter().position(|h| core::ptr::eq(&**h, job)) {
+            let _ = held.jobs.remove(i);
+            if let Some(head) = held.heads.iter().position(|h| core::ptr::eq(&**h, job)) {
+                let mut promoted=None;
+                if let Some(next) = held.jobs.iter().find(|h| h.queue_key == job.queue_key).cloned() {
+                    held.heads[head] = next.clone();
+                    // A successor may already have run without arming a
+                    // timer. Promotion and is_head use this same IRQ lock.
+                    promoted=Some(next.clone());
+                    let _ = workqueue::system_dfl().enqueue::<_, 0>(next);
+                } else {
+                    let _ = held.heads.remove(head);
+                    for preferred in &mut held.preferred {
+                        if *preferred == Some(job.queue_key) { *preferred = None; }
+                    }
+                }
+                // Poll ownership can move to a DIFFERENT public queue. Its
+                // head may have waited without arming a fallback timer. The
+                // retiring worker withdrew firmware_waiting before progress,
+                // so always re-elect here rather than testing its old flag.
+                if let Some(poller)=held.poll_head() {
+                    if promoted.as_ref().is_none_or(|next|!core::ptr::eq(&**next,&**poller)) {
+                        let _=workqueue::system_dfl().enqueue::<_,0>(poller.clone());
+                    }
+                }
             }
         }
     }
     fn is_head(&self, job: &Job) -> bool {
-        self.jobs.lock().iter().find(|held| held.queue_key == job.queue_key)
-            .is_some_and(|held| core::ptr::eq(&**held, job))
+        self.jobs.lock().heads.iter().any(|h| core::ptr::eq(&**h, job))
     }
+    pub(super) fn prefer_queue(&self, engine: usize, key: (u64, u32)) {
+        self.jobs.lock().preferred[engine] = Some(key);
+    }
+    pub(super) fn release_queue(&self, engine: usize, key: (u64, u32)) {
+        let mut held = self.jobs.lock();
+        if held.preferred[engine] == Some(key) {
+            held.preferred[engine] = None;
+            if let Some(poller)=held.poll_head() {
+                let _=workqueue::system_dfl().enqueue::<_,0>(poller.clone());
+            }
+        }
+    }
+    // Every scheduled progress pass polls the complete session. One waiting
+    // queue head covers coalesced notifications and watchdogs for all owners.
+    // Removal/promotion wakes a successor so another waiter can take over.
+    fn is_poll_head(&self, job: &Job) -> bool {
+        let held = self.jobs.lock();
+        held.poll_head().is_some_and(|h|core::ptr::eq(&**h,job))
+    }
+    pub(super) fn sequence(&self) -> u64 { self.wake_sequence.load(Ordering::SeqCst) }
     pub(crate) fn wake(&self) {
         self.wake_backend(false);
     }
@@ -85,20 +144,53 @@ impl Events {
         // racing backend progress is either enqueued here or noticed by that
         // pass. SC orders this handshake across both atomic locations.
         self.wake_sequence.fetch_add(1, Ordering::SeqCst);
-        let jobs = self.jobs.lock();
-        for (index, job) in jobs.iter().enumerate() {
-            let head = !jobs[..index].iter().any(|held| held.queue_key == job.queue_key);
-            if all || (head && job.firmware_waiting.load(Ordering::SeqCst)) {
+        let mut held = self.jobs.lock();
+        if all {
+            for job in &held.jobs {
                 let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
+            }
+        } else {
+            let count = held.heads.len();
+            if count != 0 {
+                let first = held.next % count;
+                // A full-session poll services all receipts. Wake the
+                // selected admission owners and one rotating head instead of
+                // making every client compete for the same runtime mutex.
+                // The rotating head guarantees progress for other engines
+                // and for ready work which has not claimed admission yet.
+                let mut selected = [None; 2];
+                for (engine, key) in held.preferred.iter().enumerate() {
+                    if let Some(key) = key {
+                        if let Some(index) = held.heads.iter().position(|h|
+                            h.queue_key == *key && h.firmware_waiting.load(Ordering::SeqCst)) {
+                            if !selected.contains(&Some(index)) {
+                                let _ = workqueue::system_dfl().enqueue::<_, 0>(held.heads[index].clone());
+                            }
+                            selected[engine] = Some(index);
+                        }
+                    }
+                }
+                for offset in 0..count {
+                    let index = (first + offset) % count;
+                    let job = &held.heads[index];
+                    if job.firmware_waiting.load(Ordering::SeqCst) {
+                        if !selected.contains(&Some(index)) {
+                            let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
+                        }
+                        held.next = (index + 1) % count;
+                        break;
+                    }
+                }
             }
         }
     }
+
     fn wake_job(&self, identity: usize) {
         // The identity is compared only, never dereferenced. Membership owns
         // a live Arc through enqueue and retirement removes it before Drop.
         // A callback cannot keep its own Job alive in a reference cycle.
         let jobs = self.jobs.lock();
-        if let Some(job) = jobs
+        if let Some(job) = jobs.jobs
             .iter()
             .find(|job| &***job as *const Job as usize == identity)
         {
@@ -137,6 +229,9 @@ struct Execution {
     waiting: bool,
     work_gate: Option<dma_fence::Fence>,
     callbacks: KVec<KBox<FenceWake>>,
+    // Stable callback storage is allocated before ioctl commitment. Binding
+    // a newly staged receipt requires no allocation in the execution path.
+    receipt_callbacks: KVec<[KBox<FenceWake>; 2]>,
     control_timer_handle: Option<ArcHrTimerHandle<Job>>,
     // Fields drop in declaration order. File/Prepared/receipts retain GEM
     // objects whose DMA cleanup needs this device, even after driver unbind.
@@ -188,7 +283,7 @@ impl Job {
             try_pin_init!(Self {
                 work<-new_work!("asahi_neo_event"),
                 timer<-new_delayed_work!("asahi_neo_watchdog"),
-                execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,schedule,control_timer_handle:None,
+                execution<-new_mutex!(Some(Execution {dev,file,prepared,sync,previous,publication,render_receipts,schedule,control_timer_handle:None,receipt_callbacks:KVec::new(),
                     initialized:false,cursor:0,waiting:false,work_gate:None,callbacks:KVec::new()})),
                 control_timer<-HrTimer::new(),
                 committed:AtomicBool::new(false),firmware_waiting:AtomicBool::new(false),queue_key,events,
@@ -207,6 +302,13 @@ impl Job {
                 )?;
             }
             if let Some(schedule) = &e.schedule {
+                e.receipt_callbacks.reserve(e.prepared.parameters.len(), GFP_KERNEL)?;
+                for _ in &e.prepared.parameters {
+                    e.receipt_callbacks.push([
+                        FenceWake::unbound(job.events.clone(), identity)?,
+                        FenceWake::unbound(job.events.clone(), identity)?,
+                    ], GFP_KERNEL)?;
+                }
                 for fence in schedule.callback_fences()? {
                     e.callbacks.push(FenceWake::new(fence,job.events.clone(),identity)?,GFP_KERNEL)?;
                 }
@@ -290,7 +392,19 @@ impl Job {
                     return Ok(None);
                 }
             }
-            e.progress()
+            let result = e.progress()?;
+            if let Some(schedule) = &e.schedule {
+                for (index, callbacks) in e.receipt_callbacks.iter_mut().enumerate() {
+                    for (phase, callback) in callbacks.iter_mut().enumerate() {
+                        if callback.fence.is_none() {
+                            if let Some(fence) = schedule.receipt_fence(index, phase == 0) {
+                                callback.bind(fence)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(result)
         })();
         match result {
             Ok(None) if input_blocked => {
@@ -307,7 +421,11 @@ impl Job {
                 if !this.events.is_head(&this) {
                     return;
                 }
-                if this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
+                let poll_head = this.events.is_poll_head(&this);
+                // Receipt callbacks wake their exact owners. Only the elected
+                // poller needs to repeat a full-session poll when an IRQ raced
+                // this pass; otherwise one event regenerates the wake storm.
+                if poll_head && this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
                     let _ = workqueue::system_dfl().enqueue::<_, 0>(this.clone());
                 }
                 // Retained-pool admission can be blocked without a pending
@@ -316,13 +434,18 @@ impl Job {
                 // Published work also needs this cadence: its retirement and
                 // growth receipts can coalesce without another mailbox IRQ.
                 // Input fences stay callback-only in the branch above.
-                if let Some(schedule) = e.schedule.as_ref().filter(|schedule| schedule.fast_retry()) {
-                    e.control_timer_handle = Some(this.clone().start(Delta::from_micros(schedule.fast_retry_us())));
+                if poll_head {
+                    if let Some(schedule) = e.schedule.as_ref().filter(|schedule| schedule.fast_retry()) {
+                        e.control_timer_handle = Some(this.clone().start(Delta::from_micros(schedule.fast_retry_us())));
+                    }
                 }
-                // Retain the bounded watchdog for genuinely absent/coalesced
-                // notifications, even when the sequence change requeues work.
-                let _ = workqueue::system_dfl()
-                    .enqueue_delayed::<_, 1>(this.clone(), kernel::time::msecs_to_jiffies(10));
+                // The shared scheduler checks every owner's deadlines during
+                // a session poll. Legacy/exclusive execution still needs its
+                // own watchdog; scheduled heads use only the elected poller.
+                if poll_head || e.schedule.is_none() {
+                    let _ = workqueue::system_dfl()
+                        .enqueue_delayed::<_, 1>(this.clone(), kernel::time::msecs_to_jiffies(10));
+                }
             }
             result => {
                 let execution = held.take().unwrap();
@@ -384,7 +507,7 @@ struct FenceWake {
     callback: UnsafeCell<bindings::dma_fence_cb>,
     events: Arc<Events>,
     identity: usize,
-    fence: dma_fence::Fence,
+    fence: Option<dma_fence::Fence>,
     registered: bool,
 }
 // SAFETY: Only the DMA-fence core mutates callback, under its own fence lock.
@@ -392,32 +515,40 @@ struct FenceWake {
 unsafe impl Send for FenceWake {}
 unsafe impl Sync for FenceWake {}
 impl FenceWake {
+    fn unbound(events: Arc<Events>, identity: usize) -> Result<KBox<Self>> {
+        Ok(KBox::new(Self {
+            // SAFETY: add_callback initializes callback's list linkage.
+            callback: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            events, identity, fence: None, registered: false,
+        }, GFP_KERNEL)?)
+    }
     fn new(fence: dma_fence::Fence, events: Arc<Events>, identity: usize) -> Result<KBox<Self>> {
-        let mut owned = KBox::new(
-            Self {
-                // SAFETY: add_callback initializes callback's list linkage.
-                callback: UnsafeCell::new(unsafe { core::mem::zeroed() }),
-                events,
-                identity,
-                fence,
-                registered: false,
-            },
-            GFP_KERNEL,
-        )?;
+        let mut owned = Self::unbound(events, identity)?;
+        owned.bind(fence)?;
+        Ok(owned)
+    }
+    fn bind(&mut self, fence: dma_fence::Fence) -> Result {
+        debug_assert!(self.fence.is_none());
+        self.fence = Some(fence);
         // SAFETY: Stable owned allocation and fence survive until removal;
         // callback only accesses immutable events and never a sleeping lock.
         let result = unsafe {
             bindings::dma_fence_add_callback(
-                owned.fence.raw(),
-                owned.callback.get(),
+                self.fence.as_ref().unwrap().raw(),
+                self.callback.get(),
                 Some(Self::wake),
             )
         };
-        if result != 0 && result != -(bindings::ENOENT as i32) {
+        if result == -(bindings::ENOENT as i32) {
+            // Retirement raced registration. No callback will run, so the
+            // owning job must recheck its receipt explicitly.
+            self.events.wake_job(self.identity);
+        } else if result != 0 {
             return Err(Error::from_errno(result));
+        } else {
+            self.registered = true;
         }
-        owned.registered = true;
-        Ok(owned)
+        Ok(())
     }
     unsafe extern "C" fn wake(
         _fence: *mut bindings::dma_fence,
@@ -436,7 +567,7 @@ impl Drop for FenceWake {
         }
         // SAFETY: Owned stable callback/fence; removal serializes with wake.
         unsafe {
-            bindings::dma_fence_remove_callback(self.fence.raw(), self.callback.get());
+            bindings::dma_fence_remove_callback(self.fence.as_ref().unwrap().raw(), self.callback.get());
         }
     }
 }

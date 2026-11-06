@@ -85,6 +85,9 @@ impl RuntimeImage {
     }
 }
 pub(crate) struct Runtime {
+    // Publication mutex serializes this device-wide receipt cursor. Workers
+    // for different queues share one poll per wake, with bounded fallback.
+    pub(crate) backend_poll: Option<(u64, kernel::time::Instant<kernel::time::Monotonic>)>,
     pub(crate) session: KBox<Session>,
     pub(crate) image: RuntimeImage,
     pub(crate) active: usize,
@@ -399,7 +402,7 @@ impl Vm {
     ) -> Result<Arc<admission::Snapshot>> {
         let index = usize::from(render);
         if let Some(snapshot) = &self.snapshots[index] {
-            if snapshot.matches(owner, self.mapping_generation, render, &self.bindings) {
+            if snapshot.matches(owner, self.mapping_generation, render) {
                 return Ok(snapshot.clone());
             }
         }
@@ -508,7 +511,7 @@ impl Vm {
                 root.map_page(address + index * PAGE, pa, binding.flags & WRITE != 0)?;
             }
         }
-        Ok(super::g17p_compute_runtime::Client {
+        Ok(super::g17p_compute_runtime::Client { identity: None,
             root,
             buffers,
             bindings,
@@ -634,6 +637,7 @@ pub(crate) mod asynchronous;
 struct Prepared {
     queue_key: super::g17p_compute_queues::Key,
     queue_priority: u32,
+    automatic_render_parallel: bool,
     g16c_kernel_start: u64,
     g16c_kernel_end: u64,
     owner: (u64, u32),
@@ -677,8 +681,8 @@ impl Prepared {
     fn pipeline_render(&self) -> bool {
         crate::module_parameters::native_render_vms.value() == 0
             && crate::module_parameters::native_compute_vms.value() == 0
-            && crate::module_parameters::partial_independent_owner.value() == 1
-            && crate::module_parameters::alternate_queue_pairs.value() == 1
+            && (self.automatic_render_parallel || (crate::module_parameters::partial_independent_owner.value() == 1
+            && crate::module_parameters::alternate_queue_pairs.value() == 1))
             && !self.parameters.is_empty()
             && self.parameters.iter().all(|p| matches!(p, Command::Render(_)))
             && self.parameters.iter().zip(self.barriers.iter()).all(|(p, b)| {
@@ -1612,6 +1616,7 @@ impl File {
         let prepared = Prepared {
             queue_key: (inner.id, data.queue_id),
             queue_priority,
+            automatic_render_parallel: super::g17p_render_runtime::auto_parallel_enabled(dev.params.chip_id),
             g16c_kernel_start,
             g16c_kernel_end,
             owner,
@@ -1676,6 +1681,7 @@ impl File {
         let Prepared {
             queue_key: _,
             queue_priority: _,
+            automatic_render_parallel: _,
             g16c_kernel_start: _,
             g16c_kernel_end: _,
             owner,
@@ -1736,16 +1742,7 @@ impl File {
         let unchanged =
             |next: &super::g17p_compute_runtime::Client,
              old: Option<&super::g17p_compute_runtime::Client>| {
-                old.is_some_and(|old| {
-                    old.owner == next.owner
-                        && old.bindings == next.bindings
-                        && old.buffers.len() == next.buffers.len()
-                        && old
-                            .buffers
-                            .iter()
-                            .zip(&next.buffers)
-                            .all(|(a, b)| core::ptr::eq(&**a, &**b))
-                })
+                old.is_some_and(|old| old.same_mapping(next))
             };
         if render_client
             .as_ref()

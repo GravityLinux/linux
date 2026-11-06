@@ -68,7 +68,10 @@ impl Mutex{fn lock(&self)->RefMut<'_,Option<Runtime>>{self.0.borrow_mut()}}
 struct Device{runtime:Mutex}
 struct Runtime{session:Session}
 struct Session{cold:bool,rebind:bool,can_stage:bool,root_error:bool,descriptor_error:bool}
-struct TableStorage;impl TableStorage{fn new(_:usize)->Result<Self>{Ok(Self)}}
+static ALLOCATIONS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+struct TableStorage;impl TableStorage{fn new(_:usize)->Result<Self>{
+    ALLOCATIONS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);Ok(Self)
+}}
 struct RebindSeed{fail:bool}
 struct PreparedPoolRebind;
 impl RebindSeed{fn prepare(self,_:&Client)->Result<PreparedPoolRebind>{
@@ -94,6 +97,7 @@ impl Session{
 }
 struct Schedule{nodes:Vec<Node>}
 impl Schedule{
+    fn preferred(_:&Runtime,_:usize,_:&Node)->bool{true}
     fn dependencies(_:&Node,_:&Command)->Result<Option<((),[();2])>>{Ok(Some(((),[();2])))}
 ''' + method + r'''
 }
@@ -126,7 +130,10 @@ fn main(){
     assert_eq!(schedule.nodes[0].point.error.replace(None),Some(Error));
     {let mut held=dev.runtime.lock();let s=&mut held.as_mut().unwrap().session;
         s.descriptor_error=false;s.rebind=true;s.can_stage=false;}
-    assert!(schedule.prepare_render(&dev,&prepared).is_none());
+    ALLOCATIONS.store(0,std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..1000 {assert!(schedule.prepare_render(&dev,&prepared).is_none());}
+    assert_eq!(ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),0,
+        "blocked render allocated table snapshots on every retry");
     assert!(schedule.nodes[0].point.error.get().is_none());
     {let mut held=dev.runtime.lock();held.as_mut().unwrap().session.can_stage=true;}
     prepared.render_client=None;
@@ -136,7 +143,7 @@ fn main(){
     assert!(schedule.nodes[0].point.error.get().is_none());
     prepared.render_snapshot=None;
     assert!(schedule.prepare_render(&dev,&prepared).is_none());
-    println!("PASS actual cold/warm preparation, independent root/descriptor plans and failure/retry ownership");
+    println!("PASS actual cold/warm preparation, independent root/descriptor plans, failure/retry ownership, and zero snapshot allocations across 1000 blocked retries");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='cold-rebind-') as tmp:

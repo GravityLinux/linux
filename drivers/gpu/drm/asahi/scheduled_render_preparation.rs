@@ -32,6 +32,8 @@ pub(crate) struct WrappedSeed {
     pub(crate) grids:[u8;2],
     pub(crate) context:u16,
     pub(crate) slot:u32,
+    /// Queue completion namespace, separate from the PB manager slot below.
+    pub(crate) event_slot:u8,
     pub(crate) support:u64,
     pub(crate) manager:u64,
     pub(crate) scene:u64,
@@ -46,12 +48,50 @@ fn push(out:&mut KVec<Deferred>,address:u64,bytes:&[u8])->Result {
     body.copy_from_slice(bytes);out.push(Deferred{address,body,previous:None},GFP_KERNEL)?;Ok(())
 }
 impl WrappedSeed {
+    /// Patch only the global publication identity after another independent
+    /// queue publishes. Programs, pool-local milestones and backing stay
+    /// unchanged. The caller has revalidated every other seed field.
+    pub(super) fn rebase_ordinal(self, objects: &mut [KVec<Deferred>; 2], ordinal: u32) -> Result {
+        if ordinal >= 0x3fffffff { return Err(EOVERFLOW); }
+        // Validate all affected CPU images before editing any of them.
+        for stage in 0..2 {
+            let descriptor = self.base + if stage == 0 {0x2940} else {0x9b40};
+            let row = objects[stage].iter().find(|row|row.address == descriptor).ok_or(EINVAL)?;
+            let size = if stage == 0 {body::TilingDescriptorG16C::SIZE} else {body::FragmentDescriptorG16C::SIZE};
+            if row.body.len() != size {return Err(EINVAL);}
+        }
+        let wrapper = objects[0].iter().find(|row|row.address == self.base + 0x4000).ok_or(EINVAL)?;
+        if wrapper.body.len() != core::mem::size_of::<work::WorkWrapperG16C>() {return Err(EINVAL);}
+        for stage in 0..2 {
+            let address = self.base + if stage == 0 {0x2940} else {0x9b40};
+            let row = objects[stage].iter_mut().find(|row|row.address == address).ok_or(EINVAL)?;
+            let uuid = ((0x010000e1 + ordinal * 2 - stage as u32) & 0x00ffffff)
+                | u32::from(self.context) << 24;
+            // SAFETY: Lengths above match the generated alignment-one wire
+            // types containing only byte arrays. These are private CPU images.
+            if stage == 0 {
+                let raw = unsafe {&mut *row.body.as_mut_ptr().cast::<body::TilingDescriptorG16C>()};
+                raw.uuid = uuid.to_le_bytes();
+                raw.work_index = (if ordinal == self.local {self.local}
+                    else {self.local + self.local / 2}).to_le_bytes();
+            } else {
+                let raw = unsafe {&mut *row.body.as_mut_ptr().cast::<body::FragmentDescriptorG16C>()};
+                raw.uuid = uuid.to_le_bytes();
+            }
+        }
+        let row = objects[0].iter_mut().find(|row|row.address == self.base + 0x4000).ok_or(EINVAL)?;
+        // SAFETY: Validated size and alignment-one byte-array staging type.
+        let raw = unsafe {&mut *row.body.as_mut_ptr().cast::<work::WorkWrapperG16C>()};
+        raw.lifecycle = (ordinal as u16).to_le_bytes();
+        Ok(())
+    }
     pub(super) fn build(self,p:&Parameters)->Result<[KVec<Deferred>;2]> {
         let mut objects=[KVec::new(),KVec::new()];
         let n=self.ordinal;let local=self.local;let item=self.milestone;let first_event=self.grids[0];
         if self.grids[1]!=first_event.checked_add(1).ok_or(EINVAL)? {return Err(EINVAL);}
         let context=u64::from(self.context);let slot=self.slot;let support=self.support;
-        if slot>=super::super::g17p_render_lifecycle::POOL_SLOTS {return Err(EINVAL);}
+        if slot>=super::super::g17p_render_lifecycle::POOL_SLOTS
+            || u32::from(self.event_slot)>=super::super::g17p_render_lifecycle::POOL_SLOTS {return Err(EINVAL);}
         let manager=self.manager;let scene=self.scene;let empty=self.empty;
         let scene_slot=self.sequence%79+1;
         let tpc_size=p.scratch_layout().map_err(|_|EINVAL)?.2.checked_mul(4).ok_or(EOVERFLOW)?;
@@ -116,20 +156,15 @@ impl WrappedSeed {
                 field_2128: 0,
                 field_21d8: 0x3be00,
                 field_222c: 0,
-                secondary_stamp: Some(if n != local {
-                    (local + 1).wrapping_shl(8)
-                } else {
-                    stamp & 65535
-                }),
+                // Native submission 65536 still carries secondary stamp 0x100.
+                // Keep its 16-bit rotation when other queues have advanced
+                // the global ordinal independently of this queue.
+                secondary_stamp: Some(stamp & 65535),
                 descriptor_ordinal: Some(if fragment { local } else { 0 }),
-                work_index: Some(if n != local {
-                    if fragment {
-                        local + 1
-                    } else {
-                        local + local / 2
-                    }
-                } else if fragment {
-                    (n + 1) & 255
+                work_index: Some(if fragment {
+                    (local + 1) & 255
+                } else if n != local {
+                    local + local / 2
                 } else {
                     n
                 }),
@@ -195,7 +230,7 @@ impl WrappedSeed {
                 // Same physical event slot passed to Neo's points builder.
                 // Native Max pool1 records carry 0xc01/0x1801 even with
                 // fresh queue-local item0 and application ASID2.
-                control: Some((if fragment { 0x1800 } else { 0xc00 }) | slot as u16),
+                control: Some((if fragment { 0x1800 } else { 0xc00 }) | u16::from(self.event_slot)),
                 control_low: None,
                 field_30: None,
                 field_38: 0,
@@ -222,7 +257,9 @@ impl WrappedSeed {
                     item: 0,
                     ordinal: item as u16,
                     context: context as u16,
-                    support_id: slot as u16,
+                    // As in compute, this is the zero-based UAT context,
+                    // independently of the PB manager and completion slot.
+                    support_id: self.context.checked_sub(1).ok_or(EINVAL)?,
                     uuid: self.uuid,
                     scheduler: lane.priority as u16,
                     scheduler_hint: 2,
@@ -238,7 +275,7 @@ impl WrappedSeed {
                 // This identity advances across render owners; the selected
                 // SKSM record/marker milestone above remains pool-local.
                 lifecycle: n as u16,
-                namespace: slot as u16,
+                namespace: u16::from(self.event_slot),
                 item,
                 item_control: ((item & 255) << 8) as u16,
             })

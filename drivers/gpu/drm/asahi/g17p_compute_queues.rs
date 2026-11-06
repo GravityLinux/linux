@@ -216,6 +216,8 @@ pub(crate) struct Queue {
     needs_first: bool,
     reconfiguration: Option<Maintenance>,
     wrapped: Option<WrappedQueue>,
+    retained_bytes: u64,
+    last_used: u64,
 }
 struct Maintenance {
     target: Key,
@@ -228,6 +230,7 @@ pub(crate) struct Queues {
     owners: KVec<Queue>,
     reserved_asids: u64,
     wrapped: bool,
+    use_clock: u64,
 }
 impl Queues {
     pub(crate) fn new() -> Self {
@@ -235,6 +238,7 @@ impl Queues {
             owners: KVec::new(),
             reserved_asids: 0xf,
             wrapped: false,
+            use_clock: 0,
         }
     }
     pub(crate) fn wrapped()->Self {Self {wrapped:true,..Self::new()}}
@@ -329,7 +333,13 @@ impl Queues {
         }
     }
     fn choose(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<usize> {
-        generation::select(self.owners.iter().enumerate().map(|(index, q)| generation::Candidate {
+        let retained = self.owners.iter().fold(0u64, |total, q| total.saturating_add(q.retained_bytes));
+        // Allocation shape is fixed per backend/profile. Charge actual allocator
+        // padding and transport growth, rather than the sparse DVA aperture or
+        // the nominal sum of requested sizes. The first owner is always allowed.
+        let next = self.owners.iter().map(|q| q.retained_bytes).max().unwrap_or(0);
+        let budget = u64::from(crate::module_parameters::compute_cache_mb.value()) << 20;
+        generation::select_retained(self.owners.iter().enumerate().map(|(index, q)| (generation::Candidate {
             index,
             reserved: q.reconfiguration.as_ref().is_some_and(|m| m.target == key),
             eligible: q.reconfiguration.as_ref().is_none_or(|m| m.target == key),
@@ -337,7 +347,9 @@ impl Queues {
             same_queue: q.key == key,
             idle: q.idle(),
             room: q.generation.window < WINDOW,
-        }), (self.owners.len() < CONTEXTS && self.free_asid().is_some()).then_some(self.owners.len()))
+        }, q.last_used)),
+            (self.owners.len() < CONTEXTS && self.free_asid().is_some()).then_some(self.owners.len()),
+            retained.saturating_add(next) <= budget)
     }
     pub(crate) fn selected_grid(&self, key: Key, client: &Client, p: &Parameters, priority: u32) -> Option<u8> {
         self.choose(key, client, p, priority).map(|index| FIRST_GRID + index as u8)
@@ -449,7 +461,7 @@ impl Queues {
         channel: Channel,
         key: Key,
         mut client: Option<Client>,
-        private_prepared: bool,
+        private_bytes: Option<u64>,
         rebind: Option<&mut PreparedComputeRebind>,
         prepared: KBox<PreparedWork>,
         reference: &Client,
@@ -459,6 +471,7 @@ impl Queues {
         fence: Fence,
     ) -> Result<Ticket> {
         let index = self.choose(key, reference, p, priority).ok_or(EBUSY)?;
+        let before = memory.allocation_stats().1;
         if index == self.owners.len() {
             self.owners.reserve(1, GFP_KERNEL)?;
             let queue = Queue::new(
@@ -469,10 +482,11 @@ impl Queues {
                 client.take().ok_or(EINVAL)?,
                 p,
                 priority,
-                private_prepared,
+                private_bytes.is_some(),
                 self.wrapped,
             )?;
             self.owners.push(queue, GFP_KERNEL)?;
+            self.owners[index].retained_bytes = private_bytes.ok_or(EIO)?;
             self.owners[index].install(memory, vm, ttbs, p)?;
         } else {
             let queue = &mut self.owners[index];
@@ -505,8 +519,13 @@ impl Queues {
                 queue.rotate(memory, vm).inspect_err(|e| pr_err!("G17P: compute rotate grid {} error {:?}\n",queue.generation.layout.grid,e))?;
             }
         }
-        self.owners[index].stage(memory, vm, channel, index, p, dependencies, prepared, fence)
-            .inspect_err(|e| pr_err!("G17P: compute build grid {} error {:?}\n",self.owners[index].generation.layout.grid,e))
+        let ticket = self.owners[index].stage(memory, vm, channel, index, p, dependencies, prepared, fence)
+            .inspect_err(|e| pr_err!("G17P: compute build grid {} error {:?}\n",self.owners[index].generation.layout.grid,e))?;
+        self.use_clock = self.use_clock.saturating_add(1);
+        let queue = &mut self.owners[index];
+        queue.last_used = self.use_clock;
+        queue.retained_bytes = queue.retained_bytes.saturating_add(memory.allocation_stats().1.saturating_sub(before));
+        Ok(ticket)
     }
 }
 impl Queue {
@@ -522,15 +541,7 @@ impl Queue {
         self.key == key
             && self.preempt == p.preempt
             && self.priority == priority
-            && self.client.owner == client.owner
-            && self.client.bindings == client.bindings
-            && self.client.buffers.len() == client.buffers.len()
-            && self
-                .client
-                .buffers
-                .iter()
-                .zip(&client.buffers)
-                .all(|(a, b)| core::ptr::eq(&**a, &**b))
+            && self.client.same_mapping(client)
     }
     fn new(
         memory: &mut Memory,
@@ -644,6 +655,8 @@ impl Queue {
             needs_first: false,
             reconfiguration: None,
             wrapped,
+            retained_bytes: 0,
+            last_used: 0,
         })
     }
     // Session owns the complete root before either TTB becomes visible.
@@ -935,6 +948,7 @@ pub(crate) struct ComputeRebindSeed {
     private: Option<wrapped_queue::PrivateLayout>,
 }
 pub(crate) struct PreparedComputeRebind {
+    identity: Option<runtime::MappingIdentity>,
     layout: Layout,
     old_key: Key,
     old_preempt: u64,
@@ -960,7 +974,7 @@ impl ComputeRebindSeed {
                 &[],&[],&[self.layout.asid],false)?
         } else {
             let (root,relocation)=self.snapshot.clone_tree()?;
-            let mut shadow=Client { root,buffers:self.buffers,bindings:self.bindings,owner:self.owner,
+            let mut shadow=Client { identity: None, root,buffers:self.buffers,bindings:self.bindings,owner:self.owner,
                 cpu_maps:self.cpu_maps,primer_aliases:self.primer_aliases };
             let mut private: KVec<(u64, u64, u64)> = KVec::new();
             if self.old_preempt != self.new_preempt {
@@ -1015,7 +1029,7 @@ impl ComputeRebindSeed {
             pr_info!("G17P: COMPUTE_ROOT_PREPARED grid {} bindings {} elapsed_us {} spliced {} outside_runtime_lock\n",
                 self.layout.grid,bindings.len(),started.elapsed().as_nanos()/1000,spliced);
         }
-        Ok(PreparedComputeRebind { layout:self.layout,old_key:self.old_key,old_preempt:self.old_preempt,
+        Ok(PreparedComputeRebind { identity:client.identity.clone(),layout:self.layout,old_key:self.old_key,old_preempt:self.old_preempt,
             new_preempt:self.new_preempt,old_priority:self.old_priority,root,new_key:self.new_key,
             new_priority:self.new_priority,owner:client.owner,bindings,buffers })
     }
@@ -1025,9 +1039,10 @@ impl PreparedComputeRebind {
         self.layout==queue.generation.layout && self.old_key==queue.key && self.old_preempt==queue.preempt
             && self.old_priority==queue.priority && self.root.matches(&queue.client.root) && queue.idle()
             && self.new_preempt==p.preempt && self.new_key==key && self.new_priority==priority
-            && self.owner==client.owner && self.bindings==client.bindings
-            && self.buffers.len()==client.buffers.len()
-            && self.buffers.iter().zip(&client.buffers).all(|(a,b)|core::ptr::eq(&**a,&**b))
+            && self.owner==client.owner
+            && (runtime::MappingIdentity::same(&self.identity,&client.identity)
+                || (self.bindings==client.bindings && self.buffers.len()==client.buffers.len()
+                    && self.buffers.iter().zip(&client.buffers).all(|(a,b)|core::ptr::eq(&**a,&**b))))
     }
 }
 impl Queues {

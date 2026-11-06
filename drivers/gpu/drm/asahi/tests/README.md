@@ -1,4 +1,29 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
+
+Retained render operand-bank regression:
+
+```sh
+python3 check_scheduled_render_preparation.py \
+  --native-operand-banks /path/to/single-user-three-client-phases-v1 \
+  --counter-width-native /path/to/single-user-render-warmup65536-fullcpu-20261013 \
+  --evidence /path/to/new-evidence-directory
+```
+
+The native support DATA and both program selectors must identify the same
+operand bank, independently of ASID/PB slot. This also compiles the actual
+runtime lowering and both register-array shapes for G16S/G16C. Supplying
+`--configured-source /path/to/pre-fix-scheduled_render_submit.rs` exercises
+the negative control: the old lowering leaves a nonzero bank at zero.
+
+`render_upload_isolation.c` complements the browser reproducer. Build with
+EGL/GLES development headers and `-lEGL -lGLESv2`, then run several independent
+processes as `./render-upload-isolation 128 TAG`, using distinct tags 0–7 and
+the production Zink/Honeykrisp environment. Every frame changes its PBO texture
+contents; full readback checks detect stale or cross-client data, including
+values live after discard. This is a correctness probe, not an FPS benchmark
+or a substitute for sustained video and normal Sway/DCP DMA-BUF presentation.
+See `QUALIFICATION.multi-context-20261104.rst` for the native test limits.
+
 Native Max compressed-color producer and consumer:
 
 ```sh
@@ -849,10 +874,7 @@ the normal DMA-BUF import/scanout path with legacy KMS compatibility calls,
 rather than a compositor's explicit-fence integration. Buffers are rewritten
 only after replacement on scanout. Pixels and guards are checked fully on the
 first/last frames and sparsely between them. The first three passes warm up;
-the final pass still renders/presents and fully validates pixels, but its
-complete CPU oracle is outside the timing window. `timed_full_oracle=0` marks
-this corrected metric; older figures included that CPU scan. Per-frame logging
-occurs after all work. Rows must be 256-byte aligned.
+per-frame logging occurs after the timed loop. Rows must be 256-byte aligned.
 
 `PERF_OFFSCREEN=1` provides a control with the same Vulkan workload but no DCP
 presentation. Only in that mode may `PERF_CLIENTS=1` be used: the on-screen

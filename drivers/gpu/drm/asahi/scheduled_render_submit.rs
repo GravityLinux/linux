@@ -109,9 +109,7 @@ impl State {
                 self.owner_private_required(pool,incoming,p.kernel_start,p.kernel_end))
     }
     pub(crate) fn render_pool(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<u32> {
-        super::super::super::g17p_render_lifecycle::select_pool(
-            self.render_ordinal,super::super::super::g17p_render_runtime::pool_count() as u32,
-            |pool| {
+        let available=|pool:&u32| {
                 if !session.render_pool_available(*pool) {return false;}
                 let Some(o)=self.owners.iter().find(|o|o.pool==*pool) else {
                     return super::super::super::g17p_render_lifecycle::render_asid(*pool,session.independent_compute.asid_mask()).is_some();
@@ -120,16 +118,26 @@ impl State {
                     .is_some_and(|end|end<=p.kernel_end)
                     && self.queues.iter().filter(|q|q.owner<self.owners.len() && self.owners[q.owner].pool==*pool)
                         .all(|q|q.generation.idle())
-            },
-            |pool|self.owners.iter().any(|o|o.pool==*pool&&o.client.as_ref().is_some_and(|c|same(c,incoming))))
+            };
+        let matching=|pool:&u32| self.owners.iter().any(|o|o.pool==*pool&&o.client.as_ref().is_some_and(|c|same(c,incoming)));
+        let count=if session.automatic_render_parallel {super::super::super::g17p_render_lifecycle::POOL_SLOTS}
+            else {super::super::super::g17p_render_runtime::pool_count() as u32};
+        let life=self.render_ordinal;
+        let related=|pool:&u32| self.owners.iter().any(|o|o.pool==*pool
+            &&o.render.as_ref().is_some_and(|render|render.admitted())
+            &&o.client.as_ref().is_some_and(|client|client.owner==incoming.owner)
+            &&o.private_next.checked_sub(o.directory).and_then(|span|p.kernel_start.checked_add(span))
+                .is_some_and(|end|end<=p.kernel_end));
+        super::super::super::g17p_render_lifecycle::select_affine_pool(life,count,available,matching,related,
+            &session.render_cache_hits,&session.render_cache_used)
     }
     fn retained_render_index(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<usize> {
         let key=p.queue_owner?;p.firmware_priority?;
         let pool=self.render_pool(session,incoming,p)?;
-        let owns_pool=|q:&&Queue|q.live&&q.generation.idle()&&self.owners[q.owner].pool==pool
+        let owns_pool=|q:&&Queue|q.live&&self.owners[q.owner].pool==pool&&q.generation.idle()
             && self.owners[q.owner].client.is_some()
             && self.owners[q.owner].render.as_ref().is_some_and(|r|r.attached());
-        self.queues.iter().enumerate().find(|(_,q)|owns_pool(q)&&q.key==key)
+        self.queues.iter().enumerate().find(|(_,q)|q.key==key&&owns_pool(q))
             .or_else(||self.queues.iter().enumerate().find(|(_,q)|owns_pool(q))).map(|(index,_)|index)
     }
     pub(crate) fn selected_render_client(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<&compute::Client> {
@@ -208,15 +216,19 @@ impl State {
                 o.operand_probe_seeded=false;o.operand_probe_pending=false;
                 let q=&mut self.queues[qi];q.storage.reset_retained(memory,vm,p.firmware_priority.ok_or(EINVAL)?.try_into()?)?;
                 q.live=true;q.render_count=0;q.generation.window=0;
-                kernel::dev_info!(session.peers[0].data.dev.as_ref(),
+                if crate::module_parameters::submission_log.value() != 0 {
+                    kernel::dev_info!(session.peers[0].data.dev.as_ref(),
                     "G16C: retained render private window moved context={} root={:#x} pool={} old={:#x} new={:#x} common prepared PTE commit; physical root and ASID unchanged\n",
                     context,root,o.render.as_ref().ok_or(EIO)?.parameter.slot,old,p.kernel_start);
+                }
             } else {
                 let o=&mut self.owners[oi];let installed=o.client.as_mut().ok_or(EIO)?;
                 plan.commit(installed)?;
                 o.render.as_mut().ok_or(EIO)?.refresh_root(&installed.root)?;
-                kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: retained render root rebound context={} root={:#x} pool={} through common prepared PTE commit\n",
+                if crate::module_parameters::submission_log.value() != 0 {
+                    kernel::dev_info!(session.peers[0].data.dev.as_ref(),"G16C: retained render root rebound context={} root={:#x} pool={} through common prepared PTE commit\n",
                     o.context,installed.root.root(),o.render.as_ref().ok_or(EIO)?.parameter.slot);
+                }
             }
         }
         let priority=p.firmware_priority.ok_or(EINVAL)?;
@@ -230,8 +242,11 @@ impl State {
         q.key=p.queue_owner.ok_or(EINVAL)?;self.owners[oi].close_requested=false;
         drop(client.take());Ok(true)
     }
-    fn configured_render(profile:super::super::super::scheduled_profile::Profile,input:&command::Parameters,n:u32,sequence:u32,geo:[u64;3])->Result<command::Parameters> {
+    fn configured_render(profile:super::super::super::scheduled_profile::Profile,input:&command::Parameters,n:u32,sequence:u32,geo:[u64;3],context:u16)->Result<command::Parameters> {
         let mut p=*input;
+        // These program registers select the same operand bank named in
+        // the support object and FList registration. They are not flags.
+        p.completion_control=u64::from(DispatchStateG16C::bank_for_context(context).ok_or(EINVAL)?);
         p.context_base=0x1000000000;p.deflake_3=0x1000068000;
         let offsets=profile.deflake();p.deflake_1=p.deflake_3+offsets[1];p.deflake_2=p.deflake_3+offsets[0];
         p.ta_status=0x1000078000;p.fragment_status=0x1000490000;p.aux_fb=0x10004d0000;
@@ -250,9 +265,9 @@ impl State {
         ->Result<(command::Parameters,super::super::super::g17p_render_runtime::WrappedSeed)> {
         use super::super::super::g17p_render_runtime::{WrappedSeed,WrappedLane};
         let q=&self.queues[qi];let o=&self.owners[q.owner];let r=o.render.as_ref().ok_or(EIO)?;
-        let geo=r.geometry_addresses();let p=Self::configured_render(self.profile,input,self.render_ordinal,r.sequence,geo)?;
+        let geo=r.geometry_addresses();let p=Self::configured_render(self.profile,input,self.render_ordinal,r.sequence,geo,o.context)?;
         Ok((p,WrappedSeed {base:super::super::super::g17p_render_runtime::wrapped_storage_base(storage)?,storage,ordinal:self.render_ordinal,local:q.render_count,
-            sequence:r.sequence,milestone:r.sequence_base.checked_add(r.sequence).ok_or(EOVERFLOW)?,grids:super::super::super::g17p_render_lifecycle::pool_grids(o.pool).map_err(|_|EINVAL)?.map(|grid|grid as u8),context:o.context,slot:r.parameter.slot,support:r.support,
+            sequence:r.sequence,milestone:r.sequence_base.checked_add(r.sequence).ok_or(EOVERFLOW)?,grids:super::super::super::g17p_render_lifecycle::pool_grids(o.pool).map_err(|_|EINVAL)?.map(|grid|grid as u8),context:o.context,slot:r.parameter.slot,event_slot:o.pool as u8,support:r.support,
             manager:r.manager,scene:r.scene+u64::from(r.sequence%79)*0x80,empty:r.empty_scene,
             layermeta:p.heapmeta-if p.layers>1 {0x100}else{0},queue_control:q.storage.context,uuid:q.storage.uuid,
             lanes:core::array::from_fn(|i| {let l=&q.storage.lanes[i];
@@ -439,12 +454,18 @@ impl State {
         if r.geometry_plan(root,geometry_sizes(&p)?)?.is_some() {return Ok(None);}
         r.refresh_root(root)?;
         let geo=r.geometry_addresses();
-        p=Self::configured_render(profile,input,n,r.sequence,geo)?;
-        let Some(storage)=session.next_wrapped_render_storage(n) else {return Ok(None);};
+        p=Self::configured_render(profile,input,n,r.sequence,geo,o.context)?;
+        // Off-lock preparation owns an exact work slot, independently of
+        // another queue advancing the global render ordinal. Preserve that
+        // slot when it remains retired; all seed fields are checked below.
+        let storage = prepared.as_ref().and_then(|plan|plan.wrapped_storage())
+            .filter(|slot|session.next_wrapped_render_storage(*slot)==Some(*slot))
+            .or_else(||session.next_wrapped_render_storage(n));
+        let Some(storage)=storage else {return Ok(None);};
         if !self.render_work_pages.iter().any(|(old,_)|*old==storage) && work_backing.is_none() {return Ok(None);}
         let (configured,wire)=self.render_seed(qi,storage,input)?;
         let base=wire.base;
-        let Some(prepared)=prepared.filter(|plan|plan.matches_wrapped(wire,&configured,
+        let Some(mut prepared)=prepared.filter(|plan|plan.matches_wrapped(wire,&configured,
             self.owners[oi].client.as_ref().unwrap())) else {return Ok(None);};
         let o=&mut self.owners[oi];let r=o.render.as_mut().ok_or(EIO)?;
         let receipt = RenderReceipt::new(n).map_err(StageError::allocation)?;
@@ -501,7 +522,7 @@ impl State {
         flight_allocation_checkpoint(&mut self.initial_allocation_faulted)?;
         let memory = session.memory.as_mut().ok_or(EIO)?;
         let vm = session.vm.as_mut().ok_or(EIO)?;
-        prepared.write_wrapped(memory,vm)?;
+        prepared.write_wrapped(memory,vm,wire)?;
         let mut event = [0u8; 0x28];
         event[..8].copy_from_slice(&(base + 0x18200).to_le_bytes());
         event[0x10..0x14].copy_from_slice(&0x50u32.to_le_bytes());
@@ -569,11 +590,12 @@ impl State {
                 first_event,first_event+1,wire.milestone+1,n,wire.lanes[0].scratch_high,wire.lanes[1].scratch_high);
         }
         self.queues[qi].generation.leases.published(receipt.fence.clone())?;
+        session.touch_render_cache(slot,self.owners[oi].client.as_ref().ok_or(EIO)?.owner);
         receipt.retained_pool.store(slot,Ordering::Relaxed);
         for (stored,grid)in receipt.milestones.iter().zip([first_event,first_event+1]) {
             stored.store((u64::from(grid)<<32)|u64::from(wire.milestone+1),Ordering::Relaxed);
         }
-        receipt.publication_ready.store(true, Ordering::Release);
+        receipt.mark_published();
         session.push_wrapped_render(
             RenderTicket {
                 id,

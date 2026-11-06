@@ -11,7 +11,7 @@ use super::super::super::{
 };
 use super::{
     bytes, map_private, map_prepared_private, validate_mapped_private, reset_mapped_private, operands, private_span, write_blocks, write_low, Memory, PrivateBlock, Session,
-    UserVm, Vm, DispatchStateG16C, ADDRESS, GPU_READ, PAGE, PRIVATE, SHARED,
+    UserVm, Vm, DispatchStateG16C, ADDRESS, DISPATCH, GPU_READ, PAGE, PRIVATE, SHARED,
 };
 use kernel::prelude::*;
 
@@ -805,6 +805,19 @@ impl ResourcesG16C {
         vm.flush_tables(memory)?;
         Vm::invalidate_gpu();
         let bank = DispatchStateG16C::bank_for_context(context).ok_or(EINVAL)?;
+        // Native support DATA +8 and program registers 0x14308/0x14048
+        // identify the bank passed to FList registration. Seed that bank
+        // with this render directory and its existing capacity. activate()
+        // initially installed the owner's distinct 20-buffer compute layout;
+        // rendering registers 23 existing buffers plus five new ones.
+        let memory = session.memory.as_mut().ok_or(EIO)?;
+        vm.write(memory, 2,
+            self.support + operands::OperandSupportG16C::BANK_OFFSET,
+            &bank.to_le_bytes())?;
+        let offset = DispatchStateG16C::slot_offset(context).ok_or(EINVAL)? as u64;
+        let initial = DispatchStateG16C::initial(self.directory, REGISTERED * 2048)
+            .ok_or(EINVAL)?;
+        vm.write(memory, 2, DISPATCH + offset, initial.as_bytes())?;
         session.g16c_register_flist(&RegistrationG16C {
             context: u32::from(context),
             support: self.support,

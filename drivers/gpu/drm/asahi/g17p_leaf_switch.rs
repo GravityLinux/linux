@@ -11,6 +11,10 @@ fn covers(ranges: &[(u64,u64)], va: u64) -> bool {
     ranges.partition_point(|&(base,_)|base<=va).checked_sub(1)
         .is_some_and(|i|va<ranges[i].1)
 }
+fn intersects(ranges:&[(u64,u64)],start:u64,end:u64)->bool {
+    ranges.partition_point(|&(base,_)|base<end).checked_sub(1)
+        .is_some_and(|i|ranges[i].1>start)
+}
 impl TableSnapshot {
     fn word(&self, table: u64, index: usize) -> Result<u64> {
         if index >= 2048 { return Err(EINVAL); }
@@ -107,6 +111,12 @@ impl RebindSnapshot {
             previous = Some(key);
             let old = self.snapshot.leaf_table(key)?;
             let next = incoming.caller_leaf_table(key)?;
+            // A private-only owned leaf with no incoming caller range stays
+            // linked verbatim. Do not scan its 2048 PTEs twice on every client
+            // switch. Borrowed caller leaves must still be unlinked below,
+            // and any old/incoming caller overlap retains full checks.
+            if old!=0 && next==0 && !self.borrowed.contains(&old)
+                && !intersects(&ranges,key<<25,(key+1)<<25) {continue;}
             let pure = if old == 0 || self.borrowed.contains(&old) { true } else {
                 let row = self.snapshot.rows.iter().find(|row|row.0==old).ok_or(EIO)?;
                 row.1.iter().enumerate().all(|(index,&word)| word == 0
