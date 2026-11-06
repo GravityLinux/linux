@@ -6,31 +6,21 @@
 use super::*;
 
 impl Bootstrap {
+    /// Give a VM's compute root its own FList before its first compute
+    /// command: `buffers` 2 MiB buffers plus the directory, mapped only into
+    /// this root, and an exclusively leased support object and hardware slot.
+    /// No other client's root can reach this pool's pages, and this root
+    /// reaches no other pool. ENOMEM/ENOSPC leave the root healthy: a retry
+    /// resumes the allocation.
     pub(crate) fn map_compute_work(
         &mut self,
         space: &mut g16_vm::AddressSpace,
         private: core::ops::Range<u64>,
+        buffers: usize,
     ) -> Result {
-        let opening = self._opening_client.as_mut().ok_or(EIO)?;
-        for (base, size) in compute::private_ranges() {
-            // Scratch and marker are private to each command at fresh VAs.
-            // Only the device-owned FList directory and spill pool are shared.
-            if base == compute::SCRATCH || base == compute::MARKER {
-                continue;
-            }
-            for va in (base..base + size as u64).step_by(0x4000) {
-                if space.low.translate(va)?.is_some() {
-                    return Err(EEXIST);
-                }
-                let pa = opening.low.translate(va)?.ok_or(EIO)?;
-                space.low.map_pages(
-                    va..va + 0x4000,
-                    pa,
-                    crate::pgtable::prot::PROT_GPU_SHARED_RW,
-                    false,
-                )?;
-            }
-        }
+        space.alloc_compute_pool(buffers)?;
+        let support = Arc::new(self.acquire_compute_support(buffers)?, GFP_KERNEL)?;
+        space.set_compute_support(support)?;
         space.init_compute_private(private);
         space.sync();
         Ok(())
@@ -167,6 +157,8 @@ impl Bootstrap {
         }
         fw.zero_live(work + 0x2000, 0x2000)?;
         let mut a = compute::Addresses::publication(self.compute_publication, ordinal, work, alias);
+        let support = client.compute_support().ok_or(EIO)?;
+        a.support = support.address();
         a.queue = lane.queue;
         a.driver_stamp = work + 0x4000;
         a.firmware_stamp = lane.firmware_stamp();
@@ -196,12 +188,16 @@ impl Bootstrap {
         // cache lines lost timestamps once the Work was reused.
         let user_timestamps = a.work + 0x4040;
         let count = self.compute_publication.wrapping_add(1);
-        let count32 = count as u32;
 
         let first = lane.head;
         let head = (first + 1 + dependencies.iter().flatten().count() as u32) % 0x500;
+        // The support's shared state counts every Work submitted against
+        // it (render items included, when compute shares the render pool).
+        let support = client.compute_support().ok_or(EIO)?;
+        let submitted = support.submissions.load(Ordering::Relaxed).wrapping_add(1);
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        fw.write_live(compute::SHARED_STATE, &count32.to_le_bytes())?;
+        fw.write_live(support.shared_state(), &(submitted as u32).to_le_bytes())?;
+        support.submissions.store(submitted, Ordering::Relaxed);
         fw.write_live(a.work, &self.encodings.compute)?;
         fw.write_live(a.work + compute::ENTRY_OFFSET, &compute::entry(params.cdm))?;
         let mut microsequence = params.microsequence(&a);

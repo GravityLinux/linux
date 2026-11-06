@@ -99,6 +99,7 @@ impl File {
                 draining: 0,
                 reservation,
                 render_support: None,
+                render_pool: None,
                 // The module parameter was validated at probe and debugfs
                 // writes are bounded, so the mode always parses.
                 native_mode: crate::g16_mesh::Mode::from_parameter(crate::g16_mesh::snapshot().1)

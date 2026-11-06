@@ -144,6 +144,8 @@ struct Vm {
     draining: u32,
     reservation: ARef<Object>,
     render_support: Option<Arc<crate::g16::Support>>,
+    /// The render pool layout `render_support` describes, once rendering.
+    render_pool: Option<render::OperandPool>,
     /// The native mesh mode when this VM was created. Its support header and
     /// every decode of its streams use it, whatever the runtime mode is later.
     native_mode: crate::g16_mesh::Mode,
@@ -371,6 +373,16 @@ pub(crate) fn register<'a>(
             c_str!("render_operand_buffers"),
             FlagKnob::RENDER_OPERAND_BUFFERS,
             crate::module_parameters::render_operand_buffers.value(),
+        ),
+        (
+            c_str!("compute_pool_buffers"),
+            FlagKnob::COMPUTE_POOL_BUFFERS,
+            crate::module_parameters::compute_pool_buffers.value(),
+        ),
+        (
+            c_str!("compute_shares_render_pool"),
+            FlagKnob::COMPUTE_SHARES_RENDER_POOL,
+            crate::module_parameters::compute_shares_render_pool.value(),
         ),
     ];
     let mut flags = KVec::with_capacity(knobs.len(), GFP_KERNEL)?;

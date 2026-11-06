@@ -348,6 +348,15 @@ pub(crate) fn shared_notifier() -> bool {
 /// asahi_m4/render_operand_buffers). Submission rejects values outside 1..=24.
 pub(crate) static RENDER_OPERAND_BUFFERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(24);
 
+/// Buffers in the private compute pool of each VM whose first compute comes
+/// afterwards (asahi_m4.compute_pool_buffers; runtime: debugfs
+/// asahi_m4/compute_pool_buffers). Submission rejects 0.
+pub(crate) static COMPUTE_POOL_BUFFERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(16);
+
+/// 1: a VM whose first compute comes afterwards runs compute on its render
+/// pool and support (asahi_m4.compute_shares_render_pool; runtime: debugfs).
+pub(crate) static COMPUTE_SHARES_RENDER_POOL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// A 0/1 debugfs switch over a static.
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
@@ -369,6 +378,16 @@ impl FlagKnob {
         cell: &RENDER_OPERAND_BUFFERS,
         name: "render_operand_buffers",
         max: crate::g16_render::OPERAND_BUFFERS_MAX,
+    };
+    pub(crate) const COMPUTE_POOL_BUFFERS: Self = Self {
+        cell: &COMPUTE_POOL_BUFFERS,
+        name: "compute_pool_buffers",
+        max: crate::g16_compute::BUFFER_COUNT as u32,
+    };
+    pub(crate) const COMPUTE_SHARES_RENDER_POOL: Self = Self {
+        cell: &COMPUTE_SHARES_RENDER_POOL,
+        name: "compute_shares_render_pool",
+        max: 1,
     };
 }
 

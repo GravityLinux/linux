@@ -249,8 +249,11 @@ impl File {
                 GFP_KERNEL,
             )?;
         }
-        let needs_mapping =
-            (renders != 0 && !vm.render_ready) || (computes != 0 && !vm.compute_ready);
+        let first_compute = computes != 0 && !vm.compute_ready;
+        // Experimental: compute on the VM's render pool needs that pool.
+        let share = first_compute
+            && crate::g16_timeline::COMPUTE_SHARES_RENDER_POOL.load(Ordering::Relaxed) != 0;
+        let needs_mapping = (renders != 0 && !vm.render_ready) || first_compute;
         if needs_mapping {
             // These reserved namespaces are initialized once before this
             // VM's first command on the corresponding engine.
@@ -258,7 +261,7 @@ impl File {
             if runtime.render_failed() {
                 return Err(EIO);
             }
-            if renders != 0 && !vm.render_ready {
+            if (renders != 0 || share) && !vm.render_ready {
                 // Native mesh keeps its qualified full-size pool.
                 let buffers = if vm.native_mode.enabled() {
                     render::OPERAND_BUFFERS_MAX
@@ -283,13 +286,36 @@ impl File {
                     return Err(error);
                 }
                 vm.render_support = Some(support);
+                vm.render_pool = Some(pool);
                 vm.render_ready = true;
             }
-            if computes != 0 && !vm.compute_ready {
-                vm.render_broken = true;
-                runtime.map_compute_work(&mut vm.compute_space.lock(), vm.kernel.clone())?;
+            if first_compute {
+                let result = if share {
+                    let support = vm.render_support.clone().ok_or(EIO)?;
+                    let pool = vm.render_pool.ok_or(EIO)?;
+                    let pages = vm.space.lock().render_pool_pages(&pool)?;
+                    let start = pool.end().ok_or(EINVAL)?;
+                    let mut space = vm.compute_space.lock();
+                    space
+                        .share_render_pool(&pages, vm.space.clone())
+                        .and_then(|()| space.set_compute_support(support))
+                        .map(|()| {
+                            // Compute scratch stays clear of the pool VAs.
+                            space.init_compute_private(start..vm.kernel.end);
+                            space.sync();
+                        })
+                } else {
+                    let buffers =
+                        crate::g16_timeline::COMPUTE_POOL_BUFFERS.load(Ordering::Relaxed) as usize;
+                    runtime.map_compute_work(&mut vm.compute_space.lock(), vm.kernel.clone(), buffers)
+                };
+                if let Err(error) = result {
+                    // Allocation failures resume on a retry; anything else
+                    // (a conflicting PTE) quarantines the VM.
+                    vm.render_broken = error != ENOMEM && error != ENOSPC;
+                    return Err(error);
+                }
                 vm.compute_ready = true;
-                vm.render_broken = false;
             }
         }
         // Provision what this queue's or VM root's first publication would
