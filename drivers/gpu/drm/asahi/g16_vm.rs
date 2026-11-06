@@ -375,6 +375,32 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Debug (debug_ctx): name this compute root's pool placement, so
+    /// separate clients' pools can be told apart by physical address.
+    pub(crate) fn report_compute_pool(&mut self, kind: &str) {
+        use crate::g16_compute as compute;
+        if crate::module_parameters::debug_ctx.value() == 0 {
+            return;
+        }
+        let (directory, buffer) = match self._pool_owner {
+            Some(_) => (0, 0),
+            None => (compute::DIRECTORY, compute::BUFFER_BASE),
+        };
+        let pa = |space: &mut Self, va: u64| {
+            if va == 0 { 0 } else { space.low.translate(va).ok().flatten().unwrap_or(0) }
+        };
+        let (d, b) = (pa(self, directory), pa(self, buffer));
+        pr_info!(
+            "G16: compute root {:#x}: {} pool, support {:#x}, directory pa {:#x}, buffer0 pa {:#x}, owned {} KiB\n",
+            self.low.ttb(),
+            kind,
+            self.compute_support.as_ref().map_or(0, |s| s.address()),
+            d,
+            b,
+            self.owned_bytes / 1024
+        );
+    }
+
     pub(crate) fn compute_support(&self) -> Option<&crate::g16::Support> {
         self.compute_support.as_deref()
     }
