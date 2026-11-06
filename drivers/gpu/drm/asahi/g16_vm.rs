@@ -8,11 +8,55 @@
 use crate::g16_alloc::Arena;
 use crate::pgtable::{prot, UatPageTable, UAT_PGSZ};
 use kernel::rbtree::{RBTree, RBTreeNode};
-use kernel::{device, page::Page, prelude::*};
+use kernel::{bindings, device, page::Page, prelude::*, types::Owned};
 
 const IAS: usize = 42;
 const OAS: u32 = 42;
 const USC_BASE: u64 = 0x100_0000_0000;
+
+/// A page the GPU uses on behalf of a client or the firmware. Its lifetime is
+/// counted in the node's `NR_GPU_ACTIVE` (`GPUActive` in /proc/meminfo,
+/// `nr_gpu_active` in vmstat), as TTM counts its pool pages, so these pages are
+/// not missing from the meminfo totals. The count is per node only: memory
+/// cgroups have no such item. Pages allocated with `__GFP_ACCOUNT` are charged
+/// to the allocating task's memory cgroup until they are freed.
+pub(crate) struct GpuPage(Owned<Page>);
+
+impl GpuPage {
+    pub(crate) fn alloc(flags: kernel::alloc::Flags) -> Result<Self, kernel::alloc::AllocError> {
+        let page = Page::alloc_page(flags)?;
+        // SAFETY: `page` is a valid page owned by this allocation.
+        unsafe {
+            bindings::mod_node_page_state(
+                bindings::page_pgdat(page.as_ptr()),
+                bindings::node_stat_item_NR_GPU_ACTIVE,
+                1,
+            )
+        };
+        Ok(Self(page))
+    }
+}
+
+impl core::ops::Deref for GpuPage {
+    type Target = Page;
+    fn deref(&self) -> &Page {
+        &self.0
+    }
+}
+
+impl Drop for GpuPage {
+    fn drop(&mut self) {
+        // SAFETY: The page stays allocated until `self.0` is dropped, after
+        // this function returns.
+        unsafe {
+            bindings::mod_node_page_state(
+                bindings::page_pgdat(self.0.as_ptr()),
+                bindings::node_stat_item_NR_GPU_ACTIVE,
+                -1,
+            )
+        };
+    }
+}
 
 /// Published root addresses. The submission owner must retain their VM until
 /// GPU completion; copying these addresses does not transfer page ownership.
@@ -26,7 +70,9 @@ pub(crate) struct AddressSpace {
     pub(crate) low: UatPageTable,
     pub(crate) high: UatPageTable,
     // Drop the owned tables before releasing their mapped pages.
-    pages: RBTree<u64, Owned<Page>>,
+    pages: RBTree<u64, GpuPage>,
+    /// Bytes of `pages`. Pages are only released with the address space.
+    owned_bytes: usize,
     compute_arena: Arena,
     render_arena: Arena,
     scratch_free: [KVec<core::ops::Range<u64>>; 2],
@@ -55,6 +101,12 @@ impl AddressSpace {
             ),
         }
     }
+    /// Bytes of backing owned by this root (render private storage, scratch,
+    /// tiler blocks and work aliases), for fdinfo.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        self.owned_bytes
+    }
+
     pub(crate) fn roots(&self) -> Roots {
         Roots {
             low: self.low.ttb(),
@@ -87,6 +139,7 @@ impl AddressSpace {
             low: UatPageTable::new_with_ias(OAS, IAS)?,
             high: UatPageTable::new_with_ias(OAS, IAS)?,
             pages: RBTree::new(),
+            owned_bytes: 0,
             compute_arena: Arena::default(),
             render_arena: Arena::default(),
             scratch_free: [KVec::new(), KVec::new()],
@@ -110,9 +163,10 @@ impl AddressSpace {
             }
         }
         for v in (va..end).step_by(UAT_PGSZ) {
-            let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+            let page = GpuPage::alloc(GFP_KERNEL | __GFP_ZERO)?;
             let phys = page.phys();
             self.pages.try_create_and_insert(v, page, GFP_KERNEL)?;
+            self.owned_bytes += UAT_PGSZ;
             self.low
                 .map_pages(v..v + UAT_PGSZ as u64, phys, access, false)?;
         }
@@ -123,6 +177,7 @@ impl AddressSpace {
     /// ENOMEM may leave a partial graph, all owned here. This root has never
     /// rendered: retry can finish missing pages/PTEs and reinitialize storage
     /// before its first publication. Never replace a conflicting mapping.
+    /// Runs in the submitting client's ioctl, which is charged for the pages.
     pub(crate) fn alloc_render_private(&mut self, start: u64, end: u64) -> Result {
         use crate::g16_render as render;
         let mut params = render::Parameters::default();
@@ -139,8 +194,9 @@ impl AddressSpace {
                 if self.low.translate(va)?.is_some() {
                     return Err(EEXIST);
                 }
-                let page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
-                self.pages.try_create_and_insert(va, page, GFP_KERNEL)?;
+                let page = GpuPage::alloc(GFP_KERNEL_ACCOUNT | __GFP_ZERO)?;
+                self.pages.try_create_and_insert(va, page, GFP_KERNEL_ACCOUNT)?;
+                self.owned_bytes += UAT_PGSZ;
             }
             let physical = self.pages.get(&va).ok_or(EIO)?.phys();
             self.map_render_page(va, physical)?;
@@ -342,7 +398,7 @@ impl AddressSpace {
                 }
             }
             for va in (start..start + 0x20000).step_by(UAT_PGSZ) {
-                let page = match Page::alloc_page(gfp | __GFP_ZERO) {
+                let page = match GpuPage::alloc(gfp | __GFP_ZERO) {
                     Ok(page) => page,
                     Err(_) => return Ok(None),
                 };
@@ -357,6 +413,7 @@ impl AddressSpace {
         self.render_arena = arena;
         for node in pages {
             self.pages.insert(node);
+            self.owned_bytes += UAT_PGSZ;
         }
         for block in 0..count {
             let start = base + block as u64 * 0x28000;
@@ -493,11 +550,9 @@ impl AddressSpace {
     }
 }
 
-use kernel::types::Owned;
-
 struct FirmwareRegion {
     va: u64,
-    pages: KVec<Owned<Page>>,
+    pages: KVec<GpuPage>,
 }
 
 /// The firmware uses this bootloader root independently of all client slots.
@@ -593,7 +648,7 @@ impl FirmwareSpace {
         }
         let mut pages = KVec::new();
         for _ in 0..size / UAT_PGSZ {
-            pages.push(Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?, GFP_KERNEL)?;
+            pages.push(GpuPage::alloc(GFP_KERNEL | __GFP_ZERO)?, GFP_KERNEL)?;
         }
         let node = RBTreeNode::new(va, FirmwareRegion { va, pages }, GFP_KERNEL)?;
         self.regions.insert(node);
