@@ -696,22 +696,25 @@ impl drm::file::DriverFile for File {
     }
     const HAS_SHOW_FDINFO: bool = true;
     /// GEM handles as the standard `memory` region, plus the pages the driver
-    /// owns for this client's VMs (render private storage and its operand
-    /// pool, scratch, tiler blocks) as the resident `kernel` region.
+    /// owns for this client's VMs as two resident regions: `kernel`, the
+    /// render roots (render private storage and its operand pool, render
+    /// scratch, tiler blocks), and `compute`, the compute roots (each private
+    /// compute pool and compute scratch). The regions are disjoint.
     fn show_fdinfo(&self, file: &DrmFile, printer: &mut drm::file::Printer) {
         printer.gem_memory_stats(file);
-        let mut owned = 0u64;
+        let (mut render, mut compute) = (0u64, 0u64);
         for vm in self.state.lock().vms.iter() {
-            for space in [&vm.space, &vm.compute_space] {
-                owned += space.lock().owned_bytes() as u64;
-            }
+            render += vm.space.lock().owned_bytes() as u64;
+            compute += vm.compute_space.lock().owned_bytes() as u64;
         }
-        let stats = drm::file::MemoryStats {
-            private: owned,
-            resident: owned,
-            ..Default::default()
-        };
-        printer.memory_stats(&stats, true, c_str!("kernel"));
+        for (owned, region) in [(render, c_str!("kernel")), (compute, c_str!("compute"))] {
+            let stats = drm::file::MemoryStats {
+                private: owned,
+                resident: owned,
+                ..Default::default()
+            };
+            printer.memory_stats(&stats, true, region);
+        }
     }
 }
 
