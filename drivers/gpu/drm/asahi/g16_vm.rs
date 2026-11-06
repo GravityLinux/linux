@@ -177,18 +177,29 @@ impl AddressSpace {
     /// ENOMEM may leave a partial graph, all owned here. This root has never
     /// rendered: retry can finish missing pages/PTEs and reinitialize storage
     /// before its first publication. Never replace a conflicting mapping.
+    /// `pool` must be the one whose support object this root's renders use.
     /// Runs in the submitting client's ioctl, which is charged for the pages.
-    pub(crate) fn alloc_render_private(&mut self, start: u64, end: u64) -> Result {
+    pub(crate) fn alloc_render_private(
+        &mut self,
+        start: u64,
+        end: u64,
+        pool: &crate::g16_render::OperandPool,
+    ) -> Result {
         use crate::g16_render as render;
         let mut params = render::Parameters::default();
         params.set_private(start, end).ok_or(EINVAL)?;
-        let pool = render::OperandPool::new(start, end).ok_or(EINVAL)?;
+        if render::OperandPool::new(start, end).map(|p| p.directory) != Some(pool.directory) {
+            return Err(EINVAL);
+        }
         let remaining = pool.end().ok_or(EINVAL)?..end.min(render::CONTEXT_BASE + (1 << 32));
         if remaining.start > remaining.end {
             return Err(ENOMEM);
         }
         self.render_arena = Arena::new(remaining);
         for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
+            if !pool.backed(offset) {
+                continue;
+            }
             let va = start + offset as u64;
             if self.pages.get(&va).is_none() {
                 if self.low.translate(va)?.is_some() {
@@ -202,16 +213,19 @@ impl AddressSpace {
             self.map_render_page(va, physical)?;
         }
         for offset in (0..render::PRIVATE_SIZE).step_by(UAT_PGSZ) {
+            if !pool.backed(offset) {
+                continue;
+            }
             let va = start + offset as u64;
             let page = self.pages.get(&va).ok_or(EIO)?;
             page.with_pointer_into_page(0, UAT_PGSZ, |ptr| {
                 // SAFETY: The closure has exclusive access to the full page
                 // owned by this unpublished VM; no GPU root references it.
                 let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, UAT_PGSZ) };
-                render::private_page(&pool, offset, bytes).ok_or(EINVAL)
+                render::private_page(pool, offset, bytes).ok_or(EINVAL)
             })?;
         }
-        for (alias, offset, size) in render::private_aliases(&pool) {
+        for (alias, offset, size) in render::private_aliases(pool) {
             for page in (0..size).step_by(UAT_PGSZ) {
                 let va = alias + page as u64;
                 let physical = self

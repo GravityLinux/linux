@@ -380,6 +380,10 @@ impl Bootstrap {
             0xffff_fc20_001b_8000,
             crate::g16_compute::QUEUE,
             crate::g16_compute::SHARED,
+            // FList support objects (render leases and the opening pool):
+            // their ring counters.
+            crate::g16_render::SUPPORT_BASE,
+            crate::g16_fw::CONTROL_DATA,
         ];
         let heaps = FIRMWARE_HEAPS.iter().map(|(va, _)| *va);
         for va in Iterator::chain(Iterator::chain(fixed.into_iter(), heaps), SHARED_PAGES) {
