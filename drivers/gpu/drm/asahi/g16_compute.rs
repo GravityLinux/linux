@@ -24,8 +24,6 @@ pub(crate) const BUFFER_SIZE: usize = 0x200000;
 pub(crate) const BUFFER_COUNT: usize = 16;
 pub(crate) const SCRATCH: u64 = 0x70_030e_0000;
 pub(crate) const MARKER: u64 = 0x10_00c6_0000;
-pub(crate) const SUPPORT: u64 = 0xffff_fc20_c05e_8000;
-pub(crate) const SHARED_STATE: u64 = 0xffff_fc20_001b_0000;
 pub(crate) const ENTRY_OFFSET: u64 = 0x1a00;
 
 /// Drain/invalidate compute caches before entering the caller's CDM stream.
@@ -46,11 +44,6 @@ pub(crate) fn private_ranges() -> [(u64, usize); 19] {
         2 => (MARKER, 0x4000),
         _ => (BUFFER_BASE + (i - 3) as u64 * BUFFER_STRIDE, BUFFER_SIZE),
     })
-}
-
-/// The opening (device) compute support object, slot 2.
-pub(crate) fn support() -> [u8; 0x100] {
-    pool_support(2, SHARED_STATE, BUFFER_COUNT)
 }
 
 /// The support object of a compute FList with `buffers` buffers at the fixed
@@ -137,7 +130,8 @@ impl Addresses {
             register_table: alias + 0x20,
             queue: QUEUE,
             stats: STATS,
-            support: SUPPORT,
+            // The VM's support object, set by the submission.
+            support: 0,
             notifier: work + 0x1400,
             threshold: work + 0x1800,
             driver_stamp: work + 0x1600,
