@@ -11,13 +11,16 @@ pub(crate) const QUEUE: u64 = 0xffff_fc20_c500_0000;
 pub(crate) const STATS: u64 = QUEUE + 0x8000;
 pub(crate) const SHARED: u64 = 0xffff_fc20_0200_0000;
 
-// Device-owned opening namespace. Client roots share only the FList directory
-// and spill pool; each command receives distinct scratch/marker VAs instead.
+// Each VM's compute FList, in its compute root: the ring directory of free
+// 4 KiB pages and the 2 MiB buffers holding them, at fixed VAs outside the
+// client's GEM range. Each command receives distinct scratch/marker VAs in
+// the VM's kernel carveout instead.
 pub(crate) const DIRECTORY: u64 = 0x70_02cc_0000;
 pub(crate) const DIRECTORY_SIZE: usize = 0x18000;
 pub(crate) const BUFFER_BASE: u64 = 0x70_0310_8000;
 pub(crate) const BUFFER_STRIDE: u64 = 0x208000;
 pub(crate) const BUFFER_SIZE: usize = 0x200000;
+/// Buffers the VA layout has room for, and the default pool size.
 pub(crate) const BUFFER_COUNT: usize = 16;
 pub(crate) const SCRATCH: u64 = 0x70_030e_0000;
 pub(crate) const MARKER: u64 = 0x10_00c6_0000;
@@ -45,21 +48,44 @@ pub(crate) fn private_ranges() -> [(u64, usize); 19] {
     })
 }
 
+/// The opening (device) compute support object, slot 2.
 pub(crate) fn support() -> [u8; 0x100] {
+    pool_support(2, SHARED_STATE, BUFFER_COUNT)
+}
+
+/// The support object of a compute FList with `buffers` buffers at the fixed
+/// pool VAs. `id` is both the pool identity (+0) and the hardware FList slot
+/// (+8): a pool must never share its slot with another pool in use.
+pub(crate) fn pool_support(id: u64, shared: u64, buffers: usize) -> [u8; 0x100] {
     let mut out = [0; 0x100];
-    let pages = (BUFFER_COUNT * BUFFER_SIZE / 0x1000) as u32;
-    u64_at(&mut out, 0, 2);
+    let pages = (buffers.min(BUFFER_COUNT) * BUFFER_SIZE / 0x1000) as u32;
+    u64_at(&mut out, 0, id);
     // +8 selects the hardware FList slot; +0 is a separate pool identity.
     // Sharing slot zero with render corrupts concurrently active pool state.
-    u32_at(&mut out, 8, 2);
+    u32_at(&mut out, 8, id as u32);
     u64_at(&mut out, 0x14, DIRECTORY);
     u32_at(&mut out, 0x1c, (DIRECTORY_SIZE / 8) as u32);
     u32_at(&mut out, 0x24, pages % (DIRECTORY_SIZE / 8) as u32);
     u32_at(&mut out, 0x2c, pages);
-    u64_at(&mut out, 0x4c, SHARED_STATE);
+    u64_at(&mut out, 0x4c, shared);
     out
 }
 
+/// One 16 KiB page of the pool directory, at byte `offset`: ring entries
+/// 0..pages start out holding every pool page, in buffer order.
+pub(crate) fn directory_page(offset: usize, buffers: usize, out: &mut [u8]) {
+    let pages = buffers.min(BUFFER_COUNT) * (BUFFER_SIZE / 0x1000);
+    out.fill(0);
+    for i in 0..out.len() / 8 {
+        let page = offset / 8 + i;
+        if page >= pages {
+            break;
+        }
+        let per = BUFFER_SIZE / 0x1000;
+        let va = BUFFER_BASE + (page / per) as u64 * BUFFER_STRIDE + (page % per) as u64 * 0x1000;
+        u64_at(out, i * 8, va);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Parameters {

@@ -77,6 +77,14 @@ pub(crate) struct AddressSpace {
     render_arena: Arena,
     scratch_free: [KVec<core::ops::Range<u64>>; 2],
     scratch_users: [usize; 2],
+    /// The support of this compute root's FList (a private pool's own lease,
+    /// or the VM's render support when sharing its pool). Pending and
+    /// quarantined Works retain it with the root, so its hardware slot is not
+    /// recycled while the firmware can still use it.
+    compute_support: Option<kernel::sync::Arc<crate::g16::Support>>,
+    /// Owner of pool pages this root maps but does not own (the render root,
+    /// when sharing its pool); retained as long as the mappings.
+    _pool_owner: Option<kernel::sync::Arc<kernel::sync::Mutex<AddressSpace>>>,
 }
 
 /// An exclusive suballocation; its backing remains owned by the VM.
@@ -144,6 +152,8 @@ impl AddressSpace {
             render_arena: Arena::default(),
             scratch_free: [KVec::new(), KVec::new()],
             scratch_users: [0; 2],
+            compute_support: None,
+            _pool_owner: None,
         })
     }
 
@@ -292,6 +302,89 @@ impl AddressSpace {
         self.write_low(p.aux_fb + 0x600, &0x0000035b60000000u64.to_le_bytes())?;
         self.sync();
         Ok(scratch)
+    }
+
+    /// Back this compute root's private FList with `buffers` 2 MiB buffers
+    /// and its ring directory, at the fixed pool VAs, so the pool's pages are
+    /// reachable from no other client's roots. Runs in the submitting client's
+    /// ioctl, which is charged for the pages. After ENOMEM a retry resumes:
+    /// pages already owned here are kept, and the directory is rewritten.
+    pub(crate) fn alloc_compute_pool(&mut self, buffers: usize) -> Result {
+        use crate::g16_compute as compute;
+        if !(1..=compute::BUFFER_COUNT).contains(&buffers) {
+            return Err(EINVAL);
+        }
+        let ranges = Iterator::chain(
+            core::iter::once((compute::DIRECTORY, compute::DIRECTORY_SIZE)),
+            (0..buffers).map(|i| {
+                (compute::BUFFER_BASE + i as u64 * compute::BUFFER_STRIDE, compute::BUFFER_SIZE)
+            }),
+        );
+        for (base, size) in ranges {
+            for va in (base..base + size as u64).step_by(UAT_PGSZ) {
+                if self.pages.get(&va).is_none() {
+                    if self.low.translate(va)?.is_some() {
+                        return Err(EEXIST);
+                    }
+                    let page = GpuPage::alloc(GFP_KERNEL_ACCOUNT | __GFP_ZERO)?;
+                    self.pages.try_create_and_insert(va, page, GFP_KERNEL_ACCOUNT)?;
+                    self.owned_bytes += UAT_PGSZ;
+                }
+                let physical = self.pages.get(&va).ok_or(EIO)?.phys();
+                self.map_render_page(va, physical)?;
+            }
+        }
+        let mut row = [0u8; 256];
+        for offset in (0..compute::DIRECTORY_SIZE).step_by(row.len()) {
+            compute::directory_page(offset, buffers, &mut row);
+            self.write_low(compute::DIRECTORY + offset as u64, &row)?;
+        }
+        self.sync();
+        Ok(())
+    }
+
+    /// The (VA, physical) pages of this render root's FList: its directory,
+    /// descriptor table and buffers.
+    pub(crate) fn render_pool_pages(
+        &mut self,
+        pool: &crate::g16_render::OperandPool,
+    ) -> Result<KVec<(u64, u64)>> {
+        let end = pool.end().ok_or(EINVAL)?;
+        let mut pages = KVec::new();
+        for va in (pool.directory..end).step_by(UAT_PGSZ) {
+            if let Some(physical) = self.low.translate(va)? {
+                pages.push((va, physical), GFP_KERNEL)?;
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Map the render pool of this VM (`pages`, from `render_pool_pages` of
+    /// `owner`) into this compute root at the same VAs, so compute Works can
+    /// use the render support object. `owner` is retained with the mappings.
+    pub(crate) fn share_render_pool(
+        &mut self,
+        pages: &[(u64, u64)],
+        owner: kernel::sync::Arc<kernel::sync::Mutex<AddressSpace>>,
+    ) -> Result {
+        for &(va, physical) in pages {
+            self.map_render_page(va, physical)?;
+        }
+        self._pool_owner = Some(owner);
+        self.sync();
+        Ok(())
+    }
+
+    pub(crate) fn compute_support(&self) -> Option<&crate::g16::Support> {
+        self.compute_support.as_deref()
+    }
+
+    pub(crate) fn set_compute_support(&mut self, support: kernel::sync::Arc<crate::g16::Support>) -> Result {
+        if self.compute_support.is_some() {
+            return Err(EEXIST);
+        }
+        self.compute_support = Some(support);
+        Ok(())
     }
 
     /// Compute commands use distinct private scratch addresses in the caller's

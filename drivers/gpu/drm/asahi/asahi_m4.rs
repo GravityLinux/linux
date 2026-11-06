@@ -175,6 +175,14 @@ kernel::module_platform_driver! {
             default: 24,
             description: "Research: 2 MiB shader private-memory (operand) buffers in each VM's render pool, 1..=24 (default 24; native mesh VMs always use 24). Each is resident for the VM's lifetime. Smaller pools starve large shader scratch frames: 8 made 32 KiB frames 3.7x slower with a 2 s stall, 4 hung the GPU. Runtime: debugfs asahi_m4/render_operand_buffers, read at each VM's first render",
         },
+        compute_pool_buffers: u32 {
+            default: 16,
+            description: "Research: 2 MiB shader private-memory buffers in each VM's private compute pool, 1..=16 (default 16, the size of the former device-wide pool). Allocated at the VM's first compute command and charged to that client; VMs that never run compute pay nothing. Runtime: debugfs asahi_m4/compute_pool_buffers, read at each VM's first compute",
+        },
+        compute_shares_render_pool: u32 {
+            default: 0,
+            description: "Experimental: 1 makes each VM's compute Works use that VM's render pool and support object (allocating them at the first compute if the VM has not rendered) instead of a private compute pool; one FList slot then serves both engines. 0 (default): a private compute pool per VM. Runtime: debugfs asahi_m4/compute_shares_render_pool, read at each VM's first compute",
+        },
         native_mesh: u32 {
             default: 0,
             description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16/T32 one-parent profile, 2=unqualified multiple-parent profile, 3=research admission of wider mesh state (not qualified); no capability advertisement. Runtime: debugfs asahi_m4/native_mesh (a VM keeps the support mode of its first render)",

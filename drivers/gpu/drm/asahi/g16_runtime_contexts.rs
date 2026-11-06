@@ -52,12 +52,13 @@ impl Bootstrap {
         self.render_failed
     }
 
-    /// `mode`: the VM's native mesh mode, latched when it was created.
-    pub(crate) fn acquire_render_support(&mut self, pool: &render::OperandPool, mode: g16_mesh::Mode) -> Result<Support> {
+    /// Lease a support object, its shared state page and hardware FList slot
+    /// 3 + index. Render pools and private compute pools share the leases, so
+    /// no two pools in use ever share a slot.
+    fn acquire_support_slot(&mut self, mode: g16_mesh::Mode) -> Result<Support> {
         if self.render_failed {
             return Err(EIO);
         }
-        let native = mode.enabled();
         let mut used = self.render_support.load(Ordering::Acquire);
         let index = loop {
             let index = (!used).trailing_zeros();
@@ -74,28 +75,46 @@ impl Bootstrap {
                 Err(value) => used = value,
             }
         };
-        let lease = Support {
+        Ok(Support {
             slots: self.render_support.clone(),
             index,
             submissions: AtomicU64::new(
                 crate::module_parameters::fw_counter_start.value().wrapping_mul(2),
             ),
-            native,
+            native: mode.enabled(),
             mode,
-        };
-        let mut a = render::Addresses::bootstrap();
-        a.support = lease.address();
-        a.render_shared_state = lease.shared_state();
+        })
+    }
+
+    /// Write a fresh support header (the rest of its page zero) and zero the
+    /// lease's shared state: a reused lease starts its submitted-Work count
+    /// afresh.
+    fn publish_support(&mut self, lease: &Support, header: &[u8; 0x100]) -> Result {
         let mut page = KVec::new();
         page.extend_with(0x4000, 0u8, GFP_KERNEL)?;
-        page[..0x100].copy_from_slice(&pool.support(3 + u64::from(index), a.render_shared_state));
-        if lease.native {
-            render::initialize_native_support(&mut page[..0x100]);
-        }
+        page[..0x100].copy_from_slice(header);
         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
-        fw.write_live(a.support, &page)?;
-        // A reused lease starts its submitted-Work count afresh.
-        fw.zero_live(a.render_shared_state, 0x4000)?;
+        fw.write_live(lease.address(), &page)?;
+        fw.zero_live(lease.shared_state(), 0x4000)?;
+        Ok(())
+    }
+
+    /// `mode`: the VM's native mesh mode, latched when it was created.
+    pub(crate) fn acquire_render_support(&mut self, pool: &render::OperandPool, mode: g16_mesh::Mode) -> Result<Support> {
+        let lease = self.acquire_support_slot(mode)?;
+        let mut header = pool.support(3 + u64::from(lease.index), lease.shared_state());
+        if lease.native {
+            render::initialize_native_support(&mut header);
+        }
+        self.publish_support(&lease, &header)?;
+        Ok(lease)
+    }
+
+    /// The support of a VM's private compute pool of `buffers` buffers.
+    pub(crate) fn acquire_compute_support(&mut self, buffers: usize) -> Result<Support> {
+        let lease = self.acquire_support_slot(g16_mesh::Mode::Disabled)?;
+        let header = compute::pool_support(3 + u64::from(lease.index), lease.shared_state(), buffers);
+        self.publish_support(&lease, &header)?;
         Ok(lease)
     }
 
