@@ -343,6 +343,11 @@ pub(crate) fn shared_notifier() -> bool {
     SHARED_NOTIFIER.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// Operand buffers in the render pool of each VM whose first render comes
+/// afterwards (asahi_m4.render_operand_buffers; runtime: debugfs
+/// asahi_m4/render_operand_buffers). Submission rejects values outside 1..=24.
+pub(crate) static RENDER_OPERAND_BUFFERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(24);
+
 /// A 0/1 debugfs switch over a static.
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
@@ -360,6 +365,11 @@ impl FlagKnob {
     pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", max: i32::MAX as u32 };
     pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", max: i32::MAX as u32 };
     pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", max: 4096 };
+    pub(crate) const RENDER_OPERAND_BUFFERS: Self = Self {
+        cell: &RENDER_OPERAND_BUFFERS,
+        name: "render_operand_buffers",
+        max: crate::g16_render::OPERAND_BUFFERS_MAX,
+    };
 }
 
 /// debugfs `asahi_m4/native_mesh`: the runtime native mesh mode. Each write

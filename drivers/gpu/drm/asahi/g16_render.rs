@@ -829,18 +829,38 @@ impl Parameters {
 
 /// Per-VM firmware operand storage, placed in the caller kernel carveout.
 pub(crate) const CONTEXT_BASE: u64 = 0x10_0000_0000;
+/// Extent of the private backing window. Its directory and operand-buffer
+/// spans are backed only as far as the pool's buffer count needs.
 pub(crate) const PRIVATE_SIZE: usize = 0x35d4000;
 pub(crate) const HEAPMETA_OFFSET: u64 = 0x35d0000;
 const OPERAND_STRIDE: u64 = 0x208000;
+/// Operand (shader private-memory) buffers the VA layout has room for.
+pub(crate) const OPERAND_BUFFERS_MAX: u32 = 24;
+/// 4 KiB accelerator pages in each 2 MiB operand buffer.
+const OPERAND_PAGES: u32 = 512;
+const DIRECTORY_BACKING: usize = 0x40000;
+const DIRECTORY_SPAN: usize = 0x400000;
+const TABLE_BACKING: usize = 0x440000;
+const BUFFER_BACKING: usize = 0x450000;
+const BUFFER_SIZE: usize = 0x200000;
 
+/// The render FList: a ring directory of free 4 KiB operand pages and the
+/// descriptor table of the 2 MiB buffers holding them. The accelerator takes
+/// pages for shader private memory and returns them to the ring tail when
+/// the work retires. Only `buffers` buffers are backed and registered; the
+/// VA layout always reserves room for `OPERAND_BUFFERS_MAX`.
 #[derive(Clone, Copy)]
 pub(crate) struct OperandPool {
     pub(crate) directory: u64,
     pub(crate) table: u64,
     buffer: u64,
+    buffers: u32,
 }
 impl OperandPool {
     pub(crate) fn new(start: u64, end: u64) -> Option<Self> {
+        Self::with_buffers(start, end, OPERAND_BUFFERS_MAX)
+    }
+    pub(crate) fn with_buffers(start: u64, end: u64, buffers: u32) -> Option<Self> {
         let directory = start.checked_add(PRIVATE_SIZE as u64 + 0x4000)?;
         let table = directory.checked_add(0x408000)?;
         let buffer = table.checked_add(0x18000)?;
@@ -848,14 +868,40 @@ impl OperandPool {
             directory,
             table,
             buffer,
+            buffers,
         };
-        if start & 0x3fff != 0 || pool.end()? > end {
+        if start & 0x3fff != 0
+            || !(1..=OPERAND_BUFFERS_MAX).contains(&buffers)
+            || pool.end()? > end
+        {
             return None;
         }
         Some(pool)
     }
     pub(crate) fn end(&self) -> Option<u64> {
-        self.buffer.checked_add(24 * OPERAND_STRIDE)
+        self.buffer.checked_add(OPERAND_BUFFERS_MAX as u64 * OPERAND_STRIDE)
+    }
+    fn pages(&self) -> u32 {
+        self.buffers * OPERAND_PAGES
+    }
+    /// Ring entries: at least twice the page count, so a ring holding every
+    /// page is never full (the compute FList likewise keeps its capacity above
+    /// its pages), in whole 16 KiB directory pages.
+    fn capacity(&self) -> u32 {
+        (2 * self.pages()).next_multiple_of(0x4000 / 8)
+    }
+    fn directory_bytes(&self) -> usize {
+        self.capacity() as usize * 8
+    }
+    /// Whether this page of the private backing window is allocated. The
+    /// unregistered directory tail and operand buffers are holes: the
+    /// accelerator reaches the directory and buffers only through their
+    /// aliases, within the extents the support object advertises.
+    pub(crate) fn backed(&self, offset: usize) -> bool {
+        let directory = DIRECTORY_BACKING + self.directory_bytes()..DIRECTORY_BACKING + DIRECTORY_SPAN;
+        let buffers = BUFFER_BACKING + self.buffers as usize * BUFFER_SIZE
+            ..BUFFER_BACKING + OPERAND_BUFFERS_MAX as usize * BUFFER_SIZE;
+        !directory.contains(&offset) && !buffers.contains(&offset)
     }
     pub(crate) fn support(&self, id: u64, shared: u64) -> [u8; 0x100] {
         let mut out = [0; 0x100];
@@ -865,11 +911,13 @@ impl OperandPool {
         // this slot into the accelerator's private-memory pool selector.
         u32_at(&mut out, 8, id as u32);
         u64_at(&mut out, 0x14, self.directory);
-        u32_at(&mut out, 0x1c, 0x400000 / 8);
-        u32_at(&mut out, 0x24, 24 * 512);
-        u32_at(&mut out, 0x2c, 24 * 512);
+        // Ring capacity, tail index (all pages free) and free page count,
+        // as in the compute support object.
+        u32_at(&mut out, 0x1c, self.capacity());
+        u32_at(&mut out, 0x24, self.pages() % self.capacity());
+        u32_at(&mut out, 0x2c, self.pages());
         u64_at(&mut out, 0x30, self.table);
-        u32_at(&mut out, 0x48, 24 * 0x40 / 8);
+        u32_at(&mut out, 0x48, self.buffers * 0x40 / 8);
         u64_at(&mut out, 0x4c, shared);
         out
     }
@@ -905,8 +953,8 @@ pub(crate) fn private_aliases(pool: &OperandPool) -> [(u64, u64, usize); 40] {
         (0x10_0008_0000, 0x3c000, 0x4000),
         (0x10_0025_8000, 0x3450000, 0x1c000),
         (0x10_0024_0000, 0x346c000, 0x4000),
-        (pool.directory, 0x40000, 0x400000),
-        (pool.table, 0x440000, 0x10000),
+        (pool.directory, DIRECTORY_BACKING as u64, pool.directory_bytes()),
+        (pool.table, TABLE_BACKING as u64, 0x10000),
     ]);
     for i in 0..11 {
         out[5 + i] = (
@@ -915,11 +963,11 @@ pub(crate) fn private_aliases(pool: &OperandPool) -> [(u64, u64, usize); 40] {
             0x20000,
         );
     }
-    for i in 0..24 {
+    for i in 0..pool.buffers as usize {
         out[16 + i] = (
             pool.buffer + i as u64 * OPERAND_STRIDE,
-            0x450000 + i as u64 * 0x200000,
-            0x200000,
+            (BUFFER_BACKING + i * BUFFER_SIZE) as u64,
+            BUFFER_SIZE,
         );
     }
     out
@@ -928,25 +976,29 @@ pub(crate) fn private_aliases(pool: &OperandPool) -> [(u64, u64, usize); 40] {
 /// Return one initialized backing page, without allocating a contiguous 54 MiB
 /// CPU buffer. All unmapped padding and scratch begin at zero.
 pub(crate) fn private_page(pool: &OperandPool, offset: usize, out: &mut [u8]) -> Option<()> {
-    if offset & 0x3fff != 0 || offset >= PRIVATE_SIZE || out.len() != 0x4000 {
+    if offset & 0x3fff != 0 || offset >= PRIVATE_SIZE || out.len() != 0x4000 || !pool.backed(offset) {
         return None;
     }
     out.fill(0);
     if offset == 0x38000 {
         u32_at(out, 0x600, 0x60000000);
         u32_at(out, 0x604, 0x35b);
-    } else if (0x40000..0x58000).contains(&offset) {
-        let first = (offset - 0x40000) / 8;
+    } else if (DIRECTORY_BACKING..DIRECTORY_BACKING + pool.directory_bytes()).contains(&offset) {
+        // Ring entries 0..pages start out holding every operand page.
+        let first = (offset - DIRECTORY_BACKING) / 8;
         for i in 0..0x800 {
             let page = first + i;
+            if page >= pool.pages() as usize {
+                break;
+            }
             u64_at(
                 out,
                 i * 8,
                 pool.buffer + (page / 512) as u64 * OPERAND_STRIDE + (page % 512) as u64 * 0x1000,
             );
         }
-    } else if offset == 0x440000 {
-        for i in 0..24 {
+    } else if offset == TABLE_BACKING {
+        for i in 0..pool.buffers as usize {
             u64_at(
                 out,
                 i * 0x40,

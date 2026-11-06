@@ -259,8 +259,14 @@ impl File {
                 return Err(EIO);
             }
             if renders != 0 && !vm.render_ready {
+                // Native mesh keeps its qualified full-size pool.
+                let buffers = if vm.native_mode.enabled() {
+                    render::OPERAND_BUFFERS_MAX
+                } else {
+                    crate::g16_timeline::RENDER_OPERAND_BUFFERS.load(Ordering::Relaxed)
+                };
                 let pool =
-                    render::OperandPool::new(vm.kernel.start, vm.kernel.end).ok_or_else(|| reject(format_args!("VM kernel VA {:#x}..{:#x} too small for the render operand pool", vm.kernel.start, vm.kernel.end)))?;
+                    render::OperandPool::with_buffers(vm.kernel.start, vm.kernel.end, buffers).ok_or_else(|| reject(format_args!("VM kernel VA {:#x}..{:#x} too small for the render operand pool, or render_operand_buffers={} outside 1..={}", vm.kernel.start, vm.kernel.end, buffers, render::OPERAND_BUFFERS_MAX)))?;
                 // Acquire scarce support and its Arc before editing this
                 // root. ENOSPC/ENOMEM here must not quarantine a healthy VM.
                 let support = Arc::new(
@@ -268,7 +274,7 @@ impl File {
                     GFP_KERNEL,
                 )?;
                 if let Err(error) = vm.space.lock()
-                    .alloc_render_private(vm.kernel.start, vm.kernel.end)
+                    .alloc_render_private(vm.kernel.start, vm.kernel.end, &pool)
                 {
                     // The unpublished graph owns every partial allocation
                     // and resumes on ENOMEM. Structural/PTE inconsistencies

@@ -171,6 +171,10 @@ kernel::module_platform_driver! {
             default: 0,
             description: "Debug: 1 logs each VM's owning process and every firmware context slot rebind",
         },
+        render_operand_buffers: u32 {
+            default: 24,
+            description: "Research: 2 MiB shader private-memory (operand) buffers in each VM's render pool, 1..=24 (default 24; native mesh VMs always use 24). Each is resident for the VM's lifetime. Smaller pools starve large shader scratch frames: 8 made 32 KiB frames 3.7x slower with a 2 s stall, 4 hung the GPU. Runtime: debugfs asahi_m4/render_operand_buffers, read at each VM's first render",
+        },
         native_mesh: u32 {
             default: 0,
             description: "Experimental paired native object/mesh streams: 0=disabled, 1=T16/T32 one-parent profile, 2=unqualified multiple-parent profile, 3=research admission of wider mesh state (not qualified); no capability advertisement. Runtime: debugfs asahi_m4/native_mesh (a VM keeps the support mode of its first render)",
