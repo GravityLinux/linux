@@ -23,6 +23,62 @@ use kernel::{
     },
 };
 
+/// Private CPU work queue for the device. Its already allocated cleanup work is
+/// handed to a different queue on last-owner release: never flush/destroy a
+/// queue from its own worker, including device teardown after final job drop.
+#[pin_data(PinnedDrop)]
+struct JobQueue {
+    #[pin]
+    release: Work<JobQueue>,
+    queue: *mut bindings::workqueue_struct,
+}
+// SAFETY: C workqueues support concurrent enqueue; the pointer is initialized
+// before publication and is released only after the last Events owner drops.
+unsafe impl Send for JobQueue {}
+unsafe impl Sync for JobQueue {}
+impl JobQueue {
+    fn new() -> Result<Pin<KBox<Self>>> {
+        let mut owner=KBox::pin_init(pin_init!(Self {
+            release<-new_work!("agx_jobs_release"),queue:core::ptr::null_mut(),
+        }),GFP_KERNEL)?;
+        // SAFETY: Static format string has no substitutions. The device queue
+        // retains ordinary per-job concurrency and workqueue affinity controls.
+        let queue=unsafe {bindings::alloc_workqueue_noprof(
+            kernel::c_str!("agx_jobs").as_char_ptr(),
+            bindings::wq_flags_WQ_UNBOUND|bindings::wq_flags_WQ_SYSFS,0)};
+        if queue.is_null() {return Err(ENOMEM);}
+        // SAFETY: Only the unpinned pointer field changes, before publication.
+        unsafe {owner.as_mut().get_unchecked_mut().queue=queue;}
+        Ok(owner)
+    }
+}
+#[pinned_drop]
+impl PinnedDrop for JobQueue {
+    fn drop(self: Pin<&mut Self>) {
+        if !self.queue.is_null() {
+            // SAFETY: Owns this allocation; initialization failures run on
+            // the probe thread, normal release on the separate cleanup queue.
+            unsafe {bindings::destroy_workqueue(self.queue);}
+        }
+    }
+}
+impl_has_work! {impl HasWork<Self> for JobQueue {self.release}}
+impl WorkItem for JobQueue {
+    type Pointer=Pin<KBox<Self>>;
+    fn run(this: Self::Pointer) {drop(this);}
+}
+
+/// Concentrate the serialized firmware state and its short CPU preparation
+/// bursts on one fast CPU, so cache lines and scheduler utilization stay local.
+/// Other device workqueues, CPU online masks and frequency policy are untouched.
+/// Prefer the first fastest frequency domain, then a later CPU within it to
+/// keep its boot/interrupt CPU available and avoid crossing shared caches.
+fn local_job_cpu(cpus:impl Iterator<Item=(u32,u32,u32)>)->Option<u32> {
+    cpus.filter(|(_,maximum,_)|*maximum!=0)
+        .max_by_key(|(cpu,maximum,domain)|(*maximum,core::cmp::Reverse(*domain),*cpu))
+        .map(|(cpu,_,_)|cpu)
+}
+
 /// Queue heads are maintained at admission/retirement, never rediscovered
 /// quadratically in IRQ context. Membership owns each Job through enqueue.
 struct JobSet {
@@ -41,19 +97,84 @@ impl JobSet {
     }
 }
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct Events {
+    queue_owner: Option<Pin<KBox<JobQueue>>>,
     error: AtomicI32,
     wake_sequence: AtomicU64,
+    queue_configured: AtomicBool,
+    #[pin]
+    queue_configuration: Mutex<()>,
     #[pin]
     jobs: kernel::sync::lock::Lock<JobSet, IrqLock>,
 }
 impl Events {
     pub(crate) fn new() -> Result<Arc<Self>> {
+        let queue_owner=Some(JobQueue::new()?);
         Arc::pin_init(
-            pin_init!(Self {error:AtomicI32::new(0),wake_sequence:AtomicU64::new(0),jobs<-kernel::sync::lock::Lock::new(JobSet::new(),kernel::c_str!("neo_events"),kernel::static_lock_class!())}),
+            pin_init!(Self {queue_owner,queue_configured:AtomicBool::new(false),queue_configuration<-new_mutex!(()),error:AtomicI32::new(0),wake_sequence:AtomicU64::new(0),jobs<-kernel::sync::lock::Lock::new(JobSet::new(),kernel::c_str!("neo_events"),kernel::static_lock_class!())}),
             GFP_KERNEL,
         )
+    }
+    /// Called in submission context, after CPU-frequency drivers have had
+    /// an opportunity to probe. Configuration is performed once, before any
+    /// accepted job can enter this workqueue; later operator changes persist.
+    fn configure_queue(&self)->Result {
+        if self.queue_configured.load(Ordering::Acquire) {return Ok(());}
+        let _configuration=self.queue_configuration.lock();
+        if self.queue_configured.load(Ordering::Relaxed) {return Ok(());}
+        // SAFETY: CPU hotplug read exclusion keeps the online mask stable.
+        // cpufreq returns the rated maximum, not current governor/thermal state.
+        #[cfg(CONFIG_CPU_FREQ)]
+        let selected=unsafe {
+            #[cfg(CONFIG_HOTPLUG_CPU)]
+            bindings::cpus_read_lock();
+            let online=core::ptr::addr_of!(bindings::__cpu_online_mask);
+            let count=bindings::nr_cpu_ids;
+            let bits=core::mem::size_of::<kernel::ffi::c_ulong>()*8;
+            let cpu=local_job_cpu((0..count).filter(|cpu| {
+                (*online).bits.get(*cpu as usize/bits)
+                    .is_some_and(|word|*word&(1<<(*cpu as usize%bits))!=0)
+            }).map(|cpu| {
+                let policy=bindings::cpufreq_cpu_get(cpu);
+                if policy.is_null() {return (cpu,0,cpu);}
+                // A policy reference keeps its immutable rated maximum live;
+                // CPU hotplug exclusion also stabilizes its representative.
+                let row=(cpu,(*policy).cpuinfo.max_freq,(*policy).cpu);
+                bindings::cpufreq_cpu_put(policy);
+                row
+            }));
+            #[cfg(CONFIG_HOTPLUG_CPU)]
+            bindings::cpus_read_unlock();
+            cpu
+        };
+        #[cfg(not(CONFIG_CPU_FREQ))]
+        let selected=None::<u32>;
+        let Some(cpu)=selected else {
+            // No frequency information: preserve the kernel's default pool
+            // placement rather than guessing the platform's CPU topology.
+            self.queue_configured.store(true,Ordering::Release);return Ok(());
+        };
+        // SAFETY: These kernel routines allocate/free an owned attributes
+        // object. apply_workqueue_attrs copies it and handles CPU hotplug.
+        let attrs=unsafe {bindings::alloc_workqueue_attrs_noprof()};
+        if attrs.is_null() {return Err(ENOMEM);}
+        let result=unsafe {
+            #[cfg(CONFIG_CPUMASK_OFFSTACK)]
+            let mask=(*attrs).cpumask;
+            #[cfg(not(CONFIG_CPUMASK_OFFSTACK))]
+            let mask=(*attrs).cpumask.as_mut_ptr();
+            for word in &mut (*mask).bits {*word=0;}
+            let bits=core::mem::size_of::<kernel::ffi::c_ulong>()*8;
+            (*mask).bits[cpu as usize/bits]=1<<(cpu as usize%bits);
+            let result=bindings::apply_workqueue_attrs(
+                self.queue_owner.as_ref().unwrap().queue,attrs);
+            bindings::free_workqueue_attrs(attrs);
+            result
+        };
+        if result<0 {return Err(Error::from_errno(result));}
+        self.queue_configured.store(true,Ordering::Release);
+        Ok(())
     }
     pub(crate) fn healthy(&self) -> Result {
         let error = self.error.load(Ordering::Acquire);
@@ -88,7 +209,7 @@ impl Events {
                     // A successor may already have run without arming a
                     // timer. Promotion and is_head use this same IRQ lock.
                     promoted=Some(next.clone());
-                    let _ = workqueue::system_dfl().enqueue::<_, 0>(next);
+                    Job::request(next);
                 } else {
                     let _ = held.heads.remove(head);
                     for preferred in &mut held.preferred {
@@ -101,7 +222,7 @@ impl Events {
                 // so always re-elect here rather than testing its old flag.
                 if let Some(poller)=held.poll_head() {
                     if promoted.as_ref().is_none_or(|next|!core::ptr::eq(&**next,&**poller)) {
-                        let _=workqueue::system_dfl().enqueue::<_,0>(poller.clone());
+                        Job::request(poller.clone());
                     }
                 }
             }
@@ -118,7 +239,7 @@ impl Events {
         if held.preferred[engine] == Some(key) {
             held.preferred[engine] = None;
             if let Some(poller)=held.poll_head() {
-                let _=workqueue::system_dfl().enqueue::<_,0>(poller.clone());
+                Job::request(poller.clone());
             }
         }
     }
@@ -147,7 +268,7 @@ impl Events {
         let mut held = self.jobs.lock();
         if all {
             for job in &held.jobs {
-                let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
+                Job::request(job.clone());
             }
         } else {
             let count = held.heads.len();
@@ -164,7 +285,7 @@ impl Events {
                         if let Some(index) = held.heads.iter().position(|h|
                             h.queue_key == *key && h.firmware_waiting.load(Ordering::SeqCst)) {
                             if !selected.contains(&Some(index)) {
-                                let _ = workqueue::system_dfl().enqueue::<_, 0>(held.heads[index].clone());
+                                Job::request(held.heads[index].clone());
                             }
                             selected[engine] = Some(index);
                         }
@@ -175,7 +296,7 @@ impl Events {
                     let job = &held.heads[index];
                     if job.firmware_waiting.load(Ordering::SeqCst) {
                         if !selected.contains(&Some(index)) {
-                            let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
+                            Job::request(job.clone());
                         }
                         held.next = (index + 1) % count;
                         break;
@@ -194,8 +315,17 @@ impl Events {
             .iter()
             .find(|job| &***job as *const Job as usize == identity)
         {
-            let _ = workqueue::system_dfl().enqueue::<_, 0>(job.clone());
+            Job::request(job.clone());
         }
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for Events {
+    fn drop(self:Pin<&mut Self>) {
+        // SAFETY: Move only the unpinned handle, never a pinned field.
+        let owner=unsafe {self.get_unchecked_mut()}.queue_owner.take();
+        if let Some(owner)=owner {let _=workqueue::system_long().enqueue::<_,0>(owner);}
     }
 }
 
@@ -257,7 +387,7 @@ impl HrTimerCallback for Job {
     fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
         // IRQ context only schedules this owner. All receipt reads and mapping
         // edits remain in the existing sleeping worker.
-        let _ = workqueue::system_dfl().enqueue::<Arc<Self>, 0>(this.into());
+        Job::request(this.into());
         HrTimerRestart::NoRestart
     }
 }
@@ -278,6 +408,7 @@ impl Job {
         let mut render_receipts = KVec::new();
         render_receipts.reserve(prepared.parameters.len(), GFP_KERNEL)?;
         let events = dev.events.clone();
+        events.configure_queue()?;
         let queue_key = prepared.queue_key;
         let job = Arc::pin_init(
             try_pin_init!(Self {
@@ -356,10 +487,22 @@ impl Job {
             execution.sync.publish_outputs();
             job.committed.store(true, Ordering::Release);
         }
-        let _ = workqueue::system_dfl().enqueue::<_, 0>(job);
+        Job::request(job);
     }
 }
 impl Job {
+    fn request(this:Arc<Self>) {
+        let queue=this.events.queue_owner.as_ref().unwrap().queue;
+        // SAFETY: This Job keeps Events and its queue alive through enqueue;
+        // a queued/running Job keeps them alive when enqueue coalesces.
+        unsafe {let _=workqueue::Queue::from_raw(queue).enqueue::<_,0>(this);}
+    }
+    fn watchdog(this:Arc<Self>) {
+        let queue=this.events.queue_owner.as_ref().unwrap().queue;
+        // SAFETY: The delayed work owns this Job, which retains the queue.
+        unsafe {let _=workqueue::Queue::from_raw(queue).enqueue_delayed::<_,1>(
+            this,kernel::time::msecs_to_jiffies(10));}
+    }
     fn advance(this: Arc<Self>) {
         if !this.committed.load(Ordering::Acquire) {
             return;
@@ -426,7 +569,7 @@ impl Job {
                 // poller needs to repeat a full-session poll when an IRQ raced
                 // this pass; otherwise one event regenerates the wake storm.
                 if poll_head && this.events.wake_sequence.load(Ordering::SeqCst) != wake_sequence {
-                    let _ = workqueue::system_dfl().enqueue::<_, 0>(this.clone());
+                    Job::request(this.clone());
                 }
                 // Retained-pool admission can be blocked without a pending
                 // control receipt. Poll that case at the same bounded cadence
@@ -443,8 +586,7 @@ impl Job {
                 // a session poll. Legacy/exclusive execution still needs its
                 // own watchdog; scheduled heads use only the elected poller.
                 if poll_head || e.schedule.is_none() {
-                    let _ = workqueue::system_dfl()
-                        .enqueue_delayed::<_, 1>(this.clone(), kernel::time::msecs_to_jiffies(10));
+                    Self::watchdog(this.clone());
                 }
             }
             result => {
