@@ -1047,10 +1047,7 @@ impl Session {
             let vm = self.vm.as_ref().ok_or(EINVAL)?;
             render::quiesce(memory, vm, self.render.as_ref().ok_or(EINVAL)?)?;
             let control = image.graph.channels[0][12];
-            let mut counts = [0; 3];
-            for (value, address) in counts.iter_mut().zip(control.states) {
-                *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
-            }
+            let counts = vm.read_firmware32s(memory, 2, control.states)?;
             if counts[0] != counts[1] || counts[1] != counts[2] {
                 return Err(EBUSY);
             }
@@ -1160,6 +1157,39 @@ impl Session {
             }
             && !self.render_cpu_leases.iter().any(|(owner,fence)|*owner==pool
                 && unsafe {kernel::bindings::dma_fence_get_status(fence.raw())}==0)
+    }
+    /// One selection runs under runtime locking. Classify the complete lease
+    /// set once instead of rescanning it for every exact/related/eviction
+    /// candidate. Off-lock CPU completions and preparation release can only
+    /// make a blocked pool available during this borrow, so a stale negative
+    /// is conservative. No availability survives this selection.
+    fn render_pool_availability(&self)->[bool;super::g17p_render_lifecycle::POOL_SLOTS as usize] {
+        let mut available=[true;super::g17p_render_lifecycle::POOL_SLOTS as usize];
+        let serialized=render::serialized_cache_enabled() && !self.automatic_render_parallel;
+        if serialized && self.live_render_count()!=0 {return [false;super::g17p_render_lifecycle::POOL_SLOTS as usize];}
+        for (key,active) in &self.render_prepare_leases {
+            if let render::PreparationKey::Pool(pool)=key {
+                if active.load(Ordering::Acquire) {
+                    if let Some(slot)=available.get_mut(*pool as usize) {*slot=false;}
+                }
+            }
+        }
+        match &self.pending {
+            Some(PendingWork::Render(wave))=>for frame in &wave.frames[wave.next..] {
+                if let Some(slot)=available.get_mut(frame.pool() as usize) {*slot=false;}
+            },
+            Some(PendingWork::WrappedRender(wave))=>for frame in &wave.frames[wave.next..] {
+                if let Some(slot)=available.get_mut(frame.pool() as usize) {*slot=false;}
+            },
+            _=>(),
+        }
+        for (pool,fence) in &self.render_cpu_leases {
+            if unsafe {kernel::bindings::dma_fence_get_status(fence.raw())}==0 {
+                if serialized {return [false;super::g17p_render_lifecycle::POOL_SLOTS as usize];}
+                if let Some(slot)=available.get_mut(*pool as usize) {*slot=false;}
+            }
+        }
+        available
     }
     fn retained_render_idle(&self) -> bool {
         self.live_render_count() == 0 && self.render_cpu_leases.iter().all(|(_, fence)|
@@ -1380,9 +1410,10 @@ impl Session {
             work.pool_count()
         } else { return Ok(Some(work.layout.pair)); };
         let desired=incoming.unwrap_or(&work.client);
+        let availability=self.render_pool_availability();
         // A retired pool still owns its tiler reservation. A changed caller
         // can use another pool without overwriting this pool's grown backing.
-        let available=|pair:&u32|self.render_pool_available(*pair)
+        let available=|pair:&u32|availability[*pair as usize]
             && (!self.independent_render_roots() || work.growth.as_ref().is_none_or(|service|
                 service.caller_compatible(*pair,&desired.bindings)))
             && (!self.independent_render_roots() || *pair==0
@@ -1675,10 +1706,7 @@ impl Session {
         if ordinal < 2 { return Ok(true); }
         let memory = self.memory.as_ref().ok_or(EIO)?;
         let vm = self.vm.as_ref().ok_or(EIO)?;
-        let mut values = [0; 3];
-        for (value, at) in values.iter_mut().zip(image.graph.channels[0][12].states) {
-            *value = memory.read_firmware32(vm.physical(memory, 2, at)?)?;
-        }
+        let values = vm.read_firmware32s(memory, 2, image.graph.channels[0][12].states)?;
         Ok(queue::Counters::new(values).map_err(|_| EIO)?.available() != 0)
     }
 
@@ -1701,10 +1729,7 @@ impl Session {
             && (!pipelined || (!self.independent_compute.pending() && self.compute_pending.is_none()));
         let memory = self.memory.as_mut().ok_or(EINVAL)?;
         let vm = self.vm.as_ref().ok_or(EINVAL)?;
-        let mut before = [0; 3];
-        for (value, at) in before.iter_mut().zip(channel.states) {
-            *value = memory.read_firmware32(vm.physical(memory, 2, at)?)?;
-        }
+        let before = vm.read_firmware32s(memory, 2, channel.states)?;
         let credits = queue::Counters::new(before).map_err(|_| EIO)?;
         if (pipelined && credits.available() == 0)
             || (!pipelined && (before[0] != before[2] || before[1] != before[2])) {
@@ -2547,10 +2572,7 @@ impl Session {
                     .map_or(image.graph.channels[0][8], |w| w.channel);
                 let memory = self.memory.as_ref().ok_or(EINVAL)?;
                 let vm = self.vm.as_ref().ok_or(EINVAL)?;
-                let mut values = [0; 3];
-                for (value, address) in values.iter_mut().zip(channel.states) {
-                    *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
-                }
+                let values = vm.read_firmware32s(memory, 2, channel.states)?;
                 let credits = queue::Counters::new(values).map_err(|_| EIO)?.available() as usize;
                 // Startup executes its opening command before entering the
                 // retained wave lifetime, as in the source direct bootstrap.
@@ -2933,8 +2955,7 @@ impl Session {
             let memory = self.memory.as_ref().ok_or(EIO)?;
             let vm = self.vm.as_ref().ok_or(EIO)?;
             let channel = self.render.as_ref().ok_or(EIO)?.growth.as_ref().ok_or(EIO)?.command_channel();
-            let mut values = [0;3];
-            for (v,at) in values.iter_mut().zip(channel.states) { *v = memory.read_firmware32(vm.physical(memory,2,at)?)?; }
+            let values = vm.read_firmware32s(memory, 2, channel.states)?;
             if self.independent_render_roots() {
                 if queue::Counters::new(values).map_err(|_| EIO)?.available() == 0 { return Ok(false); }
             } else if values[0] != values[2] || values[1] != values[2] { return Ok(false); }
@@ -2982,8 +3003,7 @@ impl Session {
         }
         let memory = self.memory.as_ref().ok_or(EIO)?;
         let vm = self.vm.as_ref().ok_or(EIO)?;
-        let mut values = [0; 3];
-        for (value, va) in values.iter_mut().zip(work.channel.states) { *value = memory.read_firmware32(vm.physical(memory,2,va)?)?; }
+        let values = vm.read_firmware32s(memory, 2, work.channel.states)?;
         if queue::Counters::new(values).map_err(|_| EIO)?.available() == 0 { return Ok(false); }
         // Registered root words remain authoritative for the retained client.
         for slot in [2u64,3] {
@@ -3473,10 +3493,7 @@ impl Session {
         if self.phase==Phase::Failed {return Err(EIO);}
         if !matches!(self.phase,Phase::Prepared|Phase::Running) || !self.independent_compute_enabled() {return Ok((false,false));}
         let memory=self.memory.as_ref().ok_or(EIO)?;let vm=self.vm.as_ref().ok_or(EIO)?;
-        let mut values=[0;3];
-        for (v,at) in values.iter_mut().zip(image.compute_channel(priority).states) {
-            *v=memory.read_firmware32(vm.physical(memory,2,at)?)?;
-        }
+        let values = vm.read_firmware32s(memory, 2, image.compute_channel(priority).states)?;
         if queue::Counters::new(values).map_err(|_|EIO)?.slot().is_err() {return Ok((false,false));}
         if !self.independent_compute.can_stage(key,client,p,priority)
             || self.cleanup.require_idle().is_err() { return Ok((false,false)); }
@@ -3696,8 +3713,7 @@ impl Session {
         while index<self.independent_pending.len() {
             let pending=&mut self.independent_pending[index];let ticket=&pending.ticket;
             let done=memory.read_firmware32(vm.physical(memory,2,ticket.pointers)?)?;
-            let mut values=[0;3];
-            for (v,at) in values.iter_mut().zip(ticket.channel.states) {*v=memory.read_firmware32(vm.physical(memory,2,at)?)?;}
+            let values = vm.read_firmware32s(memory, 2, ticket.channel.states)?;
             let _counters=queue::Counters::new(values).map_err(|_|EIO)?;
             for i in 0..2 {
                 pending.outer_done[i] |= queue::reached(ticket.publication.consumers_before[i],

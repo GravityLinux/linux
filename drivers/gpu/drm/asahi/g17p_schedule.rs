@@ -653,7 +653,8 @@ impl Schedule {
         }
         Ok(None)
     }
-    fn prepare_render_support(&self, dev: &Device, prepared: &Prepared) -> Result {
+    fn prepare_render_support(&self, dev: &Device, prepared: &Prepared) -> Result<bool> {
+        let mut changed = false;
         for (index, node) in self.nodes.iter().enumerate() {
             if node.staged || status(&node.point.completion) != 0 { continue; }
             let Command::Render(mut parameters) = prepared.parameters[index] else { continue; };
@@ -676,6 +677,7 @@ impl Schedule {
                 (seed, count)
             };
             if let Some(seed) = seed {
+                changed = true;
                 let scratch = match seed.prepare() {
                     Ok(scratch) => scratch,
                     Err(error) => { node.point.finish(Some(error)); continue; },
@@ -696,6 +698,7 @@ impl Schedule {
                 Option::as_ref(&*held).ok_or(ENODEV)?.session.capture_render_template(snapshot.client(), &parameters, storage)?
             };
             if let Some(seed) = seed {
+                changed = true;
                 let template = match seed.prepare() {
                     Ok(template) => template,
                     Err(error) => { node.point.finish(Some(error)); continue; },
@@ -706,7 +709,7 @@ impl Schedule {
                 Option::as_mut(&mut *held).ok_or(ENODEV)?.session.commit_render_template(snapshot.client(), &parameters, template)?;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn prepare_shared_backing(&self, dev: &Device) -> Result {
@@ -756,9 +759,9 @@ impl Schedule {
         let backing_us = phase_us();
         self.prepare_clients(dev, prepared)?;
         let clients_us = phase_us();
-        self.prepare_render_support(dev, prepared)?;
+        let support_changed = self.prepare_render_support(dev, prepared)?;
         let support_us = phase_us();
-        self.prepare_clients(dev, prepared)?;
+        if support_changed { self.prepare_clients(dev, prepared)?; }
         let clients2_us = phase_us();
         let (mut prepared_compute, mut prepared_compute_rebind)=match self.prepare_compute(dev,prepared)? {
             Some((index,objects,rebind))=>(Some((index,objects)),rebind.map(|plan|(index,plan))),

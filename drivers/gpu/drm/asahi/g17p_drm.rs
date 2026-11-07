@@ -1608,16 +1608,16 @@ impl File {
             .ok_or(ENOENT)?;
         // Snapshot under the file lock, without the runtime lock or any GPU
         // wait. Each accepted job owns exactly these mappings and GEMs.
+        let scheduled = scheduling::Schedule::enabled();
         let render_snapshot = if render {
             Some(vm.cached_snapshot(owner, true)?)
         } else {
             None
         };
-        let render_client = render_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.deferred_client())
-            .transpose()?;
-        if let Some(client) = &render_client {
+        // Validation reads immutable caller metadata. Ordinary jobs create a
+        // private Client off-lock only when the selected owner needs one.
+        if let Some(snapshot) = &render_snapshot {
+            let client = snapshot.client();
             for command in &parameters {
                 if let Command::Render(p) = command {
                     if matches!(dev.abi, super::GpuAbi::G16C) {
@@ -1628,15 +1628,19 @@ impl File {
                 }
             }
         }
-        let compute_snapshot = if compute || render {
+        let render_client = if scheduled { None } else {
+            render_snapshot.as_ref().map(|snapshot| snapshot.deferred_client()).transpose()?
+        };
+        // The implicit compute primer belongs to the legacy bootstrap.
+        // Ordinary render nodes never consume a compute snapshot.
+        let compute_snapshot = if compute || (render && !scheduled) {
             Some(vm.cached_snapshot(owner, false)?)
         } else {
             None
         };
-        let compute_client = compute_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.deferred_client())
-            .transpose()?;
+        let compute_client = if scheduled { None } else {
+            compute_snapshot.as_ref().map(|snapshot| snapshot.deferred_client()).transpose()?
+        };
         let mut buffers = KVec::new();
         for binding in &vm.bindings {
             buffers.push(binding.bo.clone(), GFP_KERNEL)?;
@@ -1656,8 +1660,8 @@ impl File {
             vm_pending,
             parameters,
             barriers,
-            render_client: if scheduling::Schedule::enabled() { None } else { render_client },
-            compute_client: if scheduling::Schedule::enabled() { None } else { compute_client },
+            render_client,
+            compute_client,
             compute_storage: None,
             render_storage: None,
             render_transport: None,

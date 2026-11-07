@@ -9,7 +9,7 @@ use super::{
     g17p_platform::Platform, g17p_topology as topology,
 };
 use kernel::{device, prelude::*};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const PAGE: u64 = 0x4000;
 const ADDRESS: u64 = 0x0000_ffff_ffff_c000;
@@ -32,6 +32,9 @@ pub(crate) struct Vm {
     g16c_graph_started: bool,
     roots: [u64; 3],
     tables: KVec<u64>,
+    /// Last verified ownership index at each walk level. Cache membership,
+    /// never a PTE: every translation still reads the current table entry.
+    table_hints: [AtomicUsize; 3],
     /// Set before uncleaned PTE stores; mutations require exclusive Vm access.
     tables_dirty: AtomicBool,
     claims: KVec<(u64, usize)>,
@@ -81,6 +84,7 @@ impl Vm {
             g16c_graph_started: false,
             roots,
             tables: KVec::new(),
+            table_hints: [const { AtomicUsize::new(0) }; 3],
             tables_dirty: AtomicBool::new(true),
             claims: KVec::new(),
             leaves: 0,
@@ -187,6 +191,7 @@ impl Vm {
                 target(2, &[]).ok_or(EINVAL)?,
             ],
             tables: KVec::new(),
+            table_hints: [const { AtomicUsize::new(0) }; 3],
             tables_dirty: AtomicBool::new(true),
             claims: KVec::new(),
             leaves: 0,
@@ -420,6 +425,16 @@ impl Vm {
     pub(crate) fn physical(&self, memory: &Memory, group: usize, va: u64) -> Result<u64> {
         let offset = va & (PAGE - 1);
         Ok((self.lookup(memory, group, va - offset)?.ok_or(EINVAL)? & ADDRESS) + offset)
+    }
+    /// Firmware counters read without intermediate host publication. Resolve
+    /// every current mapping before performing grouped cache maintenance.
+    pub(crate) fn read_firmware32s<const N:usize>(&self,memory:&Memory,group:usize,
+        addresses:[u64;N])->Result<[u32;N]> {
+        let mut physical=[0;N];
+        for (pa,address) in physical.iter_mut().zip(addresses) {
+            *pa=self.physical(memory,group,address)?;
+        }
+        memory.read_firmware32s(physical)
     }
     /// Ordinary independent render roots only borrow these immutable cold
     /// Source leaves. Capture once at boot; no executable leaf is read.
@@ -888,11 +903,18 @@ impl Vm {
         ])
     }
 
+    fn owns_table(&self, level: usize, table: u64) -> bool {
+        let hint = &self.table_hints[level];
+        if self.tables.get(hint.load(Ordering::Relaxed)) == Some(&table) { return true; }
+        let Some(index) = self.tables.iter().position(|&page| page == table) else { return false; };
+        hint.store(index, Ordering::Relaxed);
+        true
+    }
     fn lookup(&self, memory: &Memory, group: usize, va: u64) -> Result<Option<u64>> {
         let indices = Self::indices(group, va)?;
         let mut table = self.roots[group];
         for (level, index) in indices.into_iter().enumerate() {
-            if !self.tables.contains(&table) {
+            if !self.owns_table(level, table) {
                 return Err(EINVAL);
             }
             let pte = memory.read64(table + index as u64 * 8)?;

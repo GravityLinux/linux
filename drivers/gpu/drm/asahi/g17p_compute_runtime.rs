@@ -1097,10 +1097,7 @@ pub(crate) fn build(
     if channel.ring != 0xfffffc20c07a1dc0 {
         return Err(EINVAL);
     }
-    let mut counts = [0; 3];
-    for (value, address) in counts.iter_mut().zip(channel.states) {
-        *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
-    }
+    let counts = vm.read_firmware32s(memory,2,channel.states)?;
     if counts[0] != counts[1] || counts[1] != counts[2] {
         return Err(EBUSY);
     }
@@ -1186,10 +1183,7 @@ pub(crate) fn build(
 /// Prepare one later item on the completed retained transport. No producer
 /// becomes visible until the session validates and explicitly publishes it.
 pub(crate) fn idle(memory: &Memory, vm: &Vm, work: &Submission) -> Result<(q::Counters, u32)> {
-    let mut values = [0; 3];
-    for (value, address) in values.iter_mut().zip(work.channel.states) {
-        *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
-    }
+    let values = vm.read_firmware32s(memory,2,work.channel.states)?;
     let counters = q::Counters::new(values).map_err(|_| EIO)?;
     let done = memory.read_firmware32(vm.physical(memory, 2, work.pointers)?)?;
     if done != work.publication.write_after
@@ -1245,10 +1239,7 @@ pub(crate) fn stage_next(
         work.status_base + ordinal as u64 * 0x10 + 8,
     ];
     let (counters, mut write_index) = if pending {
-        let mut values = [0; 3];
-        for (value, address) in values.iter_mut().zip(work.channel.states) {
-            *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
-        }
+        let values=vm.read_firmware32s(memory,2,work.channel.states)?;
         let counters = q::Counters::new(values).map_err(|_| EIO)?;
         if counters.slot().map_err(|_| EBUSY)? != work.publication.producer {
             return Err(EIO);

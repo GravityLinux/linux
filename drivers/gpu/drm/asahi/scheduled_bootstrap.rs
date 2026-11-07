@@ -93,15 +93,11 @@ pub(crate) fn prepare_control(memory: &mut Memory, vm: &Vm) -> Result {
 }
 
 pub(crate) fn control_retired(memory: &Memory, vm: &Vm, target: u32) -> Result<bool> {
-    Ok([
-        read32(memory, vm, CONTROL_STATE)?,
-        read32(memory, vm, CONTROL_STATE + 0x10)?,
-        read32(memory, vm, CONTROL_STATE + 0x20)?,
-    ] == [target; 3])
+    Ok(vm.read_firmware32s(memory,2,[CONTROL_STATE,CONTROL_STATE+0x10,CONTROL_STATE+0x20])? == [target;3])
 }
 
 pub(crate) fn control_cursors(memory:&Memory,vm:&Vm)->Result<[u32;3]> {
-    let values=[read32(memory,vm,CONTROL_STATE)?,read32(memory,vm,CONTROL_STATE+0x10)?,read32(memory,vm,CONTROL_STATE+0x20)?];
+    let values=vm.read_firmware32s(memory,2,[CONTROL_STATE,CONTROL_STATE+0x10,CONTROL_STATE+0x20])?;
     if values.iter().any(|&v|v>=256) {return Err(EIO);}
     Ok(values)
 }
@@ -165,8 +161,7 @@ fn drain_events(memory: &mut Memory, vm: &Vm,
         (graph::BASE + 0x3f1c0, graph::BASE + 0x3f440, 256, true),
         (graph::BASE + 0x3f3c0, graph::BASE + 0xe5c40, 512, false),
     ] {
-        let mut consumer = read32(memory, vm, state)?;
-        let mut producer = read32(memory, vm, state + 0x20)?;
+        let [mut consumer,mut producer]=vm.read_firmware32s(memory,2,[state,state+0x20])?;
         if consumer >= capacity || producer >= capacity {
             return Err(EIO);
         }
@@ -213,8 +208,7 @@ fn drain_events(memory: &mut Memory, vm: &Vm,
         0x3f400, 0x3f200, 0x3f230, 0x3f260, 0x3f290, 0x3f2c0, 0x3f2f0,
     ] {
         let state = graph::BASE + offset;
-        let consumer = read32(memory, vm, state)?;
-        let producer = read32(memory, vm, state + 0x20)?;
+        let [consumer,producer]=vm.read_firmware32s(memory,2,[state,state+0x20])?;
         if consumer >= 256 || producer >= 256 {
             return Err(EIO);
         }

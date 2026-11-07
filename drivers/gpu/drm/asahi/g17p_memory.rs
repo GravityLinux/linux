@@ -5,6 +5,7 @@
 
 use super::{g17p_platform::Platform, g17p_topology};
 use kernel::{bindings, c_str, device, io::mem, io::resource::Resource, page, prelude::*, rbtree::{RBTree, RBTreeNodeReservation}, sync::Arc};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const PAGE: usize = 0x4000;
 
@@ -79,6 +80,7 @@ pub(crate) struct Memory {
     // Exclusive physical ends index the permanently retained, disjoint
     // allocations. Access checks remain exact while avoiding a heap scan.
     allocation_ends: RBTree<u64, usize>,
+    allocation_hints: [AtomicUsize; 16],
     prepared_blocks: KVec<(usize,u64)>,
     prepared_growth: bool,
     growth_refused: bool,
@@ -166,11 +168,22 @@ impl Memory {
     }
 
     fn owns_allocation(&self, address: u64, end: u64) -> bool {
+        let hint = &self.allocation_hints[((address >> 14) & 15) as usize];
+        let contains = |allocation: &Arc<Allocation>| address >= allocation.base
+            && end <= allocation.base + allocation.size as u64;
+        // Page-table walks, descriptors and status reads repeatedly touch the
+        // same retained allocations. Verify both bounds on every cache hit;
+        // an index is only a hint and never substitutes for RAM ownership.
+        if self.allocations.get(hint.load(Ordering::Relaxed)).is_some_and(contains) {
+            return true;
+        }
         // The first allocation ending at or beyond this span is the only
         // possible owner: the allocator's retained physical ranges disjoint.
         self.allocation_ends.cursor_lower_bound(&end).is_some_and(|cursor| {
-            let allocation = &self.allocations[*cursor.current().1];
-            address >= allocation.base && end <= allocation.base + allocation.size as u64
+            let index = *cursor.current().1;
+            if !contains(&self.allocations[index]) { return false; }
+            hint.store(index, Ordering::Relaxed);
+            true
         })
     }
 
@@ -217,6 +230,7 @@ impl Memory {
     /// worker without borrowing the session heap or its shared mappings.
     pub(crate) fn detached() -> Self {
         Self { mappings: KVec::new(), allocations: KVec::new(), allocated_bytes: 0, allocation_ends: RBTree::new(),
+            allocation_hints: [const { AtomicUsize::new(0) }; 16],
             prepared_blocks: KVec::new(), prepared_growth: false, growth_refused: false, growth_waiting: false }
     }
     /// Transfer all backing before publishing a root that references it.
@@ -251,6 +265,7 @@ impl Memory {
             allocations: KVec::new(),
             allocated_bytes: 0,
             allocation_ends: RBTree::new(),
+            allocation_hints: [const { AtomicUsize::new(0) }; 16],
             prepared_blocks: KVec::new(), prepared_growth: false, growth_refused: false, growth_waiting: false,
         };
         for (index, name) in [
@@ -436,6 +451,32 @@ impl Memory {
             // SAFETY: access bounds the aligned word in live shared RAM.
             u32::from_le(unsafe { p.cast::<u32>().read_volatile() })
         })
+    }
+
+    /// Read a group of clean firmware-owned counters in one observation
+    /// epoch. These are independent volatile words, not an atomic snapshot.
+    /// Callers must not need a publication/store between any of these reads.
+    pub(crate) fn read_firmware32s<const N:usize>(&self, addresses:[u64;N])->Result<[u32;N]> {
+        if addresses.iter().any(|address|address&3!=0) {return Err(EINVAL);}
+        sync();
+        for address in addresses {
+            self.access(address,4,|pointer| {
+                // SAFETY: access proves a live, aligned ordinary RAM word.
+                // As with invalidate, host writes in this line are clean.
+                unsafe {core::arch::asm!("dc ivac, {pointer}",pointer=in(reg)pointer,
+                    options(nostack,preserves_flags));}
+            })?;
+        }
+        sync();
+        let mut values=[0;N];
+        for (value,address) in values.iter_mut().zip(addresses) {
+            *value=self.access(address,4,|pointer| {
+                // SAFETY: access checks bounds/alignment. Do not retain a
+                // page mapping pointer beyond this closure.
+                u32::from_le(unsafe {pointer.cast::<u32>().read_volatile()})
+            })?;
+        }
+        Ok(values)
     }
 
     /// Only for clean lines shared with firmware, never dirty host data.
