@@ -27,10 +27,11 @@ struct Mutex<T>(RefCell<T>);impl<T>Mutex<T>{fn lock(&self)->std::cell::RefMut<'_
 struct Job{id:usize,queue_key:(u64,u32),firmware_waiting:AtomicBool}
 mod workqueue{use super::*;pub fn system_dfl()->Q{Q}pub struct Q;impl Q{pub fn enqueue<T:std::ops::Deref<Target=Job>,const N:usize>(&self,j:T)->bool{WAKES.with(|w|w.borrow_mut().push(j.id));true}}}
 '''+item('struct JobSet {')+'\n'+item('impl JobSet {')+'''
-struct Events{jobs:Mutex<JobSet>,wake_sequence:AtomicU64}
+impl Job{fn request(j:Arc<Self>){WAKES.with(|w|w.borrow_mut().push(j.id));}}
+struct Events{jobs:Mutex<JobSet>,wake_sequence:AtomicU64,firmware_sequence:AtomicU64}
 impl Events{
 '''
-for marker in ['fn add(&self','fn remove(&self','fn is_head(&self','pub(super) fn prefer_queue(&self','pub(super) fn release_queue(&self','fn is_poll_head(&self','fn wake_backend(&self','fn wake_job(&self']:code+=item(marker).replace('pub(super) ', '')+'\n'
+for marker in ['fn add(&self','fn remove(&self','fn is_head(&self','pub(super) fn prefer_queue(&self','pub(super) fn release_queue(&self','fn is_poll_head(&self','fn wake_backend(&self','fn wake_job(&self','pub(super) fn sequence(&self','pub(crate) fn firmware_wake(&self','pub(crate) fn wake(&self']:code+=item(marker).replace('pub(super) ', '').replace('pub(crate) ', '')+'\n'
 code+=r'''
 }
 fn take()->Vec<usize>{WAKES.with(|v|std::mem::take(&mut *v.borrow_mut()))}
@@ -49,16 +50,19 @@ fn check(e:&Events,live:&[Arc<Job>]){
  e.wake_backend(true);assert_eq!(take(),live.iter().map(|j|j.id).collect::<Vec<_>>());
 }
 fn main(){
+ let epochs=Events{jobs:Mutex(RefCell::new(JobSet::new())),wake_sequence:AtomicU64::new(0),firmware_sequence:AtomicU64::new(0)};
+ for n in 0..10000{epochs.wake();assert_eq!(epochs.sequence(),n);epochs.firmware_wake();assert_eq!(epochs.sequence(),n+1);assert_eq!(epochs.wake_sequence.load(Ordering::SeqCst),2*(n+1));}
+ epochs.firmware_sequence.store(u64::MAX,Ordering::SeqCst);epochs.firmware_wake();assert_eq!(epochs.sequence(),0);
  // Final IRQ already consumed: the old poller withdraws its waiting flag
  // and completes with no successor on its queue. A different waiting queue
  // must be explicitly queued so it can arm the next fallback timer.
- let test=Events{jobs:Mutex(RefCell::new(JobSet::new())),wake_sequence:AtomicU64::new(0)};
+ let test=Events{jobs:Mutex(RefCell::new(JobSet::new())),wake_sequence:AtomicU64::new(0),firmware_sequence:AtomicU64::new(0)};
  let x=Arc::new(Job{id:41,queue_key:(1,0),firmware_waiting:AtomicBool::new(true)});
  let y=Arc::new(Job{id:42,queue_key:(2,0),firmware_waiting:AtomicBool::new(true)});
  test.add(x.clone()).unwrap();test.add(y.clone()).unwrap();assert!(test.is_poll_head(&x));
  x.firmware_waiting.store(false,Ordering::SeqCst);test.remove(&x);assert_eq!(take(),vec![42]);assert!(test.is_poll_head(&y));
  test.prefer_queue(0,y.queue_key);test.release_queue(0,y.queue_key);assert_eq!(take(),vec![42]);
- let e=Events{jobs:Mutex(RefCell::new(JobSet::new())),wake_sequence:AtomicU64::new(0)};
+ let e=Events{jobs:Mutex(RefCell::new(JobSet::new())),wake_sequence:AtomicU64::new(0),firmware_sequence:AtomicU64::new(0)};
  let mut live:Vec<Arc<Job>>=Vec::new();let mut seed=73u64;
  for id in 0..20000{
   seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1);

@@ -102,6 +102,9 @@ pub(crate) struct Events {
     queue_owner: Option<Pin<KBox<JobQueue>>>,
     error: AtomicI32,
     wake_sequence: AtomicU64,
+    // CPU fence/promotion wakes participate in the lost-wake handshake,
+    // but only firmware notifications invalidate the shared backend poll.
+    firmware_sequence: AtomicU64,
     queue_configured: AtomicBool,
     #[pin]
     queue_configuration: Mutex<()>,
@@ -112,7 +115,7 @@ impl Events {
     pub(crate) fn new() -> Result<Arc<Self>> {
         let queue_owner=Some(JobQueue::new()?);
         Arc::pin_init(
-            pin_init!(Self {queue_owner,queue_configured:AtomicBool::new(false),queue_configuration<-new_mutex!(()),error:AtomicI32::new(0),wake_sequence:AtomicU64::new(0),jobs<-kernel::sync::lock::Lock::new(JobSet::new(),kernel::c_str!("neo_events"),kernel::static_lock_class!())}),
+            pin_init!(Self {queue_owner,queue_configured:AtomicBool::new(false),queue_configuration<-new_mutex!(()),error:AtomicI32::new(0),wake_sequence:AtomicU64::new(0),firmware_sequence:AtomicU64::new(0),jobs<-kernel::sync::lock::Lock::new(JobSet::new(),kernel::c_str!("neo_events"),kernel::static_lock_class!())}),
             GFP_KERNEL,
         )
     }
@@ -250,7 +253,11 @@ impl Events {
         let held = self.jobs.lock();
         held.poll_head().is_some_and(|h|core::ptr::eq(&**h,job))
     }
-    pub(super) fn sequence(&self) -> u64 { self.wake_sequence.load(Ordering::SeqCst) }
+    pub(super) fn sequence(&self) -> u64 { self.firmware_sequence.load(Ordering::SeqCst) }
+    pub(crate) fn firmware_wake(&self) {
+        self.firmware_sequence.fetch_add(1, Ordering::SeqCst);
+        self.wake();
+    }
     pub(crate) fn wake(&self) {
         self.wake_backend(false);
     }
@@ -536,12 +543,17 @@ impl Job {
                 }
             }
             let result = e.progress()?;
-            if let Some(schedule) = &e.schedule {
-                for (index, callbacks) in e.receipt_callbacks.iter_mut().enumerate() {
-                    for (phase, callback) in callbacks.iter_mut().enumerate() {
-                        if callback.fence.is_none() {
-                            if let Some(fence) = schedule.receipt_fence(index, phase == 0) {
-                                callback.bind(fence)?;
+            // A retiring job will remove its membership and signal outputs.
+            // Binding already-retired receipt fences only queues this same
+            // job again after its Execution has been taken and dropped.
+            if result.is_none() {
+                if let Some(schedule) = &e.schedule {
+                    for (index, callbacks) in e.receipt_callbacks.iter_mut().enumerate() {
+                        for (phase, callback) in callbacks.iter_mut().enumerate() {
+                            if callback.fence.is_none() {
+                                if let Some(fence) = schedule.receipt_fence(index, phase == 0) {
+                                    callback.bind(fence)?;
+                                }
                             }
                         }
                     }
@@ -582,10 +594,12 @@ impl Job {
                         e.control_timer_handle = Some(this.clone().start(Delta::from_micros(schedule.fast_retry_us())));
                     }
                 }
-                // The shared scheduler checks every owner's deadlines during
-                // a session poll. Legacy/exclusive execution still needs its
-                // own watchdog; scheduled heads use only the elected poller.
-                if poll_head || e.schedule.is_none() {
+                // The high-resolution retry already polls all owners and
+                // checks their deadlines. A second delayed work item survives
+                // short jobs and wakes again after retirement for no work.
+                // Keep the legacy watchdog, and the slow fallback only when
+                // this elected head did not arm a high-resolution retry.
+                if e.schedule.is_none() || (poll_head && e.control_timer_handle.is_none()) {
                     Self::watchdog(this.clone());
                 }
             }

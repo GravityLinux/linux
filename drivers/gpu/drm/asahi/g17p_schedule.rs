@@ -116,6 +116,10 @@ impl Point {
         self.publication.signal();
     }
     fn refresh(&self) {
+        // Successful history has released its predecessor and cannot change
+        // result. Each preparation phase revisits that history; avoid locking
+        // its completed receipt again. Preserve failed-history handling.
+        if status(&self.completion) > 0 { return; }
         let held = self.receipt.lock();
         if let Some(receipt) = held.as_ref() {
             let completed = status(receipt.fence());
@@ -262,11 +266,16 @@ impl Schedule {
         Ok(fences)
     }
     pub(super) fn receipt_fence(&self, index: usize, publication: bool) -> Option<Fence> {
-        let held = self.nodes[index].point.receipt.lock();
+        let point = &self.nodes[index].point;
+        // Skip only a result already propagated into this Point. Testing the
+        // receipt's published flag would lose a wake racing the last refresh.
+        if status(if publication { &point.publication } else { &point.completion }) != 0 {
+            return None;
+        }
+        let held = point.receipt.lock();
         let receipt = held.as_ref()?;
-        // Register even if publication already happened: it may have raced
-        // the last Point refresh. The callback's ENOENT path requeues its
-        // owner, covering that boundary without another global broadcast.
+        // A racing publication/completion still binds the underlying fence;
+        // ENOENT queues the owner to refresh the Point exactly as before.
         Some(if publication {receipt.publication_fence()} else {receipt.fence()}.clone())
     }
     pub(super) fn fail_unstaged(&self, error: Error) {
@@ -484,42 +493,36 @@ impl Schedule {
             parameters.prior_queue_ta=previous;
             parameters.vdm_dependency=dependencies[0];
             parameters.cdm_dependency=dependencies[1];
-            let count = {
-                let mut held = dev.runtime.lock();
-                let runtime = Option::as_mut(&mut *held)?;
-                // A blocked head can be revisited on every firmware wake.
-                // Test admission before allocating/zeroing a full table
-                // snapshot. In particular, an idle alternate pool does not
-                // permit a rebind while serialized render work is live.
-                // Selection is checked again after the off-lock allocation.
-                if !Self::preferred(runtime, 0, node) { continue; }
-                let snapshot = prepared.render_snapshot.as_ref()?;
-                if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
-                runtime.session.render_rebind_size(snapshot.client(),&parameters).ok()?
-            };
-            let storage = match count {
-                Some(count) => match super::super::g17p_user_vm::TableStorage::new(count) {
-                    Ok(storage) => Some(storage),
-                    Err(error) => { node.point.finish(Some(error)); continue; }
-                },
-                None => None,
-            };
             let (seed,rebind) = {
                 let preparation_wait = RuntimeInterval::waiting();
                 let mut held = dev.runtime.lock();
-                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                let preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
                 let runtime = Option::as_mut(&mut *held)?;
-                // Respect the same engine handoff during preparation as at
-                // publication. Otherwise a competing client can repeatedly
-                // reserve the pool needed by the preferred client.
                 if !Self::preferred(runtime, 0, node) { continue; }
                 let snapshot = prepared.render_snapshot.as_ref()?;
                 if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
+                let count = runtime.session.render_rebind_size(snapshot.client(),&parameters).ok()?;
+                // Warm retained owners need no allocation between sizing and
+                // capture. Keep this one observation/lock instead of selecting
+                // the same owner twice and bouncing the shared runtime lock.
+                let storage = if let Some(count) = count {
+                    drop(preparation_interval);
+                    drop(held);
+                    let storage = match super::super::g17p_user_vm::TableStorage::new(count) {
+                        Ok(storage) => storage,
+                        Err(error) => { node.point.finish(Some(error)); continue; }
+                    };
+                    held = dev.runtime.lock();
+                    let runtime = Option::as_mut(&mut *held)?;
+                    // Allocation was off-lock: preserve the complete admission
+                    // recheck before capturing either root or descriptor data.
+                    if !Self::preferred(runtime, 0, node) { continue; }
+                    if !runtime.session.can_stage_render(Some(snapshot.client()),&parameters).ok()? { continue; }
+                    Some(storage)
+                } else { None };
+                let runtime = Option::as_mut(&mut *held)?;
                 let Some(rebind) = runtime.session.capture_render_rebind(snapshot.client(),&parameters,storage).ok()? else { continue; };
                 let seed = runtime.session.claim_render_preparation(&parameters,snapshot.client()).ok()?;
-                // A cold retained pool can need a caller/root rebind before
-                // its geometry exists. Preserve that independently prepared
-                // root plan even while descriptor preparation must wait.
                 if seed.is_none() && rebind.is_none() { continue; }
                 (seed,rebind)
             };
@@ -598,28 +601,26 @@ impl Schedule {
             for point in [previous, dependencies[0], dependencies[1]].into_iter().flatten() {
                 if !waits[..count].contains(&point) { waits[count] = point; count += 1; }
             }
-            let table_count = {
-                let mut held=dev.runtime.lock();
-                let runtime=Option::as_mut(&mut *held).ok_or(ENODEV)?;
-                let snapshot=prepared.compute_snapshot.as_ref().ok_or(EIO)?;
-                // Advance the selected owner's nonblocking control handshake
-                // before copying any tables. A wrapped owner needs eight
-                // receipts; preparing and discarding the same rebind before
-                // every receipt made a client switch take tens of ms.
-                // Publication still repeats admission and full seed checks.
-                let (ready,_) = runtime.session.can_stage_independent_compute(&runtime.image,
-                    prepared.queue_key,snapshot.client(),parameters,prepared.queue_priority)?;
-                if !ready {continue;}
-                runtime.session.compute_rebind_size(prepared.queue_key,snapshot.client(),parameters,prepared.queue_priority)
-            };
-            let storage=if let Some(count)=table_count {Some(super::super::g17p_user_vm::TableStorage::new(count)?)} else {None};
             let (seed, stamps, rebind) = {
                 let preparation_wait = RuntimeInterval::waiting();
-                let held = dev.runtime.lock();
-                let _preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                let mut held = dev.runtime.lock();
+                let preparation_interval = RuntimeInterval::acquired(preparation_wait, (0,0), "preparation-state");
+                let runtime = Option::as_mut(&mut *held).ok_or(ENODEV)?;
+                let snapshot = prepared.compute_snapshot.as_ref().ok_or(EIO)?;
+                let (ready,_) = runtime.session.can_stage_independent_compute(&runtime.image,
+                    prepared.queue_key,snapshot.client(),parameters,prepared.queue_priority)?;
+                if !ready { continue; }
+                let table_count = runtime.session.compute_rebind_size(prepared.queue_key,
+                    snapshot.client(),parameters,prepared.queue_priority);
+                let storage = if let Some(count) = table_count {
+                    drop(preparation_interval);
+                    drop(held);
+                    let storage = super::super::g17p_user_vm::TableStorage::new(count)?;
+                    held = dev.runtime.lock();
+                    Some(storage)
+                } else { None };
                 let runtime = Option::as_ref(&*held).ok_or(ENODEV)?;
                 if !runtime.session.independent_compute_enabled() { return Ok(None); }
-                let snapshot = prepared.compute_snapshot.as_ref().ok_or(EIO)?;
                 (runtime.session.compute_preparation_seed(prepared.queue_key, snapshot.client(),
                     parameters, prepared.queue_priority, &waits[..count])?,
                  runtime.session.timestamp_cache_seed(&parameters.timestamps)?,
