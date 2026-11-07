@@ -35,7 +35,8 @@ const CONTROL_STATE:u64=0x20300;const CONTROL_RING:u64=0x1e5c0;
 thread_local!{static TRACE:RefCell<Vec<&'static str>>=const{RefCell::new(Vec::new())};}
 #[derive(Default)]struct Memory{cursors:[u32;3],writes:Vec<(u64,Vec<u8>)>,fail_at:Option<usize>}
 struct Vm;
-impl Vm{fn write(&self,m:&mut Memory,context:u32,at:u64,data:&[u8])->Result{
+impl Vm{fn read_firmware32s<const N:usize>(&self,m:&Memory,context:u32,addresses:[u64;N])->Result<[u32;N]>{assert_eq!(context,2);Ok(addresses.map(|at|m.cursors[((at-CONTROL_STATE)/0x10) as usize]))}
+fn write(&self,m:&mut Memory,context:u32,at:u64,data:&[u8])->Result{
  assert_eq!(context,2);
  if m.fail_at==Some(m.writes.len()){return Err(ENOMEM);}
  TRACE.with(|t|t.borrow_mut().push(if at==CONTROL_STATE+0x20{"tail"}else{"data"}));

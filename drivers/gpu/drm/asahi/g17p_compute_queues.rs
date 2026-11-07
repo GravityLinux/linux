@@ -425,10 +425,7 @@ impl Queues {
             started: kernel::time::Instant::now(),
         });
         if maintenance.started.elapsed().as_millis() > 10000 { return Err(ETIMEDOUT); }
-        let mut values = [0; 3];
-        for (value, address) in values.iter_mut().zip(channel.states) {
-            *value = memory.read_firmware32(vm.physical(memory, 2, address)?)?;
-        }
+        let values = vm.read_firmware32s(memory, 2, channel.states)?;
         let counters = q::Counters::new(values).inspect_err(|e| pr_err!("G17P: compute control counters {:?} error {:?}\n",values,e)).map_err(|_| EIO)?;
         if let Some((before, target)) = maintenance.published {
             for i in 0..2 {
@@ -790,10 +787,7 @@ impl Queue {
         // its trailing state. Mapping only the 0x1000 host-authored bytes
         // faults when those bytes end exactly at a 16 KiB page boundary.
         vm.alias_firmware(memory, descriptor, low, 0x1040)?;
-        let mut counters = [0; 3];
-        for (v, at) in counters.iter_mut().zip(channel.states) {
-            *v = memory.read_firmware32(vm.physical(memory, 2, at)?)?;
-        }
+        let counters = vm.read_firmware32s(memory, 2, channel.states)?;
         let counters = q::Counters::new(counters).map_err(|_| EIO)?;
         counters.slot().map_err(|_| EBUSY)?;
         let write_index = if self.generation.window == 0 {

@@ -214,14 +214,14 @@ fn poll(
         idle &= read(memory, vm, a)? == 0;
     }
     for q in &f.queues {
-        for a in [q.pointers, q.pointers + 0x30] {
-            idle &= ring_reached(read(memory, vm, a)?, q.head, q.capacity);
+        for value in vm.read_firmware32s(memory,2,[q.pointers,q.pointers+0x30])? {
+            idle &= ring_reached(value,q.head,q.capacity);
         }
     }
     for c in &f.channels {
         let r = routes[c.index];
-        for a in [r.read, r.done] {
-            idle &= ring_reached(read(memory, vm, a)?, c.head, 256);
+        for value in vm.read_firmware32s(memory,2,[r.read,r.done])? {
+            idle &= ring_reached(value,c.head,256);
         }
     }
     for r in &f.requirements.drains {

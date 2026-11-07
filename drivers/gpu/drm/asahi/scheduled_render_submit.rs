@@ -109,8 +109,9 @@ impl State {
                 self.owner_private_required(pool,incoming,p.kernel_start,p.kernel_end))
     }
     pub(crate) fn render_pool(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<u32> {
+        let availability=session.render_pool_availability();
         let available=|pool:&u32| {
-                if !session.render_pool_available(*pool) {return false;}
+                if !availability[*pool as usize] {return false;}
                 let Some(o)=self.owners.iter().find(|o|o.pool==*pool) else {
                     return super::super::super::g17p_render_lifecycle::render_asid(*pool,session.independent_compute.asid_mask()).is_some();
                 };

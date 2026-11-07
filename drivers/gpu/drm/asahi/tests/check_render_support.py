@@ -61,7 +61,7 @@ fn main(){let mut cases=0;
   let s=Schedule{nodes:vec![Node{staged:false,ready:true,point:Point{completion:Cell::new(0)}}]};
   let result=s.prepare_render_support(&dev,&p);unlocked();
   if mode==0{
-   assert!(result.is_ok());assert_eq!(LOCKS.with(Cell::get),1+usize::from(scratch)+2*usize::from(template));
+   assert_eq!(result,Ok(scratch||template));assert_eq!(LOCKS.with(Cell::get),1+usize::from(scratch)+2*usize::from(template));
    let held=dev.runtime.lock();let session=&held.as_ref().unwrap().session;assert!(!session.scratch&&!session.template);
   }else if mode==1&&scratch{assert_eq!(s.nodes[0].point.completion.get(),41)}
   else if mode==2&&template{assert_eq!(s.nodes[0].point.completion.get(),42)}
