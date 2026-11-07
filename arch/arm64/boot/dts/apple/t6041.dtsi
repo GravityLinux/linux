@@ -14,6 +14,51 @@
     cpus {
         #address-cells = <2>;
         #size-cells = <0>;
+        /* Per-MHz capacities follow the existing M4 CPU description.
+         * OPP maximum frequencies supply the remaining E/P capacity ratio.
+         */
+        cpu-map {
+            cluster0 {
+                core0 { cpu = <&cpu0>; };
+                core1 { cpu = <&cpu1>; };
+                core2 { cpu = <&cpu2>; };
+                core3 { cpu = <&cpu3>; };
+            };
+            cluster1 {
+                core0 { cpu = <&cpu4>; };
+                core1 { cpu = <&cpu5>; };
+                core2 { cpu = <&cpu6>; };
+                core3 { cpu = <&cpu7>; };
+                core4 { cpu = <&cpu8>; };
+                core5 { cpu = <&cpu9>; };
+            };
+            cluster2 {
+                core0 { cpu = <&cpu10>; };
+                core1 { cpu = <&cpu11>; };
+                core2 { cpu = <&cpu12>; };
+                core3 { cpu = <&cpu13>; };
+                core4 { cpu = <&cpu14>; };
+                core5 { cpu = <&cpu15>; };
+            };
+        };
+        m4max_l2_e: l2-cache-e {
+            compatible = "cache";
+            cache-level = <2>;
+            cache-unified;
+            cache-size = <0x400000>;
+        };
+        m4max_l2_p0: l2-cache-p0 {
+            compatible = "cache";
+            cache-level = <2>;
+            cache-unified;
+            cache-size = <0x1000000>;
+        };
+        m4max_l2_p1: l2-cache-p1 {
+            compatible = "cache";
+            cache-level = <2>;
+            cache-unified;
+            cache-size = <0x1000000>;
+        };
         cpu0: cpu@0 {
             compatible = "apple,sawtooth";
             device_type = "cpu";
@@ -24,6 +69,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <741>;
+            next-level-cache = <&m4max_l2_e>;
         };
         cpu1: cpu@1 {
             compatible = "apple,sawtooth";
@@ -35,6 +82,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <741>;
+            next-level-cache = <&m4max_l2_e>;
         };
         cpu2: cpu@2 {
             compatible = "apple,sawtooth";
@@ -46,6 +95,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <741>;
+            next-level-cache = <&m4max_l2_e>;
         };
         cpu3: cpu@3 {
             compatible = "apple,sawtooth";
@@ -57,6 +108,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <741>;
+            next-level-cache = <&m4max_l2_e>;
         };
         cpu4: cpu@10100 {
             compatible = "apple,everest";
@@ -68,6 +121,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p0>;
         };
         cpu5: cpu@10101 {
             compatible = "apple,everest";
@@ -79,6 +134,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p0>;
         };
         cpu6: cpu@10102 {
             compatible = "apple,everest";
@@ -90,6 +147,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p0>;
         };
         cpu7: cpu@10103 {
             compatible = "apple,everest";
@@ -101,6 +160,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p0>;
         };
         cpu8: cpu@10104 {
             compatible = "apple,everest";
@@ -112,6 +173,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p0>;
         };
         cpu9: cpu@10105 {
             compatible = "apple,everest";
@@ -123,6 +186,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p0>;
         };
         cpu10: cpu@10200 {
             compatible = "apple,everest";
@@ -134,6 +199,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p1>;
         };
         cpu11: cpu@10201 {
             compatible = "apple,everest";
@@ -145,6 +212,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p1>;
         };
         cpu12: cpu@10202 {
             compatible = "apple,everest";
@@ -156,6 +225,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p1>;
         };
         cpu13: cpu@10203 {
             compatible = "apple,everest";
@@ -167,6 +238,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p1>;
         };
         cpu14: cpu@10204 {
             compatible = "apple,everest";
@@ -178,6 +251,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p1>;
         };
         cpu15: cpu@10205 {
             compatible = "apple,everest";
@@ -189,6 +264,8 @@
             enable-method = "spin-table";
 #endif
             cpu-release-addr = <0 0>;
+            capacity-dmips-mhz = <1024>;
+            next-level-cache = <&m4max_l2_p1>;
         };
     };
 #ifdef M1N1_MONITOR
