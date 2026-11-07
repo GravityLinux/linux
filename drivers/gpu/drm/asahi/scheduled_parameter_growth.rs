@@ -53,7 +53,8 @@ impl GrowthRequestG16C {
         // SAFETY: Every field is an initialized byte array, alignment one.
         let request = unsafe { raw.as_ptr().cast::<Self>().read() };
         (u32::from_le_bytes(request.kind) == 6
-            && (1..64).contains(&request.context()) && request.slot() < 15).then_some(request)
+            && (1..64).contains(&request.context())
+            && request.slot() < super::super::g17p_render_lifecycle::POOL_SLOTS).then_some(request)
     }
     pub(crate) fn context(&self) -> u32 { u32::from_le_bytes(self.context) }
     pub(crate) fn slot(&self) -> u32 { u32::from_le_bytes(self.slot) }

@@ -26,7 +26,7 @@ for i in range(128):
         f'let neo_reply=neo::Owner{{vm:{context},pool:{slot}}}.reply(&neo_request,{token},true).unwrap();'
         'assert_eq!(&reply.bytes()[..20],&neo_reply[..20],"Max growth reply retains original Neo success/pool/VM/counter ordering");'
         f'emit(reply.bytes());assert!(r.reply(0).is_none());'
-        'for(at,value)in[(0,7u32),(4,0),(4,64),(8,15)]{let mut bad=raw;'
+        'for(at,value)in[(0,7u32),(4,0),(4,64),(8,33)]{let mut bad=raw;'
         'bad[at..at+4].copy_from_slice(&value.to_le_bytes());assert!(growth::GrowthRequestG16C::parse(&bad).is_none());}')
     expected.append(growth_reply(context,slot,generation,token,word))
 parameter=ParameterBuffer(2,0xfffffc20c3150000,0xfffffc20c3120000,
@@ -52,14 +52,15 @@ lines.extend([array('manager',parameter.encode()[:0x88]),array('control',paramet
     'for at in [0,23*16,pages.len()-1] {let saved=pages[at];pages[at]=0xff;'
     'assert!(!growth::metadata_owned(&p,&ids,&manager,&control,1,&region,&pages,&blocks));pages[at]=saved;}'])
 code='#![allow(dead_code,unused_mut)]\nuse std::io::Write;#[derive(Debug)]enum Error{Invalid,Overflow}\n'
+code+='mod render_data{use super::Error;\n'
 for name,file in [('resources','scheduled_render_resources.rs'),('growth','scheduled_parameter_growth.rs')]:
-    code+=f'#[path={json.dumps(str(tests.parent/file))}]mod {name};\n'
-code+='fn emit(bytes:&[u8]){std::io::stdout().write_all(bytes).unwrap();}\nfn main(){\n'
+    code+=f'#[path={json.dumps(str(tests.parent/file))}]pub mod {name};\n'
+code+='}use render_data::{resources,growth};\nfn emit(bytes:&[u8]){std::io::stdout().write_all(bytes).unwrap();}\nfn main(){\n'
 fields=f'slot:2,blocks:23,page_list:{parameter.page_list},block_list:{parameter.block_list},block_control:{parameter.block_control},counter:{parameter.counter},scene_list:{parameter.scene_list}'
 code+='let p=resources::ParameterBufferG16C{'+fields+'};\n'+'\n'.join(lines)+'\n}'
 with tempfile.TemporaryDirectory()as directory:
     tmp=Path(directory);(tmp/'neo.rs').write_text(neo_source)
-    code=code.replace('fn emit(bytes:',f'mod g17p_render_lifecycle{{pub const POOL_SLOTS:u32=15;}}\n#[path={json.dumps(str(tmp/"neo.rs"))}]mod neo;\nfn emit(bytes:')
+    code=code.replace('fn emit(bytes:',f'mod g17p_render_lifecycle{{{next(x for x in (tests.parent/"g17p_render_lifecycle.rs").read_text().splitlines()if x.startswith("pub(crate) const POOL_SLOTS:"))}}}\n#[path={json.dumps(str(tmp/"neo.rs"))}]mod neo;\nfn emit(bytes:')
     (tmp/'gate.rs').write_text(code)
     subprocess.run(['rustc','--edition=2021','-Dwarnings',str(tmp/'gate.rs'),'-o',str(tmp/'gate')],check=True)
     actual=subprocess.check_output([str(tmp/'gate')]);assert actual==b''.join(expected)

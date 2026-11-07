@@ -226,7 +226,9 @@ impl ResourcesG16C {
         directory: u64,
         limit: u64,
     ) -> Result<(Memory, Self)> {
-        if slot >= 15 || bank >= 15 || directory & (PAGE - 1) != 0 || directory == 0 {
+        if slot >= super::super::super::g17p_render_lifecycle::POOL_SLOTS
+            || bank >= super::super::super::g17p_render_lifecycle::POOL_SLOTS
+            || directory & (PAGE - 1) != 0 || directory == 0 {
             return Err(EINVAL);
         }
         // Bootstrap retains two scratch objects at c4000000/c4028000.

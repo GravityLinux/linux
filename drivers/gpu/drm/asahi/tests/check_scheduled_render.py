@@ -79,7 +79,7 @@ def emit(name,p,s,fragment,item,grid,captured=None):
     # Verify errors cannot partly overwrite existing caller staging, including
     # errors found after all other input fields have been checked.
     lines.append('out.fill(0xa5);let seeded=out.clone();')
-    for field,bad in [('context','0'),('pool','15'),('event','128'),('alias','u64::MAX')]:
+    for field,bad in [('context','0'),('pool','g17p_render_lifecycle::POOL_SLOTS'),('event','128'),('alias','u64::MAX')]:
         lines.append(f'let saved=s.{field};s.{field}={bad};assert!({call}.is_err());'
                      f'assert_eq!(out,seeded);s.{field}=saved;')
     for field,bad in [('sampler_count','u32::MAX'),('sampler_array','3'),('width','0')]:
@@ -151,7 +151,8 @@ with tempfile.TemporaryDirectory() as directory:
     code='#![allow(dead_code,unused_mut,unused_assignments)]\nuse std::io::Write;\n'
     for name in ('scheduled_profile','g17p_compute','g17p_render'):
         code+=f'#[path={json.dumps(str(tests.parent/(name+".rs")))}]mod {name};\n'
-    code+='mod g17p_render_lifecycle{pub const POOL_SLOTS:u32=(u32::BITS-2)/2;}\n'
+    pool_constant=next(line for line in (tests.parent/'g17p_render_lifecycle.rs').read_text().splitlines()if line.startswith('pub(crate) const POOL_SLOTS:'))
+    code+=f'mod g17p_render_lifecycle{{{pool_constant}}}\n'
     code+='use g17p_render::program;\n'
     code+='use g17p_render::wire as render;\nfn main(){\n'+'\n'.join(lines)+'\n}\n'
     (tmp/'main.rs').write_text(code)
@@ -172,7 +173,7 @@ with tempfile.TemporaryDirectory() as directory:
     neo+=f'#[path={json.dumps(str(tests.parent/"scheduled_profile.rs"))}]mod scheduled_profile;\n'
     neo+=f'#[path={json.dumps(str(tests.parent/"g17p_compute.rs"))}]mod g17p_compute;\n'
     neo+=f'#[path={json.dumps(str(tests.parent/"g17p_render.rs"))}]mod current;\n'
-    neo+='mod legacy;\nmod g17p_render_lifecycle {pub const POOL_SLOTS:u32=(u32::BITS-2)/2;}\n'
+    neo+=f'mod legacy;\nmod g17p_render_lifecycle {{{pool_constant}}}\n'
     neo+='macro_rules! images {($r:ident,$i:expr)=>{{let i=$i;let mut p=$r::Parameters{\n'
     neo+='width:[1,32,33,129,1970,16384][i as usize%6],height:1123,layers:1+i%4,\n'
     neo+='samples:[1,2,4][i as usize%3],context_base:0x1000000000,queue_pair:i%4,\n'

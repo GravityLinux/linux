@@ -459,7 +459,7 @@ impl Context<'_> {
                 }
                 if self.pair >= 2 {
                     let grid = self.grid.ok_or(Error::Invalid)?;
-                    if grid >= 32 || grid % 2 != u32::from(fragment) { return Err(Error::Invalid); }
+                    if grid >= 128 || grid % 2 != u32::from(fragment) { return Err(Error::Invalid); }
                     w[0] = (u64::from(fragment) << 58) | ((grid as u64) << 42) | 4;
                     w[0x20 / 8] |= (self.pair as u64) << 32;
                     w[0x28 / 8] = ((grid - u32::from(fragment)) as u64) << 40 | u64::from(fragment);
