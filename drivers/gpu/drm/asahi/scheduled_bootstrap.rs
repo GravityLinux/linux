@@ -106,8 +106,15 @@ pub(crate) fn control_cursors(memory:&Memory,vm:&Vm)->Result<[u32;3]> {
     Ok(values)
 }
 pub(crate) fn publish_control(memory:&mut Memory,vm:&Vm,record:&[u8;64])->Result<u32> {
-    let [read,done,producer]=control_cursors(memory,vm)?;
-    if read!=producer || done!=producer {return Err(EBUSY);}
+    let values=control_cursors(memory,vm)?;
+    // Retained compute cleanup publishes nonblocking control transactions on
+    // this same ring. Append behind those transactions, using BOTH consumers
+    // to protect storage, rather than requiring the whole channel to be idle.
+    // Runtime locking serializes producers; synchronous callers wait for this
+    // new tail, and cleanup retains its own wrap-aware retirement receipt.
+    let counters=super::g17p_queue::Counters::new(values).map_err(|_|EIO)?;
+    counters.slot().map_err(|_|EBUSY)?;
+    let producer=values[2];
     vm.write(memory,2,CONTROL_RING+producer as u64*64,record)?;
     super::g17p_memory::sync();
     let next=(producer+1)%256;
