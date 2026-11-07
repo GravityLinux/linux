@@ -21,7 +21,7 @@ for i in range(32):
         ('resources::PAGE',f'p.scenes(&mut out,{low_slots})'),('resources::BLOCK_LIST_SIZE','p.block_ids(&mut out)'),
         ('resources::PAGE_LIST_SIZE','p.pages(&mut out)'),('resources::PAGE','p.control(&mut out)'),('resources::PAGE','p.counter(&mut out)')]:
         lines.append(f'let mut out=vec![0xa5;{size}];{call}.unwrap();emit(&out);'
-                     'out.fill(0xa5);let saved=out.clone();let original=p.slot;p.slot=15;'
+                     'out.fill(0xa5);let saved=out.clone();let original=p.slot;p.slot=g17p_render_lifecycle::POOL_SLOTS;'
                      f'assert!({call}.is_err());assert_eq!(out,saved);p.slot=original;')
     lines.append('for(a,n)in p.backing_ranges().unwrap(){emit(&a.to_le_bytes());emit(&n.to_le_bytes());}')
     expected.append(b''.join(struct.pack('<QQ',*r)for r in param.backing_ranges()))
@@ -52,9 +52,11 @@ for i in range(64):
 with tempfile.TemporaryDirectory()as directory:
     tmp=Path(directory)
     code='#![allow(dead_code,unused_mut)]\nuse std::io::Write;#[derive(Debug)]enum Error{Invalid,Overflow}\n'
+    constant=next(x for x in (tests.parent/'g17p_render_lifecycle.rs').read_text().splitlines()if x.startswith('pub(crate) const POOL_SLOTS:'))
+    code+='mod g17p_render_lifecycle{'+constant+'}\nmod render_data{use super::Error;\n'
     for name,file in [('resources','scheduled_render_resources.rs'),('admission','scheduled_render_admission.rs'),('operands','scheduled_operands.rs')]:
-        code+=f'#[path={json.dumps(str(tests.parent/file))}]mod {name};\n'
-    code+='fn emit(bytes:&[u8]){std::io::stdout().write_all(bytes).unwrap();}\nfn main(){\n'+'\n'.join(lines)+'''
+        code+=f'#[path={json.dumps(str(tests.parent/file))}]pub mod {name};\n'
+    code+='}use render_data::{resources,admission,operands};\nfn emit(bytes:&[u8]){std::io::stdout().write_all(bytes).unwrap();}\nfn main(){\n'+'\n'.join(lines)+'''
     let mut r=admission::RegistrationG16C{context:1,support:0xfffffc20c3000000,table:0x7001000000,added:5,previous:23,bank:0,tag:19};
     r.context=0;assert!(r.prepare().is_err());r.context=64;assert!(r.prepare().is_err());r.context=1;
     r.added=0;assert!(r.prepare().is_err());r.added=1<<29;assert!(r.prepare().is_err());r.added=5;

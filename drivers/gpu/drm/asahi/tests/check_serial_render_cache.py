@@ -21,7 +21,7 @@ mod module_parameters{
  pub static native_barriers:P=P(4);pub static partial_independent_owner:P=P(5);
  pub static alternate_queue_pairs:P=P(6);
 }
-mod life{pub const POOL_SLOTS:u32=15;}
+mod life{POOL_CONSTANT}
 mod render{use super::*;
 '''+item('g17p_render_runtime.rs','pub(crate) fn serialized_cache_enabled(')+'\n'+item('g17p_render_runtime.rs','pub(crate) fn pool_count(')+'\n}\n'
 code+=item('g17p_render_lifecycle.rs','pub(crate) fn select_affine_pool(')+'\n'+item('g17p_render_lifecycle.rs','pub(crate) fn select_pool(')+'\n'+item('g17p_render_lifecycle.rs','pub(crate) fn select_cached_pool(')+r'''
@@ -29,7 +29,7 @@ struct Fence(AtomicI32);impl Fence{fn raw(&self)->*const AtomicI32{&self.0}}
 mod kernel{pub mod bindings{pub unsafe fn dma_fence_get_status(p:*const super::super::AtomicI32)->i32{unsafe{(*p).load(super::super::Ordering::Acquire)}}}}
 struct Wave(Vec<u32>);impl Wave{fn pool_busy(&self,p:u32)->bool{self.0.contains(&p)}}
 enum PendingWork{Render(Wave),WrappedRender(Wave),Control}
-struct Session{automatic_render_parallel:bool,render_cache_clock:u64,render_cache_used:[u64;15],render_cache_hits:[u8;15],render_cache_cost:[u16;15],render_cache_owner:[Option<(u64,u32)>;15],pending:Option<PendingWork>,render_cpu_leases:Vec<(u32,Fence)>,preparing:u32}
+struct Session{automatic_render_parallel:bool,render_cache_clock:u64,render_cache_used:[u64;33],render_cache_hits:[u8;33],render_cache_cost:[u16;33],render_cache_owner:[Option<(u64,u32)>;33],pending:Option<PendingWork>,render_cpu_leases:Vec<(u32,Fence)>,preparing:u32}
 impl Session{
  fn render_preparing(&self,p:u32)->bool{self.preparing&(1<<p)!=0}
  fn live_render_count(&self)->usize{match &self.pending{Some(PendingWork::Render(w)|PendingWork::WrappedRender(w))=>w.0.len(),_=>0}}
@@ -71,7 +71,7 @@ fn main(){
     |p|owned&(1<<p)!=0,&hits,&[1;4],&ages),expected);
   }
  }}}}
- let mut s=Session{automatic_render_parallel:false,render_cache_clock:0,render_cache_used:[0;15],render_cache_hits:[0;15],render_cache_cost:[1;15],render_cache_owner:[None;15],pending:None,render_cpu_leases:vec![],preparing:0};
+ let mut s=Session{automatic_render_parallel:false,render_cache_clock:0,render_cache_used:[0;33],render_cache_hits:[0;33],render_cache_cost:[1;33],render_cache_owner:[None;33],pending:None,render_cpu_leases:vec![],preparing:0};
  assert!(s.render_pool_available(0)&&s.render_pool_available(1));
  for wrapped in [false,true]{
   s.pending=Some(if wrapped{PendingWork::WrappedRender(Wave(vec![0]))}else{PendingWork::Render(Wave(vec![0]))});
@@ -97,7 +97,7 @@ fn main(){
  assert!(s.render_cache_hits[..14].iter().all(|&n|n==0));
  let victim=select_affine_pool(0,15,|_|true,|_|false,|_|false,&s.render_cache_hits,&s.render_cache_cost,&s.render_cache_used).unwrap();
  assert!(victim<14);s.touch_render_cache(victim,(2,1),1);assert_eq!(s.render_cache_hits[victim as usize],1);
- let clock=s.render_cache_clock;s.touch_render_cache(15,(9,9),1);assert_eq!(s.render_cache_clock,clock);
+ let clock=s.render_cache_clock;s.touch_render_cache(33,(9,9),1);assert_eq!(s.render_cache_clock,clock);
  s.render_cache_clock=u64::MAX-1;s.touch_render_cache(14,(1,99),1);s.touch_render_cache(14,(1,99),1);assert_eq!(s.render_cache_clock,u64::MAX);
  // Equal-frequency active roots retain their accumulated binding-walk
  // cost. A large compositor must not be the cheapest victim merely because
@@ -112,12 +112,13 @@ fn main(){
  // enable it or alter native/diagnostic profiles.
  for slots in [0,1,2,4,15,16,u32::MAX]{
   module_parameters::SETTINGS.with(|v|v.set([slots,1,0,0,0,0,0]));
-  assert_eq!(render::serialized_cache_enabled(),slots>1);assert_eq!(render::pool_count(),if slots>1{slots.min(15)as u64}else{1},"slots {slots}");
+  assert_eq!(render::serialized_cache_enabled(),slots>1);assert_eq!(render::pool_count(),if slots>1{slots.min(life::POOL_SLOTS)as u64}else{1},"slots {slots}");
  }
  for setting in 1..6{let mut v=[2,1,0,0,0,0,0];v[setting]=if setting==1{0}else{1};module_parameters::SETTINGS.with(|c|c.set(v));assert!(!render::serialized_cache_enabled());}
  println!("PASS {checks} original selector cases +32768 affine cases; actual GPU/CPU cross-pool lease exclusion, preparation, failure fences, bounded cache and legacy/native policy isolation");
 }
 '''
+code=code.replace('POOL_CONSTANT',next(line for line in sources['g17p_render_lifecycle.rs'].splitlines()if line.startswith('pub(crate) const POOL_SLOTS:')))
 a.evidence.mkdir(parents=True,exist_ok=False);(a.evidence/'test.rs').write_text(code)
 subprocess.run(['rustc','--edition=2021','-O',str(a.evidence/'test.rs'),'-o',str(a.evidence/'gate')],check=True)
 out=subprocess.check_output([str(a.evidence/'gate')],text=True);(a.evidence/'output.txt').write_text(out);(a.evidence/'source.json').write_text(json.dumps({'sources':{n:hashlib.sha256(s.encode()).hexdigest() for n,s in sources.items()},'GPU_execution':False},indent=2)+'\n');print(out,end='')

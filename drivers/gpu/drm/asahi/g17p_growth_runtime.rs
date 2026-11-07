@@ -48,7 +48,7 @@ pub(crate) struct Pool {
     work: [u64; 2],
     fragment: u64,
     fragment_event: u32,
-    terminal_mask: u32,
+    terminal_mask: u128,
     initial_limit_reply: Option<(u64, u32)>,
     // Every retained initial and newly allocated TVB leaf, for root admission.
     mappings: KVec<(u64, u64)>,
@@ -980,12 +980,12 @@ impl Service {
             // The same physical report ring serves both engines. A CL2
             // terminal belongs only to the active synchronous compute owner;
             // it cannot satisfy the render pair's terminal baseline.
-            let subtype = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            let subtype = u128::from_le_bytes(body[4..20].try_into().unwrap());
             let combined = self
                 .pools
                 .iter()
                 .fold(0, |bits, pool| bits | pool.terminal_mask);
-            let mut mask = 0;
+            let mut mask = 0u64;
             for (index, pool) in self.pools.iter().enumerate() {
                 if subtype & !combined == 0 && subtype & pool.terminal_mask == pool.terminal_mask {
                     mask |= 1 << index;
@@ -994,7 +994,7 @@ impl Service {
             let recognized = self.pools.iter().enumerate().fold(0, |bits, (index, pool)|
                 bits | if mask & (1 << index) != 0 { pool.terminal_mask } else { 0 });
             if mask != 0 && subtype != recognized { return Err(EIO); }
-            if mask == 0 && body[8..16] == [0; 8] {
+            if mask == 0 && body[8..20] == [0; 12] {
                 if (!mixed && compute_ordinal.is_none()) || self.compute_owners.is_empty() {
                     return Err(EIO);
                 }
@@ -1003,7 +1003,7 @@ impl Service {
                 self.consume(memory, vm, next)?;
                 return Ok(Action::Consumed);
             }
-            if mask == 0 || body[8..16] != [0; 8] {
+            if mask == 0 {
                 return Err(EIO);
             }
             for (index, pool) in self.pools.iter_mut().enumerate() {

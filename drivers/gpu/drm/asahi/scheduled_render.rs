@@ -125,7 +125,7 @@ fn encode(out: &mut [u8], program: &[Register]) {
 
 fn preflight(p: &Parameters, s: &State, item: u32, grid: u32) -> Result<(u32, u64), Error> {
     if !(1..64).contains(&s.context)
-        || s.pool >= 15
+        || s.pool >= super::super::g17p_render_lifecycle::POOL_SLOTS
         || grid >= 128
         || s.event != grid
         || !(1..=16384).contains(&p.width)

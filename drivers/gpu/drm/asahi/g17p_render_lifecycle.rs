@@ -83,12 +83,15 @@ pub(crate) fn render_asid(pool:u32,mask:u64)->Option<u16> {
 }
 
 pub(crate) const NATIVE_SUBMISSIONS: u32 = 255;
-// The terminal report is a u32 grid bitmap. Compute reserves grids 4/5;
-// each render owner consumes an adjacent TA/FR pair from the remaining bits.
-pub(crate) const POOL_SLOTS: u32 = (u32::BITS - 2) / 2;
+// Terminal reports carry 128 event bits. Keep the existing render grids
+// below 32 and independent compute's 60 grids (32..92) unchanged; additional
+// retained render owners use the remaining high pairs. Pool residency must
+// not inherit the old low-word-only terminal decoder's fifteen-owner limit.
+pub(crate) const POOL_SLOTS: u32 = 15 + (128 - 92) / 2;
 pub(crate) fn pool_grids(pool: u32) -> Result<[u32; 2]> {
     if pool >= POOL_SLOTS { return Err(Error::Invalid); }
-    let ta = 2 * pool + if pool >= 2 { 2 } else { 0 };
+    let ta = if pool < 15 { 2 * pool + if pool >= 2 { 2 } else { 0 } }
+        else { 92 + 2 * (pool - 15) };
     Ok([ta, ta + 1])
 }
 pub(crate) fn private_delta(pool: u32) -> u64 {

@@ -189,7 +189,8 @@ const _: () = {
 };
 impl ParameterBufferG16C {
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.slot >= 15 || self.blocks == 0 || self.blocks > MAX_BLOCKS {
+        if self.slot >= super::super::g17p_render_lifecycle::POOL_SLOTS
+            || self.blocks == 0 || self.blocks > MAX_BLOCKS {
             return Err(Error::Invalid);
         }
         for address in [
