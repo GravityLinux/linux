@@ -103,7 +103,7 @@ impl rtkit::Operations for Operations {
         message: u64,
     ) {
         data.last_message.store(message, Ordering::Release);
-        data.events.wake();
+        data.events.firmware_wake();
         if endpoint == 0x20 && message >> 48 == 0x09 {
             data.acknowledged.store(true, Ordering::Release);
         }
@@ -1411,25 +1411,38 @@ impl Session {
         } else { return Ok(Some(work.layout.pair)); };
         let desired=incoming.unwrap_or(&work.client);
         let availability=self.render_pool_availability();
-        // A retired pool still owns its tiler reservation. A changed caller
-        // can use another pool without overwriting this pool's grown backing.
+        let independent=self.independent_render_roots();
+        let mut matching=[false;super::g17p_render_lifecycle::POOL_SLOTS as usize];
+        let mut related=[false;super::g17p_render_lifecycle::POOL_SLOTS as usize];
+        if independent {
+            if let Some(slot)=matching.get_mut(work.layout.pair as usize) {
+                *slot=Self::same_client(desired,&work.client);
+            }
+            if let Some(slot)=related.get_mut(work.layout.pair as usize) {
+                *slot=desired.owner==work.client.owner;
+            }
+            for (pool,client) in &self.render_pool_clients {
+                // The active pool's caller is work.client, even if an older
+                // cached entry with this pool identity is still present.
+                if *pool==work.layout.pair {continue;}
+                if let Some(slot)=matching.get_mut(*pool as usize) {
+                    *slot|=Self::same_client(desired,client);
+                }
+                if let Some(slot)=related.get_mut(*pool as usize) {
+                    *slot|=desired.owner==client.owner;
+                }
+            }
+        }
         let available=|pair:&u32|availability[*pair as usize]
-            && (!self.independent_render_roots() || work.growth.as_ref().is_none_or(|service|
+            && (!independent || work.growth.as_ref().is_none_or(|service|
                 service.caller_compatible(*pair,&desired.bindings)))
-            && (!self.independent_render_roots() || *pair==0
-                || self.render_pool_asids[*pair as usize]!=0
+            && (!independent || *pair==0 || self.render_pool_asids[*pair as usize]!=0
                 || self.independent_compute.asid_mask()!=u64::MAX);
-        let matching=|pair:&u32| self.independent_render_roots() && if *pair==work.layout.pair {
-            Self::same_client(desired,&work.client)
-        } else { self.render_pool_clients.iter().any(|(pool,client)|
-            pool==pair && Self::same_client(desired,client)) };
-        let related=|pair:&u32| self.independent_render_roots()
+        let matches=|pair:&u32|matching[*pair as usize];
+        let relates=|pair:&u32|related[*pair as usize]
             && work.pair_queue_owner(*pair).is_some()
-            && work.growth.as_ref().is_none_or(|service|service.caller_compatible(*pair,&desired.bindings))
-            && if *pair==work.layout.pair {
-            desired.owner==work.client.owner
-        } else {self.render_pool_clients.iter().any(|(pool,client)|pool==pair&&desired.owner==client.owner)};
-        Ok(super::g17p_render_lifecycle::select_affine_pool(next,count,available,matching,related,
+            && work.growth.as_ref().is_none_or(|service|service.caller_compatible(*pair,&desired.bindings));
+        Ok(super::g17p_render_lifecycle::select_affine_pool(next,count,available,matches,relates,
             &self.render_cache_hits,&self.render_cache_cost,&self.render_cache_used))
     }
 

@@ -109,28 +109,47 @@ impl State {
                 self.owner_private_required(pool,incoming,p.kernel_start,p.kernel_end))
     }
     pub(crate) fn render_pool(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<u32> {
-        let availability=session.render_pool_availability();
-        let available=|pool:&u32| {
-                if !availability[*pool as usize] {return false;}
-                let Some(o)=self.owners.iter().find(|o|o.pool==*pool) else {
-                    return super::super::super::g17p_render_lifecycle::render_asid(*pool,session.independent_compute.asid_mask()).is_some();
-                };
-                o.private_next.checked_sub(o.directory).and_then(|span|p.kernel_start.checked_add(span))
-                    .is_some_and(|end|end<=p.kernel_end)
-                    && self.queues.iter().filter(|q|q.owner<self.owners.len() && self.owners[q.owner].pool==*pool)
-                        .all(|q|q.generation.idle())
-            };
-        let matching=|pool:&u32| self.owners.iter().any(|o|o.pool==*pool&&o.client.as_ref().is_some_and(|c|same(c,incoming)));
-        let count=if session.automatic_render_parallel {super::super::super::g17p_render_lifecycle::POOL_SLOTS}
-            else {super::super::super::g17p_render_runtime::pool_count() as u32};
-        let life=self.render_ordinal;
-        let related=|pool:&u32| self.owners.iter().any(|o|o.pool==*pool
-            &&o.render.as_ref().is_some_and(|render|render.admitted())
-            &&o.client.as_ref().is_some_and(|client|client.owner==incoming.owner)
-            &&o.private_next.checked_sub(o.directory).and_then(|span|p.kernel_start.checked_add(span))
-                .is_some_and(|end|end<=p.kernel_end));
-        super::super::super::g17p_render_lifecycle::select_affine_pool(life,count,available,matching,related,
-            &session.render_cache_hits,&session.render_cache_cost,&session.render_cache_used)
+        use super::super::super::g17p_render_lifecycle as life;
+        let mut available = session.render_pool_availability();
+        let mut occupied = [false; life::POOL_SLOTS as usize];
+        let mut matching = [false; life::POOL_SLOTS as usize];
+        let mut related = [false; life::POOL_SLOTS as usize];
+        // Classify each retained owner and queue once. Repeated predicates in
+        // the affine selector otherwise multiply a pool scan by owner/queue
+        // scans, on every admission query. No result survives this selection.
+        for owner in &self.owners {
+            let pool = owner.pool as usize;
+            if pool >= occupied.len() { continue; }
+            let fits = owner.private_next.checked_sub(owner.directory)
+                .and_then(|span| p.kernel_start.checked_add(span))
+                .is_some_and(|end| end <= p.kernel_end);
+            // Preserve the original first-owner space check, including old
+            // dormant owners sharing a pool with its current queue owner.
+            if !occupied[pool] {
+                occupied[pool] = true;
+                available[pool] &= fits;
+            }
+            matching[pool] |= owner.client.as_ref().is_some_and(|c| same(c, incoming));
+            related[pool] |= fits && owner.render.as_ref().is_some_and(|r| r.admitted())
+                && owner.client.as_ref().is_some_and(|c| c.owner == incoming.owner);
+        }
+        for queue in &self.queues {
+            if let Some(owner) = self.owners.get(queue.owner) {
+                if let Some(slot) = available.get_mut(owner.pool as usize) {
+                    *slot &= queue.generation.idle();
+                }
+            }
+        }
+        let asids = session.independent_compute.asid_mask();
+        for (pool, slot) in available.iter_mut().enumerate() {
+            if !occupied[pool] { *slot &= life::render_asid(pool as u32, asids).is_some(); }
+        }
+        let count = if session.automatic_render_parallel { life::POOL_SLOTS }
+            else { super::super::super::g17p_render_runtime::pool_count() as u32 };
+        life::select_affine_pool(self.render_ordinal, count,
+            |pool| available[*pool as usize], |pool| matching[*pool as usize],
+            |pool| related[*pool as usize], &session.render_cache_hits,
+            &session.render_cache_cost, &session.render_cache_used)
     }
     fn retained_render_index(&self,session:&Session,incoming:&compute::Client,p:&command::Parameters)->Option<usize> {
         let key=p.queue_owner?;p.firmware_priority?;

@@ -61,25 +61,29 @@ struct Prepared{parameters:[Command;1],queue_key:(u64,u32),
     render_snapshot:Option<Snapshot>,render_client:Option<Client>}
 struct RuntimeInterval;
 impl RuntimeInterval{
-    fn waiting(){}fn acquired(_:(),_:(u64,u32),_:&str){}
+    fn waiting(){}fn acquired(_:(),_:(u64,u32),_:&str)->Self{Self}
 }
-struct Mutex(RefCell<Option<Runtime>>);
-impl Mutex{fn lock(&self)->RefMut<'_,Option<Runtime>>{self.0.borrow_mut()}}
+thread_local!{static LOCKED:Cell<bool>=const{Cell::new(false)};static LOCKS:Cell<usize>=const{Cell::new(0)};}
+struct Mutex(RefCell<Option<Runtime>>);struct Guard<'a>(RefMut<'a,Option<Runtime>>);
+impl Mutex{fn lock(&self)->Guard<'_>{assert!(!LOCKED.with(Cell::get));LOCKED.with(|v|v.set(true));LOCKS.with(|v|v.set(v.get()+1));Guard(self.0.borrow_mut())}}
+impl std::ops::Deref for Guard<'_>{type Target=Option<Runtime>;fn deref(&self)->&Self::Target{&self.0}}
+impl std::ops::DerefMut for Guard<'_>{fn deref_mut(&mut self)->&mut Self::Target{&mut self.0}}
+impl Drop for Guard<'_>{fn drop(&mut self){LOCKED.with(|v|v.set(false));}}
 struct Device{runtime:Mutex}
 struct Runtime{session:Session}
 struct Session{cold:bool,rebind:bool,can_stage:bool,root_error:bool,descriptor_error:bool}
 static ALLOCATIONS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
-struct TableStorage;impl TableStorage{fn new(_:usize)->Result<Self>{
+struct TableStorage;impl TableStorage{fn new(_:usize)->Result<Self>{assert!(!LOCKED.with(Cell::get));
     ALLOCATIONS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);Ok(Self)
 }}
 struct RebindSeed{fail:bool}
 struct PreparedPoolRebind;
-impl RebindSeed{fn prepare(self,_:&Client)->Result<PreparedPoolRebind>{
+impl RebindSeed{fn prepare(self,_:&Client)->Result<PreparedPoolRebind>{assert!(!LOCKED.with(Cell::get));
     if self.fail{Err(Error)}else{Ok(PreparedPoolRebind)}
 }}
 struct PreparationSeed{fail:bool}
 struct PreparedAppend;
-impl PreparationSeed{fn prepare(self:Box<Self>)->Result<Box<PreparedAppend>>{
+impl PreparationSeed{fn prepare(self:Box<Self>)->Result<Box<PreparedAppend>>{assert!(!LOCKED.with(Cell::get));
     if self.fail{Err(Error)}else{Ok(Box::new(PreparedAppend))}
 }}
 impl Session{
@@ -110,12 +114,13 @@ fn main(){
         cold:true,rebind:true,can_stage:true,root_error:false,descriptor_error:false}})))};
     let first=schedule.prepare_render(&dev,&prepared)
         .expect("cold pool discarded a needed root plan while waiting for descriptor geometry");
-    assert_eq!(first.0,0);assert!(first.2.is_some());
+    assert_eq!(first.0,0);assert!(first.2.is_some());assert_eq!(LOCKS.with(Cell::get),2);
 ''' + ('    assert!(first.1.is_none());\n' if optional_objects else '') + r'''
     // Installing that returned plan allows the existing geometry phase to
     // run; normal descriptor preparation then makes progress independently.
     {let mut held=dev.runtime.lock();let s=&mut held.as_mut().unwrap().session;s.rebind=false;s.cold=false;}
-    let warm=schedule.prepare_render(&dev,&prepared).unwrap();assert!(warm.2.is_none());
+    LOCKS.with(|v|v.set(0));
+    let warm=schedule.prepare_render(&dev,&prepared).unwrap();assert!(warm.2.is_none());assert_eq!(LOCKS.with(Cell::get),1);
 ''' + ('    assert!(warm.1.is_some());\n' if optional_objects else '') + r'''
     {let mut held=dev.runtime.lock();held.as_mut().unwrap().session.rebind=true;}
     assert!(schedule.prepare_render(&dev,&prepared).unwrap().2.is_some());
