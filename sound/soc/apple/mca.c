@@ -170,11 +170,13 @@ struct mca_cluster {
 	unsigned long configured_bclk;
 	u32 mclk_sel_flags;
 
-	/* Masks etc. picked up via the set_tdm_slot method */
-	int tdm_slots;
-	int tdm_slot_width;
-	unsigned int tdm_tx_mask;
-	unsigned int tdm_rx_mask;
+	/*
+	 * Masks etc. picked up via the set_tdm_slot method, per direction:
+	 * one frontend can transmit 32-bit slots while it receives 16-bit ones.
+	 */
+	int tdm_slots[SNDRV_PCM_STREAM_LAST + 1];
+	int tdm_slot_width[SNDRV_PCM_STREAM_LAST + 1];
+	unsigned int tdm_mask[SNDRV_PCM_STREAM_LAST + 1];
 };
 
 struct mca_data {
@@ -658,33 +660,40 @@ static int mca_fe_startup(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
-	unsigned int mask, nchannels;
+	unsigned int nchannels;
 
-	if (cl->tdm_slots) {
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-			mask = cl->tdm_tx_mask;
-		else
-			mask = cl->tdm_rx_mask;
-
-		nchannels = hweight32(mask);
-	} else {
+	if (cl->tdm_slots[substream->stream])
+		nchannels = hweight32(cl->tdm_mask[substream->stream]);
+	else
 		nchannels = 2;
-	}
 
 	return snd_pcm_hw_constraint_minmax(substream->runtime,
 					    SNDRV_PCM_HW_PARAM_CHANNELS,
 					    1, nchannels);
 }
 
+/*
+ * A direction whose mask is zero keeps its earlier configuration, so a
+ * capture-only link can describe its own slots on a frontend that another
+ * link uses for playback.
+ */
 static int mca_fe_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
 			       unsigned int rx_mask, int slots, int slot_width)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
+	unsigned int masks[] = {
+		[SNDRV_PCM_STREAM_PLAYBACK] = tx_mask,
+		[SNDRV_PCM_STREAM_CAPTURE] = rx_mask,
+	};
+	int stream;
 
-	cl->tdm_slots = slots;
-	cl->tdm_slot_width = slot_width;
-	cl->tdm_tx_mask = tx_mask;
-	cl->tdm_rx_mask = rx_mask;
+	for_each_pcm_streams(stream) {
+		if (!masks[stream])
+			continue;
+		cl->tdm_slots[stream] = slots;
+		cl->tdm_slot_width[stream] = slot_width;
+		cl->tdm_mask[stream] = masks[stream];
+	}
 
 	return 0;
 }
@@ -829,7 +838,7 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 	u32 regval, pad;
 	int ret, portmask, nchans_ceiled;
 
-	if (!cl->tdm_slot_width) {
+	if (!cl->tdm_slot_width[substream->stream]) {
 		/*
 		 * We were not given TDM settings from above, set initial
 		 * guesses which will later be refined.
@@ -838,9 +847,9 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 		tdm_slots = params_channels(params);
 		refine_tdm = true;
 	} else {
-		tdm_slot_width = cl->tdm_slot_width;
-		tdm_slots = cl->tdm_slots;
-		tdm_mask = is_tx ? cl->tdm_tx_mask : cl->tdm_rx_mask;
+		tdm_slot_width = cl->tdm_slot_width[substream->stream];
+		tdm_slots = cl->tdm_slots[substream->stream];
+		tdm_mask = cl->tdm_mask[substream->stream];
 	}
 
 	if (cl->bclk_ratio)
