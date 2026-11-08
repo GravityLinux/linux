@@ -710,10 +710,37 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.scl1 = true,
 };
 
+/*
+ * M4 (T8132) has the M4 Max's H16 ISP and runs the same macOS 26.6.2
+ * firmware, so it takes the T6041 boot and command paths. The values below
+ * come from the J713 ADT, not from a native trace:
+ * - DSID bases: dart-isp's DAPF grants the two MCC ranges at 0x2201c4000 and
+ *   0x2221c4000; the base uses the T6041 offset within such a range.
+ * - Bandwidth request: pmgr "bwr-agent" lists ISP as agent 1, the block at
+ *   0x382824000 next to DCP's 0x382820000, and DAPF grants dart-isp that word.
+ * - The clock request scratch inside the PMP PTD window is not identified
+ *   yet, so PMP_CTRL_SET is not sent (clock_scratch = 0).
+ */
+static const struct apple_isp_hw apple_isp_hw_t8132 = {
+	.gen = ISP_GEN_T6041,
+	.dsid_count = 2,
+	.dsid_clr_base0 = 0x2201d4000,
+	.dsid_clr_base1 = 0x2221d4000,
+	.dsid_clr_range0 = 0x2fc,
+	.clock_scratch = 0,
+	.clock_size = 8,
+	.bandwidth_scratch = 0x382824000,
+	.bandwidth_size = 8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+	.scl1 = true,
+	.meta_size = ISP_META_SIZE_T6031,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t8142-isp", .data = &apple_isp_hw_t8142 },
 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6041 },
+	{ .compatible = "apple,t8132-isp", .data = &apple_isp_hw_t8132 },
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
 	{ .compatible = "apple,t8122-isp", .data = &apple_isp_hw_t8122 },
