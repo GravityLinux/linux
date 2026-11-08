@@ -390,6 +390,64 @@
 	dma-names = "tx2a";
 };
 
+/*
+ * Speakers: four SN012776 amplifiers on i2c3 (ADT audio-speaker*), sharing the
+ * SDZ line held off above. TX slots follow the ADT rx_slot order (0x38 0,
+ * 0x3b 1, 0x39 2, 0x3c 3); V/I sense slots as macOS programs them. The left
+ * pair is on MCA port 0 and the right pair on port 1, both fed from cluster 0.
+ * Described for the protected speaker driver: i2c3 stays disabled, so none of
+ * this probes until that driver and its limits land.
+ */
+/ {
+	speaker_sdz_supply: regulator-speaker-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "Speaker SDZ reference";
+		/* The common SDZ (AP GPIO 15) is owned by the protected machine driver. */
+	};
+};
+
+&i2c3 {
+	amp_left_woofer: amplifier@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <0>;
+		ti,imon-slot-no = <2>;
+	};
+
+	amp_left_tweeter: amplifier@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <8>;
+		ti,imon-slot-no = <10>;
+	};
+
+	amp_right_woofer: amplifier@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <4>;
+		ti,imon-slot-no = <6>;
+	};
+
+	amp_right_tweeter: amplifier@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <12>;
+		ti,imon-slot-no = <14>;
+	};
+};
+
 &i2c1 {
 	status = "okay";
 
