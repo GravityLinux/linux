@@ -24,6 +24,7 @@
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/dmaengine.h>
@@ -126,6 +127,7 @@
 #define REG_T8132_OUTPUT_CLR	0x144
 #define REG_T8132_RX_SET	0x150
 #define REG_T8132_RX_CLR	0x154
+#define REG_T8132_RX_STATUS	0x158	/* receivers enabled after the latch */
 #define REG_T8132_TX_SET	0x160
 #define REG_T8132_TX_CLR	0x164
 #define REG_T8132_LATCH		0x170
@@ -167,6 +169,15 @@ struct mca_cluster {
 	unsigned int output_users;
 	/* T8132: capture DMA requests enabled (switch unit 0x04 bit 4) */
 	bool rx_req;
+	/*
+	 * T8132 serializer state for the staged enables. A following capture is
+	 * armed by its own trigger but receives only while playback runs; when
+	 * playback stops, the capture is suspended so that it restarts with its
+	 * DMA aligned to the frame (see mca_fe_trigger_staged()).
+	 */
+	bool tx_running, rx_armed, rx_running;
+	struct snd_pcm *follower_pcm;
+	struct work_struct follower_work;
 
 	unsigned int bclk_ratio;
 	unsigned long configured_bclk;
@@ -317,6 +328,29 @@ static struct mca_cluster *mca_dai_to_cluster(struct snd_soc_dai *dai)
 	return &mca->clusters[cluster_no];
 }
 
+/*
+ * T8132: re-align a serializer to the frame before it starts, by resetting it
+ * and re-selecting its sync source as on T8103. Without this, the playback
+ * channels and the sense channels land in different TDM slots at every
+ * start. The cluster's clocks must run and the serializer must be disabled:
+ * touching a receive serializer while it runs, or without clocks, wedges the
+ * SoC.
+ */
+static void mca_t8132_resync(struct mca_cluster *cl, int serdes_unit, int serdes_conf)
+{
+	mca_modify(cl, serdes_conf, SERDES_CONF_SYNC_SEL,
+		   FIELD_PREP(SERDES_CONF_SYNC_SEL, 0));
+	mca_modify(cl, serdes_conf, SERDES_CONF_SYNC_SEL,
+		   FIELD_PREP(SERDES_CONF_SYNC_SEL, 7));
+	mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
+		   SERDES_STATUS_EN | SERDES_STATUS_RST, SERDES_STATUS_RST);
+	udelay(50);
+	mca_modify(cl, serdes_conf, SERDES_CONF_SYNC_SEL,
+		   FIELD_PREP(SERDES_CONF_SYNC_SEL, 0));
+	mca_modify(cl, serdes_conf, SERDES_CONF_SYNC_SEL,
+		   FIELD_PREP(SERDES_CONF_SYNC_SEL, cl->no + 1));
+}
+
 /* called before PCM trigger */
 static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 				 struct snd_soc_dai *dai)
@@ -326,6 +360,23 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 	int serdes_unit = is_tx ? CLUSTER_TX_OFF : CLUSTER_RX_OFF;
 	int serdes_conf =
 		serdes_unit + (is_tx ? REG_TX_SERDES_CONF : cl->host->variant->rx_conf);
+	int rx_conf = CLUSTER_RX_OFF + cl->host->variant->rx_conf;
+
+	if (cl->host->variant->staged_enables) {
+		if (cmd != SNDRV_PCM_TRIGGER_START && cmd != SNDRV_PCM_TRIGGER_RESUME &&
+		    cmd != SNDRV_PCM_TRIGGER_PAUSE_RELEASE)
+			return;
+		if (is_tx) {
+			/* the clocks run from back-end prepare on */
+			mca_t8132_resync(cl, serdes_unit, serdes_conf);
+			/* an armed following capture starts with this playback */
+			if (cl->rx_armed && !cl->rx_running)
+				mca_t8132_resync(cl, CLUSTER_RX_OFF, rx_conf);
+		} else if (!cl->capture_follows || cl->tx_running) {
+			mca_t8132_resync(cl, serdes_unit, serdes_conf);
+		}
+		return;
+	}
 
 	if (!cl->host->variant->serdes_reset)
 		return;
@@ -369,21 +420,74 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
  * then latches them together. The output stays on while either direction of
  * this FE runs.
  */
-static void mca_fe_trigger_staged(struct mca_cluster *cl, bool is_tx, bool enable)
+static void mca_fe_trigger_staged(struct mca_cluster *cl,
+				  struct snd_pcm_substream *substream, bool enable)
 {
 	void __iomem *base = cl->host->base;
+	bool is_tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
+	bool rx_was_running = cl->rx_running;
+	u32 bit = BIT(cl->no);
 
 	if (enable && !cl->output_users++)
-		writel_relaxed(BIT(cl->no), base + REG_T8132_OUTPUT_SET);
+		writel_relaxed(bit, base + REG_T8132_OUTPUT_SET);
 	else if (!enable && cl->output_users && !--cl->output_users)
-		writel_relaxed(BIT(cl->no), base + REG_T8132_OUTPUT_CLR);
-	if (is_tx)
-		writel_relaxed(BIT(cl->no), base +
-			       (enable ? REG_T8132_TX_SET : REG_T8132_TX_CLR));
-	else
-		writel_relaxed(BIT(cl->no), base +
-			       (enable ? REG_T8132_RX_SET : REG_T8132_RX_CLR));
+		writel_relaxed(bit, base + REG_T8132_OUTPUT_CLR);
+
+	if (is_tx) {
+		cl->tx_running = enable;
+		writel_relaxed(bit, base + (enable ? REG_T8132_TX_SET : REG_T8132_TX_CLR));
+		/*
+		 * A following capture receives exactly while playback runs, so
+		 * its first word is the first slot of a frame. Its DMA has
+		 * consumed a partial frame by the time playback stops, so
+		 * suspend it: the reader restarts it, aligned, before the next
+		 * playback (speakersafetyd reopens the PCM on ESTRPIPE).
+		 */
+		if (cl->rx_armed && cl->rx_running != enable) {
+			writel_relaxed(bit, base + (enable ? REG_T8132_RX_SET : REG_T8132_RX_CLR));
+			cl->rx_running = enable;
+			if (!enable)
+				schedule_work(&cl->follower_work);
+		}
+	} else if (cl->capture_follows) {
+		cl->rx_armed = enable;
+		if (enable)
+			cl->follower_pcm = substream->pcm;
+		if (enable ? cl->tx_running : cl->rx_running) {
+			writel_relaxed(bit, base + (enable ? REG_T8132_RX_SET : REG_T8132_RX_CLR));
+			cl->rx_running = enable;
+		}
+	} else {
+		writel_relaxed(bit, base + (enable ? REG_T8132_RX_SET : REG_T8132_RX_CLR));
+	}
 	writel_relaxed(1, base + REG_T8132_LATCH);
+
+	/*
+	 * A receive serializer stopped while the clocks still run keeps the
+	 * words of a partial frame. Flush them now, or the next capture DMA
+	 * starts with them and its channels are shifted.
+	 */
+	if (!enable && (is_tx || cl->capture_follows) && rx_was_running && !cl->rx_running) {
+		u32 v;
+
+		/* only once the latched disable has taken effect */
+		if (readl_relaxed_poll_timeout_atomic(base + REG_T8132_RX_STATUS, v,
+						      !(v & bit), 1, 200))
+			dev_warn_ratelimited(cl->host->dev,
+					     "cluster %d: receiver did not stop, not flushed\n", cl->no);
+		else
+			mca_t8132_resync(cl, CLUSTER_RX_OFF,
+					 CLUSTER_RX_OFF + cl->host->variant->rx_conf);
+	}
+}
+
+static void mca_follower_work(struct work_struct *work)
+{
+	struct mca_cluster *cl = container_of(work, struct mca_cluster, follower_work);
+	struct snd_pcm *pcm = READ_ONCE(cl->follower_pcm);
+
+	if (pcm && !READ_ONCE(cl->rx_running))
+		snd_pcm_suspend_all(pcm);
 }
 
 static int mca_fe_trigger(struct snd_pcm_substream *substream, int cmd,
@@ -412,7 +516,7 @@ static int mca_fe_trigger(struct snd_pcm_substream *substream, int cmd,
 	}
 
 	if (cl->host->variant->staged_enables)
-		mca_fe_trigger_staged(cl, is_tx, enable);
+		mca_fe_trigger_staged(cl, substream, enable);
 	else if (enable)
 		mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
 			   SERDES_STATUS_EN | SERDES_STATUS_RST,
@@ -1458,6 +1562,7 @@ static void apple_mca_release(struct mca_data *mca)
 	for (i = 0; i < mca->nclusters; i++) {
 		struct mca_cluster *cl = &mca->clusters[i];
 
+		cancel_work_sync(&cl->follower_work);
 		if (!IS_ERR_OR_NULL(cl->clk_parent))
 			clk_put(cl->clk_parent);
 
@@ -1513,6 +1618,9 @@ static int apple_mca_probe(struct platform_device *pdev)
 	mutex_init(&mca->port_mutex);
 	platform_set_drvdata(pdev, mca);
 	clusters = mca->clusters;
+	/* before any error path: apple_mca_release() cancels these */
+	for (i = 0; i < nclusters; i++)
+		INIT_WORK(&clusters[i].follower_work, mca_follower_work);
 
 	mca->switch_base = variant->switch_in_cluster ? base + variant->switch_off :
 		devm_platform_ioremap_resource(pdev, 1);
