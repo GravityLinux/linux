@@ -258,6 +258,21 @@ int isp_cmd_t6041_start(struct apple_isp *isp)
 
 	static_assert(sizeof(dsid) == 0x50);
 	static_assert(sizeof(rpc) == 0xc);
+
+	/* Other H16 SoCs list their own MCC ranges in the hw data. */
+	if (isp->hw->dsid_count) {
+		const u64 bases[] = { isp->hw->dsid_clr_base0,
+				      isp->hw->dsid_clr_base1,
+				      isp->hw->dsid_clr_base2,
+				      isp->hw->dsid_clr_base3 };
+
+		if (isp->hw->dsid_count > ARRAY_SIZE(bases))
+			return -EINVAL;
+		memset(dsid.bases, 0, sizeof(dsid.bases));
+		memcpy(dsid.bases, bases, isp->hw->dsid_count * sizeof(u64));
+		dsid.count = isp->hw->dsid_count;
+		dsid.range = isp->hw->dsid_clr_range0;
+	}
 	ret = isp_cmd_print_enable(isp, 1);
 	if (ret)
 		return ret;
@@ -267,10 +282,15 @@ int isp_cmd_t6041_start(struct apple_isp *isp)
 	ret = CISP_SEND_INOUT(isp, dsid);
 	if (ret)
 		return ret;
-	ret = isp_cmd_pmp_ctrl_set(isp, isp->hw->clock_scratch, 0, 0, 8,
-				 isp->hw->bandwidth_scratch, 0, 0, 8);
-	if (ret)
-		return ret;
+	/* Without a known clock scratch, leave the PMP request unconfigured. */
+	if (isp->hw->clock_scratch) {
+		ret = isp_cmd_pmp_ctrl_set(isp, isp->hw->clock_scratch, 0, 0,
+					   isp->hw->clock_size,
+					   isp->hw->bandwidth_scratch, 0, 0,
+					   isp->hw->bandwidth_size);
+		if (ret)
+			return ret;
+	}
 	ret = CISP_SEND_IN(isp, rpc);
 	if (ret)
 		return ret;
