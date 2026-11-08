@@ -149,6 +149,8 @@ struct mca_cluster {
 	struct dma_chan *dma_chans[SNDRV_PCM_STREAM_LAST + 1];
 
 	bool clk_provider;
+	/* Capture follows the clocks of this cluster's playback (see mca_capture_follows()) */
+	bool capture_follows;
 
 	bool port_clk_started[SNDRV_PCM_STREAM_LAST + 1];
 	int port_clk_driver; /* The cluster driving this cluster's port */
@@ -220,6 +222,7 @@ struct mca_variant {
 	bool cluster_divider;		/* divide a fixed parent instead of setting its rate */
 	bool has_rx;
 	bool clk_consumer;
+	bool capture_follower;		/* consumer requests make capture follow playback */
 	/* receive serializer register offsets within its unit */
 	u8 rx_conf, rx_bitstart, rx_slotmask, rx_port;
 };
@@ -274,6 +277,7 @@ static const struct mca_variant mca_t8132_variant = {
 	.port_pd = true,
 	.cluster_divider = true,
 	.has_rx = true,
+	.capture_follower = true,
 	.rx_conf = 0x04,
 	.rx_bitstart = 0x08,
 	.rx_slotmask = 0x0c,
@@ -712,9 +716,12 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 		break;
 
 	case SND_SOC_DAIFMT_BC_FC:
-		if (!mca->variant->clk_consumer)
+		if (mca->variant->clk_consumer)
+			cl->clk_provider = false;
+		else if (mca->variant->capture_follower)
+			cl->capture_follows = true;
+		else
 			goto err;
-		cl->clk_provider = false;
 		break;
 
 	default:
@@ -759,10 +766,10 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
 	/*
-	 * macOS leaves BCLK_POL clear for its 8 x 16-bit sense receive
-	 * (0x1b047), but with the 4 x 32-bit layout used here the port-1
-	 * samples are only clean on the transmit edge, so both follow the
-	 * format as on T8103.
+	 * Receive follows the format like transmit, as on T8103. macOS leaves
+	 * BCLK_POL clear for the J713 sense receive (0x1b047); in Linux
+	 * captures both edges sample port 0 cleanly, and the transmit edge
+	 * leaves more margin for the later-arriving port-1 data.
 	 */
 	if (mca->variant->has_rx)
 		mca_modify(cl, CLUSTER_RX_OFF + mca->variant->rx_conf,
@@ -1029,6 +1036,19 @@ static struct snd_soc_pcm_runtime *mca_be_get_fe(struct snd_soc_pcm_runtime *be,
 	return fe;
 }
 
+/*
+ * T8132 clusters cannot take their clocks from a port. A capture-only link
+ * that asks for consumer clocking (the speaker V/I sense) instead follows the
+ * clocks of the same cluster's playback: it neither starts nor holds the port
+ * clocks, so it can stay open without keeping the bit clock running, and like
+ * a consumer cluster on earlier SoCs it returns no data while playback is
+ * stopped.
+ */
+static bool mca_capture_follows(struct mca_cluster *fe_cl, int stream)
+{
+	return stream == SNDRV_PCM_STREAM_CAPTURE && fe_cl->capture_follows;
+}
+
 static int mca_be_prepare(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
@@ -1041,7 +1061,7 @@ static int mca_be_prepare(struct snd_pcm_substream *substream,
 
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
 
-	if (!fe_cl->clk_provider)
+	if (!fe_cl->clk_provider || mca_capture_follows(fe_cl, substream->stream))
 		return 0;
 
 	if (cl->port_clk_driver < 0)
@@ -1088,6 +1108,9 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	if (!fe)
 		return -EINVAL;
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
+
+	if (mca_capture_follows(fe_cl, substream->stream))
+		return 0;
 
 	if (mca->variant->port_pd && cl != fe_cl &&
 	    !cl->port_pd_link[substream->stream]) {
@@ -1178,6 +1201,9 @@ static void __mca_be_shutdown(struct snd_pcm_substream *substream,
 	if (!fe)
 		return;
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
+
+	if (mca_capture_follows(fe_cl, substream->stream))
+		return;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_TX_DATA, 0);
