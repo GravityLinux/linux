@@ -959,6 +959,16 @@ static int mca_be_prepare(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+/*
+ * Port data source: the FE cluster's TX serializer. T8132 encodes it as one bit
+ * per cluster; earlier SoCs use a TXA/TXB bit pair per cluster.
+ */
+static u32 mca_port_data_sel(struct mca_data *mca, struct mca_cluster *fe_cl)
+{
+	return mca->variant->staged_enables ? BIT(fe_cl->no) :
+	       PORT_DATA_SEL_TXA(fe_cl->no);
+}
+
 static int mca_be_startup(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
@@ -973,8 +983,7 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		writel_relaxed(mca->variant->staged_enables ? BIT(fe_cl->no) :
-			       PORT_DATA_SEL_TXA(fe_cl->no),
+		writel_relaxed(mca_port_data_sel(mca, fe_cl),
 			       mca_reg(cl, REG_PORT_DATA_SEL));
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_TX_DATA,
 			   PORT_ENABLES_TX_DATA);
@@ -999,7 +1008,7 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	writel_relaxed(FIELD_PREP(PORT_CLOCK_SEL, fe_cl->no + 1),
 		       mca_reg(cl, REG_PORT_CLOCK_SEL));
 
-	writel_relaxed(PORT_DATA_SEL_TXA(fe_cl->no),
+	writel_relaxed(mca_port_data_sel(mca, fe_cl),
 		       mca_reg(cl, REG_PORT_DATA_SEL));
 
 	mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS,
