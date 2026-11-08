@@ -460,3 +460,5 @@
 		sound-name-prefix = "Jack";
 	};
 };
+
+#include "t8132-usb4.dtsi"
