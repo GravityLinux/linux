@@ -1151,7 +1151,16 @@ static int macaudio_fe_init(struct snd_soc_pcm_runtime *rtd)
 
 	if (props->tdm_slots) {
 		unsigned int mask = GENMASK(props->tdm_slots - 1, 0);
+		int ret;
 
+		/*
+		 * The frame is fixed. Set it here so that a capture-only link
+		 * (the sense, which hw_params gives no bit clock ratio) can be
+		 * configured before playback has run.
+		 */
+		ret = snd_soc_dai_set_bclk_ratio(snd_soc_rtd_to_cpu(rtd, 0), ma->mca->bclk_ratio);
+		if (ret)
+			return ret;
 		/* Claim only this link's directions: links may share a DAI */
 		return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_cpu(rtd, 0),
 						rtd->dai_link->capture_only ? 0 : mask,
