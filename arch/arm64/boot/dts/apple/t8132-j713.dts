@@ -14,6 +14,7 @@
 #include "t8132-mtp.dtsi"
 #include "t8132-gpu.dtsi"
 #include "t8132-aop.dtsi"
+#include "t8132-isp.dtsi"
 #include "t8132-j713-thermal.dtsi"
 #include <dt-bindings/leds/common.h>
 
@@ -507,3 +508,27 @@
 };
 
 #include "t8132-usb4.dtsi"
+
+#include "isp-common.dtsi"
+
+&isp {
+	/*
+	 * ADT isp "sensor-type" is 23. Asahi uses sensor-type as the boot
+	 * argument platform-id; unconfirmed for J713.
+	 */
+	apple,platform-id = <23>;
+
+	sensor-presets {
+		/*
+		 * Assumes the M4 Max's 12 MP Center Stage sensor (0x958): config 0
+		 * reads 3072 x 3024 and a centred 16:9 crop gives 1280x720, as in
+		 * t6041-isp.dtsi. Check against the CONFIG_GET dump at probe.
+		 */
+		preset0 {
+			apple,config-index = <0>;
+			apple,input-size = <3072 3024>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 648 3072 1728>;
+		};
+	};
+};
