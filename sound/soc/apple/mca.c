@@ -152,6 +152,8 @@ struct mca_cluster {
 
 	bool clocks_in_use[SNDRV_PCM_STREAM_LAST + 1];
 	struct device_link *pd_link;
+	/* Keeps this cluster's domain up while another cluster's FE uses its port */
+	struct device_link *port_pd_link[SNDRV_PCM_STREAM_LAST + 1];
 
 	/* In case of clock consumer FE */
 	int syncgen_in_use;
@@ -204,6 +206,7 @@ struct mca_variant {
 	unsigned int dma_adapter_nchans; /* fixed NCHANS field, 0: the stream's channels */
 	bool serdes_reset;		/* pulse SERDES_STATUS_RST before starting */
 	bool staged_enables;		/* enables are staged and latched, not serdes EN */
+	bool port_pd;			/* a port unit needs its own cluster's domain */
 	bool cluster_divider;		/* divide a fixed parent instead of setting its rate */
 	bool has_rx;
 	bool clk_consumer;
@@ -242,6 +245,12 @@ static const struct mca_variant mca_t8132_variant = {
 	 */
 	.dma_adapter_nchans = 1,
 	.staged_enables = true,
+	/*
+	 * The port units live in their cluster's domain: on J713 the right-hand
+	 * speaker amplifiers sit on port 1, fed from cluster 0, and see no
+	 * clock unless audio_mca1_m is up as well.
+	 */
+	.port_pd = true,
 	.cluster_divider = true,
 };
 
@@ -990,6 +999,19 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
 
+	if (mca->variant->port_pd && cl != fe_cl &&
+	    !cl->port_pd_link[substream->stream]) {
+		cl->port_pd_link[substream->stream] =
+			device_link_add(mca->dev, cl->pd_dev,
+					DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME |
+					DL_FLAG_RPM_ACTIVE);
+		if (!cl->port_pd_link[substream->stream]) {
+			dev_err(mca->dev, "port %d: unable to prop-up power domain\n",
+				cl->no);
+			return -EINVAL;
+		}
+	}
+
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		writel_relaxed(mca_port_data_sel(mca, fe_cl),
 			       mca_reg(cl, REG_PORT_DATA_SEL));
@@ -1006,8 +1028,13 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 		 * Make sure there isn't a conflict with another cluster
 		 * driving the port clocks.
 		 */
-		if (cl->port_clk_driver != fe_cl->no)
+		if (cl->port_clk_driver != fe_cl->no) {
+			if (cl->port_pd_link[substream->stream]) {
+				device_link_del(cl->port_pd_link[substream->stream]);
+				cl->port_pd_link[substream->stream] = NULL;
+			}
 			return -EINVAL;
+		}
 
 		cl->port_clk_started[substream->stream] = true;
 		return 0;
@@ -1029,8 +1056,8 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-static void mca_be_shutdown(struct snd_pcm_substream *substream,
-			    struct snd_soc_dai *dai)
+static void __mca_be_shutdown(struct snd_pcm_substream *substream,
+			      struct snd_soc_dai *dai)
 {
 	struct snd_soc_pcm_runtime *be = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_pcm_runtime *fe = mca_be_get_fe(be, substream->stream);
@@ -1080,6 +1107,20 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 		writel_relaxed(0, mca_reg(cl, REG_PORT_CLOCK_SEL));
 		scoped_guard(mutex, &mca->port_mutex)
 			cl->port_clk_driver = -1;
+	}
+}
+
+static void mca_be_shutdown(struct snd_pcm_substream *substream,
+			    struct snd_soc_dai *dai)
+{
+	struct mca_cluster *cl = mca_dai_to_cluster(dai);
+
+	__mca_be_shutdown(substream, dai);
+
+	/* after the last access to this port's registers */
+	if (cl->port_pd_link[substream->stream]) {
+		device_link_del(cl->port_pd_link[substream->stream]);
+		cl->port_pd_link[substream->stream] = NULL;
 	}
 }
 
