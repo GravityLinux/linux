@@ -201,6 +201,7 @@ struct mca_variant {
 	bool switch_in_cluster;
 	u32 mclk_sel_flags;		/* extra bits in REG_SYNCGEN_MCLK_SEL */
 	u32 dma_adapter_flags;		/* constant bits of the DMA adapter word */
+	unsigned int dma_adapter_nchans; /* fixed NCHANS field, 0: the stream's channels */
 	bool serdes_reset;		/* pulse SERDES_STATUS_RST before starting */
 	bool staged_enables;		/* enables are staged and latched, not serdes EN */
 	bool cluster_divider;		/* divide a fixed parent instead of setting its rate */
@@ -234,6 +235,12 @@ static const struct mca_variant mca_t8132_variant = {
 	.switch_in_cluster = true,
 	.mclk_sel_flags = BIT(9),
 	.dma_adapter_flags = BIT(29),
+	/*
+	 * macOS programs 1 here for 2-channel headphone and 4-channel speaker
+	 * streams alike; with 4 the ADMAC is no longer paced by the serializer
+	 * and drains the buffer in a few milliseconds.
+	 */
+	.dma_adapter_nchans = 1,
 	.staged_enables = true,
 	.cluster_divider = true,
 };
@@ -822,7 +829,8 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 	/*
 	 * TODO: Here the register semantics aren't clear.
 	 */
-	nchans_ceiled = min_t(int, params_channels(params), 4);
+	nchans_ceiled = mca->variant->dma_adapter_nchans ?:
+			min_t(int, params_channels(params), 4);
 	regval = FIELD_PREP(DMA_ADAPTER_NCHANS, nchans_ceiled) |
 		 FIELD_PREP(DMA_ADAPTER_TX_LSB_PAD, pad) |
 		 mca->variant->dma_adapter_flags;
