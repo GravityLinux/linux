@@ -124,11 +124,14 @@
 #define REG_T8132_OUTPUT_CLOCK_SEL(n)	(0x100 + 4 * (n))
 #define REG_T8132_OUTPUT_SET	0x140
 #define REG_T8132_OUTPUT_CLR	0x144
+#define REG_T8132_RX_SET	0x150
+#define REG_T8132_RX_CLR	0x154
 #define REG_T8132_TX_SET	0x160
 #define REG_T8132_TX_CLR	0x164
 #define REG_T8132_LATCH		0x170
 /* T8132 only, relative to switch base */
 #define REG_T8132_SWITCH_UNK_04	0x4
+#define T8132_SWITCH_RX_EN	BIT(4)	/* receive DMA requests; macOS speakers: 0x11 */
 #define REG_T8132_SWITCH_UNK_08	0x8
 
 #define MAX_NCLUSTERS	6
@@ -157,6 +160,11 @@ struct mca_cluster {
 
 	/* In case of clock consumer FE */
 	int syncgen_in_use;
+
+	/* T8132: streams of this FE holding its staged output enable */
+	unsigned int output_users;
+	/* T8132: capture DMA requests enabled (switch unit 0x04 bit 4) */
+	bool rx_req;
 
 	unsigned int bclk_ratio;
 	unsigned long configured_bclk;
@@ -210,6 +218,8 @@ struct mca_variant {
 	bool cluster_divider;		/* divide a fixed parent instead of setting its rate */
 	bool has_rx;
 	bool clk_consumer;
+	/* receive serializer register offsets within its unit */
+	u8 rx_conf, rx_bitstart, rx_slotmask, rx_port;
 };
 
 static const struct mca_variant mca_t8103_variant = {
@@ -221,18 +231,27 @@ static const struct mca_variant mca_t8103_variant = {
 	.serdes_reset = true,
 	.has_rx = true,
 	.clk_consumer = true,
+	.rx_conf = REG_RX_SERDES_CONF,
+	.rx_bitstart = REG_RX_SERDES_BITSTART,
+	.rx_slotmask = REG_RX_SERDES_SLOTMASK,
+	.rx_port = REG_RX_SERDES_PORT,
 };
 
 /*
  * T8132 has separate banks for clocks, ports, serializers and adapters.
  * Each bank contains 0x100-byte units; the global enable registers are shared.
- * Capture routing is not yet supported.
+ * The receive serializers (bank 0x4000, used as the RXB unit, so the DMA
+ * channel is "rx<n>b") lay out their registers like the
+ * transmit ones: configuration at 0x04, bit start 0x08, slot masks 0x0c/0x10
+ * and the port mask at 0x14 (macOS speaker sense capture: 0x0001b047,
+ * 0xffffff00, ports 0x3).
  */
 static const struct mca_variant mca_t8132_variant = {
 	.cluster_stride = 0x100,
 	.aperture_size = 0xc000,
 	.adapter_stride = 0x100,
-	.group_off = { 0x2000, 0x2020, MCA_GROUP_UNMAPPED, 0x6000, MCA_GROUP_UNMAPPED,
+	/* capture uses the RXB unit (USE_RXB_FOR_CAPTURE): T8132's receive bank */
+	.group_off = { 0x2000, 0x2020, MCA_GROUP_UNMAPPED, 0x6000, 0x4000,
 		       MCA_GROUP_UNMAPPED, 0x2060, MCA_GROUP_UNMAPPED },
 	.switch_off = 0x8000,
 	.switch_in_cluster = true,
@@ -252,6 +271,11 @@ static const struct mca_variant mca_t8132_variant = {
 	 */
 	.port_pd = true,
 	.cluster_divider = true,
+	.has_rx = true,
+	.rx_conf = 0x04,
+	.rx_bitstart = 0x08,
+	.rx_slotmask = 0x0c,
+	.rx_port = 0x14,
 };
 
 static void __iomem *mca_reg(struct mca_cluster *cl, unsigned int reg)
@@ -295,7 +319,7 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 	bool is_tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
 	int serdes_unit = is_tx ? CLUSTER_TX_OFF : CLUSTER_RX_OFF;
 	int serdes_conf =
-		serdes_unit + (is_tx ? REG_TX_SERDES_CONF : REG_RX_SERDES_CONF);
+		serdes_unit + (is_tx ? REG_TX_SERDES_CONF : cl->host->variant->rx_conf);
 
 	if (!cl->host->variant->serdes_reset)
 		return;
@@ -334,14 +358,26 @@ static void mca_fe_early_trigger(struct snd_pcm_substream *substream, int cmd,
 	}
 }
 
-/* T8132 stages the output mux and TX enables, then latches both. */
-static void mca_fe_trigger_staged(struct mca_cluster *cl, bool enable)
+/*
+ * T8132 stages the output enable and the per-direction serializer enables,
+ * then latches them together. The output stays on while either direction of
+ * this FE runs.
+ */
+static void mca_fe_trigger_staged(struct mca_cluster *cl, bool is_tx, bool enable)
 {
-	writel_relaxed(BIT(cl->no), cl->host->base +
-		       (enable ? REG_T8132_OUTPUT_SET : REG_T8132_OUTPUT_CLR));
-	writel_relaxed(BIT(cl->no), cl->host->base +
-		       (enable ? REG_T8132_TX_SET : REG_T8132_TX_CLR));
-	writel_relaxed(1, cl->host->base + REG_T8132_LATCH);
+	void __iomem *base = cl->host->base;
+
+	if (enable && !cl->output_users++)
+		writel_relaxed(BIT(cl->no), base + REG_T8132_OUTPUT_SET);
+	else if (!enable && cl->output_users && !--cl->output_users)
+		writel_relaxed(BIT(cl->no), base + REG_T8132_OUTPUT_CLR);
+	if (is_tx)
+		writel_relaxed(BIT(cl->no), base +
+			       (enable ? REG_T8132_TX_SET : REG_T8132_TX_CLR));
+	else
+		writel_relaxed(BIT(cl->no), base +
+			       (enable ? REG_T8132_RX_SET : REG_T8132_RX_CLR));
+	writel_relaxed(1, base + REG_T8132_LATCH);
 }
 
 static int mca_fe_trigger(struct snd_pcm_substream *substream, int cmd,
@@ -370,7 +406,7 @@ static int mca_fe_trigger(struct snd_pcm_substream *substream, int cmd,
 	}
 
 	if (cl->host->variant->staged_enables)
-		mca_fe_trigger_staged(cl, enable);
+		mca_fe_trigger_staged(cl, is_tx, enable);
 	else if (enable)
 		mca_modify(cl, serdes_unit + REG_SERDES_STATUS,
 			   SERDES_STATUS_EN | SERDES_STATUS_RST,
@@ -509,6 +545,16 @@ static int mca_fe_hw_free(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
 	struct mca_cluster *cl = mca_dai_to_cluster(dai);
+	struct mca_data *mca = cl->host;
+
+	if (mca->variant->staged_enables &&
+	    substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+		void __iomem *reg = mca->switch_base + mca->variant->adapter_stride * cl->no +
+				    REG_T8132_SWITCH_UNK_04;
+
+		cl->rx_req = false;
+		writel_relaxed(readl_relaxed(reg) & ~T8132_SWITCH_RX_EN, reg);
+	}
 
 	if (cl->clk_provider)
 		return 0;
@@ -578,7 +624,7 @@ static int mca_configure_serdes(struct mca_cluster *cl, int serdes_unit,
 
 	mca_modify(cl,
 		   serdes_unit +
-			   (is_tx ? REG_TX_SERDES_CONF : REG_RX_SERDES_CONF),
+			   (is_tx ? REG_TX_SERDES_CONF : cl->host->variant->rx_conf),
 		   serdes_conf_mask, serdes_conf);
 
 	if (is_tx) {
@@ -591,12 +637,12 @@ static int mca_configure_serdes(struct mca_cluster *cl, int serdes_unit,
 		writel_relaxed(~((u32)mask),
 			       serdes_base + REG_TX_SERDES_SLOTMASK + 0xc);
 	} else {
-		writel_relaxed(0xffffffff,
-			       serdes_base + REG_RX_SERDES_SLOTMASK);
+		const struct mca_variant *v = cl->host->variant;
+
+		writel_relaxed(0xffffffff, serdes_base + v->rx_slotmask);
 		writel_relaxed(~((u32)mca_crop_mask(mask, nchans)),
-			       serdes_base + REG_RX_SERDES_SLOTMASK + 0x4);
-		writel_relaxed(portmask,
-			       serdes_base + REG_RX_SERDES_PORT);
+			       serdes_base + v->rx_slotmask + 0x4);
+		writel_relaxed(portmask, serdes_base + v->rx_port);
 	}
 
 	return 0;
@@ -703,14 +749,20 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 
 	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
+	/*
+	 * macOS leaves BCLK_POL clear for its 8 x 16-bit sense receive
+	 * (0x1b047), but with the 4 x 32-bit layout used here the port-1
+	 * samples are only clean on the transmit edge, so both follow the
+	 * format as on T8103.
+	 */
 	if (mca->variant->has_rx)
-		mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
+		mca_modify(cl, CLUSTER_RX_OFF + mca->variant->rx_conf,
 			   SERDES_CONF_BCLK_POL, serdes_conf);
 	writel_relaxed(bitstart,
 		       mca_reg(cl, CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART));
 	if (mca->variant->has_rx)
 		writel_relaxed(bitstart,
-			       mca_reg(cl, CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART));
+			       mca_reg(cl, CLUSTER_RX_OFF + mca->variant->rx_bitstart));
 
 	return 0;
 
@@ -754,7 +806,8 @@ static int mca_fe_set_clocks_divider(struct mca_cluster *cl, unsigned long bclk_
 	/* Required for output on this generation; their meaning is not known. */
 	writel_relaxed(0x10, mca->switch_base + cl->no * mca->variant->adapter_stride +
 		       REG_T8132_SWITCH_UNK_08);
-	writel_relaxed(1, mca->switch_base + cl->no * mca->variant->adapter_stride +
+	writel_relaxed(1 | (cl->rx_req ? T8132_SWITCH_RX_EN : 0),
+		       mca->switch_base + cl->no * mca->variant->adapter_stride +
 		       REG_T8132_SWITCH_UNK_04);
 	writel_relaxed(cl->no + 1, mca->base + REG_T8132_OUTPUT_CLOCK_SEL(cl->no));
 	cl->configured_bclk = bit_rate;
@@ -846,6 +899,33 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 	if (mca->variant->has_rx)
 		regval |= FIELD_PREP(DMA_ADAPTER_RX_MSB_PAD, pad);
 
+	/*
+	 * T8132 playback and capture of one cluster share the adapter word
+	 * (macOS speakers: 24-bit out, 16-bit sense in, 0x20101008). Capture
+	 * owns the receive fields and playback everything else, so neither
+	 * direction clobbers the other's pad.
+	 */
+	if (mca->variant->staged_enables) {
+		u32 rx_mask = DMA_ADAPTER_RX_MSB_PAD | DMA_ADAPTER_RX_NCHANS;
+		u32 mask = is_tx ? ~rx_mask : rx_mask;
+		void __iomem *adapter = mca->switch_base +
+					mca->variant->adapter_stride * cl->no;
+
+		if (is_tx)
+			regval &= ~rx_mask;
+		else
+			regval = FIELD_PREP(DMA_ADAPTER_RX_MSB_PAD, pad);
+		writel_relaxed((readl_relaxed(adapter) & ~mask) | (regval & mask),
+			       adapter);
+		/* without this the receive FIFO fills and the ADMAC never sees data */
+		if (!is_tx) {
+			cl->rx_req = true;
+			writel_relaxed(readl_relaxed(adapter + REG_T8132_SWITCH_UNK_04) |
+				       T8132_SWITCH_RX_EN, adapter + REG_T8132_SWITCH_UNK_04);
+		}
+		goto adapter_done;
+	}
+
 #ifndef USE_RXB_FOR_CAPTURE
 	writel_relaxed(regval, mca->switch_base + mca->variant->adapter_stride * cl->no);
 #else
@@ -856,6 +936,7 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 		writel_relaxed(regval,
 			       mca->switch_base + REG_DMA_ADAPTER_B(cl->no));
 #endif
+adapter_done:
 
 	if (mca->variant->cluster_divider)
 		return mca_fe_set_clocks_divider(cl, bclk_ratio, samp_rate);
