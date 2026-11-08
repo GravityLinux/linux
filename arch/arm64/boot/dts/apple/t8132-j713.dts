@@ -34,9 +34,41 @@
 	};
 
 	sound {
-		compatible = "apple,j713-headphones";
-		apple,mca = <&mca>;
-		apple,headphone-codec = <&jack_codec>;
+		compatible = "apple,j713-macaudio", "apple,macaudio";
+		model = "MacBook Air J713";
+
+		dai-link@0 {
+			link-name = "Speakers";
+			/*
+			 * The MCA receives sense data from both ports at once, and
+			 * a port's line keeps its last level after its amps' slots.
+			 * As in the ADT amp-tx-zd-config, the first amp on each
+			 * port drives zeros in the other port's slots.
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-2 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-slot-tx-idle-mask-2 = <0xff0f0f0f>;
+
+			cpu {
+				sound-dai = <&mca 0>, <&mca 1>;
+			};
+			codec {
+				sound-dai = <&amp_left_woofer>, <&amp_left_tweeter>,
+					    <&amp_right_woofer>, <&amp_right_tweeter>;
+			};
+		};
+
+		dai-link@1 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
 	};
 
 	led-controller {
@@ -365,16 +397,6 @@
 	status = "okay";
 };
 
-/* Stage A: no amplifier nodes, and hold the shared amp enable inactive. */
-&pinctrl_ap {
-	speaker-disable-hog {
-		gpio-hog;
-		gpios = <15 GPIO_ACTIVE_HIGH>;
-		output-low;
-		line-name = "J713 speaker disable";
-	};
-};
-
 &dart_audio {
 	status = "okay";
 };
@@ -385,28 +407,32 @@
 
 &mca {
 	status = "okay";
-	/* Only TX2 is available to the headphone-only card. */
-	dmas = <&admac 4>;
-	dma-names = "tx2a";
+	/* Speakers and their sense on cluster 0, the jack on cluster 2 */
+	dmas = <&admac 0>, <&admac 1>, <&admac 4>;
+	dma-names = "tx0a", "rx0b", "tx2a";
 };
 
 /*
- * Speakers: four SN012776 amplifiers on i2c3 (ADT audio-speaker*), sharing the
- * SDZ line held off above. TX slots follow the ADT rx_slot order (0x38 0,
- * 0x3b 1, 0x39 2, 0x3c 3); V/I sense slots as macOS programs them. The left
- * pair is on MCA port 0 and the right pair on port 1, both fed from cluster 0.
- * Described for the protected speaker driver: i2c3 stays disabled, so none of
- * this probes until that driver and its limits land.
+ * Speakers: four SN012776 amplifiers on i2c3 (ADT audio-speaker*) with one
+ * shared SDZ line (AP GPIO 15). The sound card's codec order gives the ADT
+ * rx_slot TX slots (0x38 0, 0x3b 1, 0x39 2, 0x3c 3); V/I sense slots are the
+ * ADT speaker-config ones. The left pair is on MCA port 0 and the right pair on
+ * port 1, both fed from cluster 0. Output stays at the macaudio safe limit
+ * until speakersafetyd runs.
  */
 / {
 	speaker_sdz_supply: regulator-speaker-sdz {
 		compatible = "regulator-fixed";
-		regulator-name = "Speaker SDZ reference";
-		/* The common SDZ (AP GPIO 15) is owned by the protected machine driver. */
+		regulator-name = "speaker-sdz";
+		gpio = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <2000>;
 	};
 };
 
 &i2c3 {
+	status = "okay";
+
 	amp_left_woofer: amplifier@38 {
 		compatible = "ti,sn012776", "ti,tas2764";
 		reg = <0x38>;
