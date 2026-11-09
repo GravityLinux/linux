@@ -532,3 +532,93 @@
 		};
 	};
 };
+
+/*
+ * Release DT: the camera stays off. Disable the ISP, its DARTs and every
+ * ISP power domain, including the always-on ISP_SYS and PMP ISP report, so
+ * nothing camera-related is powered or touched at boot. The ISP domains
+ * are only used by the ISP and its DARTs.
+ */
+&isp {
+	status = "disabled";
+};
+
+&isp_dart0 {
+	status = "disabled";
+};
+
+&isp_dart1 {
+	status = "disabled";
+};
+
+&isp_dart2 {
+	status = "disabled";
+};
+
+&pmp_report_isp {
+	status = "disabled";
+};
+
+&ps_isp_sys {
+	status = "disabled";
+};
+
+&ps_ispsens0 {
+	status = "disabled";
+};
+
+&ps_ispsens1 {
+	status = "disabled";
+};
+
+&ps_isp_cpu {
+	status = "disabled";
+};
+
+&ps_isp_cpu_core0 {
+	status = "disabled";
+};
+
+&ps_isp_cpu_core1 {
+	status = "disabled";
+};
+
+&ps_isp_fe {
+	status = "disabled";
+};
+
+&ps_isp_dprx {
+	status = "disabled";
+};
+
+&ps_isp_secure {
+	status = "disabled";
+};
+
+&ps_isp_sts0 {
+	status = "disabled";
+};
+
+&ps_isp_sts1 {
+	status = "disabled";
+};
+
+&ps_isp_pearl {
+	status = "disabled";
+};
+
+&ps_isp_be {
+	status = "disabled";
+};
+
+&ps_isp_clr {
+	status = "disabled";
+};
+
+&ps_isp_cvd {
+	status = "disabled";
+};
+
+&ps_isp_cvm {
+	status = "disabled";
+};
