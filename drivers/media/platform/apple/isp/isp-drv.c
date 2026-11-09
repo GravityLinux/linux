@@ -734,6 +734,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
 	.scl1 = true,
 	.meta_size = ISP_META_SIZE_T6031,
+	.halt_cores = true,
 };
 
 static const struct of_device_id apple_isp_of_match[] = {

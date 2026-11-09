@@ -328,15 +328,16 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
-	if (isp->hw->gen == ISP_GEN_T8140) {
+	if (isp->hw->gen == ISP_GEN_T8140 || isp->hw->halt_cores) {
 		/* Native firmware halts both cores through this configuration register
-		 * before requesting their PMGR power-down sequence.
+		 * before requesting their PMGR power-down sequence. On T8132,
+		 * ISP_CPU_CORE0 does not power up again without it.
 		 */
 		writel(0x02000000, isp->coproc + 0x1600040);
 		udelay(10);
-	} else {
-		isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
 	}
+	if (isp->hw->gen != ISP_GEN_T8140)
+		isp_coproc_write32(isp, ISP_COPROC_CONTROL, 0x0);
 
 	apple_isp_power_down_domains(isp);
 }
@@ -810,12 +811,40 @@ static int isp_stop_command_processor(struct apple_isp *isp)
 	return 0;
 }
 
+/* Print the text of the firmware's boot log (exception reports included). */
+static void isp_dump_boot_log_text(struct apple_isp *isp)
+{
+	const u8 *log;
+	size_t size, start = 0;
+	int lines = 0;
+
+	if (!isp->boot_log_surf || !isp->boot_log_surf->virt)
+		return;
+
+	log = isp->boot_log_surf->virt;
+	size = isp->boot_log_surf->size;
+	for (size_t i = 0; i <= size && lines < 256; i++) {
+		if (i < size && log[i] >= 0x20 && log[i] < 0x7f)
+			continue;
+		if (i - start >= 6) {
+			dev_info(isp->dev, "fw: %.*s\n",
+				 (int)min_t(size_t, i - start, 160), log + start);
+			lines++;
+		}
+		start = i + 1;
+	}
+}
+
 static int isp_start_command_processor(struct apple_isp *isp)
 {
 	int err;
 
-	if (isp->hw->gen == ISP_GEN_T6041)
-		return isp_cmd_t6041_start(isp);
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		err = isp_cmd_t6041_start(isp);
+		if (err)
+			isp_dump_boot_log_text(isp);
+		return err;
+	}
 
 	err = isp_cmd_print_enable(isp, 1);
 	if (err)
