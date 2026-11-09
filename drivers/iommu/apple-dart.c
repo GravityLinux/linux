@@ -214,6 +214,9 @@ struct apple_dart_hw {
  * @supports_bypass: indicates if this DART supports bypass mode
  * @locked: indicates if this DART is locked
  * @sid_remap: optional requestor SID to translation SID mapping
+ * @dapf: optional DAPF (physical access filter) register block
+ * @dapf_ranges: inclusive [start, end] physical ranges the DAPF allows
+ * @dapf_count: number of @dapf_ranges entries
  * @sid2group: maps stream ids to iommu_groups
  * @iommu: iommu core device
  */
@@ -243,6 +246,10 @@ struct apple_dart {
 
 	u8 *sid_remap;
 	DECLARE_BITMAP(bypass_sids, DART_MAX_STREAMS);
+
+	void __iomem *dapf;
+	u64 *dapf_ranges;
+	unsigned int dapf_count;
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
@@ -612,6 +619,32 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 	return !!(readl(dart->regs + dart->hw->lock) & dart->hw->lock_bit);
 }
 
+/*
+ * DAPF entries are 0x40 apart: control at +0x0, start and inclusive end at
+ * +0x8/+0x10 and an enable word at +0x20. The control and enable values are
+ * the ones the ADT's dapf-instance tables use for every range.
+ */
+#define DART_DAPF_STRIDE	0x40
+#define DART_DAPF_CTRL		0x00
+#define DART_DAPF_ATTR		0x04
+#define DART_DAPF_START		0x08
+#define DART_DAPF_END		0x10
+#define DART_DAPF_ENABLE	0x20
+#define DART_DAPF_CTRL_ALLOW	0x31
+
+static void apple_dart_dapf_program(struct apple_dart *dart)
+{
+	for (unsigned int i = 0; i < dart->dapf_count; i++) {
+		void __iomem *e = dart->dapf + i * DART_DAPF_STRIDE;
+
+		writel(0, e + DART_DAPF_ATTR);
+		writeq(dart->dapf_ranges[2 * i], e + DART_DAPF_START);
+		writeq(dart->dapf_ranges[2 * i + 1], e + DART_DAPF_END);
+		writel(DART_DAPF_CTRL_ALLOW, e + DART_DAPF_CTRL);
+		writel(1, e + DART_DAPF_ENABLE);
+	}
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
@@ -666,6 +699,10 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 
 	if (dart->hw->type == DART_T8110)
 		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
+
+	/* The filter loses its contents with the DART's power domain. */
+	if (dart->dapf)
+		apple_dart_dapf_program(dart);
 
 	return dart->hw->invalidate_tlb(&stream_map);
 }
@@ -1544,6 +1581,37 @@ static int apple_dart_parse_sid_remap(struct apple_dart *dart)
 	return 0;
 }
 
+static int apple_dart_parse_dapf(struct platform_device *pdev,
+				 struct apple_dart *dart)
+{
+	struct device *dev = &pdev->dev;
+	struct resource *res;
+	int count;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf");
+	if (!res)
+		return 0;
+
+	count = of_property_count_u64_elems(dev->of_node, "apple,dapf-ranges");
+	if (count <= 0 || count % 2 ||
+	    count / 2 * DART_DAPF_STRIDE > resource_size(res)) {
+		dev_err(dev, "invalid apple,dapf-ranges\n");
+		return -EINVAL;
+	}
+
+	dart->dapf = devm_ioremap_resource(dev, res);
+	if (IS_ERR(dart->dapf))
+		return PTR_ERR(dart->dapf);
+
+	dart->dapf_ranges = devm_kcalloc(dev, count, sizeof(u64), GFP_KERNEL);
+	if (!dart->dapf_ranges)
+		return -ENOMEM;
+
+	dart->dapf_count = count / 2;
+	return of_property_read_u64_array(dev->of_node, "apple,dapf-ranges",
+					  dart->dapf_ranges, count);
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -1664,6 +1732,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	dart->locked = apple_dart_is_locked(dart);
 	ret = apple_dart_parse_sid_remap(dart);
+	if (ret)
+		goto err_clk_disable;
+
+	ret = apple_dart_parse_dapf(pdev, dart);
 	if (ret)
 		goto err_clk_disable;
 
