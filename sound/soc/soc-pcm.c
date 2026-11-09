@@ -2794,6 +2794,14 @@ static int soc_dpcm_fe_runtime_update(struct snd_soc_pcm_runtime *fe, int new)
 		    !snd_soc_dai_stream_active(snd_soc_rtd_to_codec(fe, 0), stream))
 			continue;
 
+		/*
+		 * The DAI activity above is shared: a playback-only FE whose
+		 * CPU DAI also carries another FE's capture sees that capture
+		 * as active, but has no capture substream of its own.
+		 */
+		if (!snd_soc_dpcm_get_substream(fe, stream))
+			continue;
+
 		paths = dpcm_path_get(fe, stream, &list);
 		if (paths < 0)
 			return paths;
