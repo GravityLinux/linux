@@ -132,6 +132,8 @@ struct apple_isp_hw {
 	u32 meta_size;
 	bool scl1;
 	bool lpdp;
+	/* Halt the ISP cores before power-down so that they power up again. */
+	bool halt_cores;
 };
 
 enum isp_sensor_id {
