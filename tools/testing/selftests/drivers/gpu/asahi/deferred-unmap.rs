@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Included by test-deferred-unmap.py with the production g16_deferred.rs.
 use core::ops::Range;
-use g16_deferred::{admit, covered, overlap, ready, Overlap, Span, MAX_ENTRIES};
+use g16_deferred::{admit, covered, overlap, ready, retired_by, Overlap, Span, LIVE, MAX_ENTRIES};
 
 #[derive(Clone)]
 struct M(Range<u64>, u32, bool);
@@ -72,4 +72,17 @@ fn the_entry_cap_falls_back_to_waiting() {
     assert!(admit(0));
     assert!(admit(MAX_ENTRIES - 1));
     assert!(!admit(MAX_ENTRIES));
+}
+
+#[test]
+fn a_close_reaps_only_the_mappings_it_retired() {
+    // Close 7 retired the object's first mapping. The same GEM object then
+    // came back under a new handle (dma-buf imported again) and was bound
+    // at a new address: that mapping is live (LIVE) and must survive close
+    // 7's reap, as must a mapping a later close 9 retired.
+    assert!(retired_by(7, 7));
+    assert!(!retired_by(LIVE, 7));
+    assert!(!retired_by(9, 7));
+    // No entry has id LIVE, and a live mapping is never reaped.
+    assert!(!retired_by(LIVE, LIVE));
 }

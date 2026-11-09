@@ -10,6 +10,13 @@
 //! deferral only keeps PTEs valid for work that may still use them. Closing
 //! mappings no longer satisfy `covered`, and a bind over them waits only for
 //! their own snapshot. Pure range logic, host-tested.
+//!
+//! Each close stamps the mappings it retires with its own id, and the reaper
+//! unmaps only mappings carrying the id of a completed entry. Identity of the
+//! GEM object is not enough: after a close, the same object can come back
+//! under a new handle (a dma-buf imported again, or one exported by another
+//! client of this device) and be bound at a new address. That mapping is live
+//! and must outlive the old close.
 
 use core::ops::Range;
 
@@ -72,6 +79,15 @@ pub(crate) fn overlap<T: Span>(items: &[T], start: u64, end: u64) -> Overlap {
         }
     }
     kind
+}
+
+/// Close id of a mapping that no close has retired.
+pub(crate) const LIVE: u64 = 0;
+
+/// Whether the deferred close `entry` owns a mapping stamped `close`: only the
+/// close that retired a mapping may unmap it.
+pub(crate) fn retired_by(close: u64, entry: u64) -> bool {
+    entry != LIVE && close == entry
 }
 
 /// Whether a deferred close may be recorded on a VM already tracking
