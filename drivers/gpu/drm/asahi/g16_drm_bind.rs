@@ -69,7 +69,7 @@ impl Vm {
                 offset: bo_offset,
                 single,
                 obj,
-                closing: false,
+                closing: crate::g16_deferred::LIVE,
             },
             GFP_KERNEL,
         )?;
@@ -120,11 +120,12 @@ impl Vm {
         }
     }
 
-    /// Unmap every mapping of `obj`: a closed object whose deferred
-    /// snapshot completed, or whose VM has drained.
-    pub(super) fn unmap_object(&mut self, obj: &Object, runtime: &crate::g16::Bootstrap) -> Result {
+    /// Unmap the mappings retired by deferred close `close`, whose snapshot
+    /// has completed. Later mappings of the same object (bound again under a
+    /// new handle) are live and stay.
+    pub(super) fn unmap_closed(&mut self, close: u64, runtime: &crate::g16::Bootstrap) -> Result {
         while let Some(range) = self.mappings.iter()
-            .find(|m| core::ptr::eq(&*m.obj, obj))
+            .find(|m| crate::g16_deferred::retired_by(m.closing, close))
             .map(|m| m.range.clone())
         {
             self.unmap(range, runtime)?;

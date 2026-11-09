@@ -552,7 +552,7 @@ impl File {
                     let mut fences = KVec::new();
                     for entry in vm.deferred.iter() {
                         if vm.mappings.iter().any(|m| {
-                            m.closing && core::ptr::eq(&*m.obj, &*entry.obj)
+                            crate::g16_deferred::retired_by(m.closing, entry.id)
                                 && address < m.range.end && end > m.range.start
                         }) {
                             fences.extend_from_slice(&entry.fences, GFP_KERNEL)?;

@@ -91,9 +91,10 @@ struct Mapping {
     offset: u64,
     single: bool,
     obj: ARef<Object>,
-    /// Its object was closed while work was queued: the PTEs stay until the
-    /// reaper unmaps them (see g16_deferred), but nothing new may use it.
-    closing: bool,
+    /// Nonzero once its object was closed while work was queued: the id of
+    /// that close (g16_deferred::LIVE otherwise). The PTEs stay until the
+    /// reaper completes that close, but nothing new may use the mapping.
+    closing: u64,
 }
 
 impl crate::g16_deferred::Span for Mapping {
@@ -104,7 +105,7 @@ impl crate::g16_deferred::Span for Mapping {
         self.permissions
     }
     fn closing(&self) -> bool {
-        self.closing
+        self.closing != crate::g16_deferred::LIVE
     }
 }
 
@@ -120,9 +121,16 @@ impl Mapping {
 
 /// A GEM close deferred until every fence pending at the close has signaled.
 struct Deferred {
-    obj: ARef<Object>,
+    /// Stamped on the mappings this close retired; the reaper unmaps those
+    /// only, not later mappings of the same object.
+    id: u64,
+    /// Keeps the object (and so its pages) alive until the unmap.
+    _obj: ARef<Object>,
     fences: KVec<dma_fence::Fence>,
 }
+
+/// Deferred close ids; never LIVE.
+static NEXT_CLOSE: AtomicU64 = AtomicU64::new(1);
 
 struct Vm {
     id: u32,
@@ -499,9 +507,11 @@ impl DriverObject for Buffer {
         loop {
             // IDs never repeat. Re-find after each wait: another ioctl may
             // destroy a VM or swap_remove an earlier vector entry meanwhile.
+            // Mappings an earlier close already retired belong to that
+            // close; only live ones (this handle's) are ours.
             let Some(id) = state.vms.iter()
                 .filter(|vm| vm.id > cursor && vm.mappings.iter()
-                    .any(|m| core::ptr::eq(&*m.obj, obj)))
+                    .any(|m| core::ptr::eq(&*m.obj, obj) && !crate::g16_deferred::Span::closing(m)))
                 .map(|vm| vm.id).min()
             else { break };
             cursor = id;
@@ -534,17 +544,20 @@ impl DriverObject for Buffer {
             if !vm.pending.is_empty() && crate::g16_deferred::admit(vm.deferred.len()) {
                 let mut fences = KVec::new();
                 let object = vm.mappings.iter()
-                    .find(|m| core::ptr::eq(&*m.obj, obj))
+                    .find(|m| core::ptr::eq(&*m.obj, obj) && m.closing == crate::g16_deferred::LIVE)
                     .map(|m| m.obj.clone());
                 if let Some(object) = object {
                     if fences.extend_from_slice(&vm.pending, GFP_KERNEL).is_ok()
                         && vm.deferred.reserve(1, GFP_KERNEL).is_ok()
                     {
-                        for m in vm.mappings.iter_mut().filter(|m| core::ptr::eq(&*m.obj, obj)) {
-                            m.closing = true;
+                        let close = NEXT_CLOSE.fetch_add(1, Ordering::Relaxed);
+                        for m in vm.mappings.iter_mut().filter(|m| {
+                            core::ptr::eq(&*m.obj, obj) && m.closing == crate::g16_deferred::LIVE
+                        }) {
+                            m.closing = close;
                         }
                         // Reserved above: cannot fail.
-                        let _ = vm.deferred.push_within_capacity(Deferred { obj: object, fences });
+                        let _ = vm.deferred.push_within_capacity(Deferred { id: close, _obj: object, fences });
                         // Pairs with signal_finished: it signals (a fully
                         // ordered bit set), then loads `armed`. If the snapshot
                         // completed before this store, it may have missed us;
@@ -765,7 +778,7 @@ fn reap(state: &mut FileState, device: &Device, armed: &AtomicBool) {
             }
             let entry = vm.deferred.swap_remove(index);
             let runtime = runtime.get_or_insert_with(|| device.runtime.lock());
-            if let Err(error) = vm.unmap_object(&entry.obj, runtime) {
+            if let Err(error) = vm.unmap_closed(entry.id, runtime) {
                 // Page tables may be partly edited: stop the device, as a
                 // failed close-time unbind always has.
                 device.failed.store(true, Ordering::Release);
