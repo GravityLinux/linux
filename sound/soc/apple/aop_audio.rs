@@ -1058,6 +1058,11 @@ kernel::of_device_table!(
             of::DeviceId::new(c_str!("apple,t6041-aop-audio")),
             &HW_CFG_T6041
         ),
+        // T8132 runs the same M4 generation AOP audio interface (three mics).
+        (
+            of::DeviceId::new(c_str!("apple,t8132-aop-audio")),
+            &HW_CFG_T6041
+        ),
     ]
 );
 
