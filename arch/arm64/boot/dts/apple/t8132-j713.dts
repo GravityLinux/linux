@@ -13,6 +13,7 @@
 #include "t8132-jxxx.dtsi"
 #include "t8132-mtp.dtsi"
 #include "t8132-gpu.dtsi"
+#include "t8132-aop.dtsi"
 #include "t8132-j713-thermal.dtsi"
 #include <dt-bindings/leds/common.h>
 
@@ -403,6 +404,24 @@
 
 &admac {
 	status = "okay";
+};
+
+/* Built-in microphones: three PDM mics behind AOP (ADT audio-hp-mic, 48 kHz). */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_admac {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
 };
 
 &mca {
