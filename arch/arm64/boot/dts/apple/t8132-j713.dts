@@ -208,6 +208,14 @@
 	status = "disabled";
 };
 
+&pmp_report_atc2 {
+	status = "disabled";
+};
+
+&pmp_report_atc3_common {
+	status = "disabled";
+};
+
 &ps_atc2_common {
 	status = "disabled";
 };
@@ -336,14 +344,6 @@
 };
 
 &pmp_report_atc1 {
-	apple,always-on;
-};
-
-&pmp_report_atc2 {
-	apple,always-on;
-};
-
-&pmp_report_atc3_common {
 	apple,always-on;
 };
 
