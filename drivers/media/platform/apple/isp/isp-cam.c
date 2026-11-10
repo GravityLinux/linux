@@ -2,6 +2,9 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/firmware.h>
+#include <linux/limits.h>
+
+#include <linux/of.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
@@ -43,6 +46,7 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX514_2820_03] = {0x514, 0x28200305, "apple/isp_2820_03XX.dat", 0xa198},
 	[ISP_IMX514_2820_04] = {0x514, 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
 	[ISP_IMX558_1921_01] = {0x558, 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
+	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcba8},
 	[ISP_IMX558_1922_02] = {0x558, 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
 	[ISP_IMX603_7920_01] = {0x603, 0x79200109, "apple/isp_7920_01XX.dat", 0xad2c},
 	[ISP_IMX603_7920_02] = {0x603, 0x79200205, "apple/isp_7920_02XX.dat", 0xad2c},
@@ -67,6 +71,9 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX913_7523_01] = {0x913, 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
 	[ISP_VD56G0_6221_01] = {0xd56, 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
 	[ISP_VD56G0_6222_01] = {0xd56, 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
+	[ISP_SENSOR_0958] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4},
+	/* This firmware exposes the module's factory calibration through CISP. */
+	[ISP_IMX958_FACTORY] = {.version = 0x958},
 };
 // clang-format on
 
@@ -114,7 +121,7 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		id = ISP_IMX514_2820_01;
 		break;
 	case 0x558:
-		id = ISP_IMX558_1921_01;
+		id = isp->hw->gen == ISP_GEN_T8140 ? ISP_IMX558_1925_03 : ISP_IMX558_1921_01;
 		break;
 	case 0x603:
 		id = ISP_IMX603_7920_01;
@@ -148,6 +155,16 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 		break;
 	case 0x913:
 		id = ISP_IMX913_7523_01;
+		break;
+	case 0x958:
+		if (isp->hw->gen == ISP_GEN_T6041)
+			id = ISP_SENSOR_0958;
+		else if (isp->hw->module_tuning)
+			id = ISP_IMX958_FACTORY;
+		else {
+			err = -EINVAL;
+			break;
+		}
 		break;
 	case 0xd56:
 		id = ISP_VD56G0_6221_01;
@@ -219,7 +236,9 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	err = isp_ch_get_sensor_id(isp, ch);
 	if (err ||
 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
-	     fmt->id != ISP_IMX364_8720_01)) {
+	     fmt->id != ISP_IMX558_1925_03 &&
+	     fmt->id != ISP_IMX364_8720_01 && fmt->id != ISP_SENSOR_0958 &&
+	     fmt->id != ISP_IMX958_FACTORY)) {
 		dev_err(isp->dev,
 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
 			ch);
@@ -301,6 +320,39 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 	return err;
 }
 
+static int isp_ch_load_module_tuning(struct apple_isp *isp, u32 ch)
+{
+	const struct firmware *fw;
+	const char *filename;
+	int err;
+
+	/* The ISP owns the sensor bus; board firmware names are channel-indexed. */
+	err = of_property_read_string_index(isp->dev->of_node, "firmware-name",
+					    ch, &filename);
+	if (err) {
+		dev_err(isp->dev, "missing tuning firmware name for channel %u\n", ch);
+		return err;
+	}
+
+	err = request_firmware(&fw, filename, isp->dev);
+	if (err)
+		return err;
+
+	/* Tuning is opaque device firmware data, interpreted by the ISP. */
+	if (!fw->size || fw->size > isp->data_surf->size || fw->size > U32_MAX) {
+		dev_err(isp->dev, "invalid tuning firmware size: %zu\n", fw->size);
+		err = -EINVAL;
+		goto release;
+	}
+
+	memcpy(isp->data_surf->virt, fw->data, fw->size);
+	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova, fw->size);
+
+release:
+	release_firmware(fw);
+	return err;
+}
+
 static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -308,6 +360,15 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	const struct firmware *fw;
 	u32 magic;
 	int err;
+
+	if (fmt->id == ISP_IMX958_FACTORY) {
+		err = isp_cmd_ch_check_factory_lsc(isp, ch);
+		if (err)
+			return err;
+		return isp_ch_load_module_tuning(isp, ch);
+	}
+	if (!setfile->path)
+		return -ENOENT;
 
 	err = request_firmware(&fw, setfile->path, isp->dev);
 	if (err) {
@@ -333,8 +394,13 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	memcpy(isp->data_surf->virt, (void *)fw->data, setfile->size);
 	release_firmware(fw);
 
-	return isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
-					setfile->size);
+	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
+				       setfile->size);
+	if (!err)
+		dev_info(isp->dev, "loaded calibration setfile '%s' (%zu bytes)\n",
+			 setfile->path, setfile->size);
+
+	return err;
 }
 
 static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
@@ -344,14 +410,27 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 
 	isp_cmd_flicker_sensor_set(isp, 0);
 
-	/* The setfile isn't requisite but then we don't get calibration */
+	/* Legacy modules use a setfile; IMX958 exposes its resident module data. */
 	err = isp_ch_load_setfile(isp, ch);
 	if (err) {
 		dev_err(isp->dev, "warning: calibration data not loaded: %d\n",
 			err);
+		if (fmt->id == ISP_IMX958_FACTORY)
+			return err;
 
 		/* If this failed due to a signal, propagate */
 		if (err == -EINTR)
+			return err;
+	}
+
+	if (isp->hw->gen == ISP_GEN_T8140) {
+		u32 fuses[2];
+		err = of_property_read_u32_array(isp->dev->of_node,
+						 "apple,aciphy-fuses", fuses, 2);
+		if (err)
+			return err;
+		err = isp_cmd_neo_sensor_config(isp, ch, fuses[0], fuses[1]);
+		if (err)
 			return err;
 	}
 
@@ -424,7 +503,7 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, ISP_FRAME_RATE_DEN);
+	err = isp_cmd_ch_ae_frame_rate_max_set(isp, ch, isp->frame_rate);
 	if (err)
 		return err;
 

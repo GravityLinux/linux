@@ -51,6 +51,13 @@ static inline void isp_mbox_write32(struct apple_isp *isp, u32 reg, u32 val)
 
 static inline void isp_mbox2_write32(struct apple_isp *isp, u32 reg, u32 val)
 {
+	/* T6041 uses notify +0xc and IRQ acknowledge +0x18. */
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		if (reg == ISP_MBOX2_IRQ_DOORBELL)
+			reg = 0x0c;
+		else if (reg == ISP_MBOX2_IRQ_ACK)
+			reg = 0x18;
+	}
 	writel(val, isp->mbox2 + reg);
 }
 

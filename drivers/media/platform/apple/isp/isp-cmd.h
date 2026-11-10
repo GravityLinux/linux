@@ -238,6 +238,7 @@ struct cmd_flicker_sensor_set {
 } __packed;
 static_assert(sizeof(struct cmd_flicker_sensor_set) == 0xc);
 
+int isp_cmd_neo_sensor_config(struct apple_isp *isp, u32 chan, u32 fuse0, u32 fuse1);
 int isp_cmd_start(struct apple_isp *isp, u32 mode);
 int isp_cmd_stop(struct apple_isp *isp, u32 mode);
 int isp_cmd_power_down(struct apple_isp *isp);
@@ -257,6 +258,7 @@ int isp_cmd_pmp_ctrl_set(struct apple_isp *isp, u64 clock_scratch,
 			 u64 clock_base, u8 clock_bit, u8 clock_size,
 			 u64 bandwidth_scratch, u64 bandwidth_base,
 			 u8 bandwidth_bit, u8 bandwidth_size);
+int isp_cmd_neo_dsid_config(struct apple_isp *isp);
 int isp_cmd_fid_enter(struct apple_isp *isp);
 int isp_cmd_fid_exit(struct apple_isp *isp);
 int isp_cmd_flicker_sensor_set(struct apple_isp *isp, u32 mode);
@@ -550,7 +552,8 @@ struct cmd_apple_ch_temporal_filter_start {
 	u64 opcode;
 	u32 chan;
 	u32 unk_c;
-	u32 unk_10;
+	/* T8142 runtime identifies 0x10 as the requested YUV/RAW fusion type. */
+	u32 fusion_type;
 } __packed;
 static_assert(sizeof(struct cmd_apple_ch_temporal_filter_start) == 0x14);
 
@@ -584,7 +587,8 @@ struct cmd_apple_ch_temporal_filter_disable {
 } __packed;
 static_assert(sizeof(struct cmd_apple_ch_temporal_filter_disable) == 0xc);
 
-int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan, u32 arg);
+int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan,
+					 u32 fusion_type);
 int isp_cmd_apple_ch_temporal_filter_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_motion_history_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_motion_history_stop(struct apple_isp *isp, u32 chan);
@@ -687,5 +691,8 @@ static_assert(sizeof(struct cmd_ch_semantic_awb_enable) == 0x10);
 int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
 				     u32 enable);
 int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
+
+int isp_cmd_t6041_start(struct apple_isp *isp);
+int isp_cmd_ch_check_factory_lsc(struct apple_isp *isp, u32 chan);
 
 #endif /* __ISP_CMD_H__ */

@@ -6,6 +6,11 @@
 #include "isp-iommu.h"
 #include "isp-ipc.h"
 
+#include <linux/slab.h>
+
+/* Modern CISP module-calibration query size, observed on the 27.2 API. */
+#define CISP_FACTORY_LSC_GRID_SIZE 0x620
+
 #define CISP_OPCODE_SHIFT     32UL
 #define CISP_OPCODE(x)	      (((u64)(x)) << CISP_OPCODE_SHIFT)
 #define CISP_OPCODE_GET(x)    (((u64)(x)) >> CISP_OPCODE_SHIFT)
@@ -26,6 +31,8 @@ static int cisp_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 	req->arg0 = isp->cmd_iova;
 	req->arg1 = insize;
 	req->arg2 = outsize;
+	if (isp->hw->gen == ISP_GEN_T6041 && !outsize)
+		req->arg2 = insize;
 
 	memcpy(isp->cmd_virt, args, insize);
 	err = ipc_chan_send(isp, chan, timeout);
@@ -36,6 +43,7 @@ static int cisp_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 			"%s: failed to send OPCODE 0x%04llx: [0x%llx, 0x%llx, 0x%llx]\n",
 			chan->name, CISP_OPCODE_GET(opcode), req->arg0,
 			req->arg1, req->arg2);
+		isp_dump_boot_log(isp);
 	}
 
 	return err;
@@ -51,6 +59,47 @@ static int cisp_send_read(struct apple_isp *isp, void *args, u32 insize,
 
 	memcpy(args, isp->cmd_virt, outsize);
 	return 0;
+}
+
+/* The modern response appends fields; the common prefix is unchanged. */
+static int cisp_send_neo_read(struct apple_isp *isp, void *args,
+			    u32 prefix_size, u32 response_size)
+{
+	u8 response[0x190] = {};
+	int err;
+
+	if (prefix_size > response_size || response_size > sizeof(response))
+		return -EINVAL;
+	memcpy(response, args, prefix_size);
+	err = cisp_send_read(isp, response, response_size, response_size);
+	if (!err)
+		memcpy(args, response, prefix_size);
+	return err;
+}
+
+/* Native Neo setup preceding capture configuration. Firmware logs identify
+ * 0x0632 as CISP_CMD_CH_STATUS_LED_THR_GET; PHY tuning uses per-unit ADT fuses.
+ */
+int isp_cmd_neo_sensor_config(struct apple_isp *isp, u32 chan, u32 fuse0, u32 fuse1)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 value;
+	} __packed setup = { CISP_OPCODE(0x0632), chan, 0 };
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 count;
+		u32 fuse0;
+		u32 fuse1;
+	} __packed tuning = {
+		CISP_OPCODE(CISP_CMD_CH_LPDP_HS_RECEIVER_TUNING_SET), chan, 2, fuse0, fuse1
+	};
+	int err = CISP_SEND_INOUT(isp, setup);
+	if (err)
+		return err;
+	return CISP_SEND_INOUT(isp, tuning);
 }
 
 int isp_cmd_start(struct apple_isp *isp, u32 mode)
@@ -172,6 +221,82 @@ int isp_cmd_pmp_ctrl_set(struct apple_isp *isp, u64 clock_scratch,
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_neo_dsid_config(struct apple_isp *isp)
+{
+	struct {
+		u64 opcode;
+		u32 count;
+		u32 range;
+		u64 base;
+	} __packed args = {
+		.opcode = CISP_OPCODE(0x3206),
+		.count = 1,
+		.range = isp->hw->dsid_clr_range0,
+		.base = isp->hw->dsid_clr_base0,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_t6041_start(struct apple_isp *isp)
+{
+	/* Native 26.6.2 publishes eight DSID ranges through opcode 0x3206. */
+	struct {
+		u64 opcode;
+		u32 count;
+		u32 range;
+		u64 bases[8];
+	} __packed dsid = {
+		.opcode = CISP_OPCODE(0x3206), .count = 8, .range = 0x2fc,
+		.bases = { 0x2201d4000, 0x2221d4000, 0x2241d4000, 0x2261d4000,
+			   0x2281d4000, 0x22a1d4000, 0x22c1d4000, 0x22e1d4000 },
+	};
+	struct {
+		u64 opcode;
+		s32 value;
+	} __packed rpc = { .opcode = CISP_OPCODE(0x13), .value = -3 };
+	int ret;
+
+	static_assert(sizeof(dsid) == 0x50);
+	static_assert(sizeof(rpc) == 0xc);
+
+	/* Other H16 SoCs list their own MCC ranges in the hw data. */
+	if (isp->hw->dsid_count) {
+		const u64 bases[] = { isp->hw->dsid_clr_base0,
+				      isp->hw->dsid_clr_base1,
+				      isp->hw->dsid_clr_base2,
+				      isp->hw->dsid_clr_base3 };
+
+		if (isp->hw->dsid_count > ARRAY_SIZE(bases))
+			return -EINVAL;
+		memset(dsid.bases, 0, sizeof(dsid.bases));
+		memcpy(dsid.bases, bases, isp->hw->dsid_count * sizeof(u64));
+		dsid.count = isp->hw->dsid_count;
+		dsid.range = isp->hw->dsid_clr_range0;
+	}
+	ret = isp_cmd_print_enable(isp, 1);
+	if (ret)
+		return ret;
+	ret = isp_cmd_trace_enable(isp, 0x18);
+	if (ret)
+		return ret;
+	ret = CISP_SEND_INOUT(isp, dsid);
+	if (ret)
+		return ret;
+	/* Without a known clock scratch, leave the PMP request unconfigured. */
+	if (isp->hw->clock_scratch) {
+		ret = isp_cmd_pmp_ctrl_set(isp, isp->hw->clock_scratch, 0, 0,
+					   isp->hw->clock_size,
+					   isp->hw->bandwidth_scratch, 0, 0,
+					   isp->hw->bandwidth_size);
+		if (ret)
+			return ret;
+	}
+	ret = CISP_SEND_IN(isp, rpc);
+	if (ret)
+		return ret;
+	return isp_cmd_start(isp, 0);
+}
+
 int isp_cmd_fid_enter(struct apple_isp *isp)
 {
 	struct cmd_fid_enter args = {
@@ -218,17 +343,52 @@ int isp_cmd_flicker_sensor_set(struct apple_isp *isp, u32 mode)
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args)
 {
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		struct {
+			struct cmd_ch_info prefix;
+			u8 tail[0x190 - sizeof(struct cmd_ch_info)];
+		} __packed native = { .prefix = {
+			.opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET), .chan = chan,
+		} };
+		int ret;
+
+		static_assert(sizeof(native) == 0x190);
+		ret = cisp_send_read(isp, &native, sizeof(native), sizeof(native));
+		if (!ret)
+			memcpy(args, &native.prefix, sizeof(*args));
+		return ret;
+	}
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_INFO_GET);
 	args->chan = chan;
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return cisp_send_neo_read(isp, args, sizeof(*args), 0x190);
 	return CISP_SEND_OUT(isp, args);
 }
 
 int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
 				 struct cmd_ch_camera_config *args)
 {
+	if (isp->hw->gen == ISP_GEN_T6041) {
+		struct {
+			struct cmd_ch_camera_config prefix;
+			u8 tail[0x120 - sizeof(struct cmd_ch_camera_config)];
+		} __packed native = { .prefix = {
+			.opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET),
+			.chan = chan, .preset = preset,
+		} };
+		int ret;
+
+		static_assert(sizeof(native) == 0x120);
+		ret = cisp_send_read(isp, &native, sizeof(native), sizeof(native));
+		if (!ret)
+			memcpy(args, &native.prefix, sizeof(*args));
+		return ret;
+	}
 	args->opcode = CISP_OPCODE(CISP_CMD_CH_CAMERA_CONFIG_GET);
 	args->preset = preset;
 	args->chan = chan;
+	if (isp->hw->gen == ISP_GEN_T8140)
+		return cisp_send_neo_read(isp, args, sizeof(*args), 0x120);
 	return CISP_SEND_OUT(isp, args);
 }
 
@@ -372,8 +532,8 @@ int isp_cmd_ch_sif_pixel_format_set(struct apple_isp *isp, u32 chan)
 	struct cmd_ch_sif_pixel_format_set args = {
 		.opcode = CISP_OPCODE(CISP_CMD_CH_SIF_PIXEL_FORMAT_SET),
 		.chan = chan,
-		.format = 3,
-		.type = 1,
+		.format = isp->hw->gen == ISP_GEN_T8140 ? 1 : 3,
+		.type = isp->hw->gen == ISP_GEN_T8140 ? 0 : 1,
 		.compress = 0,
 		.unk_10 = 0,
 	};
@@ -427,13 +587,14 @@ int isp_cmd_ch_buffer_pool_return(struct apple_isp *isp, u32 chan)
 	return CISP_SEND_IN(isp, args);
 }
 
-int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan, u32 arg)
+int isp_cmd_apple_ch_temporal_filter_start(struct apple_isp *isp, u32 chan,
+					 u32 fusion_type)
 {
 	struct cmd_apple_ch_temporal_filter_start args = {
 		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_START),
 		.chan = chan,
 		.unk_c = 1,
-		.unk_10 = arg,
+		.fusion_type = fusion_type,
 	};
 	return CISP_SEND_IN(isp, args);
 }
@@ -630,5 +791,50 @@ int isp_cmd_ch_property_read(struct apple_isp *isp, u32 chan, u32 prop, u32 *val
 
 	*val = args.val;
 
+	return ret;
+}
+
+int isp_cmd_ch_check_factory_lsc(struct apple_isp *isp, u32 chan)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 layout;
+		u32 info;
+	} __packed info = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET),
+		.chan = chan,
+	};
+	struct factory_lsc_grid {
+		u64 opcode;
+		u32 chan;
+		u32 info;
+		u8 payload[CISP_FACTORY_LSC_GRID_SIZE - 16];
+	} __packed *grid;
+	int ret;
+
+	/* This route uses firmware's sensor/module profile, not a captured blob.
+	 * Require a live, populated factory grid before attempting capture.
+	 * The upper layout fields remain firmware-format metadata.
+	 */
+	ret = CISP_SEND_OUT(isp, &info);
+	if (ret)
+		return ret;
+	if (!(info.layout & 0xff) || !(info.layout & 0xff00))
+		return -ENODATA;
+	grid = kzalloc(sizeof(*grid), GFP_KERNEL);
+	if (!grid)
+		return -ENOMEM;
+	grid->opcode = CISP_OPCODE(CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET);
+	grid->chan = chan;
+	ret = cisp_send_read(isp, grid, sizeof(*grid), sizeof(*grid));
+	if (!ret && (!grid->info ||
+		     !memchr_inv(grid->payload, 0, sizeof(grid->payload))))
+		ret = -ENODATA;
+	if (!ret)
+		dev_info(isp->dev, "factory LSC available: %ux%u, format %#x, info %#x\n",
+			 info.layout & 0xff, (info.layout >> 8) & 0xff,
+			 info.layout >> 16, info.info);
+	kfree(grid);
 	return ret;
 }

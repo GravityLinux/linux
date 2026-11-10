@@ -32,6 +32,8 @@ enum isp_generation {
 	ISP_GEN_T8103,
 	ISP_GEN_T8112,
 	ISP_GEN_T6031,
+	ISP_GEN_T8140,
+	ISP_GEN_T6041,
 };
 
 enum isp_firmware_version {
@@ -40,6 +42,9 @@ enum isp_firmware_version {
 	ISP_FIRMWARE_V_12_4,
 	ISP_FIRMWARE_V_13_5,
 	ISP_FIRMWARE_V_14_7,
+	ISP_FIRMWARE_V_26_6,
+	ISP_FIRMWARE_V_26_6_2,
+	ISP_FIRMWARE_V_27_2,
 };
 
 struct isp_surf {
@@ -99,6 +104,8 @@ struct isp_preset {
 };
 
 struct apple_isp_hw {
+	/* This profile obtains module processing tuning from board firmware. */
+	bool module_tuning;
 	enum isp_generation gen;
 	u64 pmu_base;
 
@@ -125,6 +132,8 @@ struct apple_isp_hw {
 	u32 meta_size;
 	bool scl1;
 	bool lpdp;
+	/* Halt the ISP cores before power-down so that they power up again. */
+	bool halt_cores;
 };
 
 enum isp_sensor_id {
@@ -152,6 +161,7 @@ enum isp_sensor_id {
 	ISP_IMX514_2820_03,
 	ISP_IMX514_2820_04,
 	ISP_IMX558_1921_01,
+	ISP_IMX558_1925_03,
 	ISP_IMX558_1922_02,
 	ISP_IMX603_7920_01,
 	ISP_IMX603_7920_02,
@@ -176,6 +186,8 @@ enum isp_sensor_id {
 	ISP_IMX913_7523_01,
 	ISP_VD56G0_6221_01,
 	ISP_VD56G0_6222_01,
+	ISP_SENSOR_0958,
+	ISP_IMX958_FACTORY,
 };
 
 struct isp_format {
@@ -194,6 +206,7 @@ struct apple_isp {
 	enum isp_firmware_version fw_compat;
 	u32 platform_id;
 	u32 temporal_filter;
+	u32 frame_rate; /* Q8 frames per second, negotiated through V4L2. */
 	struct isp_preset *presets;
 	int num_presets;
 
@@ -217,6 +230,8 @@ struct apple_isp {
 	int irq;
 
 	void __iomem *coproc;
+	void __iomem *boot_control;
+	void __iomem *watchdog;
 	void __iomem *mbox;
 	void __iomem *gpio;
 	void __iomem *mbox2;
@@ -228,10 +243,12 @@ struct apple_isp {
 
 	struct isp_firmware {
 		u64 heap_top;
+		u64 image_phys;
 	} fw;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;
+	struct isp_surf *boot_log_surf;
 	struct isp_surf *data_surf;
 	struct isp_surf *log_surf;
 	struct isp_surf *bt_surf;
