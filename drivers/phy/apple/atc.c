@@ -34,8 +34,10 @@
 #include <linux/of_device.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
@@ -2888,10 +2890,33 @@ static const struct of_device_id atcphy_match[] = {
 };
 MODULE_DEVICE_TABLE(of, atcphy_match);
 
+static int atcphy_suspend(struct device *dev)
+{
+	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+
+	guard(mutex)(&atcphy->lock);
+
+	/*
+	 * The USB4/Thunderbolt host router only lets suspend-to-idle proceed with a link up
+	 * when it keeps that link, and it can only do so while the PHY carrying it stays
+	 * configured. Keep our power domain on in that case instead of relying on the DWC3
+	 * controller that shares it, which a USB4 device without a USB 2.0 connection leaves
+	 * unused.
+	 */
+	if (pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT))
+		device_set_awake_path(dev);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(atcphy_pm_ops, atcphy_suspend, NULL);
+
 static struct platform_driver atcphy_driver = {
 	.driver = {
 		.name = "phy-apple-atc",
 		.of_match_table = atcphy_match,
+		.pm = pm_sleep_ptr(&atcphy_pm_ops),
 	},
 	.probe = atcphy_probe,
 };
