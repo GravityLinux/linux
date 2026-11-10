@@ -345,7 +345,8 @@ pub(crate) fn shared_notifier() -> bool {
 
 /// Operand buffers in the render pool of each VM whose first render comes
 /// afterwards (asahi_m4.render_operand_buffers; runtime: debugfs
-/// asahi_m4/render_operand_buffers). Submission rejects values outside 1..=24.
+/// asahi_m4/render_operand_buffers). Values outside
+/// `OPERAND_BUFFERS_MIN..=OPERAND_BUFFERS_MAX` are refused.
 pub(crate) static RENDER_OPERAND_BUFFERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(24);
 
 /// Buffers in the private compute pool of each VM whose first compute comes
@@ -361,32 +362,40 @@ pub(crate) static COMPUTE_SHARES_RENDER_POOL: core::sync::atomic::AtomicU32 = co
 pub(crate) struct FlagKnob {
     cell: &'static core::sync::atomic::AtomicU32,
     name: &'static str,
+    min: u32,
     max: u32,
 }
 
 impl FlagKnob {
     pub(crate) fn init(&self, value: u32) {
-        self.cell.store(value.min(self.max), core::sync::atomic::Ordering::Relaxed);
+        let clamped = value.clamp(self.min, self.max);
+        if clamped != value {
+            pr_warn!("G16: {}={} outside {}..={}, using {}\n", self.name, value, self.min, self.max, clamped);
+        }
+        self.cell.store(clamped, core::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", max: 1 };
-    pub(crate) const SHARED_NOTIFIER: Self = Self { cell: &SHARED_NOTIFIER, name: "shared_notifier", max: 1 };
-    pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", max: i32::MAX as u32 };
-    pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", max: i32::MAX as u32 };
-    pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", max: 4096 };
+    pub(crate) const PROFILE: Self = Self { cell: &PROFILE, name: "profile", min: 0, max: 1 };
+    pub(crate) const SHARED_NOTIFIER: Self = Self { cell: &SHARED_NOTIFIER, name: "shared_notifier", min: 0, max: 1 };
+    pub(crate) const FAIL_PREP: Self = Self { cell: &FAIL_PREP, name: "fail_prep", min: 0, max: i32::MAX as u32 };
+    pub(crate) const FAIL_RETIRE: Self = Self { cell: &FAIL_RETIRE, name: "fail_retire", min: 0, max: i32::MAX as u32 };
+    pub(crate) const FAIL_SKIP: Self = Self { cell: &FAIL_SKIP, name: "fail_skip", min: 0, max: 4096 };
     pub(crate) const RENDER_OPERAND_BUFFERS: Self = Self {
         cell: &RENDER_OPERAND_BUFFERS,
         name: "render_operand_buffers",
+        min: crate::g16_render::OPERAND_BUFFERS_MIN,
         max: crate::g16_render::OPERAND_BUFFERS_MAX,
     };
     pub(crate) const COMPUTE_POOL_BUFFERS: Self = Self {
         cell: &COMPUTE_POOL_BUFFERS,
         name: "compute_pool_buffers",
+        min: 0,
         max: crate::g16_compute::BUFFER_COUNT as u32,
     };
     pub(crate) const COMPUTE_SHARES_RENDER_POOL: Self = Self {
         cell: &COMPUTE_SHARES_RENDER_POOL,
         name: "compute_shares_render_pool",
+        min: 0,
         max: 1,
     };
 }
@@ -422,7 +431,7 @@ impl kernel::debugfs::Writer for FlagKnob {
 impl kernel::debugfs::Reader for FlagKnob {
     fn read_from_slice(&self, reader: &mut kernel::uaccess::UserSliceReader) -> Result {
         let value = knob_u32(reader)?;
-        if value > self.max {
+        if value < self.min || value > self.max {
             return Err(EINVAL);
         }
         self.cell.store(value, core::sync::atomic::Ordering::Relaxed);

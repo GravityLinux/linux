@@ -836,6 +836,9 @@ pub(crate) const HEAPMETA_OFFSET: u64 = 0x35d0000;
 const OPERAND_STRIDE: u64 = 0x208000;
 /// Operand (shader private-memory) buffers the VA layout has room for.
 pub(crate) const OPERAND_BUFFERS_MAX: u32 = 24;
+/// Fewest operand buffers allowed: 8 was the smallest pool seen to complete
+/// large shader scratch frames (slowly); 4 hung the GPU.
+pub(crate) const OPERAND_BUFFERS_MIN: u32 = 8;
 /// 4 KiB accelerator pages in each 2 MiB operand buffer.
 const OPERAND_PAGES: u32 = 512;
 const DIRECTORY_BACKING: usize = 0x40000;
@@ -871,7 +874,7 @@ impl OperandPool {
             buffers,
         };
         if start & 0x3fff != 0
-            || !(1..=OPERAND_BUFFERS_MAX).contains(&buffers)
+            || !(OPERAND_BUFFERS_MIN..=OPERAND_BUFFERS_MAX).contains(&buffers)
             || pool.end()? > end
         {
             return None;

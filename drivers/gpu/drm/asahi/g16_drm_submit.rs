@@ -269,7 +269,7 @@ impl File {
                     crate::g16_timeline::RENDER_OPERAND_BUFFERS.load(Ordering::Relaxed)
                 };
                 let pool =
-                    render::OperandPool::with_buffers(vm.kernel.start, vm.kernel.end, buffers).ok_or_else(|| reject(format_args!("VM kernel VA {:#x}..{:#x} too small for the render operand pool, or render_operand_buffers={} outside 1..={}", vm.kernel.start, vm.kernel.end, buffers, render::OPERAND_BUFFERS_MAX)))?;
+                    render::OperandPool::with_buffers(vm.kernel.start, vm.kernel.end, buffers).ok_or_else(|| reject(format_args!("VM kernel VA {:#x}..{:#x} too small for the render operand pool, or render_operand_buffers={} outside {}..={}", vm.kernel.start, vm.kernel.end, buffers, render::OPERAND_BUFFERS_MIN, render::OPERAND_BUFFERS_MAX)))?;
                 // Acquire scarce support and its Arc before editing this
                 // root. ENOSPC/ENOMEM here must not quarantine a healthy VM.
                 let support = Arc::new(

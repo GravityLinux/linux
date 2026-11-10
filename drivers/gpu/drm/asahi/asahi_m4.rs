@@ -173,7 +173,7 @@ kernel::module_platform_driver! {
         },
         render_operand_buffers: u32 {
             default: 24,
-            description: "Research: 2 MiB shader private-memory (operand) buffers in each VM's render pool, 1..=24 (default 24; native mesh VMs always use 24). Each is resident for the VM's lifetime. Smaller pools starve large shader scratch frames: 8 made 32 KiB frames 3.7x slower with a 2 s stall, 4 hung the GPU. Runtime: debugfs asahi_m4/render_operand_buffers, read at each VM's first render",
+            description: "Research: 2 MiB shader private-memory (operand) buffers in each VM's render pool, 8..=24 (default 24; native mesh VMs always use 24). Each is resident for the VM's lifetime. Smaller pools starve large shader scratch frames: 8 made 32 KiB frames 3.7x slower with a 2 s stall; 4 hung the GPU, so values below 8 are refused. Runtime: debugfs asahi_m4/render_operand_buffers, read at each VM's first render",
         },
         compute_pool_buffers: u32 {
             default: 16,
