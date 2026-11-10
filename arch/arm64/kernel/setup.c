@@ -37,6 +37,7 @@
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
 #include <asm/cpu.h>
+#include <asm/cpuidle.h>
 #include <asm/cputype.h>
 #include <asm/daifflags.h>
 #include <asm/elf.h>
@@ -279,6 +280,29 @@ u64 cpu_logical_map(unsigned int cpu)
 	return __cpu_logical_map[cpu];
 }
 
+/* Whether setup_arch() still holds the poll idle it forces on T8132. */
+static bool apple_t8132_poll_idle_forced;
+
+/*
+ * Called by the T8132 cpuidle driver once it owns idle on every CPU, so that
+ * the default idle (a plain WFI) can no longer run.
+ */
+void apple_t8132_release_poll_idle(void)
+{
+	if (WARN_ON_ONCE(!apple_t8132_poll_idle_forced))
+		return;
+	apple_t8132_poll_idle_forced = false;
+	cpu_idle_poll_ctrl(false);
+}
+
+static int __init apple_t8132_check_poll_idle(void)
+{
+	if (apple_t8132_poll_idle_forced)
+		pr_err("Apple T8132: no CPU idle driver took over idle. Every CPU busy-polls whenever it is idle, which costs several watts and keeps the cores hot. Enable CONFIG_ARM_APPLE_M4_CPUIDLE and check the cpuidle_apple_m4 parameters and messages.\n");
+	return 0;
+}
+late_initcall_sync(apple_t8132_check_poll_idle);
+
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
 	setup_initial_init_mm(_text, _etext, _edata, _end);
@@ -348,8 +372,10 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 * until cpuidle-apple-m4 takes idle over. This has to happen before
 	 * the boot CPU first idles in rest_init().
 	 */
-	if (of_machine_is_compatible("apple,t8132"))
+	if (of_machine_is_compatible("apple,t8132")) {
 		cpu_idle_poll_ctrl(true);
+		apple_t8132_poll_idle_forced = true;
+	}
 
 	bootmem_init();
 
