@@ -313,8 +313,16 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			active = apple_pmgr_ps_power_on(&ps->genpd) == 0;
 		}
 	} else if (active) {
-		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
+		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF;
 	}
+
+	/*
+	 * Let a consumer keep its domain powered across system sleep by marking its device as
+	 * being on an awake path. Nothing changes for devices that don't. Whether the
+	 * bootloader left a domain on says nothing about whether a driver started later needs
+	 * it across suspend, e.g. a USB4 host router that is only powered while a link is up.
+	 */
+	ps->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 
 	/* Turn on auto-PM if the domain is already on */
 	if (active && !preserve_clkgated)
