@@ -143,6 +143,7 @@ struct admac_data {
 
 	bool set_unk28;
 	bool split_channels;
+	bool ctl_initialized;
 	int irq;
 	int irq_index;
 	int nchannels;
@@ -174,6 +175,16 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 {
 	struct admac_sram *sram;
 	int i, ret = 0, nblocks;
+
+	mutex_lock(&ad->cache_alloc_lock);
+	/* AOP may gate LEAP's registers until the audio client wakes it.
+	 * Clients acquire channels after powering their audio interface, so
+	 * defer the split-bank controller setup until the first allocation.
+	 */
+	if (ad->split_channels && !ad->ctl_initialized) {
+		writel_relaxed(0x18080001, ad->base + REG_CTL);
+		ad->ctl_initialized = true;
+	}
 	ad->txcache.size = readl_relaxed(ad->base + REG_TX_SRAM_SIZE);
 	ad->rxcache.size = readl_relaxed(ad->base + REG_RX_SRAM_SIZE);
 	/* T8132 reports channel metadata in the upper half of these words. */
@@ -186,8 +197,6 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 		sram = &ad->txcache;
 	else
 		sram = &ad->rxcache;
-
-	mutex_lock(&ad->cache_alloc_lock);
 
 	nblocks = sram->size / SRAM_BLOCK;
 	for (i = ad->split_channels ? 1 : 0; i < nblocks; i++)
@@ -946,9 +955,6 @@ static int admac_probe(struct platform_device *pdev)
 	if (err)
 		return dev_err_probe(&pdev->dev, err,
 				     "unable to trigger reset\n");
-
-	if (ad->split_channels)
-		writel_relaxed(0x18080001, ad->base + REG_CTL);
 
 	err = request_irq(irq, admac_interrupt, 0, dev_name(&pdev->dev), ad);
 	if (err) {

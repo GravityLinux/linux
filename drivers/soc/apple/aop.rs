@@ -355,7 +355,7 @@ impl AFKEndpoint {
         // SAFETY: TODO
         let bound_dev = unsafe { dev.as_bound() };
         let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size, GFP_KERNEL)?;
-        rtkit.send_message(self.index, AFK_MSG_GET_BUF_ACK | iomem.dma_handle())?;
+        rtkit.send_message(self.index, AFK_MSG_GET_BUF_ACK | iomem.dma_address())?;
         self.iomem = Some(iomem);
         Ok(())
     }

@@ -446,6 +446,7 @@ struct AudioSetDeviceProp<T> {
 // AudioSetDeviceProp<T> is intended to use `#[repr(C, packed)]` but this
 // conflicts ith pin_init. Instead just ensure that it has the same size as if
 // it where packed.
+static_assert!(mem::size_of::<AudioSetDeviceProp<[u8; 0]>>() == 52);
 static_assert!(mem::size_of::<AudioSetDeviceProp<PDMConfig>>() == 52 + mem::size_of::<PDMConfig>());
 static_assert!(
     mem::size_of::<AudioSetDeviceProp<DecimatorConfig>>() == 52 + mem::size_of::<DecimatorConfig>()
@@ -454,6 +455,7 @@ static_assert!(
     mem::size_of::<AudioSetDeviceProp<LpaiChannelConfig>>()
         == 52 + mem::size_of::<LpaiChannelConfig>()
 );
+static_assert!(mem::size_of::<AudioSetDeviceProp<[u32; 3]>>() == 64);
 static_assert!(
     mem::size_of::<AudioSetDeviceProp<PowerSetting>>() == 52 + mem::size_of::<PowerSetting>()
 );
@@ -502,6 +504,8 @@ impl<T: Zeroable> AudioSetDeviceProp<T> {
 struct SndSocAopHwConfig {
     bytes_per_sample: u32,
     hf_decimator: bool,
+    /// Native property 300 payload, when property 301 is read-only.
+    lpai_channel_map: Option<[u32; 3]>,
 }
 
 struct SndSocAopData {
@@ -632,8 +636,15 @@ impl SndSocAopData {
             voice_trigger_channel: 1,
             unk4: 7,
         };
-        let msg = AudioSetDeviceProp::new(AUDIO_DEV_LPAI, 301, cfg);
-        let ret = self.epic_wrapped_call(&msg)?;
+        let ret = if let Some(channels) = self.hwdata.lpai_channel_map {
+            // T6041's native setup writes three channel masks to property 300.
+            // Property 301 is readable but rejects writes with NotWritable.
+            let msg = AudioSetDeviceProp::new(AUDIO_DEV_LPAI, 300, channels);
+            self.epic_wrapped_call(&msg)?
+        } else {
+            let msg = AudioSetDeviceProp::new(AUDIO_DEV_LPAI, 301, cfg);
+            self.epic_wrapped_call(&msg)?
+        };
         if ret != 0 {
             dev_err!(
                 self.dev,
@@ -687,6 +698,21 @@ impl SndSocAopData {
         self.adata
             .epic_call(&self.service, EPIC_SUBTYPE_WRAPPED_CALL, msg_bytes)
     }
+    fn speaker_property(&self, modifier: u32, payload: &[u8]) -> Result<()> {
+        if payload.len() > 109 { return Err(EINVAL); }
+        let mut header = AudioSetDeviceProp::new(from_fourcc(b"spkr"), modifier, [0u8; 0]);
+        header.len = 48 + payload.len() as u32;
+        header.len2 = payload.len() as u32;
+        let mut wire = [0u8; 161];
+        // SAFETY: the 52-byte header has no implicit padding and is initialized.
+        wire[..52].copy_from_slice(unsafe {
+            slice::from_raw_parts((&header as *const AudioSetDeviceProp<[u8; 0]>).cast(), 52)
+        });
+        wire[52..52 + payload.len()].copy_from_slice(payload);
+        let ret = self.adata.epic_call(&self.service, EPIC_SUBTYPE_WRAPPED_CALL,
+                                      &wire[..52 + payload.len()])?;
+        if ret == 0 { Ok(()) } else { Err(EIO) }
+    }
     fn request_dma_channel(&self) -> Result<*mut bindings::dma_chan> {
         let res = unsafe {
             from_err_ptr(bindings::dma_request_chan(
@@ -698,6 +724,57 @@ impl SndSocAopData {
             dev_err!(self.dev, "Unable to get dma channel");
         }
         res
+    }
+}
+
+// The C card owns one Arc reference until its device resources are released.
+unsafe extern "C" {
+    fn apple_aop_speaker_new(dev: *mut core::ffi::c_void,
+                             context: *const core::ffi::c_void) -> i32;
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn apple_aop_speaker_context_put(context: *const core::ffi::c_void) {
+    // SAFETY: the C card relinquishes its sole owned reference exactly once.
+    unsafe { Arc::<SndSocAopData>::from_foreign(context.cast_mut()); }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn apple_aop_speaker_power(context: *const core::ffi::c_void,
+                                              state: u32, unknown: u32) -> i32 {
+    // SAFETY: context remains owned by the C card throughout this call.
+    let data = unsafe { Arc::<SndSocAopData>::borrow(context.cast_mut()) };
+    let spkr = from_fourcc(b"spkr");
+    let power = PowerSetting::new(spkr, data.pstate_cookie.fetch_add(1, Relaxed), state, unknown);
+    let msg = AudioSetDeviceProp::new(spkr, 202, power);
+    match data.epic_wrapped_call(&msg) {
+        Ok(0) => 0,
+        Ok(_) => EIO.to_errno(),
+        Err(e) => e.to_errno(),
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn apple_aop_speaker_configure(context: *const core::ffi::c_void) -> i32 {
+    // Native Max property701 is a packed 109-byte clock/serializer graph.
+    // Keep the complete captured data template, including its unknown constants.
+    const TEMPLATE: [u8; 109] = [
+        0x20, 0x53, 0x70, 0x73, 0x30, 0x6b, 0x63, 0x6d, 0x20, 0x30, 0x69, 0x78,
+        0x00, 0x1b, 0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x67, 0x6b, 0x63,
+        0x30, 0x6b, 0x63, 0x6d, 0x01, 0x03, 0x00, 0x00, 0x00, 0x30, 0x6e, 0x79,
+        0x73, 0x30, 0x67, 0x6b, 0x63, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0xf9,
+        0x00, 0x00, 0x00, 0x30, 0x30, 0x73, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x18, 0x03,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x73, 0x6d,
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x10, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    // SAFETY: context remains owned by the C card throughout this call.
+    let data = unsafe { Arc::<SndSocAopData>::borrow(context.cast_mut()) };
+    match data.speaker_property(701, &TEMPLATE) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
     }
 }
 
@@ -796,6 +873,9 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         dev_err!(data.dev, "Unable to refine hwparams");
         return ret;
     }
+    // DMA width compatibility does not change the coprocessor's sample format.
+    // The helper adds integer formats too, but AOP always supplies float32 PCM.
+    hwparams.formats = bindings::BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE;
     if let Err(e) = data.set_audio_power(POWER_STATE_ON, 1) {
         dev_err!(data.dev, "Unable to power mic on");
         return e.to_errno();
@@ -859,7 +939,7 @@ impl SndSocAopDriver {
                 data.dev.as_raw(),
                 -1,
                 ptr::null(),
-                THIS_MODULE.as_ptr(),
+                <DriverModule as kernel::ModuleMetadata>::THIS_MODULE.as_ptr(),
                 0,
                 &mut this.0,
             )
@@ -919,6 +999,13 @@ impl SndSocAopDriver {
             copy_str(&mut (*pcm).name, c"aop_audio".to_bytes_with_nul());
         }
 
+        if data.fwnode.property_present(c_str!("apple,protected-speakers")) {
+            let context = data.clone().into_foreign();
+            // SAFETY: C consumes the Arc on every return path and owns the card.
+            let ret = unsafe { apple_aop_speaker_new(data.dev.as_raw().cast(), context) };
+            if ret < 0 { return Err(Error::from_errno(ret)); }
+        }
+
         let ret = unsafe { bindings::snd_card_register(this.0) };
         if ret < 0 {
             dev_err!(data.dev, "Unable to register sound card");
@@ -944,11 +1031,18 @@ unsafe impl Sync for SndSocAopDriver {}
 const HW_CFG_T8013: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 2,
     hf_decimator: false,
+    lpai_channel_map: None,
 };
 
 const HW_CFG_T6030: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 3,
     hf_decimator: true,
+    lpai_channel_map: None,
+};
+
+const HW_CFG_T6041: SndSocAopHwConfig = SndSocAopHwConfig {
+    lpai_channel_map: Some([7, 7, 7]),
+    ..HW_CFG_T6030
 };
 
 kernel::of_device_table!(
@@ -959,6 +1053,15 @@ kernel::of_device_table!(
         (
             of::DeviceId::new(c_str!("apple,t6030-aop-audio")),
             &HW_CFG_T6030
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,t6041-aop-audio")),
+            &HW_CFG_T6041
+        ),
+        // T8132 runs the same M4 generation AOP audio interface (three mics).
+        (
+            of::DeviceId::new(c_str!("apple,t8132-aop-audio")),
+            &HW_CFG_T6041
         ),
     ]
 );
@@ -985,7 +1088,7 @@ impl platform::Driver for SndSocAopDriver {
         let fwnode = parent_fwnode
             .get_child_by_name(c_str!("audio"))
             .ok_or(EIO)?;
-        let audio = *module_parameters::mic_check_123.value() != 0;
+        let audio = module_parameters::mic_check_123.value() != 0;
         if !audio && parent_fwnode.property_present(c_str!("apple,no-beamforming")) {
             return Err(ENODEV);
         }
