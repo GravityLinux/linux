@@ -217,6 +217,7 @@ config USB_DWC3_APPLE
 	depends on OF && ARCH_APPLE
 	default USB_DWC3
 	select USB_ROLE_SWITCH
+	select APPLE_TUNABLE
 	help
 	  Support Apple Silicon SoCs with DesignWare Core USB3 IP.
 	  The DesignWare Core USB3 IP has to be used in dual-role

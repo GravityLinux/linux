@@ -139,6 +139,16 @@ int dwc3_gadget_set_link_state(struct dwc3 *dwc, enum dwc3_link_state state)
 	return -ETIMEDOUT;
 }
 
+/*
+ * Program interrupt endpoints as bulk in the controller (the descriptors stay
+ * interrupt, so the host still polls them periodically). On Apple T8132 (and
+ * reportedly M3) a started interrupt IN transfer stops all further IN traffic,
+ * EP0 included, while OUT keeps working.
+ */
+static bool dwc3_int_as_bulk;
+module_param_named(int_as_bulk, dwc3_int_as_bulk, bool, 0644);
+MODULE_PARM_DESC(int_as_bulk, "Program interrupt endpoints as bulk");
+
 static void dwc3_ep0_reset_state(struct dwc3 *dwc)
 {
 	unsigned int	dir;
@@ -587,13 +597,17 @@ static int dwc3_gadget_set_ep_config(struct dwc3_ep *dep, unsigned int action)
 	const struct usb_endpoint_descriptor *desc;
 	struct dwc3_gadget_ep_cmd_params params;
 	struct dwc3 *dwc = dep->dwc;
+	bool int_as_bulk;
 
 	comp_desc = dep->endpoint.comp_desc;
 	desc = dep->endpoint.desc;
 
 	memset(&params, 0x00, sizeof(params));
 
-	params.param0 = DWC3_DEPCFG_EP_TYPE(usb_endpoint_type(desc))
+	int_as_bulk = usb_endpoint_xfer_int(desc) &&
+		      (dwc3_int_as_bulk || dwc->int_as_bulk);
+	params.param0 = DWC3_DEPCFG_EP_TYPE(int_as_bulk ? USB_ENDPOINT_XFER_BULK :
+					    usb_endpoint_type(desc))
 		| DWC3_DEPCFG_MAX_PACKET_SIZE(usb_endpoint_maxp(desc));
 
 	/* Burst size is only needed in SuperSpeed mode */
@@ -638,7 +652,7 @@ static int dwc3_gadget_set_ep_config(struct dwc3_ep *dep, unsigned int action)
 	if (dep->direction)
 		params.param0 |= DWC3_DEPCFG_FIFO_NUMBER(dep->number >> 1);
 
-	if (desc->bInterval) {
+	if (desc->bInterval && !int_as_bulk) {
 		u8 bInterval_m1;
 
 		/*

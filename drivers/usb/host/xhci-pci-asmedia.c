@@ -162,7 +162,7 @@ static int asmedia_wait_reset(struct pci_dev *pdev)
 	u32 val;
 	int ret;
 
-	op = hcd->regs + HC_LENGTH(readl(&cap->hc_capbase));
+	op = hcd->regs + FIELD_GET(HC_LENGTH, readl(&cap->hc_capbase));
 
 	ret = readl_poll_timeout(&op->command,
 				 val, !(val & CMD_RESET),

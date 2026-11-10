@@ -9,12 +9,30 @@
  */
 
 #include <linux/of.h>
+#include <linux/bitfield.h>
+#include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/usb.h>
+#include <linux/usb/hcd.h>
+#include <linux/usb/ch11.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 
 #include "glue.h"
+
+/* USB3 hub SetPortFeature(LINK_STATE): port in the low byte of wIndex,
+ * unshifted link-state selector in the high byte.
+ */
+#define DWC3_APPLE_SS_ROOT_PORT 1
+#define DWC3_APPLE_LINK_STATE_SELECTOR GENMASK(15, 8)
+#define DWC3_APPLE_HUB_REQUEST_TIMEOUT_MS 1000
+#define DWC3_APPLE_SS_DISABLE_POLL_COUNT 100
+#define DWC3_APPLE_SS_DISABLE_POLL_MIN_US 1000
+#define DWC3_APPLE_SS_DISABLE_POLL_MAX_US 2000
 
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
@@ -86,6 +104,15 @@ enum dwc3_apple_state {
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see documentation for the enum for details
  */
+struct dwc3_apple;
+
+struct dwc3_apple_host_port {
+	struct dwc3_apple *controller;
+	struct usb_role_switch *sw;
+	enum usb_role role;
+	u32 index;
+};
+
 struct dwc3_apple {
 	struct dwc3 dwc;
 
@@ -94,7 +121,12 @@ struct dwc3_apple {
 	void __iomem *apple_regs;
 
 	struct reset_control *reset;
+	struct apple_tunable *host_tunable;
+	void __iomem *cfg_regs;
+	struct apple_tunable *cfg_host_tunable;
 	struct usb_role_switch *role_sw;
+	bool ss_port_disabled;
+	struct dwc3_apple_host_port host_ports[2];
 
 	struct mutex lock;
 
@@ -187,6 +219,12 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	if (ret)
 		return ret;
 
+	/*
+	 * Started interrupt IN transfers stop all IN traffic on this core
+	 * (seen on T8132, reported on M3); run interrupt endpoints as bulk.
+	 */
+	appledwc->dwc.int_as_bulk = 1;
+
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 	return 0;
 }
@@ -216,6 +254,32 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
 	}
 
 	return ret;
+}
+
+/* Private Neo bring-up: current DT has no suspend-clock provider, so
+ * the generic core leaves the reset PWRDNSCALE value (1560) untouched.
+ * Native startup programs 13; live A/B shows warm-reset completion changing
+ * from 3.30s to 27.6ms. Preserve other GCTL fields and normal autosuspend.
+ * Replace this captured board setting with the real suspend clock when its
+ * rate/source is established; do not infer a clock rate from this alone.
+ */
+#define DWC3_APPLE_NEO_NATIVE_PWRDNSCALE 13
+
+static void dwc3_apple_setup_suspend_scale(struct dwc3_apple *appledwc)
+{
+	void __iomem *gctl;
+	u32 reg;
+
+	if (!of_machine_is_compatible("apple,j700") || appledwc->dwc.susp_clk)
+		return;
+
+	/* The core mapping starts at the global registers, not the xHCI area. */
+	gctl = appledwc->dwc.regs + DWC3_GCTL - DWC3_GLOBALS_REGS_START;
+	reg = readl(gctl);
+	reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
+	reg |= FIELD_PREP(DWC3_GCTL_PWRDNSCALE_MASK,
+			  DWC3_APPLE_NEO_NATIVE_PWRDNSCALE);
+	writel(reg, gctl);
 }
 
 static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
@@ -253,6 +317,14 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	if (ret)
 		goto reset_assert;
 
+	dwc3_apple_setup_suspend_scale(appledwc);
+
+	/* Factory host configuration is needed after every controller reset,
+	 * including USB2-only startup. Values are supplied by the board ADT.
+	 */
+	apple_tunable_apply(appledwc->dwc.regs, appledwc->host_tunable);
+	apple_tunable_apply(appledwc->cfg_regs, appledwc->cfg_host_tunable);
+
 	/*
 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
@@ -270,6 +342,7 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 		 */
 		dwc3_enable_susphy(&appledwc->dwc, true);
 		phy_set_mode(appledwc->dwc.usb3_generic_phy[0], PHY_MODE_USB_HOST);
+		appledwc->ss_port_disabled = false;
 		ret = dwc3_host_init(&appledwc->dwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
@@ -432,10 +505,170 @@ static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 	return 0;
 }
 
+/* Both Neo Type-C connectors feed one internal high-speed hub and DWC3.
+ * A port owns its own role request; stop the host only after the last user.
+ */
+/* The back connector owns the single SuperSpeed root port. Stop its link
+ * before Type-C removes the PHY, without resetting the live front HS hub.
+ * Use hub requests so xHCI owns PORTSC and its change-bit bookkeeping.
+ */
+static int dwc3_apple_ss_link(struct dwc3_apple *appledwc, bool enable)
+{
+	struct usb_hcd *hcd;
+	struct usb_device *root;
+	struct usb_interface *intf;
+	struct usb_port_status status;
+	u16 link = enable ? USB_SS_PORT_LS_RX_DETECT : USB_SS_PORT_LS_SS_DISABLED;
+	int ret;
+
+	if (!appledwc->dwc.xhci)
+		return -ENODEV;
+	hcd = platform_get_drvdata(appledwc->dwc.xhci);
+	if (!hcd || !hcd->shared_hcd)
+		return -ENODEV;
+	root = hcd->shared_hcd->self.root_hub;
+	if (!root || root->maxchild != 1)
+		return -EOPNOTSUPP;
+	intf = usb_ifnum_to_if(root, 0);
+	if (!intf)
+		return -ENODEV;
+	ret = usb_autopm_get_interface(intf);
+	if (ret)
+		return ret;
+	ret = usb_control_msg_send(root, 0, USB_REQ_SET_FEATURE, USB_RT_PORT,
+				   USB_PORT_FEAT_LINK_STATE, DWC3_APPLE_SS_ROOT_PORT |
+				   FIELD_PREP(DWC3_APPLE_LINK_STATE_SELECTOR,
+					      FIELD_GET(USB_PORT_STAT_LINK_STATE, link)),
+				   NULL, 0, DWC3_APPLE_HUB_REQUEST_TIMEOUT_MS, GFP_KERNEL);
+	if (ret)
+		goto out;
+	if (!enable) {
+		ret = -ETIMEDOUT;
+		for (unsigned int i = 0; i < DWC3_APPLE_SS_DISABLE_POLL_COUNT; i++) {
+			int err = usb_control_msg_recv(root, 0, USB_REQ_GET_STATUS,
+					USB_DIR_IN | USB_RT_PORT, HUB_PORT_STATUS,
+					DWC3_APPLE_SS_ROOT_PORT, &status,
+					offsetof(struct usb_port_status, dwExtPortStatus),
+					DWC3_APPLE_HUB_REQUEST_TIMEOUT_MS, GFP_KERNEL);
+
+			if (err) {
+				ret = err;
+				break;
+			}
+			if ((le16_to_cpu(status.wPortStatus) & USB_PORT_STAT_LINK_STATE) == link) {
+				ret = 0;
+				break;
+			}
+			usleep_range(DWC3_APPLE_SS_DISABLE_POLL_MIN_US,
+				     DWC3_APPLE_SS_DISABLE_POLL_MAX_US);
+		}
+	}
+	if (!ret)
+		appledwc->ss_port_disabled = !enable;
+out:
+	usb_autopm_put_interface(intf);
+	dev_info(appledwc->dev, "Neo SS link %s result%d\n",
+		 enable ? "RxDetect" : "disabled", ret);
+	return ret;
+}
+
+static int dwc3_apple_host_port_set(struct usb_role_switch *sw, enum usb_role role)
+{
+	struct dwc3_apple_host_port *port = usb_role_switch_get_drvdata(sw);
+	struct dwc3_apple *appledwc = port->controller;
+	bool active = role == USB_ROLE_HOST;
+	int ret = 0;
+
+	if (role != USB_ROLE_NONE && role != USB_ROLE_HOST)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&appledwc->lock);
+	if (port->role == role)
+		return 0;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(appledwc->host_ports); i++)
+		if (&appledwc->host_ports[i] != port &&
+		    appledwc->host_ports[i].role == USB_ROLE_HOST)
+			active = true;
+
+	if (!port->index && active && appledwc->state == DWC3_APPLE_HOST) {
+		if (role == USB_ROLE_NONE)
+			ret = dwc3_apple_ss_link(appledwc, false);
+		else if (appledwc->ss_port_disabled)
+			ret = dwc3_apple_ss_link(appledwc, true);
+		if (ret)
+			return ret;
+	}
+
+	if (active && appledwc->state != DWC3_APPLE_HOST)
+		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+	else if (!active)
+		ret = dwc3_apple_exit(appledwc);
+
+	if (!ret)
+		port->role = role;
+	dev_info(appledwc->dev, "shared host port%u role%u active%d state%u result%d\n",
+		 port->index, role, active, appledwc->state, ret);
+	return ret;
+}
+
+static void dwc3_apple_host_port_unregister(void *data)
+{
+	struct dwc3_apple_host_port *port = data;
+
+	if (port->sw) {
+		usb_role_switch_unregister(port->sw);
+		port->sw = NULL;
+	}
+}
+
+static int dwc3_apple_setup_host_ports(struct dwc3_apple *appledwc)
+{
+	struct device *dev = appledwc->dev;
+	unsigned long seen = 0;
+	int ret;
+
+	device_for_each_child_node_scoped(dev, child) {
+		struct usb_role_switch_desc desc = {};
+		struct dwc3_apple_host_port *port;
+		u32 index;
+
+		if (!fwnode_property_present(child, "usb-role-switch"))
+			continue;
+		ret = fwnode_property_read_u32(child, "reg", &index);
+		if (ret || index >= ARRAY_SIZE(appledwc->host_ports) || test_bit(index, &seen))
+			return -EINVAL;
+		set_bit(index, &seen);
+		port = &appledwc->host_ports[index];
+		port->controller = appledwc;
+		port->index = index;
+		/* Private diagnostic: cycle each host request without cable changes. */
+		desc.allow_userspace_control = true;
+		desc.fwnode = child;
+		desc.set = dwc3_apple_host_port_set;
+		desc.driver_data = port;
+		desc.name = devm_kasprintf(dev, GFP_KERNEL, "%s-port%u", dev_name(dev), index);
+		if (!desc.name)
+			return -ENOMEM;
+		port->sw = usb_role_switch_register(dev, &desc);
+		if (IS_ERR(port->sw)) {
+			ret = PTR_ERR(port->sw);
+			port->sw = NULL;
+			return ret;
+		}
+		ret = devm_add_action_or_reset(dev, dwc3_apple_host_port_unregister, port);
+		if (ret)
+			return ret;
+	}
+
+	return seen == GENMASK(ARRAY_SIZE(appledwc->host_ports) - 1, 0) ? 0 : -EINVAL;
+}
+
 static int dwc3_apple_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct dwc3_apple *appledwc;
+	enum usb_dr_mode dr_mode;
 	int ret;
 
 	appledwc = devm_kzalloc(&pdev->dev, sizeof(*appledwc), GFP_KERNEL);
@@ -443,7 +676,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	/* PM/remove must also work before the first cable starts the core. */
+	platform_set_drvdata(pdev, &appledwc->dwc);
 	mutex_init(&appledwc->lock);
+	dr_mode = usb_get_dr_mode(dev);
+	appledwc->dwc.dr_mode = dr_mode;
 
 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
@@ -462,6 +699,35 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	if (of_find_property(dev->of_node, "apple,tunable-host", NULL)) {
+		struct resource globals = *appledwc->mmio_resource;
+
+		if (resource_size(&globals) <= DWC3_GLOBALS_REGS_START)
+			return -EINVAL;
+		globals.start += DWC3_GLOBALS_REGS_START;
+		appledwc->host_tunable = devm_apple_tunable_parse(dev, dev->of_node,
+							"apple,tunable-host", &globals);
+		if (IS_ERR(appledwc->host_tunable))
+			return dev_err_probe(dev, PTR_ERR(appledwc->host_tunable),
+					     "Invalid host tunables\n");
+	}
+
+	if (of_find_property(dev->of_node, "apple,tunable-cfg-host", NULL)) {
+		struct resource *cfg;
+
+		cfg = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dwc3-cfg");
+		if (!cfg)
+			return -EINVAL;
+		appledwc->cfg_host_tunable = devm_apple_tunable_parse(dev, dev->of_node,
+						"apple,tunable-cfg-host", cfg);
+		if (IS_ERR(appledwc->cfg_host_tunable))
+			return dev_err_probe(dev, PTR_ERR(appledwc->cfg_host_tunable),
+					     "Invalid host configuration tunables\n");
+		appledwc->cfg_regs = devm_ioremap_resource(dev, cfg);
+		if (IS_ERR(appledwc->cfg_regs))
+			return PTR_ERR(appledwc->cfg_regs);
+	}
+
 	appledwc->apple_regs = devm_platform_ioremap_resource_byname(pdev, "dwc3-apple");
 	if (IS_ERR(appledwc->apple_regs))
 		return dev_err_probe(dev, PTR_ERR(appledwc->apple_regs),
@@ -475,6 +741,27 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+	platform_set_drvdata(pdev, &appledwc->dwc);
+	if (device_property_read_bool(dev, "apple,shared-host-ports")) {
+		if (dr_mode != USB_DR_MODE_HOST)
+			return -EINVAL;
+		appledwc->dwc.current_dr_role = DWC3_GCTL_PRTCAP_HOST;
+		return dwc3_apple_setup_host_ports(appledwc);
+	}
+	if (dr_mode == USB_DR_MODE_HOST) {
+		/*
+		 * Host-only instances have no cable event to start the core. Mark
+		 * the role before core probe so dwc3_core_soft_reset() does not try
+		 * to reset the unused gadget side of the controller.
+		 */
+		appledwc->dwc.current_dr_role = DWC3_GCTL_PRTCAP_HOST;
+		guard(mutex)(&appledwc->lock);
+		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to start fixed host controller\n");
+		return 0;
+	}
+
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
@@ -489,7 +776,10 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 
 	guard(mutex)(&appledwc->lock);
 
-	usb_role_switch_unregister(appledwc->role_sw);
+	if (appledwc->role_sw)
+		usb_role_switch_unregister(appledwc->role_sw);
+	for (unsigned int i = 0; i < ARRAY_SIZE(appledwc->host_ports); i++)
+		dwc3_apple_host_port_unregister(&appledwc->host_ports[i]);
 
 	/*
 	 * If we're still in DWC3_APPLE_PROBE_PENDING we never got any cable connected event and
@@ -500,6 +790,30 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
 		dwc3_core_remove(&appledwc->dwc);
 }
+
+static int dwc3_apple_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
+
+	guard(mutex)(&appledwc->lock);
+
+	/*
+	 * No system-PM context save/restore exists in this glue yet. Letting
+	 * genpd cut power loses a configured gadget while its UDC still says
+	 * configured. Keep the controller and its PHY dependency powered for
+	 * J713 s2idle; hardware automatic gating remains available.
+	 */
+	if (of_machine_is_compatible("apple,j713") &&
+	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+	    (appledwc->state == DWC3_APPLE_HOST ||
+	     appledwc->state == DWC3_APPLE_DEVICE))
+		device_set_wakeup_path(dev);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dwc3_apple_pm_ops, dwc3_apple_suspend, NULL);
 
 static const struct of_device_id dwc3_apple_of_match[] = {
 	{ .compatible = "apple,t8103-dwc3" },
@@ -513,6 +827,7 @@ static struct platform_driver dwc3_apple_driver = {
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
+		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
