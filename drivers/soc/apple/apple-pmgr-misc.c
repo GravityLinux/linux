@@ -105,6 +105,9 @@ static int apple_pmgr_init_device(struct apple_pmgr_misc *misc,
 	misc->devices[dev].active_state =
 		FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED, val);
 	misc->devices[dev].suspend_state = hw->dev_min_ps[dev];
+	snprintf(name, sizeof(name), "apple,%s-min-ps", device_name);
+	of_property_read_u32(misc->dev->of_node, name,
+			     &misc->devices[dev].suspend_state);
 
 	return 0;
 }
