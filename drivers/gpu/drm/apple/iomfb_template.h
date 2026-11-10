@@ -59,6 +59,18 @@ struct DCP_FW_NAME(dcp_swap) {
 #else
 	u32 bl_update;
 #endif
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	u8 bl_flags[6];
+	__le64 bl_nits; /* IEEE-754 binary64, unaligned at 0x35e */
+#ifdef DCP_FW_T8140
+	u8 unk_366[0x10];
+	__le64 bl_limit_nits;
+	__le64 bl_scale;
+	u8 unk_386[0xb];
+#else
+	u8 unk_2f3[0x2b];
+#endif
+#else
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
 #else
@@ -72,13 +84,33 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
 	u8 unk_2f3[0x2d];
+#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#ifdef DCP_FW_T8140
+	u8 unk_391[0x55];
+	__le64 bl_scale_inverse;
+	u8 unk_3ee[0xea];
+#else
 	u8 unk_320[0x13f];
+#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 	u8 unk_14_7_2[0x30];
 #endif
+
+#ifndef DCP_FW_T8140
 	u32 unk_flags;
 	u32 unk_flags2;
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/* Added after the 14.7 swap record.  Native 26.6 sets both bytes for
+	 * ordinary visible swaps; the remaining bytes have always been zero in
+	 * traces. */
+	u8 unk_26_6[0x16];
+	u8 presents_surface;
+	u8 unk_26_6_17[0x51];
+	u8 has_completion;
+	u8 unk_26_6_69[0x17];
+#endif
 #endif
 } __packed;
 
@@ -100,8 +132,15 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u64 surf_iova[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u64 unk_u64_a[SWAP_SURFACES];
+#ifndef DCP_FW_T8140
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	struct DCP_FW_NAME(dcp_surface) surf2[6];
+	u64 surf2_iova[6];
+#else
 	struct DCP_FW_NAME(dcp_surface) surf2[5];
 	u64 surf2_iova[5];
+#endif
+#endif /* !DCP_FW_T8140 */
 #endif
 	u8 unkbool;
 	u64 unkdouble;
@@ -113,20 +152,37 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u32 unkU32Ptr;
 #endif
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-	u8 padding_14_7[0x234];
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0) && \
+	DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
+	u8 padding_before_surface_null[0x234];
 #endif
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && !defined(DCP_FW_T8140)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	u8 surf2_null[6];
+#else
 	u8 surf2_null[5];
+#endif
 #endif
 	u8 unkoutbool_null;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unkU32Ptr_null;
 	u8 unkU32out_null;
 #endif
+#if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
 	u8 padding[1];
+#endif
+#ifdef DCP_FW_T8140
+	u8 padding_t8140[2];
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0) && \
+	DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
+	u8 padding_14_7[0x1e9];
+	u8 unk_14_7_zero[0x46];
+	u32 unk_14_7_u32;
+	u8 unk_bool;
+#endif
 } __packed;
 
 struct DCP_FW_NAME(dcp_swap_submit_resp) {
@@ -140,6 +196,11 @@ struct DCP_FW_NAME(dcp_swap_submit_resp) {
 
 struct DCP_FW_NAME(dc_swap_complete_resp) {
 	u32 swap_id;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	u8 opaque[0x23];
+	__le64 timestamps[5];
+	u8 opaque_tail[0x6e1];
+#else
 	u8 unkbool;
 	u64 swap_data;
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
@@ -149,7 +210,48 @@ struct DCP_FW_NAME(dc_swap_complete_resp) {
 #endif
 	u32 unkint;
 	u8 swap_info_null;
+#endif
 } __packed;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+struct DCP_FW_NAME(dcp_swap_start_req) {
+	u32 swap_id;
+	u64 client;
+	u8 swap_id_null;
+	u8 padding[3];
+} __packed;
+
+struct DCP_FW_NAME(dcp_swap_start_resp) {
+	u32 swap_id;
+	u32 ret;
+} __packed;
+
+struct DCP_FW_NAME(dcp_map_buf_resp) {
+	u32 buffer;
+	u64 dva;
+	u32 ret;
+} __packed;
+#else
+struct DCP_FW_NAME(dcp_swap_start_req) {
+	u32 swap_id;
+	struct dcp_iouserclient client;
+	u8 swap_id_null;
+	u8 client_null;
+	u8 padding[2];
+} __packed;
+
+struct DCP_FW_NAME(dcp_swap_start_resp) {
+	u32 swap_id;
+	struct dcp_iouserclient client;
+	u32 ret;
+} __packed;
+
+struct DCP_FW_NAME(dcp_map_buf_resp) {
+	u64 vaddr;
+	u64 dva;
+	u32 ret;
+} __packed;
+#endif
 
 struct DCP_FW_NAME(dcp_map_reg_req) {
 	char obj[4];

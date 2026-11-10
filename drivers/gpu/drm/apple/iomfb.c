@@ -8,7 +8,6 @@
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/iommu.h>
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
@@ -191,6 +190,9 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 	ch->output[depth] = out + sizeof(header) + in_len;
 	ch->end[depth] = offset + ALIGN(data_len, DCP_PACKET_ALIGNMENT);
 
+	/* RTKit-provided firmware buffers can be mapped WC rather than allocated
+	 * by dma_alloc_coherent(). Publish the packet before ringing DCP. */
+	dma_wmb();
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_msg(context, data_len, offset));
 }
@@ -220,6 +222,8 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
 	dcp_pop_depth(&ch->depth);
+	/* Publish callback output before the acknowledgement makes it visible. */
+	dma_wmb();
 	dcp_send_message(dcp, IOMFB_ENDPOINT,
 			 dcpep_ack(context));
 }
@@ -287,8 +291,17 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	ch->output[depth] = out;
 	ch->end[depth] = offset + ALIGN(length, DCP_PACKET_ALIGNMENT);
 
-	if (dcp->cb_handlers[tag](dcp, tag, out, in))
+	if (dcp->cb_handlers[tag](dcp, tag, out, in)) {
 		dcp_ack(dcp, context);
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 && tag == 590) {
+			/* Publish only after the callback ACK is queued, so a mode
+			 * request cannot overtake the clear-frame completion. */
+			WRITE_ONCE(dcp->swap_acked_id, READ_ONCE(dcp->last_swap_id));
+			smp_store_release(&dcp->swap_ack_sequence,
+					  dcp->swap_ack_sequence + 1);
+			wake_up_all(&dcp->swap_ack_wait);
+		}
+	}
 }
 
 static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
@@ -336,11 +349,30 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 	}
 
 	data = dcp->shmem + channel_offset + offset;
+	/* Pair with firmware's mailbox notification before consuming the packet
+	 * from the retained WC mapping. */
+	dma_rmb();
 
 	if (FIELD_GET(IOMFB_MSG_ACK, message))
 		dcpep_handle_ack(dcp, ctx_id, data, length);
 	else
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
+}
+
+static bool dcp_vrr_capable(struct apple_dcp *dcp)
+{
+	unsigned int i;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6 || !dcp_has_panel(dcp) ||
+	    !dcp->main_display || !dcp->refresh_intervals.minimum ||
+	    dcp->refresh_intervals.maximum <= dcp->refresh_intervals.minimum)
+		return false;
+
+	for (i = 0; i < dcp->nr_modes; i++)
+		if (dcp->modes[i].vrr)
+			return true;
+
+	return false;
 }
 
 int dcp_get_modes(struct drm_connector *connector)
@@ -352,6 +384,8 @@ int dcp_get_modes(struct drm_connector *connector)
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
 	int i;
+
+	drm_connector_set_vrr_capable_property(connector, dcp_vrr_capable(dcp));
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
@@ -397,6 +431,19 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 	return NULL;
 }
 
+bool dcp_vrr_requested(struct apple_dcp *dcp,
+		       const struct drm_crtc_state *state)
+{
+	struct dcp_display_mode *mode;
+
+	if (!state->active || !(state->vrr_enabled || dcp_force_vrr) ||
+	    !dcp_vrr_capable(dcp))
+		return false;
+
+	mode = lookup_mode(dcp, &state->mode);
+	return mode && mode->vrr;
+}
+
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode)
 {
@@ -438,6 +485,12 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		ret = iomfb_modeset_v26_6_0(dcp, crtc_state);
+		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		ret = iomfb_modeset_v26_6_t8140(dcp, crtc_state);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
@@ -491,6 +544,12 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_flush_v14_7_0(dcp, crtc, commit);
 		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_flush_v26_6_0(dcp, crtc, commit);
+		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_flush_v26_6_t8140(dcp, crtc, commit);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -508,6 +567,12 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_start_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_start_v26_6_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_start_v26_6_t8140(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -537,10 +602,16 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
-	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
 
-	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
-					GFP_KERNEL);
+	if (!dcp_fw_is_26_6(dcp))
+		apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE,
+					 &shmem_iova, GFP_KERNEL);
+	if (!dcp->shmem)
+		return -ENOMEM;
+
+	memset(dcp->shmem, 0, DCP_SHMEM_SIZE);
+	dma_wmb();
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
 
@@ -562,6 +633,12 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_shutdown_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_shutdown_v26_6_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_T8140:
+		iomfb_shutdown_v26_6_t8140(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

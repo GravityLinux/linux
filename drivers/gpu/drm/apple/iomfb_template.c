@@ -16,20 +16,160 @@
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "afk.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "parser.h"
 #include "trace.h"
 #include "version_utils.h"
+
+enum dcp_power_transition {
+	DCP_POWER_TRANSITION_NONE,
+	DCP_POWER_TRANSITION_DISPLAY_OFF,
+	DCP_POWER_TRANSITION_RESTARTABLE_SLEEP,
+	DCP_POWER_TRANSITION_SHUTDOWN,
+};
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+typedef struct dcp_set_power_state_req_v26_6 dcp_power_state_req_t;
+typedef struct iomfb_abort_swaps_dcp_req_v26_6 dcp_abort_swaps_req_t;
+typedef struct iomfb_abort_swaps_dcp_resp_v26_6 dcp_abort_swaps_resp_t;
+typedef struct dcp_read_edt_data_resp_v26_6 dcp_read_edt_data_resp_t;
+typedef struct dcp_swap_complete_intent_gated_v26_6 dcp_swap_intent_t;
+typedef struct dcp_bool_arg dcp_bool_arg_t;
+
+static dcp_power_state_req_t dcp_power_state_req(u64 state,
+						 enum dcp_power_transition transition)
+{
+	dcp_power_state_req_t req = {
+		.state = state,
+		.padding = { 0xaa, 0xaa, 0xaa },
+	};
+
+	switch (transition) {
+	case DCP_POWER_TRANSITION_RESTARTABLE_SLEEP:
+		req.flags[0] = 1;
+		req.flags[3] = 1;
+		req.result_is_null = 1;
+		break;
+	case DCP_POWER_TRANSITION_SHUTDOWN:
+		req.flags[1] = 1;
+		req.result_is_null = 1;
+		break;
+	case DCP_POWER_TRANSITION_NONE:
+	case DCP_POWER_TRANSITION_DISPLAY_OFF:
+		break;
+	}
+
+	return req;
+}
+
+static dcp_bool_arg_t dcp_bool_arg(bool value)
+{
+	return (dcp_bool_arg_t){
+		.value = value,
+		.padding = { 0xaa, 0xaa, 0xaa },
+	};
+}
+
+/* Native 26.6 brightness and display-off swaps use binary64 nits, not iDAC. */
+static u64 dcp_nits_binary64(u32 nits)
+{
+	u64 bits = 0;
+
+	if (nits) {
+		unsigned int exponent = fls(nits) - 1;
+
+		/* All u32 integers are exactly representable; no kernel FP use. */
+		bits = (u64)(exponent + 1023) << 52;
+		bits |= ((u64)nits << (52 - exponent)) & GENMASK_ULL(51, 0);
+	}
+
+	return bits;
+}
+
+static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits,
+				    u32 maximum)
+{
+	swap->bl_update = 1;
+	swap->bl_flags[1] = 1;
+#ifdef DCP_FW_T8140
+	/* Supply the complete linear-nits configuration. A zero gain or limit
+	 * can turn a valid requested level into zero physical backlight output. */
+	if (maximum) {
+		swap->bl_flags[2] = 1;
+		swap->bl_flags[4] = 1;
+		put_unaligned_le64(dcp_nits_binary64(maximum), &swap->bl_limit_nits);
+		put_unaligned_le64(0x3ff0000000000000ULL, &swap->bl_scale);
+		put_unaligned_le64(0x3ff0000000000000ULL, &swap->bl_scale_inverse);
+	}
+#endif
+	put_unaligned_le64(dcp_nits_binary64(nits), &swap->bl_nits);
+}
+#else
+typedef struct dcp_set_power_state_req dcp_power_state_req_t;
+typedef struct iomfb_abort_swaps_dcp_req dcp_abort_swaps_req_t;
+typedef struct iomfb_abort_swaps_dcp_resp dcp_abort_swaps_resp_t;
+typedef struct dcp_read_edt_data_resp dcp_read_edt_data_resp_t;
+typedef struct dcp_swap_complete_intent_gated dcp_swap_intent_t;
+typedef u32 dcp_bool_arg_t;
+
+static dcp_power_state_req_t dcp_power_state_req(u64 state,
+						 enum dcp_power_transition transition)
+{
+	return (dcp_power_state_req_t){
+		.unklong = state,
+		.unkbool = transition != DCP_POWER_TRANSITION_NONE,
+		.unkint_null = transition != DCP_POWER_TRANSITION_NONE,
+	};
+}
+
+static dcp_bool_arg_t dcp_bool_arg(bool value)
+{
+	return value;
+}
+#endif
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static u64 dcp_iomfb_client(struct apple_dcp *dcp)
+{
+	/* Native passes its IOUserClient pointer as an opaque client identity. */
+	return (u64)(unsigned long)dcp;
+}
+#endif
+
+static struct DCP_FW_NAME(dcp_swap_start_req)
+dcp_swap_start_request(struct apple_dcp *dcp)
+{
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	return (struct DCP_FW_NAME(dcp_swap_start_req)){
+		.client = dcp_iomfb_client(dcp),
+		.padding = { 0xaa, 0xaa, 0xaa },
+	};
+#else
+	return (struct DCP_FW_NAME(dcp_swap_start_req)){ 0 };
+#endif
+}
+
+static dcp_abort_swaps_req_t dcp_abort_swaps_request(struct apple_dcp *dcp)
+{
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	return (dcp_abort_swaps_req_t){ .client = dcp_iomfb_client(dcp) };
+#else
+	return (dcp_abort_swaps_req_t){ .client.flag2 = 1 };
+#endif
+}
 
 /* Register defines used in bandwidth setup structure */
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
@@ -54,17 +194,19 @@ DCP_THUNK_OUT(iomfb_a358_vi_set_temperature_hint, iomfbep_a358_vi_set_temperatur
 IOMFB_THUNK_INOUT(set_matrix);
 IOMFB_THUNK_INOUT(get_color_remap_mode);
 IOMFB_THUNK_INOUT(last_client_close);
-IOMFB_THUNK_INOUT(abort_swaps_dcp);
+DCP_THUNK_INOUT(iomfb_abort_swaps_dcp, iomfbep_abort_swaps_dcp,
+		dcp_abort_swaps_req_t, dcp_abort_swaps_resp_t);
 
 DCP_THUNK_INOUT(dcp_swap_submit, dcpep_swap_submit,
 		struct DCP_FW_NAME(dcp_swap_submit_req),
 		struct DCP_FW_NAME(dcp_swap_submit_resp));
 
-DCP_THUNK_INOUT(dcp_swap_start, dcpep_swap_start, struct dcp_swap_start_req,
-		struct dcp_swap_start_resp);
+DCP_THUNK_INOUT(dcp_swap_start, dcpep_swap_start,
+		struct DCP_FW_NAME(dcp_swap_start_req),
+		struct DCP_FW_NAME(dcp_swap_start_resp));
 
 DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
-		struct dcp_set_power_state_req,
+		dcp_power_state_req_t,
 		struct dcp_set_power_state_resp);
 
 DCP_THUNK_INOUT(dcp_set_digital_out_mode, dcpep_set_digital_out_mode,
@@ -76,11 +218,13 @@ DCP_THUNK_OUT(dcp_set_display_refresh_properties,
 	      dcpep_set_display_refresh_properties, u32);
 
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-DCP_THUNK_INOUT(dcp_late_init_signal, dcpep_late_init_signal, u32, u32);
+DCP_THUNK_INOUT(dcp_late_init_signal, dcpep_late_init_signal,
+		dcp_bool_arg_t, u32);
 #else
 DCP_THUNK_OUT(dcp_late_init_signal, dcpep_late_init_signal, u32);
 #endif
-DCP_THUNK_IN(dcp_flush_supports_power, dcpep_flush_supports_power, u32);
+DCP_THUNK_IN(dcp_flush_supports_power, dcpep_flush_supports_power,
+	     dcp_bool_arg_t);
 DCP_THUNK_OUT(dcp_create_default_fb, dcpep_create_default_fb, u32);
 DCP_THUNK_OUT(dcp_start_signal, dcpep_start_signal, u32);
 DCP_THUNK_VOID(dcp_setup_video_limits, dcpep_setup_video_limits);
@@ -120,8 +264,36 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	u64 counter = dcp_read_firmware_time();
+	u64 presented = get_unaligned_le64(&resp->timestamps[2]);
+
+	/* Notifications make these fields valid. Reject absent, stale or
+	 * future clocks before using them to phase subsequent submissions.
+	 */
+	if (presented && presented <= counter && counter - presented < 24000000 &&
+	    presented >= READ_ONCE(dcp->last_fw_present_ticks))
+		WRITE_ONCE(dcp->last_fw_present_ticks, presented);
+#endif
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	trace_iomfb_swap_timing(dcp, resp->swap_id, resp->opaque[0],
+		get_unaligned_le64(resp->opaque + 0x1a), counter,
+		get_unaligned_le64(&resp->timestamps[0]),
+		get_unaligned_le64(&resp->timestamps[1]),
+		get_unaligned_le64(&resp->timestamps[2]),
+		get_unaligned_le64(&resp->timestamps[3]),
+		get_unaligned_le64(&resp->timestamps[4]));
+#endif
 	dcp->last_swap_id = resp->swap_id;
+#ifdef DCP_FW_T8140
+	if (smp_load_acquire(&dcp->modeset_blank_valid) &&
+	    resp->swap_id == READ_ONCE(dcp->modeset_blank_id)) {
+		WRITE_ONCE(dcp->modeset_blank_valid, false);
+		/* An internal black frame is not the client's page flip. */
+		return;
+	}
+#endif
 
 	dcp_drm_crtc_page_flip(dcp, now);
 	if (dcp->crc_enabled) {
@@ -200,6 +372,15 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
 	switch (prop->id) {
+#ifdef DCP_FW_T8140
+	case 19: /* 26.6 brightnessLevel, in 16.16 nits */
+		if (dcp_has_panel(dcp) && !dcp->brightness.initialized)
+			dcp->brightness.nits = min_t(u32,
+				prop->value / dcp->brightness.scale,
+				dcp->brightness.maximum);
+		break;
+#endif
+#if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	case IOMFB_PROPERTY_NITS_V13_3:
 #else
@@ -215,6 +396,7 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 		}
 		break;
 	}
+#endif
 	default:
 		dev_dbg(dcp->dev, "pr_publish: id: %d = %u\n", prop->id, prop->value);
 	}
@@ -265,8 +447,8 @@ static void iomfbep_cb_set_fx_prop(struct apple_dcp *dcp, struct iomfb_set_fx_pr
  * PIODMA is separate from the main DCP and uses own IOVA space on a dedicated
  * stream of the display DART, rather than the expected DCP DART.
  */
-static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
-						   struct dcp_map_buf_req *req)
+static struct DCP_FW_NAME(dcp_map_buf_resp)
+dcpep_cb_map_piodma(struct apple_dcp *dcp, struct dcp_map_buf_req *req)
 {
 	struct dcp_mem_descriptor *memdesc;
 	struct sg_table *map;
@@ -293,12 +475,26 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 		goto reject;
 	}
 
-	return (struct dcp_map_buf_resp){ .dva = memdesc->dva };
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	return (struct DCP_FW_NAME(dcp_map_buf_resp)){
+		.buffer = req->buffer,
+		.dva = memdesc->dva,
+	};
+#else
+	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .dva = memdesc->dva };
+#endif
 
 reject:
 	dev_err(dcp->dev, "denying map of invalid buffer %llx for piodma\n",
 		req->buffer);
-	return (struct dcp_map_buf_resp){ .ret = EINVAL };
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	return (struct DCP_FW_NAME(dcp_map_buf_resp)){
+		.buffer = req->buffer,
+		.ret = EINVAL,
+	};
+#else
+	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .ret = EINVAL };
+#endif
 }
 
 static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
@@ -398,6 +594,7 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 	memdesc = &dcp->memdesc[id];
 	size = ALIGN(memdesc->size, SZ_16K);
 	if (memdesc->buf) {
+		sg_free_table(&memdesc->map);
 		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
 		memdesc->buf = NULL;
 		memset(&memdesc->map, 0, sizeof(memdesc->map));
@@ -475,9 +672,25 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
+		dma_addr_t dva;
+		size_t size = resource_size(rsrc);
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		/*
+		 * 26.6 returns register-window physical addresses directly. DCP
+		 * issues these firmware-owned MMIO transactions on its dedicated
+		 * DART-bypass stream; installing a mapping in the normal DMA stream
+		 * does not affect them.
+		 */
+		dva = rsrc->start;
+		dev_dbg(dcp->dev,
+			 "D411: physical reg[%u] DVA/PA %#llx size %#zx\n",
+			 req->index, (unsigned long long)dva, size);
+#else
+		dva = dma_map_resource(dcp->dev, rsrc->start, size,
+				       DMA_BIDIRECTIONAL, 0);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
+#endif
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
@@ -490,10 +703,10 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	}
 }
 
-static struct dcp_read_edt_data_resp
+static dcp_read_edt_data_resp_t
 dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 {
-	return (struct dcp_read_edt_data_resp){
+	return (dcp_read_edt_data_resp_t){
 		.value[0] = req->value[0],
 		.ret = 0,
 	};
@@ -558,10 +771,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
-	/* used just as opaque pointer for tracing */
-	ctx.dcp = dcp;
-
-	ret = parse(dcp->chunks.data, dcp->chunks.length, &ctx);
+	ret = parse(dcp, dcp->chunks.data, dcp->chunks.length, &ctx);
 
 	if (ret) {
 		dev_warn(dcp->dev, "bad header on dcpav props\n");
@@ -628,7 +838,7 @@ static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 static void boot_4(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u32 v_true = 1;
+	dcp_bool_arg_t v_true = dcp_bool_arg(true);
 	dcp_late_init_signal(dcp, false, &v_true, boot_5, NULL);
 #else
 	dcp_late_init_signal(dcp, false, boot_5, NULL);
@@ -637,7 +847,7 @@ static void boot_4(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_3(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	u32 v_true = true;
+	dcp_bool_arg_t v_true = dcp_bool_arg(true);
 
 	dcp_flush_supports_power(dcp, false, &v_true, boot_4, NULL);
 }
@@ -678,13 +888,13 @@ static struct dcp_rt_bandwidth dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
 			.doorbell_bit = 0,
 	};
 
-	if (dcp->disp_bw_scratch_index) {
+	if (!dcp_disable_rt_bandwidth && dcp->disp_bw_scratch_index) {
 		u32 offset = dcp->disp_bw_scratch_offset;
 		u32 index = dcp->disp_bw_scratch_index;
 		rt_bw.reg_scratch = dcp->disp_registers[index]->start + offset;
 	}
 
-	if (dcp->disp_bw_doorbell_index) {
+	if (!dcp_disable_rt_bandwidth && dcp->disp_bw_doorbell_index) {
 		u32 index = dcp->disp_bw_doorbell_index;
 		rt_bw.reg_doorbell = dcp->disp_registers[index]->start;
 		rt_bw.doorbell_bit = REG_DOORBELL_BIT(dcp->index);
@@ -699,12 +909,26 @@ static struct dcp_rt_bandwidth dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
 	return rt_bw;
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static struct dcp_set_frame_sync_props_resp_v26_6_0
+dcpep_cb_set_frame_sync_props(
+	struct apple_dcp *dcp,
+	struct dcp_set_frame_sync_props_req_v26_6_0 *req)
+{
+	struct dcp_set_frame_sync_props_resp_v26_6_0 resp;
+
+	memcpy(resp.props, req->props, sizeof(resp.props));
+	memset(&resp.props[73], 0, 3);
+	return resp;
+}
+#else
 static struct dcp_set_frame_sync_props_resp
 dcpep_cb_set_frame_sync_props(struct apple_dcp *dcp,
 			      struct dcp_set_frame_sync_props_req *req)
 {
 	return (struct dcp_set_frame_sync_props_resp){};
 }
+#endif
 
 /* Callback to get the current time as milliseconds since the UNIX epoch */
 static u64 dcpep_cb_get_time(struct apple_dcp *dcp)
@@ -758,7 +982,7 @@ static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 				   void *cookie)
 {
-	struct dcp_swap_start_resp *resp = data;
+	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
 
 	if (cookie) {
@@ -779,35 +1003,107 @@ static void dcp_on_final(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 }
 
+static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out,
+				 void *cookie);
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static const struct dcp_method_entry dcp_prepare_wake_method = {
+	.name = "dcpep_prepare_wake",
+	.tag = { 'A', '4', '1', '4' },
+};
+
+static const struct dcp_method_entry dcp_finish_wake_method = {
+	.name = "dcpep_finish_wake",
+	.tag = { 'A', '4', '7', '4' },
+};
+
+static const struct dcp_method_entry dcp_get_mode_info_method = {
+	.name = "dcpep_get_mode_info",
+	.tag = { 'A', '3', '6', '4' },
+};
+#endif
+
 static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_set_power_state_req req = {
-		.unklong = 1,
-	};
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	u32 handle = dcp->main_display ? 0 : 2;
+
+	dcp_set_display_device(dcp, false, &handle,
+			       dcp->main_display ? dcp_on_final : dcp_on_set_parameter,
+			       cookie);
+#else
+	dcp_power_state_req_t req =
+		dcp_power_state_req(1, DCP_POWER_TRANSITION_NONE);
 
 	dcp_set_power_state(dcp, false, &req, dcp_on_final, cookie);
+#endif
 }
 
 static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_set_parameter_dcp param = {
-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
-		.value = { 0 },
+	struct dcp_set_parameter_dcp param;
+	u32 count =
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		.count = 3,
+		3;
 #else
-		.count = 1,
+		1;
 #endif
-	};
 
-	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
+	memset(&param, 0xaa, sizeof(param));
+	param.param = IOMFBPARAM_ADAPTIVE_SYNC;
+	memset(param.value, 0, count * sizeof(param.value[0]));
+	param.count = count;
+
+	dcp_set_parameter_dcp(dcp, false, &param,
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+			      dcp_on_final,
+#else
+			      dcp_on_set_power_state,
+#endif
+			      cookie);
 }
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static void dcp_poweron_after_main_display(struct apple_dcp *dcp, void *out,
+					   void *cookie)
+{
+	dcp_power_state_req_t power_req =
+		dcp_power_state_req(1, DCP_POWER_TRANSITION_NONE);
+
+	dcp_set_power_state(dcp, false, &power_req, dcp_on_set_power_state,
+			    cookie);
+}
+
+static void dcp_poweron_after_finish_wake(struct apple_dcp *dcp, void *out,
+					  void *cookie)
+{
+	dcp_is_main_display(dcp, false, dcp_poweron_after_main_display, cookie);
+}
+
+static void dcp_poweron_after_first_client(struct apple_dcp *dcp, void *out,
+					   void *cookie)
+{
+	dcp_push(dcp, false, &dcp_finish_wake_method, 0, sizeof(u32), NULL,
+		 dcp_poweron_after_finish_wake, cookie);
+}
+
+static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
+					   void *cookie)
+{
+	dcp_first_client_open(dcp, false, dcp_poweron_after_first_client,
+			      cookie);
+}
+#endif
 
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
 	struct dcp_wait_cookie *cookie;
 	int ret;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	const u8 prepare_wake[8] = { 0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa };
+#else
 	u32 handle;
+#endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
@@ -819,6 +1115,15 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/* This is the wake ordering observed on 26.6 after A500 put the
+	 * external-display pipeline to sleep.  Omitting A414/A474, or selecting
+	 * the display before A473, leaves fControllerPowerState at zero and DCP
+	 * silently swallows every scanout swap. */
+	dcp_push(dcp, false, &dcp_prepare_wake_method, sizeof(prepare_wake),
+		 sizeof(u64), (void *)prepare_wake,
+		 dcp_poweron_after_prepare_wake, cookie);
+#else
 	if (dcp->main_display) {
 		handle = 0;
 		dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
@@ -828,6 +1133,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 		dcp_set_display_device(dcp, false, &handle,
 				       dcp_on_set_parameter, cookie);
 	}
+#endif
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(10000));
 
 	if (ret == 0) {
@@ -861,38 +1167,61 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 	}
 }
 
-static void last_client_closed_poff(struct apple_dcp *dcp, void *out, void *cookie)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static void dcp_poweroff_after_main_display(struct apple_dcp *dcp, void *out,
+					     void *cookie)
 {
-	struct dcp_set_power_state_req power_req = {
-		.unklong = 0,
-	};
+	dcp_power_state_req_t power_req =
+		dcp_power_state_req(0, DCP_POWER_TRANSITION_DISPLAY_OFF);
+
+	dcp_set_power_state(dcp, false, &power_req, complete_set_powerstate,
+			    cookie);
+}
+
+static void dcp_poweroff_after_prepare_state(struct apple_dcp *dcp, void *out,
+					      void *cookie)
+{
+	dcp_is_main_display(dcp, false, dcp_poweroff_after_main_display, cookie);
+}
+#endif
+
+#if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
+static void last_client_closed_poff(struct apple_dcp *dcp, void *out,
+				    void *cookie)
+{
+	dcp_power_state_req_t power_req =
+		dcp_power_state_req(0, DCP_POWER_TRANSITION_DISPLAY_OFF);
 	dcp_set_power_state(dcp, false, &power_req, complete_set_powerstate,
 			    cookie);
 }
 
 static void aborted_swaps_dcp_poff(struct apple_dcp *dcp, void *out, void *cookie)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-	/* iomfb_last_client_close times out on 14.7 */
-	last_client_closed_poff(dcp, NULL, cookie);
-#else
 	struct iomfb_last_client_close_req last_client_req = {};
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/* iomfb_last_client_close times out on 14.7. T8132 26.6 firmware
+	 * still completes it. */
+	if (!dcp_is_t8132(dcp)) {
+		last_client_closed_poff(dcp, NULL, cookie);
+		return;
+	}
+#endif
 	iomfb_last_client_close(dcp, false, &last_client_req,
 				last_client_closed_poff, cookie);
-#endif
 }
+#endif
 
 void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 {
 	int ret, swap_id;
-	struct iomfb_abort_swaps_dcp_req abort_req = {
-		.client = {
-			.flag2 = 1,
-		},
-	};
+#if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
+	dcp_abort_swaps_req_t abort_req = dcp_abort_swaps_request(dcp);
+#endif
 	struct dcp_swap_cookie *cookie;
 	struct dcp_wait_cookie *poff_cookie;
-	struct dcp_swap_start_req swap_req = { 0 };
+	struct DCP_FW_NAME(dcp_swap_start_req) swap_req =
+		dcp_swap_start_request(dcp);
 	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
@@ -918,6 +1247,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		dcp_swap_set_brightness(&swap->swap, 0, 0);
+#else
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 		swap->swap.bl_unk = 1;
 #else
@@ -925,14 +1257,17 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 #endif
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
+#endif
 	}
 
 	/* Null all surfaces */
 	for (int l = 0; l < SWAP_SURFACES; l++)
 		swap->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	for (int l = 0; l < 5; l++)
+#ifndef DCP_FW_T8140
+	for (int l = 0; l < ARRAY_SIZE(swap->surf2_null); l++)
 		swap->surf2_null[l] = true;
+#endif
 	swap->unkU32Ptr_null = true;
 	swap->unkU32out_null = true;
 #endif
@@ -957,8 +1292,24 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&poff_cookie->refcount);
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/* Native 26.6 ordinary hot-unplug goes directly from its clear
+	 * transaction through A414/A412/A473.  A469 abort-swaps and A458
+	 * last-client-close only appear in full shutdown/sleep traces, and may
+	 * tear down state which the link power-off callbacks still require. */
+	{
+		const u8 prepare_state[8] = {
+			0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa,
+		};
+
+		dcp_push(dcp, false, &dcp_prepare_wake_method,
+			 sizeof(prepare_state), sizeof(u64), (void *)prepare_state,
+			 dcp_poweroff_after_prepare_state, poff_cookie);
+	}
+#else
 	iomfb_abort_swaps_dcp(dcp, false, &abort_req,
 				aborted_swaps_dcp_poff, poff_cookie);
+#endif
 	ret = wait_for_completion_timeout(&poff_cookie->done,
 					  msecs_to_jiffies(1000));
 
@@ -976,9 +1327,8 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 static void last_client_closed_sleep(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_set_power_state_req power_req = {
-		.unklong = 0,
-	};
+	dcp_power_state_req_t power_req =
+		dcp_power_state_req(0, DCP_POWER_TRANSITION_RESTARTABLE_SLEEP);
 	dcp_set_power_state(dcp, false, &power_req, complete_set_powerstate, cookie);
 }
 
@@ -991,11 +1341,7 @@ static void aborted_swaps_dcp_sleep(struct apple_dcp *dcp, void *out, void *cook
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 {
 	int ret;
-	struct iomfb_abort_swaps_dcp_req req = {
-		.client = {
-			.flag2 = 1,
-		},
-	};
+	dcp_abort_swaps_req_t req = dcp_abort_swaps_request(dcp);
 
 	struct dcp_wait_cookie *cookie;
 
@@ -1019,7 +1365,7 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 	dev_info(dcp->dev, "dcp_sleep() done\n");
 }
 
-static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
+static void dcpep_cb_hotplug_state(struct apple_dcp *dcp, u64 connected)
 {
 	struct apple_connector *connector = dcp->connector;
 
@@ -1036,31 +1382,55 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (dcp->during_modeset) {
 		dev_info(dcp->dev,
 			 "cb_hotplug() ignored during modeset connected:%llu\n",
-			 *connected);
+			 connected);
 		return;
 	}
 
 	dev_info(dcp->dev, "cb_hotplug() connected:%llu, valid_mode:%d\n",
-		 *connected, dcp->valid_mode);
+		 connected, dcp->valid_mode);
 
 	/* Hotplug invalidates mode. DRM doesn't always handle this. */
-	if (!(*connected)) {
+	if (!connected) {
 		dcp->valid_mode = false;
 		/* after unplug swap will not complete until the next
 		 * set_digital_out_mode */
 		schedule_work(&dcp->vblank_wq);
 	}
 
-	if (connector && connector->connected != !!(*connected)) {
-		connector->connected = !!(*connected);
+	if (connector && connector->connected != !!connected) {
+		connector->connected = !!connected;
 		dcp->valid_mode = false;
 		schedule_work(&connector->hotplug_wq);
 	}
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static struct dcp_hotplug_resp_v26_6
+dcpep_cb_hotplug(struct apple_dcp *dcp, struct dcp_hotplug_req_v26_6 *req)
+{
+	struct dcp_hotplug_resp_v26_6 resp = { 0 };
+
+	dcpep_cb_hotplug_state(dcp, req->connected);
+
+	/* Every captured 26.6 connected response has an unaligned 0xffffffff
+	 * field at offsets 71..74.  Byte 75 is padding and varies in native
+	 * traces, so leave it initialized to zero.  The disconnected response
+	 * contains additional state that is not decoded yet. */
+	if (req->connected)
+		memset(&resp.opaque[0x47], 0xff, sizeof(u32));
+
+	return resp;
+}
+#else
+static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
+{
+	dcpep_cb_hotplug_state(dcp, *connected);
+}
+#endif
+
 static void
 dcpep_cb_swap_complete_intent_gated(struct apple_dcp *dcp,
-				    struct dcp_swap_complete_intent_gated *info)
+				    dcp_swap_intent_t *info)
 {
 	trace_iomfb_swap_complete_intent_gated(dcp, info->swap_id,
 		info->width, info->height);
@@ -1098,7 +1468,8 @@ TRAMPOLINE_INOUT(trampoline_get_uint_prop, dcpep_cb_get_uint_prop,
 TRAMPOLINE_IN(trampoline_set_fx_prop, iomfbep_cb_set_fx_prop,
 	      struct iomfb_set_fx_prop_req)
 TRAMPOLINE_INOUT(trampoline_map_piodma, dcpep_cb_map_piodma,
-		 struct dcp_map_buf_req, struct dcp_map_buf_resp);
+		 struct dcp_map_buf_req,
+		 struct DCP_FW_NAME(dcp_map_buf_resp));
 TRAMPOLINE_IN(trampoline_unmap_piodma, dcpep_cb_unmap_piodma,
 	      struct dcp_unmap_buf_resp);
 TRAMPOLINE_INOUT(trampoline_sr_set_property_int, iomfbep_cb_sr_set_property_int,
@@ -1114,7 +1485,7 @@ TRAMPOLINE_INOUT(trampoline_map_reg, dcpep_cb_map_reg,
 		 struct DCP_FW_NAME(dcp_map_reg_req),
 		 struct DCP_FW_NAME(dcp_map_reg_resp));
 TRAMPOLINE_INOUT(trampoline_read_edt_data, dcpep_cb_read_edt_data,
-		 struct dcp_read_edt_data_req, struct dcp_read_edt_data_resp);
+		 struct dcp_read_edt_data_req, dcp_read_edt_data_resp_t);
 TRAMPOLINE_INOUT(trampoline_prop_start, dcpep_cb_prop_start, u32, u8);
 TRAMPOLINE_INOUT(trampoline_prop_chunk, dcpep_cb_prop_chunk,
 		 struct dcp_set_dcpav_prop_chunk_req, u8);
@@ -1124,15 +1495,28 @@ TRAMPOLINE_INOUT(trampoline_allocate_bandwidth, dcpep_cb_allocate_bandwidth,
 	       struct dcp_allocate_bandwidth_req, struct dcp_allocate_bandwidth_resp);
 TRAMPOLINE_OUT(trampoline_rt_bandwidth, dcpep_cb_rt_bandwidth,
 	       struct dcp_rt_bandwidth);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+TRAMPOLINE_INOUT(trampoline_set_frame_sync_props,
+		 dcpep_cb_set_frame_sync_props,
+		 struct dcp_set_frame_sync_props_req_v26_6_0,
+		 struct dcp_set_frame_sync_props_resp_v26_6_0);
+#else
 TRAMPOLINE_INOUT(trampoline_set_frame_sync_props, dcpep_cb_set_frame_sync_props,
-	       struct dcp_set_frame_sync_props_req,
-	       struct dcp_set_frame_sync_props_resp);
+		 struct dcp_set_frame_sync_props_req,
+		 struct dcp_set_frame_sync_props_resp);
+#endif
 TRAMPOLINE_OUT(trampoline_get_frequency, dcpep_cb_get_frequency, u64);
 TRAMPOLINE_OUT(trampoline_get_time, dcpep_cb_get_time, u64);
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+TRAMPOLINE_INOUT(trampoline_hotplug, dcpep_cb_hotplug,
+		 struct dcp_hotplug_req_v26_6,
+		 struct dcp_hotplug_resp_v26_6);
+#else
 TRAMPOLINE_IN(trampoline_hotplug, dcpep_cb_hotplug, u64);
+#endif
 TRAMPOLINE_IN(trampoline_swap_complete_intent_gated,
 	      dcpep_cb_swap_complete_intent_gated,
-	      struct dcp_swap_complete_intent_gated);
+	      dcp_swap_intent_t);
 TRAMPOLINE_IN(trampoline_abort_swap_ap_gated, dcpep_cb_abort_swap_ap_gated, u32);
 TRAMPOLINE_IN(trampoline_enable_backlight_message_ap_gated,
 	      iomfbep_cb_enable_backlight_message_ap_gated, u8);
@@ -1173,7 +1557,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 
 static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 {
-	struct dcp_swap_start_resp *resp = data;
+	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
 
@@ -1184,7 +1568,8 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 /* Helpers to modeset and swap, used to flush */
 static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 {
-	struct dcp_swap_start_req start_req = { 0 };
+	struct DCP_FW_NAME(dcp_swap_start_req) start_req =
+		dcp_swap_start_request(dcp);
 
 	if (dcp->connector && dcp->connector->connected)
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
@@ -1192,16 +1577,249 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 		dcp_drm_crtc_vblank(dcp->crtc);
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+struct dcp_modeset_cookie {
+	/* Must be first: release_wait_cookie() frees this allocation. */
+	struct dcp_wait_cookie wait;
+	struct dcp_set_digital_out_mode_req actual;
+	struct dcp_set_digital_out_mode_req bootstrap;
+	u32 result;
+	u32 adaptive_sync_rate;
+	bool set_adaptive_sync;
+};
+#endif
+
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 					  void *cookie)
 {
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		((struct dcp_modeset_cookie *)cookie)->result =
+			get_unaligned_le32(data);
+#endif
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
 }
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+
+static void dcp_get_mode_info(struct apple_dcp *dcp,
+			      const struct dcp_set_digital_out_mode_req *mode,
+			      dcp_callback_t cb, void *cookie)
+{
+	struct dcp_get_mode_info_req_v26_6 req;
+
+	/* Native 26.6 requests on J616c clear the entire input record, including
+	 * the opaque word at 0x68. T8132 requests keep the 0xaa fill outside the
+	 * mode record. A364 fills the mode record before A413 consumes the
+	 * selected timing/color pair.
+	 */
+	if (dcp_is_t8132(dcp)) {
+		memset(&req, 0xaa, sizeof(req));
+		memset(req.mode, 0, sizeof(req.mode));
+	} else {
+		memset(&req, 0, sizeof(req));
+	}
+	req.mode_null = 0;
+	req.timing_mode_id = mode->timing_mode_id;
+	req.color_mode_id = mode->color_mode_id;
+	req.result_null = 0;
+	memset(req.padding1, 0, sizeof(req.padding1));
+
+	dcp_push(dcp, false, &dcp_get_mode_info_method, sizeof(req),
+		 sizeof(struct dcp_get_mode_info_resp_v26_6), &req, cb, cookie);
+}
+
+/* Neo selects the pipe, resets adaptive sync, and completes a black swap
+ * before A413. The M4 A364 prequery is absent from the native sequence. */
+static void dcp_modeset_neo_selected(struct apple_dcp *dcp, void *data, void *cookie)
+{
+#ifndef DCP_FW_T8140
+	struct dcp_modeset_cookie *modeset = cookie;
+#endif
+
+	if (get_unaligned_le32(data)) {
+		complete_set_digital_out_mode(dcp, data, cookie);
+		return;
+	}
+#ifdef DCP_FW_T8140
+	/* Native A411 -> adaptive-sync state -> blank -> A413 sequence. */
+	{
+		struct dcp_set_parameter_dcp param = { };
+
+		param.param = IOMFBPARAM_ADAPTIVE_SYNC;
+		param.count = 3;
+		dcp_set_parameter_dcp(dcp, false, &param,
+				      complete_set_digital_out_mode, cookie);
+	}
+#else
+	dcp_set_digital_out_mode(dcp, false, &modeset->actual,
+				 complete_set_digital_out_mode, cookie);
+#endif
+}
+
+/* Asahi's adaptive-sync parameter is a 16.16 minimum refresh rate.
+ * Configure the capable mode once; KMS VRR hints subsequently select the
+ * per-submission presentation policy without reconfiguring the link.
+ */
+static void dcp_modeset_after_adaptive_sync(struct apple_dcp *dcp, void *data,
+					  void *cookie)
+{
+	struct dcp_modeset_cookie *modeset = cookie;
+	u32 status = get_unaligned_le32(data);
+
+	dev_info(dcp->dev, "adaptive sync min_rate=0x%x status=0x%x\n",
+		 modeset->adaptive_sync_rate, status);
+	if (status) {
+		complete_set_digital_out_mode(dcp, data, cookie);
+		return;
+	}
+	dcp_set_digital_out_mode(dcp, false, &modeset->actual,
+				 complete_set_digital_out_mode, cookie);
+}
+
+static void dcp_modeset_after_actual_info(struct apple_dcp *dcp, void *data,
+					   void *cookie)
+{
+	struct dcp_modeset_cookie *modeset = cookie;
+	struct dcp_set_parameter_dcp parameter = {
+		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.value = { modeset->adaptive_sync_rate, 0, 0, 0 },
+		.count = 3,
+	};
+
+	if (modeset->set_adaptive_sync)
+		dcp_set_parameter_dcp(dcp, false, &parameter,
+				      dcp_modeset_after_adaptive_sync, cookie);
+	else
+		dcp_set_digital_out_mode(dcp, false, &modeset->actual,
+					 complete_set_digital_out_mode, cookie);
+}
+
+static void dcp_modeset_after_bootstrap(struct apple_dcp *dcp, void *data,
+					 void *cookie)
+{
+	struct dcp_modeset_cookie *modeset = cookie;
+
+	if (get_unaligned_le32(data)) {
+		complete_set_digital_out_mode(dcp, data, cookie);
+		return;
+	}
+
+	dcp_get_mode_info(dcp, &modeset->actual,
+			  dcp_modeset_after_actual_info, cookie);
+}
+
+static void dcp_modeset_after_bootstrap_info(struct apple_dcp *dcp, void *data,
+					      void *cookie)
+{
+	struct dcp_modeset_cookie *modeset = cookie;
+
+	dcp_set_digital_out_mode(dcp, false, &modeset->bootstrap,
+				 dcp_modeset_after_bootstrap, cookie);
+}
+#endif
+
+
+#ifdef DCP_FW_T8140
+struct dcp_modeset_blank_cookie {
+	struct kref refcount;
+	struct completion submitted;
+	struct DCP_FW_NAME(dcp_swap_submit_req) request;
+	u32 swap_id;
+	u32 result;
+};
+
+static void release_modeset_blank(struct kref *ref)
+{
+	kfree(container_of(ref, struct dcp_modeset_blank_cookie, refcount));
+}
+
+static void complete_modeset_blank(struct apple_dcp *dcp, void *data,
+				   void *opaque)
+{
+	struct dcp_modeset_blank_cookie *cookie = opaque;
+	struct DCP_FW_NAME(dcp_swap_submit_resp) *response = data;
+
+	cookie->result = response->ret;
+	complete(&cookie->submitted);
+	kref_put(&cookie->refcount, release_modeset_blank);
+}
+
+static void start_modeset_blank(struct apple_dcp *dcp, void *data, void *opaque)
+{
+	struct dcp_modeset_blank_cookie *cookie = opaque;
+	struct DCP_FW_NAME(dcp_swap_start_resp) *response = data;
+
+	if (response->ret) {
+		cookie->result = response->ret;
+		complete(&cookie->submitted);
+		kref_put(&cookie->refcount, release_modeset_blank);
+		return;
+	}
+	cookie->swap_id = response->swap_id;
+	cookie->request.swap.swap_id = response->swap_id;
+	WRITE_ONCE(dcp->modeset_blank_id, response->swap_id);
+	smp_store_release(&dcp->modeset_blank_valid, true);
+	dcp_swap_submit(dcp, false, &cookie->request,
+			complete_modeset_blank, cookie);
+}
+
+static int dcp_modeset_neo_blank(struct apple_dcp *dcp)
+{
+	struct dcp_modeset_blank_cookie *cookie;
+	struct DCP_FW_NAME(dcp_swap_start_req) start = dcp_swap_start_request(dcp);
+	u64 sequence = smp_load_acquire(&dcp->swap_ack_sequence);
+	u32 swap_id, result;
+	unsigned long remaining;
+	int ret;
+
+	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->submitted);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount); /* callback ownership, including late ACKs */
+	cookie->request.swap.swap_enabled = IOMFB_SET_BACKGROUND | 0x7;
+	cookie->request.swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
+	cookie->request.swap.bg_color = 0xff000000;
+	for (int i = 0; i < SWAP_SURFACES; i++)
+		cookie->request.surf_null[i] = true;
+	cookie->request.unkU32Ptr_null = true;
+	cookie->request.unkU32out_null = true;
+
+	dcp_swap_start(dcp, false, &start, start_modeset_blank, cookie);
+	remaining = wait_for_completion_timeout(&cookie->submitted,
+						msecs_to_jiffies(1000));
+	if (!remaining) {
+		kref_put(&cookie->refcount, release_modeset_blank);
+		dev_err(dcp->dev, "mode blank submit timed out\n");
+		return -ETIMEDOUT;
+	}
+	result = cookie->result;
+	swap_id = cookie->swap_id;
+	kref_put(&cookie->refcount, release_modeset_blank);
+	if (result) {
+		dev_err(dcp->dev, "mode blank submit failed: status=%u\n", result);
+		return -EIO;
+	}
+	/* A408 ACK only accepts the swap. Wait for its actual D590 callback
+	 * and the ACK of that callback before submitting a new digital mode. */
+	ret = wait_event_timeout(dcp->swap_ack_wait,
+		smp_load_acquire(&dcp->swap_ack_sequence) != sequence &&
+		READ_ONCE(dcp->swap_acked_id) == swap_id,
+		msecs_to_jiffies(1000));
+	if (!ret) {
+		dev_err(dcp->dev, "mode blank completion timed out: swap=%u\n", swap_id);
+		return -ETIMEDOUT;
+	}
+	dev_info(dcp->dev, "mode blank completed and ACKed: swap=%u\n", swap_id);
+	return 0;
+}
+#endif
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
@@ -1209,6 +1827,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_display_mode *mode;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	struct dcp_modeset_cookie *modeset_cookie;
+#endif
 	int ret;
 
 	mode = lookup_mode(dcp, &crtc_state->mode);
@@ -1219,7 +1840,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 
 	dev_info(dcp->dev,
-		 "set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
+		 "select_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		 mode->color_mode_id, mode->timing_mode_id,
 		 DRM_MODE_ARG(&crtc_state->mode));
 	if (mode->color_mode_id == mode->sdr_rgb.id)
@@ -1232,7 +1853,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		cmode = &mode->best;
 	if (cmode)
 		dev_info(dcp->dev,
-			"set_digital_out_mode() color mode depth:%hhu format:%u "
+			"select_mode() color mode depth:%hhu format:%u "
 			"colorimetry:%u eotf:%u range:%u vrr:%u\n", cmode->depth,
 			cmode->format, cmode->colorimetry, cmode->eotf,
 			cmode->range, mode->vrr);
@@ -1245,7 +1866,38 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	/* Keep track of suspected vrr modes */
 	dcp->use_timestamps = mode->vrr;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/*
+	 * Native fixed-panel mode changes use A407 source/destination geometry,
+	 * not the external digital-output A364/A413 sequence. Accept only the
+	 * single firmware-advertised non-VRR timing, already matched above.
+	 */
+	if (dcp_has_panel(dcp) && dcp->main_display &&
+	    dcp->nr_modes == 1 && !mode->vrr) {
+		dcp->valid_mode = true;
+		return 0;
+	}
+
+	modeset_cookie = kzalloc(sizeof(*modeset_cookie), GFP_KERNEL);
+	if (!modeset_cookie)
+		return -ENOMEM;
+	cookie = &modeset_cookie->wait;
+	modeset_cookie->actual = dcp->mode;
+	/* Use the range published by this firmware, not an EDID or ADT guess.
+	 * T8132 panels keep their qualified fixed-rate mode sequence. */
+	if (!dcp_is_t8132(dcp) && dcp_has_panel(dcp) && dcp->main_display &&
+	    dcp->refresh_intervals.minimum &&
+	    dcp->refresh_intervals.maximum > dcp->refresh_intervals.minimum) {
+		modeset_cookie->set_adaptive_sync = true;
+		if (mode->vrr)
+			modeset_cookie->adaptive_sync_rate =
+				DIV_ROUND_CLOSEST_ULL(24000000ULL << 16,
+						      dcp->refresh_intervals.maximum);
+	}
+
+#else
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+#endif
 	if (!cookie) {
 		return -ENOMEM;
 	}
@@ -1257,8 +1909,54 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	dcp->during_modeset = true;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140) {
+		u32 handle = dcp->main_display ? 0 : 2;
+
+		dcp_set_display_device(dcp, false, &handle,
+				       dcp_modeset_neo_selected, cookie);
+#ifdef DCP_FW_T8140
+		ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+		if (!ret || modeset_cookie->result) {
+			dev_err(dcp->dev, "mode pipe preparation failed: status=%u\n",
+				modeset_cookie->result);
+			ret = ret ? -EIO : -ETIMEDOUT;
+			goto neo_prepare_failed;
+		}
+		/* Before the first timing, firmware swallows swaps and emits no
+		 * D590. Quiesce only an acknowledged, already active mode. */
+		if (dcp->valid_mode) {
+			ret = dcp_modeset_neo_blank(dcp);
+			if (ret)
+				goto neo_prepare_failed;
+		}
+		reinit_completion(&cookie->done);
+		kref_get(&cookie->refcount);
+		dcp_set_digital_out_mode(dcp, false, &modeset_cookie->actual,
+					 complete_set_digital_out_mode, cookie);
+#endif
+	} else if (!dcp->valid_mode && mode->bootstrap.score >= 0) {
+		modeset_cookie->bootstrap =
+			(struct dcp_set_digital_out_mode_req) {
+				.color_mode_id = mode->bootstrap.id,
+				.timing_mode_id = mode->timing_mode_id,
+			};
+		dev_info(dcp->dev,
+			 "bootstrapping generic pipe (color:%u timing:%u)\n",
+			 modeset_cookie->bootstrap.color_mode_id,
+			 modeset_cookie->bootstrap.timing_mode_id);
+		dcp_get_mode_info(dcp, &modeset_cookie->bootstrap,
+				  dcp_modeset_after_bootstrap_info,
+				  modeset_cookie);
+	} else {
+		dcp_get_mode_info(dcp, &modeset_cookie->actual,
+				  dcp_modeset_after_actual_info,
+				  modeset_cookie);
+	}
+#else
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
 				 complete_set_digital_out_mode, cookie);
+#endif
 
 	/*
 	 * The DCP firmware has an internal timeout of ~8 seconds for
@@ -1267,6 +1965,20 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 */
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	if (ret > 0 && modeset_cookie->result) {
+		dev_err(dcp->dev, "set_digital_out_mode returned 0x%08x\n",
+			modeset_cookie->result);
+		ret = -EIO;
+	}
+	if (ret <= 0) {
+		dcp->valid_mode = false;
+		dcp->vrr_active = false;
+	} else {
+		dcp->vrr_active = modeset_cookie->set_adaptive_sync &&
+				  modeset_cookie->adaptive_sync_rate;
+	}
+#endif
 
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->during_modeset = false;
@@ -1277,7 +1989,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	} else if (ret < 0) {
 		dev_info(dcp->dev,
-			 "waiting on set_digital_out_mode failed:%d\n", ret);
+			 "set_digital_out_mode failed:%d\n", ret);
 		return -EIO;
 
 	} else if (ret > 0) {
@@ -1286,9 +1998,45 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			jiffies_to_msecs(ret));
 	}
 	dcp->valid_mode = true;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	WRITE_ONCE(dcp->last_fw_present_ticks, 0);
+	/* Firmware timing reconfiguration can reset its backlight state. */
+	if (dcp_has_panel(dcp))
+		dcp->brightness.update = true;
+#endif
 
 	return 0;
+#ifdef DCP_FW_T8140
+neo_prepare_failed:
+	dcp->during_modeset = false;
+	dcp->valid_mode = false;
+	kref_put(&cookie->refcount, release_wait_cookie);
+	return ret;
+#endif
 }
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static u64 dcp_fixed_presentation_deadline(struct apple_dcp *dcp, u64 ready)
+{
+	u64 last = READ_ONCE(dcp->last_fw_present_ticks);
+	u64 period = dcp->refresh_intervals.minimum;
+	u64 lead = dcp->refresh_intervals.step;
+	u64 count;
+
+	/* Establish a fresh phase on the first frame or after an idle gap.
+	 * DCP may have changed its internal repetition cadence while idle.
+	 */
+	if (!last || !period || last > ready ||
+	    ready - last > dcp->refresh_intervals.maximum)
+		return ready;
+
+	count = max_t(u64, 1, DIV_ROUND_UP_ULL(ready + lead - last, period));
+	/* Leave 1/1000 of a frame before the boundary to tolerate rounding
+	 * between the firmware's scheduling clock and its nominal interval.
+	 */
+	return last + count * period - max_t(u64, 1, period / 1000);
+}
+#endif
 
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
@@ -1306,10 +2054,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < SWAP_SURFACES; l++)
 		req->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	for (l = 0; l < 5; l++)
+#ifndef DCP_FW_T8140
+	for (l = 0; l < ARRAY_SIZE(req->surf2_null); l++)
 		req->surf2_null[l] = true;
+#endif
 	req->unkU32Ptr_null = true;
 	req->unkU32out_null = true;
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	req->swap.presents_surface = 1;
+	req->swap.has_completion = 1;
 #endif
 
 	/*
@@ -1354,16 +2108,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			drm_framebuffer_get(old_state->fb);
 		}
 
-		if (!new_state->fb || !new_state->visible) {
+		if (!new_state->fb || !new_state->visible)
 			continue;
-		}
+
 		req->surf_null[l] = false;
 		has_surface = 1;
-
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
 
-		req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
+		if (apl_plane->modern)
+			req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
 
 		if (dcp->notch_height > 0)
 			req->swap.dst_rect[l].y += dcp->notch_height;
@@ -1371,11 +2125,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
 
-		/* Use sRGB colorspace only for internal panels. External
-		 * displays are expected to have EDID and user space can use
-		 * the contained colorimetry information to provide native
-		 * colors.
-		 */
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
@@ -1402,6 +2151,22 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.ts1 = 120;
 		req->swap.ts2 = 120;
 		req->swap.ts3 = 120;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		if (dcp->vrr_active) {
+			u64 ready = dcp_read_firmware_time();
+
+			/* Native timestamp IDs 1,2,5,7 occupy offsets 0,8,0x20,0x30.
+			 * The frame is ready now; firmware enforces the panel interval.
+			 */
+			req->swap.flags1 = BIT_ULL(26);
+			req->swap.flags2 = BIT_ULL(2);
+			req->swap.ts1 = dcp_vrr_requested(dcp, crtc_state) ? ready :
+				dcp_fixed_presentation_deadline(dcp, ready);
+			req->swap.ts2 = ready;
+			req->swap.ts64_unk = ready;
+			req->swap.ts3 = ready;
+		}
+#endif
 	}
 
 	/* These fields should be set together */
@@ -1409,6 +2174,17 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+		/* Restore the requested level, not transient firmware telemetry.
+		 * T8132 keeps sending its tracked level. */
+		int brightness = dcp->brightness.bl_dev && !dcp_is_t8132(dcp) ?
+			backlight_get_brightness(dcp->brightness.bl_dev) :
+			dcp->brightness.nits;
+
+		dcp_swap_set_brightness(&req->swap, brightness,
+					dcp->brightness.maximum);
+		dcp->brightness.initialized = true;
+#else
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 		req->swap.bl_update = 1;
 #else
@@ -1416,6 +2192,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 
@@ -1451,6 +2228,13 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 
 	dcp->active = true;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	/* 26.6 no longer publishes the legacy initial-nits property (D300/15).
+	 * Start with the requested value zero; userspace sets its desired nits.
+	 */
+	if (dcp_has_panel(dcp) && dcp->brightness.maximum > 0)
+		schedule_work(&dcp->bl_register_wq);
+#endif
 	complete(&dcp->start_done);
 }
 
@@ -1459,8 +2243,35 @@ static void init_3(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_is_main_display(dcp, false, res_is_main_display, NULL);
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+static void init_notifications_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	dcp_first_client_open(dcp, false, init_3, NULL);
+}
+#endif
+
 static void init_2(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+	static const struct dcp_method_entry call = {
+		.name = "dcpep_update_notify_clients",
+		.tag = { 'A', '0', '3', '5' },
+	};
+	/* Native 26.6 registration, including presentation timing reports. */
+	static const u32 notifications[27] = {
+		[6] = 1, [7] = 1, [8] = 1, [10] = 1, [11] = 1,
+		[12] = 1, [25] = 1, [26] = 1,
+	};
+
+	static_assert(sizeof(notifications) == 108);
+	if (!dcp_is_t8132(dcp) && dcp_has_panel(dcp) &&
+	    dcp->refresh_intervals.minimum &&
+	    dcp->refresh_intervals.maximum > dcp->refresh_intervals.minimum) {
+		dcp_push(dcp, false, &call, sizeof(notifications), 0,
+			 (void *)notifications, init_notifications_done, NULL);
+		return;
+	}
+#endif
 	dcp_first_client_open(dcp, false, init_3, NULL);
 }
 
@@ -1484,9 +2295,8 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 {
-	struct dcp_set_power_state_req req = {
-		/* defaults are ok */
-	};
+	dcp_power_state_req_t req =
+		dcp_power_state_req(0, DCP_POWER_TRANSITION_SHUTDOWN);
 
 	dcp_set_power_state(dcp, false, &req, NULL, NULL);
 }

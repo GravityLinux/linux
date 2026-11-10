@@ -337,7 +337,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.stride = fb->pitches[0],
 		.width = fb->width,
 		.height = fb->height,
-		.surface_id = plane->base.id,
+		.surface_id = to_apple_plane(plane)->modern ? plane->base.id : 0,
 
 		/* Only used for compressed or multiplanar surfaces */
 		.pix_size = 1,
@@ -345,7 +345,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.pel_h = 1,
 		.has_comp = 1,
 		.has_planes = 1,
-		.has_compr_info = 1,
+		.has_compr_info = to_apple_plane(plane)->modern,
 	};
 
 	/* Populate plane information for planar formats */
@@ -458,6 +458,9 @@ apple_plane_duplicate_state(struct drm_plane *plane)
         __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
+	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
+	apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
+	apple_plane_state->iova = old_apple_plane_state->iova;
 
 	return &apple_plane_state->base;
 }
@@ -511,6 +514,23 @@ static const u32 dcp_primary_formats[] = {
 #endif
 };
 
+static const u32 dcp_primary_formats_legacy[] = {
+	DRM_FORMAT_XRGB2101010,
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV24,
+	DRM_FORMAT_P010,
+	DRM_FORMAT_P210,
+#if defined(DRM_FORMAT_P410)
+	DRM_FORMAT_P410,
+#endif
+};
+
 static const u32 dcp_overlay_formats[] = {
 	DRM_FORMAT_ABGR16161616F,
 	DRM_FORMAT_ARGB2101010,
@@ -528,6 +548,20 @@ static const u32 dcp_overlay_formats[] = {
 	DRM_FORMAT_P230,
 #if defined(DRM_FORMAT_P430)
 	DRM_FORMAT_P430,
+#endif
+};
+
+static const u32 dcp_overlay_formats_legacy[] = {
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV24,
+	DRM_FORMAT_P010,
+	DRM_FORMAT_P210,
+#if defined(DRM_FORMAT_P410)
+	DRM_FORMAT_P410,
 #endif
 };
 
@@ -578,7 +612,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
 				   enum drm_plane_type type,
-				   bool interchange)
+				   bool modern_formats, bool interchange)
 {
 	struct apple_plane *plane;
 	const u32 *fmts;
@@ -587,21 +621,24 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
 		if (supports_l10r) {
-			fmts = dcp_primary_formats;
-			num_fmts = ARRAY_SIZE(dcp_primary_formats);
+			fmts = modern_formats ? dcp_primary_formats : dcp_primary_formats_legacy;
+			num_fmts = modern_formats ? ARRAY_SIZE(dcp_primary_formats) :
+				   ARRAY_SIZE(dcp_primary_formats_legacy);
 		} else {
 			fmts = dcp_primary_formats_12_x;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats_12_x);
 		}
 		plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
 				       &apple_plane_funcs, fmts, num_fmts,
-				       format_modifiers, type, NULL);
+				       interchange ? format_modifiers : format_modifiers_no_ix,
+				       type, NULL);
 		break;
 	case DRM_PLANE_TYPE_OVERLAY:
 	case DRM_PLANE_TYPE_CURSOR:
 		if (supports_l10r) {
-			fmts = dcp_overlay_formats;
-			num_fmts = ARRAY_SIZE(dcp_overlay_formats);
+			fmts = modern_formats ? dcp_overlay_formats : dcp_overlay_formats_legacy;
+			num_fmts = modern_formats ? ARRAY_SIZE(dcp_overlay_formats) :
+				   ARRAY_SIZE(dcp_overlay_formats_legacy);
 		} else {
 			fmts = dcp_overlay_formats_12_x;
 			num_fmts = ARRAY_SIZE(dcp_overlay_formats_12_x);
@@ -630,6 +667,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 		drm_plane_helper_add(&plane->base, &apple_plane_helper_funcs);
 
 	plane->iomfb_surf = iomfb_surf;
+	plane->modern = modern_formats;
 
 	return &plane->base;
 }

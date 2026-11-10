@@ -56,7 +56,12 @@ void dcp_set_dimensions(struct apple_dcp *dcp);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
+int dcp_dptx_phy_activate_oob(struct platform_device *pdev);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
+void dcp_hotplug_mark_disconnected_oob(struct platform_device *pdev);
+void dcp_av_disconnect_oob(struct platform_device *pdev);
+int dcp_dptx_set_hpd_oob(struct platform_device *pdev, u32 port, bool hpd);
+int dcp_dptx_release_oob(struct platform_device *pdev, u32 port);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
@@ -66,6 +71,8 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);
 int systemep_init(struct apple_dcp *dcp);
 int dptxep_init(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
+int ibootep_set_surface(struct apple_dcp *dcp, dma_addr_t iova, u32 stride,
+			u32 width, u32 height, u32 drm_format);
 int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);
 

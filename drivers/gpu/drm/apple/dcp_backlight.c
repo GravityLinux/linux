@@ -86,6 +86,10 @@ static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 &&
+	    dcp->brightness.actual_nits >= 0)
+		return min_t(int, dcp->brightness.actual_nits,
+			     bd->props.max_brightness);
 	return dcp->brightness.nits;
 }
 
@@ -165,6 +169,13 @@ retry:
 	}
 
 	crtc_state->color_mgmt_changed |= true;
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140) {
+		/* The Neo brightness swap needs the active surfaces even when
+		 * their contents are unchanged. Reuse their existing buffers. */
+		ret = drm_atomic_add_affected_planes(commit, crtc);
+		if (ret)
+			goto out;
+	}
 
 	ret = drm_atomic_commit(commit);
 out:
@@ -210,7 +221,10 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	if (ret)
 		return ret;
 
-	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	if (dcp_fw_is_26_6(dcp))
+		dcp->brightness.nits = brightness;
+	else
+		dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
 	drm_modeset_unlock(&dcp->crtc->base.mutex);
@@ -233,7 +247,11 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.brightness = dcp->brightness.nits,
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
-	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+	if (dcp_fw_is_26_6(dcp))
+		props.max_brightness = dcp->brightness.maximum;
+	else
+		props.max_brightness = min(dcp->brightness.maximum,
+					  MAX_BRIGHTNESS_PART2 - 1);
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);
@@ -241,7 +259,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		return PTR_ERR(bl_dev);
 
 	dcp->brightness.bl_dev = bl_dev;
-	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	if (!dcp_fw_is_26_6(dcp))
+		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
 
 	return 0;
 }

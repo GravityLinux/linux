@@ -58,6 +58,8 @@ struct dptx_port {
 	u32 lane_count;
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
+	u32 neo_drive[4][3];
+	bool neo_drive_valid;
 };
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
@@ -67,4 +69,6 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 int dptxport_request_display(struct apple_epic_service *service);
 int dptxport_release_display(struct apple_epic_service *service);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);
+int dptxport_hpd_irq(struct apple_epic_service *service);
+
 #endif

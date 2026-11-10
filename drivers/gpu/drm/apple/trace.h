@@ -280,6 +280,42 @@ TRACE_EVENT(iomfb_swap_complete,
 	    )
 );
 
+/* Raw firmware clock values, independent of estimated DRM event times. */
+TRACE_EVENT(iomfb_swap_timing,
+	TP_PROTO(struct apple_dcp *dcp, u32 swap_id, u8 info, u64 mask, u64 counter,
+		 u64 clock0, u64 requested, u64 clock2, u64 clock3, u64 producer),
+	TP_ARGS(dcp, swap_id, info, mask, counter, clock0, requested, clock2, clock3, producer),
+	TP_STRUCT__entry(
+		__field(u64, dcp)
+		__field(u32, swap_id)
+		__field(u8, info)
+		__field(u64, mask)
+		__field(u64, counter)
+		__field(u64, clock0)
+		__field(u64, requested)
+		__field(u64, clock2)
+		__field(u64, clock3)
+		__field(u64, producer)
+	),
+	TP_fast_assign(
+		__entry->dcp = (u64)dcp;
+		__entry->swap_id = swap_id;
+		__entry->info = info;
+		__entry->mask = mask;
+		__entry->counter = counter;
+		__entry->clock0 = clock0;
+		__entry->requested = requested;
+		__entry->clock2 = clock2;
+		__entry->clock3 = clock3;
+		__entry->producer = producer;
+	),
+	TP_printk("dcp=%llx id=%u info=%u mask=%llu counter=%llu clock0=%llu requested=%llu clock2=%llu clock3=%llu producer=%llu",
+		__entry->dcp, __entry->swap_id, __entry->info, __entry->mask,
+		__entry->counter,
+		__entry->clock0, __entry->requested, __entry->clock2,
+		__entry->clock3, __entry->producer)
+);
+
 TRACE_EVENT(iomfb_swap_complete_intent_gated,
 	    TP_PROTO(struct apple_dcp *dcp, u32 swap_id, u32 width, u32 height),
 	    TP_ARGS(dcp, swap_id, width, height),

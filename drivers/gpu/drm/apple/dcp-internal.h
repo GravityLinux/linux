@@ -4,10 +4,14 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include <asm/sysreg.h>
+
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/wait.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -19,13 +23,26 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
+#include "iomfb_v26_6.h"
+#include "iomfb_v26_6_t8140.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
 #define DCP_MAX_PLANES 4
 
+/* DCP uses Apple's 24 MHz timebase, independent of CNTFRQ_EL0.
+ * On M4 the architectural counter runs at 1 GHz.
+ */
+static inline u64 dcp_read_firmware_time(void)
+{
+	return read_sysreg_s(sys_reg(3, 4, 15, 10, 6));
+}
+
 struct apple_dcp;
 struct apple_dcp_afkep;
+
+extern bool dcp_disable_rt_bandwidth;
+extern bool dcp_force_vrr;
 
 struct dcpav_service_epic;
 
@@ -34,10 +51,15 @@ enum {
 	TEST_ENDPOINT = 0x21,
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
+	DPAVCTRL_ENDPOINT = 0x24,
+	EPIC25_ENDPOINT = 0x25,
+	DPSAC_ENDPOINT = 0x26,
+	DPDEV_ENDPOINT = 0x27,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
 	HDCP_ENDPOINT = 0x2b,
+	EPIC2C_ENDPOINT = 0x2c,
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
@@ -89,8 +111,17 @@ struct dcp_brightness {
 	u32 maximum;
 	u32 dac;
 	int nits;
+	int actual_nits;
 	int scale;
 	bool update;
+	bool initialized;
+};
+
+/* Firmware IOMFBDisplayRefresh limits, in the native counter's ticks. */
+struct dcp_refresh_intervals {
+	u64 minimum;
+	u64 maximum;
+	u64 step;
 };
 
 struct audiosrv_data;
@@ -175,16 +206,36 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
 		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
+		struct dcp_swap_submit_req_v26_6_0 v26_6_0;
+		struct dcp_swap_submit_req_v26_6_t8140 v26_6_t8140;
 	} swap;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
 	ktime_t swap_start;
 
+	/* Neo mode changes wait for the clear-frame callback to be ACKed. */
+	wait_queue_head_t swap_ack_wait;
+	u64 swap_ack_sequence;
+	u32 swap_acked_id;
+	u32 modeset_blank_id;
+	bool modeset_blank_valid;
+
 	/* Current display mode */
 	bool during_modeset;
 	bool valid_mode;
+	/*
+	 * Diagnostic 26.6 external-hotplug path: the link can disappear while
+	 * IOMFB remains powered.  Remember that atomic_disable deliberately
+	 * skipped the firmware power-off sequence so atomic_enable does not send
+	 * a mismatched power-on sequence on reconnect.
+	 */
+	bool hotplug_keepalive;
 	bool use_timestamps;
+	/* Firmware-capable mode; independent of the KMS presentation hint. */
+	bool vrr_active;
+	u64 last_fw_present_ticks;
+	struct dcp_refresh_intervals refresh_intervals;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -236,6 +287,25 @@ struct apple_dcp {
 	struct completion systemep_done;
 
 	struct apple_dcp_afkep *ibootep;
+	struct apple_epic_service *iboot_service;
+	struct apple_dcp_afkep *dpavctrlep;
+	struct apple_dcp_afkep *dpdevep;
+	struct apple_epic_service *dpdev_service;
+	struct completion dpdev_ready;
+	struct apple_dcp_afkep *avauxep;
+	struct apple_dcp_afkep *dpsacep;
+	struct apple_dcp_afkep *remoteallocep;
+	struct apple_dcp_afkep *epicep2c;
+	struct apple_dcp_afkep *expertep;
+	struct apple_dcp_afkep *epicep25;
+	struct apple_dcp_afkep *hdcpep;
+	struct completion hdcp_ready;
+	struct apple_epic_service *hdcp_service[2];
+	u32 hdcp_teardown_interface;
+	bool hdcp_mprime_attempted;
+	struct completion dpavctrl_ready;
+	struct apple_epic_service *dpavctrl_av_controller[2];
+	struct apple_epic_service *dpavctrl_late_service;
 	struct apple_dcp_afkep *dcpavservep;
 	struct dcpavserv dcpavserv;
 
@@ -253,6 +323,14 @@ struct apple_dcp {
 	struct phy *phy;
 	struct mux_control *xbar;
 	struct typec_mux *typec_mux;
+	/* Type-C notifications can precede RTKit/IOMFB startup. */
+	struct typec_mux_dev *typec_hpd_mux;
+	spinlock_t typec_hpd_lock;
+	struct work_struct typec_hpd_work;
+	bool typec_hpd_ready;
+	bool typec_hpd_level;
+	bool typec_hpd_irq;
+	u32 typec_hpd_seq;
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
@@ -272,5 +350,18 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+/* T8132 keeps the DCP protocol details it was qualified with. */
+static inline bool dcp_is_t8132(const struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcp") ||
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext");
+}
+
+static inline bool dcp_fw_is_26_6(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6 ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140;
+}
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

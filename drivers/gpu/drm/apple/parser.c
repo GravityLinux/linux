@@ -12,6 +12,7 @@
 #include <sound/pcm.h> // for sound format masks
 #endif
 
+#include "dcp-internal.h"
 #include "parser.h"
 #include "trace.h"
 
@@ -266,11 +267,13 @@ static int iterator_begin(struct dcp_parse_ctx *handle, struct iterator *it,
 #define dcp_parse_foreach_in_dict(handle, it)                                  \
 	for (iterator_begin(handle, &it, true); it.idx < it.len; ++it.idx)
 
-int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
+int parse(struct apple_dcp *dcp, const void *blob, size_t size,
+	  struct dcp_parse_ctx *ctx)
 {
 	const u32 *header;
 
 	*ctx = (struct dcp_parse_ctx) {
+		.dcp = dcp,
 		.blob = blob,
 		.len = size,
 		.pos = 0,
@@ -366,11 +369,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr_rgb.score = -1;
 	out->sdr.score = -1;
 	out->best.score = -1;
+	out->bootstrap.score = -1;
 
 	dcp_parse_foreach_in_array(handle, outer_it) {
 		struct iterator it;
 		bool is_virtual = true;
-		struct color_mode cmode;
+		struct color_mode cmode = {
+			.score = -1,
+			.id = -1,
+			.depth = -1,
+			.pixel_encoding = -1,
+			.dynamic_range = -1,
+			.colorimetry = -1,
+			.eotf = -1,
+		};
 
 		dcp_parse_foreach_in_dict(handle, it) {
 			char *key = parse_string(it.handle);
@@ -403,14 +415,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				return ret;
 		}
 
-		/* Skip virtual or partial entries */
-		if (is_virtual || cmode.score < 0 || cmode.id < 0)
+		/* Skip partial entries.  26.6 uses a virtual color element to
+		 * bootstrap the generic pipe before selecting a real color mode. */
+		if (cmode.score < 0 || cmode.id < 0)
 			continue;
 
 		trace_iomfb_color_mode(handle->dcp, cmode.id, cmode.score,
 				       cmode.depth, cmode.colorimetry,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
+
+		if (is_virtual) {
+			fill_color_mode(&out->bootstrap, &cmode);
+			continue;
+		}
 
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA) {
 			if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
@@ -492,7 +510,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		}
 	}
 
-	if (is_preferred)
+	/* T8132 keeps its qualified mode ranking without the preferred bonus. */
+	if (is_preferred && !dcp_is_t8132(handle->dcp))
 		*score |= (1L << 32);
 
 	if (out->sdr_rgb.score >= 0)
@@ -597,6 +616,10 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 
 	for (; it.idx < it.len; ++it.idx) {
 		mode = &modes[*count];
+		/* Optional fields (including VRR) must not inherit heap contents or
+		 * a rejected mode that reused this slot. */
+		memset(mode, 0, sizeof(*mode));
+		score = -1;
 		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm, notch_height);
 
 		/* Errors for a single mode are recoverable -- just skip it. */
@@ -1020,7 +1043,7 @@ int parse_sound_mode(struct dcp_parse_ctx *handle,
 int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mnits *entry)
 {
 	struct iterator it;
-	int ret;
+	int ret = 0;
 	s64 mnits = -1;
 	s64 idac = -1;
 	s64 timestamp = -1;

@@ -21,10 +21,14 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 	trace_dcpavserv_init(dcp, unit);
 
 	if (unit == 0 && name && !strcmp(name, "dcpav-service-epic")) {
-		if (dcp->dcpavserv.enabled) {
-			dev_err(dcp->dev,
-				"DCPAVSERV: unit %lld already exists\n", unit);
-			return;
+		if (dcp->dcpavserv.service &&
+		    dcp->dcpavserv.service != service) {
+			dev_info(dcp->dev,
+				 "DCPAVSERV: rebinding unit %lld from interface %u to %u\n",
+				 unit, dcp->dcpavserv.service->channel,
+				 service->channel);
+			dcp->dcpavserv.service->cookie = NULL;
+			dcp->dcpavserv.service->enabled = false;
 		}
 		dcp->dcpavserv.service = service;
 		dcp->dcpavserv.enabled = true;
@@ -38,7 +42,10 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 	struct apple_dcp *dcp = service->ep->dcp;
 	service->enabled = false;
 
-	if (dcp->dcpavserv.enabled) {
+	/* Firmware republishes this service under a new compact interface ID
+	 * after hotplug.  A delayed teardown for the old instance must not
+	 * invalidate the replacement. */
+	if (dcp->dcpavserv.service == service) {
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		service->cookie = NULL;
@@ -49,6 +56,8 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
+	if (service->ep->compact)
+		service->defer_start = true;
 }
 
 static void dcpdpserv_teardown(struct apple_epic_service *service)
@@ -78,7 +87,7 @@ struct dpavserv_copy_edid_cmd {
 #define EDID_BLOCK_SIZE			128
 #define EDID_EXT_BLOCK_COUNT_OFFSET	0x7E
 #define EDID_MAX_SIZE			SZ_32K
-#define EDID_BUF_SIZE			(EDID_LEADING_DATA_SIZE + EDID_MAX_SIZE)
+#define EDID_COMPACT_MAX_SIZE		SZ_2K
 
 struct dpavserv_copy_edid_resp {
 	__le64 max_size;
@@ -159,29 +168,44 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_epic_service *service)
 {
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
+	size_t edid_max_size, edid_buf_size;
 	int num_blocks;
 	u64 data_size;
 	int ret;
 
+	/* Compact EPIC endpoints on T8132 have a 0x1e80-byte TX ring.  A
+	 * 32-KiB inline request can never fit and fails locally with
+	 * -EMSGSIZE.  The complete 4-KiB call advances the ring by 0x1100
+	 * bytes, so it can also fail with -ENOMEM on an otherwise empty ring
+	 * when the remaining tail is too short and wrapping would collide
+	 * with the read pointer.  A 2-KiB EDID limit makes the complete call
+	 * 0x900 bytes, less than half the ring, while still accommodating 15
+	 * extension blocks.  Retain the older maximum for non-compact
+	 * endpoints. */
+	edid_max_size = service->ep->compact ? EDID_COMPACT_MAX_SIZE :
+						EDID_MAX_SIZE;
+	edid_buf_size = EDID_LEADING_DATA_SIZE + edid_max_size;
+
 	memset(&cmd, 0, sizeof(cmd));
-	cmd.max_size = cpu_to_le64(EDID_BUF_SIZE);
-	resp = kzalloc(sizeof(*resp) + EDID_BUF_SIZE, GFP_KERNEL);
+	cmd.max_size = cpu_to_le64(edid_buf_size);
+	resp = kzalloc(sizeof(*resp) + edid_buf_size, GFP_KERNEL);
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
-	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE, resp,
-			       sizeof(resp) + EDID_BUF_SIZE, 0);
+	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), edid_buf_size,
+			       resp, sizeof(*resp) + edid_buf_size, 0);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	if (le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
+	if (le64_to_cpu(resp->max_size) != edid_buf_size)
 		return ERR_PTR(-EIO);
 
 	// print_hex_dump(KERN_DEBUG, "dpavserv EDID cmd: ", DUMP_PREFIX_NONE,
 	// 	       16, 1, resp, 192, true);
 
 	data_size = le64_to_cpu(resp->used_size);
-	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE)
+	if (data_size > edid_buf_size ||
+	    data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE)
 		return ERR_PTR(-EIO);
 
 	num_blocks = resp->data[EDID_LEADING_DATA_SIZE + EDID_EXT_BLOCK_COUNT_OFFSET];
