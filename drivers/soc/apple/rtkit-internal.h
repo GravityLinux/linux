@@ -25,6 +25,9 @@
 struct apple_rtkit {
 	void *cookie;
 	const struct apple_rtkit_ops *ops;
+	/* Compatibility for clients configuring boot policy per instance. */
+	unsigned int compat_quirks;
+	bool skip_boot_ap_power;
 	struct device *dev;
 
 	struct apple_mbox *mbox;

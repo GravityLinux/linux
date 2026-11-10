@@ -88,7 +88,7 @@ struct apple_rtkit_rx_work {
 static bool apple_rtkit_has_quirk(struct apple_rtkit *rtk,
 				 enum apple_rtkit_quirks quirk)
 {
-	return rtk->ops->quirks & quirk;
+	return (rtk->ops->quirks | rtk->compat_quirks) & quirk;
 }
 
 bool apple_rtkit_is_running(struct apple_rtkit *rtk)
@@ -834,6 +834,114 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
+void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable)
+{
+	rtk->skip_boot_ap_power = !enable;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_boot_ap_power);
+
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk)
+{
+	rtk->compat_quirks |= APPLE_RTKIT_QUIRK_EARLY_CRASHLOG;
+	reinit_completion(&rtk->crashlog_completion);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_early_crashlog);
+
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
+			      size_t n_endpoints)
+{
+	size_t i;
+
+	if (!rtk || (!endpoints && n_endpoints) || rtk->crashed)
+		return -EINVAL;
+
+	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+	for (i = 0; i < n_endpoints; i++)
+		set_bit(endpoints[i], rtk->endpoints);
+
+	/* The bootloader already negotiated the current protocol and left both
+	 * halves of the link live. No HELLO, endpoint map, INIT, or AP-power
+	 * message may be replayed into that session. */
+	rtk->version = APPLE_RTKIT_MAX_SUPPORTED_VERSION;
+	rtk->boot_result = 0;
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	complete_all(&rtk->epmap_completion);
+	complete_all(&rtk->iop_pwr_ack_completion);
+	complete_all(&rtk->ap_pwr_ack_completion);
+
+	dev_info(rtk->dev, "RTKit: adopted running bootloader session\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_running);
+
+int apple_rtkit_reuse_syslog_buffer(struct apple_rtkit *rtk, dma_addr_t iova,
+				    size_t size, size_t n_entries,
+				    size_t msg_size)
+{
+	int ret;
+
+	if (!rtk || !iova || !size || !n_entries || !msg_size)
+		return -EINVAL;
+	if (rtk->syslog_buffer.size || rtk->syslog_msg_buffer)
+		return -EBUSY;
+	if (!rtk->ops->shmem_setup)
+		return -EOPNOTSUPP;
+
+	rtk->syslog_buffer.iova = iova;
+	rtk->syslog_buffer.size = size;
+	ret = rtk->ops->shmem_setup(rtk->cookie, &rtk->syslog_buffer);
+	if (ret)
+		goto clear_buffer;
+
+	rtk->syslog_msg_buffer = kzalloc(msg_size, GFP_KERNEL);
+	if (!rtk->syslog_msg_buffer) {
+		ret = -ENOMEM;
+		goto destroy_buffer;
+	}
+
+	rtk->syslog_n_entries = n_entries;
+	rtk->syslog_msg_size = msg_size;
+	dev_info(rtk->dev,
+		 "RTKit: reused syslog buffer at %pad: entries: %zd, msg_size: %zd\n",
+		 &rtk->syslog_buffer.iova, n_entries, msg_size);
+	return 0;
+
+destroy_buffer:
+	rtk->ops->shmem_destroy(rtk->cookie, &rtk->syslog_buffer);
+clear_buffer:
+	rtk->syslog_buffer = (struct apple_rtkit_shmem){};
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_reuse_syslog_buffer);
+
+int apple_rtkit_reuse_crashlog_buffer(struct apple_rtkit *rtk,
+				      dma_addr_t iova, size_t size)
+{
+	int ret;
+
+	if (!rtk || !iova || !size)
+		return -EINVAL;
+	if (rtk->crashlog_buffer.size)
+		return -EBUSY;
+	if (!rtk->ops->shmem_setup)
+		return -EOPNOTSUPP;
+
+	rtk->crashlog_buffer.iova = iova;
+	rtk->crashlog_buffer.size = size;
+	ret = rtk->ops->shmem_setup(rtk->cookie, &rtk->crashlog_buffer);
+	if (ret) {
+		rtk->crashlog_buffer = (struct apple_rtkit_shmem){};
+		return ret;
+	}
+
+	dev_info(rtk->dev, "RTKit: reused crashlog buffer at %pad\n",
+		 &rtk->crashlog_buffer.iova);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_reuse_crashlog_buffer);
+
 static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 					   unsigned int state)
 {
@@ -889,6 +997,11 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			dev_err(rtk->dev, "RTKit: timed out waiting for crash buffer: %d\n", ret);
 			return ret;
 		}
+	}
+
+	if (rtk->skip_boot_ap_power) {
+		rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+		return 0;
 	}
 
 	ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
