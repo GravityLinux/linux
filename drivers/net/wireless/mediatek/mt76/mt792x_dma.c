@@ -40,6 +40,8 @@ void mt792x_irq_tasklet(unsigned long data)
 	trace_dev_irq(&dev->mt76, intr, dev->mt76.mmio.irqmask);
 
 	mask |= intr & irq_map->rx.all_complete_mask;
+	if (is_mt7932(&dev->mt76))
+		mask |= intr & (BIT(3) | BIT(19) | BIT(23) | BIT(25) | BIT(31));
 	if (intr & dev->irq_map->tx.mcu_complete_mask)
 		mask |= dev->irq_map->tx.mcu_complete_mask;
 
@@ -68,6 +70,18 @@ void mt792x_irq_tasklet(unsigned long data)
 
 	if (intr & irq_map->rx.data_complete_mask)
 		napi_schedule(&dev->mt76.napi[MT_RXQ_MAIN]);
+	if (is_mt7932(&dev->mt76)) {
+		if (intr & BIT(3))
+			napi_schedule(&dev->mt76.napi[MT_RXQ_MAIN_WA]);
+		if (intr & BIT(31))
+			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND1_WA]);
+		if (intr & BIT(25))
+			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND1]);
+		if (intr & BIT(23))
+			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND2]);
+		if (intr & BIT(19))
+			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND2_WA]);
+	}
 }
 EXPORT_SYMBOL_GPL(mt792x_irq_tasklet);
 
@@ -76,7 +90,17 @@ void mt792x_rx_poll_complete(struct mt76_dev *mdev, enum mt76_rxq_id q)
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
 	const struct mt792x_irq_map *irq_map = dev->irq_map;
 
-	if (q == MT_RXQ_MAIN)
+	if (is_mt7932(mdev) && q == MT_RXQ_MAIN_WA)
+		mt76_connac_irq_enable(mdev, BIT(3));
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND1_WA)
+		mt76_connac_irq_enable(mdev, BIT(31));
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND1)
+		mt76_connac_irq_enable(mdev, BIT(25));
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND2)
+		mt76_connac_irq_enable(mdev, BIT(23));
+	else if (is_mt7932(mdev) && q == MT_RXQ_BAND2_WA)
+		mt76_connac_irq_enable(mdev, BIT(19));
+	else if (q == MT_RXQ_MAIN)
 		mt76_connac_irq_enable(mdev, irq_map->rx.data_complete_mask);
 	else if (q == MT_RXQ_MCU_WA)
 		mt76_connac_irq_enable(mdev, irq_map->rx.wm2_complete_mask);
@@ -235,6 +259,26 @@ static void mt7928_wfdma_setup(struct mt792x_dev *dev)
 
 static void mt792x_dma_prefetch(struct mt792x_dev *dev)
 {
+	if (is_mt7932(&dev->mt76)) {
+		static const u8 rx_rings[] = { 0, 2, 3, 4, 5, 6, 7, 8 };
+		u32 base = 0;
+		int i;
+
+		mt76_clear(dev, MT_WFDMA0_GLO_CFG, BIT(15));
+		for (i = 0; i < ARRAY_SIZE(rx_rings); i++) {
+			u32 depth = rx_rings[i] == 2 ? 8 : 4;
+			mt76_wr(dev, 0xd4680 + 4 * rx_rings[i], PREFETCH(base, depth));
+			base += depth * 16;
+		}
+		for (i = 0; i <= 18; i++) {
+			u32 depth = i == 4 || i == 8 || i == 12 ? 12 : 4;
+			if (i == 15)
+				continue;
+			mt76_wr(dev, 0xd4600 + 4 * i, PREFETCH(base, depth));
+			base += depth * 16;
+		}
+		return;
+	}
 	if (is_mt7928(&dev->mt76)) {
 		mt7928_dma_prefetch_setup(dev);
 	} else if (is_mt7927(&dev->mt76)) {
@@ -292,7 +336,11 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 	/* configure delay interrupt */
 	mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
 
-	if (is_mt7928(&dev->mt76)) {
+	if (is_mt7932(&dev->mt76)) {
+		mt76_wr(dev, MT_WFDMA0_GLO_CFG, 0x50209040);
+		mt76_wr(dev, 0xd4298, 0xc);
+		mt76_wr(dev, 0xd7038, 0x13);
+	} else if (is_mt7928(&dev->mt76)) {
 		mt76_wr(dev, MT_WFDMA0_GLO_CFG,
 			MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
 			MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
@@ -349,6 +397,9 @@ int mt792x_dma_enable(struct mt792x_dev *dev)
 	mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);
 
 	/* enable interrupts for TX/RX rings */
+	if (is_mt7932(&dev->mt76))
+		mt76_connac_irq_enable(&dev->mt76,
+			BIT(3) | BIT(19) | BIT(23) | BIT(25) | BIT(31));
 	mt76_connac_irq_enable(&dev->mt76,
 			       dev->irq_map->tx.all_complete_mask |
 			       dev->irq_map->rx.all_complete_mask |
@@ -603,6 +654,19 @@ static int mt7927_wfsys_reset(struct mt792x_dev *dev)
 static int mt792x_wfsys_reset_default(struct mt792x_dev *dev)
 {
 	u32 addr = is_connac2(&dev->mt76) ? 0x18000140 : 0x7c000140;
+	if (is_mt7932(&dev->mt76)) {
+		mt76_wr(dev, 0xfe24c, 0x18457000);
+		udelay(2);
+		mt76_wr(dev, 0x43020, 0);
+		usleep_range(1000, 1500);
+		mt76_wr(dev, 0x42600, 1);
+		msleep(50);
+		mt76_wr(dev, 0x42600, 0);
+		mt76_wr(dev, 0xfe24c, 0x1845184f);
+		if (!mt76_poll_msec(dev, 0xf0140, BIT(4), BIT(4), 300))
+			return -ETIMEDOUT;
+		return __mt792xe_mcu_drv_pmctrl(dev);
+	}
 
 	mt76_clear(dev, addr, WFSYS_SW_RST_B);
 	msleep(50);
@@ -623,4 +687,3 @@ int mt792x_wfsys_reset(struct mt792x_dev *dev)
 	return mt792x_wfsys_reset_default(dev);
 }
 EXPORT_SYMBOL_GPL(mt792x_wfsys_reset);
-

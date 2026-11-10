@@ -461,7 +461,7 @@ void mt7921_mac_add_txs(struct mt792x_dev *dev, void *data)
 	if (pid < MT_PACKET_ID_FIRST)
 		return;
 
-	if (wcidx >= MT792x_WTBL_SIZE)
+	if (wcidx >= (is_mt7932(&dev->mt76) ? 49 : MT792x_WTBL_SIZE))
 		return;
 
 	rcu_read_lock();
@@ -540,6 +540,8 @@ static void mt7921_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 		txwi = mt76_token_release(mdev, msdu, &wake);
 		if (!txwi)
 			continue;
+		if (is_mt7932(mdev) && mt7932_fullmac_tx_free(dev, txwi))
+			continue;
 
 		mt76_connac2_txwi_free(mdev, txwi, sta, &free_list);
 	}
@@ -575,6 +577,9 @@ bool mt7921_rx_check(struct mt76_dev *mdev, void *data, int len)
 		mt7921_mac_tx_free(dev, data, len);
 		return false;
 	case PKT_TYPE_TXS:
+		if (is_mt7932(mdev))
+			dev_info_ratelimited(mdev->dev, "MT7932 TX status len=%u: %*ph\n",
+				len, min_t(unsigned int, len, 40), data);
 		for (rxd += 2; rxd + 8 <= end; rxd += 8)
 			mt7921_mac_add_txs(dev, rxd);
 		return false;
@@ -592,11 +597,26 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	__le32 *end = (__le32 *)&skb->data[skb->len];
 	enum rx_pkt_type type;
 	u16 flag;
+	int ret;
+	if (is_mt7932(mdev) && skb->len < 24) {
+		dev_kfree_skb(skb);
+		return;
+	}
+	if (is_mt7932(mdev))
+		mt7932_diag_rx(q, skb);
 
 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
 	flag = le32_get_bits(rxd[0], MT_RXD0_PKT_FLAG);
+	if (is_mt7932(mdev) && type != PKT_TYPE_NORMAL &&
+	    type != PKT_TYPE_RX_EVENT && type != PKT_TYPE_TXS &&
+	    type != PKT_TYPE_TXRX_NOTIFY)
+		dev_info_ratelimited(mdev->dev, "MT7932 RX ring=%u type=%u flag=%u bytes=%u\n",
+			 q, type, flag, skb->len);
 
-	if (type == PKT_TYPE_RX_EVENT && flag == 0x1)
+	if (type == PKT_TYPE_RX_EVENT &&
+	    (flag == 0x1 || (is_mt7932(mdev) &&
+	     (rxd[4] & cpu_to_le32(MT_RXD4_NORMAL_OFLD) ||
+	      rxd[2] & cpu_to_le32(MT_RXD2_NORMAL_HDR_TRANS)))))
 		type = PKT_TYPE_NORMAL_MCU;
 
 	switch (type) {
@@ -618,10 +638,25 @@ void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 		break;
 	case PKT_TYPE_NORMAL_MCU:
 	case PKT_TYPE_NORMAL:
-		if (!mt7921_mac_fill_rx(dev, skb)) {
+		ret = mt7921_mac_fill_rx(dev, skb);
+		if (!ret) {
+			if (is_mt7932(mdev) && mt7932_fullmac_rx(dev, skb))
+				return;
+			if (is_mt7932(mdev) && skb->len >= 30 &&
+			    ieee80211_is_auth(((struct ieee80211_hdr *)skb->data)->frame_control)) {
+				struct ieee80211_mgmt *mgmt = (void *)skb->data;
+
+				dev_info_ratelimited(mdev->dev, "MT7932 RX authentication ring=%u len=%u algorithm=%u transaction=%u status=%u\n",
+					q, skb->len, le16_to_cpu(mgmt->u.auth.auth_alg),
+					le16_to_cpu(mgmt->u.auth.auth_transaction),
+					le16_to_cpu(mgmt->u.auth.status_code));
+			}
+			/* Drain on the NAPI instance servicing this hardware RX ring. */
 			mt76_rx(&dev->mt76, q, skb);
 			return;
 		}
+		if (is_mt7932(mdev))
+			dev_info_ratelimited(mdev->dev, "MT7932 RX decoding failed: %d\n", ret);
 		fallthrough;
 	default:
 		dev_kfree_skb(skb);
@@ -640,6 +675,12 @@ mt7921_vif_connect_iter(void *priv, u8 *mac,
 
 	if (vif->type == NL80211_IFTYPE_STATION)
 		ieee80211_disconnect(vif, true);
+
+	if (is_mt7932(&dev->mt76)) {
+		mt7932_add_interface(dev, vif, mvif, true);
+		mt7921_mcu_set_tx(dev, vif);
+		return;
+	}
 
 	mt76_connac_mcu_uni_add_dev(&dev->mphy, &vif->bss_conf,
 				    &mvif->bss_conf.mt76,
@@ -667,7 +708,10 @@ void mt7921_mac_reset_work(struct work_struct *work)
 	dev_dbg(dev->mt76.dev, "chip reset\n");
 	set_bit(MT76_RESET, &dev->mphy.state);
 	dev->hw_full_reset = true;
-	ieee80211_stop_queues(hw);
+	if (is_mt7932(&dev->mt76))
+		mt7932_fullmac_reset_prepare(dev);
+	else
+		ieee80211_stop_queues(hw);
 
 	cancel_delayed_work_sync(&dev->mphy.mac_work);
 	cancel_delayed_work_sync(&pm->ps_work);
@@ -701,8 +745,13 @@ void mt7921_mac_reset_work(struct work_struct *work)
 	}
 
 	dev->hw_full_reset = false;
-	clear_bit(MT76_RESET, &dev->mphy.state);
 	pm->suspended = false;
+	if (is_mt7932(&dev->mt76)) {
+		mt7932_fullmac_reset_done(dev, ret);
+		clear_bit(MT76_RESET, &dev->mphy.state);
+		return;
+	}
+	clear_bit(MT76_RESET, &dev->mphy.state);
 	ieee80211_wake_queues(hw);
 	ieee80211_iterate_active_interfaces(hw,
 					    IEEE80211_IFACE_ITER_RESUME_ALL,
@@ -716,12 +765,14 @@ void mt7921_coredump_work(struct work_struct *work)
 {
 	struct mt792x_dev *dev;
 	char *dump, *data;
+	unsigned long timeout;
 
 	dev = (struct mt792x_dev *)container_of(work, struct mt792x_dev,
 						coredump.work.work);
 
-	if (time_is_after_jiffies(dev->coredump.last_activity +
-				  4 * MT76_CONNAC_COREDUMP_TIMEOUT)) {
+	timeout = is_mt7932(&dev->mt76) ? 5 * HZ :
+		  4 * MT76_CONNAC_COREDUMP_TIMEOUT;
+	if (time_is_after_jiffies(dev->coredump.last_activity + timeout)) {
 		queue_delayed_work(dev->mt76.wq, &dev->coredump.work,
 				   MT76_CONNAC_COREDUMP_TIMEOUT);
 		return;

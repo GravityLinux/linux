@@ -2320,7 +2320,8 @@ mt76_connac_mcu_rate_txpower_band(struct mt76_phy *phy,
 			goto out;
 
 		/* read a CR to avoid PSE buffer underflow */
-		mt76_connac_mcu_reg_rr(dev, MT_PSE_BASE);
+		if (!is_mt7932(dev))
+			mt76_connac_mcu_reg_rr(dev, MT_PSE_BASE);
 	}
 
 out:

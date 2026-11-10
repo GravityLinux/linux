@@ -25,6 +25,8 @@ mt7921_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
 	enum mt76_mcuq_id txq = MT_MCUQ_WM;
 	int ret;
+	if (is_mt7932(mdev))
+		return mt7932_mcu_send_message(mdev, skb, cmd, seq);
 
 	ret = mt76_connac2_mcu_fill_message(mdev, skb, cmd, seq);
 	if (ret)
@@ -48,6 +50,8 @@ int mt7921e_mcu_init(struct mt792x_dev *dev)
 	int err;
 
 	dev->mt76.mcu_ops = &mt7921_mcu_ops;
+	if (is_mt7932(&dev->mt76))
+		return mt7921_run_firmware(dev);
 
 	err = mt7921e_driver_own(dev);
 	if (err)

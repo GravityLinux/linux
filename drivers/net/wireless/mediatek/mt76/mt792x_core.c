@@ -263,8 +263,17 @@ void mt792x_mac_link_bss_remove(struct mt792x_dev *dev,
 	link_conf = mt792x_vif_to_bss_conf(vif, mconf->link_id);
 
 	mt76_connac_free_pending_tx_skbs(&dev->pm, &mlink->wcid);
-	mt76_connac_mcu_uni_add_dev(&dev->mphy, link_conf, &mconf->mt76,
-				    &mlink->wcid, false);
+	if (is_mt7932(&dev->mt76)) {
+		u8 deactivate[12] = {
+			[0] = mconf->mt76.idx, [3] = mconf->mt76.omac_idx,
+			[10] = 0xff, [11] = 1,
+		};
+
+		mt76_mcu_send_msg(&dev->mt76, 0x11, deactivate, sizeof(deactivate), false);
+	} else {
+		mt76_connac_mcu_uni_add_dev(&dev->mphy, link_conf, &mconf->mt76,
+					    &mlink->wcid, false);
+	}
 
 	rcu_assign_pointer(dev->mt76.wcid[idx], NULL);
 
@@ -851,6 +860,15 @@ int mt792x_init_wiphy(struct ieee80211_hw *hw)
 	if (dev->pm.enable)
 		ieee80211_hw_set(hw, CONNECTION_MONITOR);
 
+	if (is_mt7932(&dev->mt76)) {
+		wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+		wiphy->iface_combinations = NULL;
+		wiphy->n_iface_combinations = 0;
+		__clear_bit(IEEE80211_HW_CONNECTION_MONITOR, hw->flags);
+		__clear_bit(IEEE80211_HW_SUPPORTS_PS, hw->flags);
+		__clear_bit(IEEE80211_HW_SUPPORTS_DYNAMIC_PS, hw->flags);
+		__clear_bit(IEEE80211_HW_WANT_MONITOR_VIF, hw->flags);
+	}
 	hw->max_tx_fragments = 4;
 
 	return 0;
@@ -932,7 +950,11 @@ mt792x_get_mac80211_ops(struct device *dev,
 	if (!ops)
 		return NULL;
 
-	*fw_features = mt792x_get_offload_capability(dev, drv_data);
+	/* MT7932 uses the legacy firmware trailer and channel-privilege ABI. */
+	if (!strcmp(drv_data, MT7932_FIRMWARE_WM))
+		*fw_features = MT792x_FW_CAP_CNM;
+	else
+		*fw_features = mt792x_get_offload_capability(dev, drv_data);
 
 	if (mt792x_needs_cnm_runtime(drv_data))
 		*fw_features |= MT792x_FW_CAP_CNM;
@@ -957,10 +979,16 @@ int mt792x_init_wcid(struct mt792x_dev *dev)
 {
 	int idx;
 
-	/* Beacon and mgmt frames should occupy wcid 0 */
-	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT792x_WTBL_STA - 1);
-	if (idx)
-		return -ENOSPC;
+	if (is_mt7932(&dev->mt76)) {
+		/* The 49-entry legacy table reserves its last row for management. */
+		idx = 48;
+		dev->mt76.wcid_mask[idx / 32] |= BIT(idx % 32);
+		dev->mt76.wcid_mask[0] |= BIT(7);
+	} else {
+		idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT792x_WTBL_STA - 1);
+		if (idx)
+			return -ENOSPC;
+	}
 
 	dev->mt76.global_wcid.idx = idx;
 	dev->mt76.global_wcid.hw_key_idx = -1;

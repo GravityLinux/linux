@@ -47,6 +47,8 @@
 #define MT7920_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1a.bin"
 #define MT7921_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1.bin"
 #define MT7922_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7922_1.bin"
+#define MT7932_FIRMWARE_WM	"mediatek/W7932_2.bin"
+#define MT7932_ROM_PATCH		"mediatek/WIFI_MT7932_patch_mcu_1_2_hdr.bin"
 #define MT7925_FIRMWARE_WM	"mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin"
 #define MT7927_FIRMWARE_WM	"mediatek/mt7927/WIFI_RAM_CODE_MT6639_2_1.bin"
 #define MT7928_FIRMWARE_WM	"mediatek/mt7928/WIFI_RAM_CODE_MT7935_1_1.bin"
@@ -342,6 +344,7 @@ struct mt792x_dev {
 	struct ieee80211_vif *nan_vif;
 	const struct ieee80211_iface_combination *iface_combinations;
 	int n_iface_combinations;
+	struct mt7932_fullmac *fullmac;
 };
 
 static inline struct mt792x_bss_conf *
@@ -534,6 +537,8 @@ void mt792x_config_mac_addr_list(struct mt792x_dev *dev);
 
 static inline char *mt792x_ram_name(struct mt792x_dev *dev)
 {
+	if (is_mt7932(&dev->mt76))
+		return MT7932_FIRMWARE_WM;
 	switch (mt76_chip(&dev->mt76)) {
 	case 0x7902:
 		return MT7902_FIRMWARE_WM;
