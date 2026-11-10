@@ -15,7 +15,9 @@
 #include <linux/hid.h>
 #include <linux/input/mt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include "hid-ids.h"
@@ -158,6 +160,7 @@ struct magicmouse_sc {
 	struct input_dev *input;
 	unsigned long quirks;
 	bool query_dimensions;
+	bool neo_mtp;
 
 	int ntouches;
 	int scroll_accel;
@@ -762,6 +765,83 @@ static void report_finger_data(struct input_dev *input, int slot,
 	input_report_abs(input, ABS_MT_POSITION_Y, pos->y);
 }
 
+static int magicmouse_raw_event_neo_mtp(struct hid_device *hdev,
+		struct hid_report *report, u8 *data, int size)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	struct input_dev *input = msc->input;
+	u32 seen = 0;
+	unsigned int count, offset, length, stride, i;
+
+	if (size < 1 || data[0] != MTP_REPORT_ID)
+		return 0;
+	/* Neo's 0x75 report declares both the header and contact payload sizes. */
+	if (size < 32 || data[2] < 32 || data[10] & BIT(7))
+		return 1;
+	count = data[22];
+	offset = data[2] + get_unaligned_le16(data + 14);
+	length = get_unaligned_le16(data + 16);
+	if (count > 32 || offset > size || length > size - offset)
+		return 1;
+	if (!count) {
+		if (length)
+			return 1;
+		stride = 0;
+	} else {
+		if (length % count)
+			return 1;
+		stride = length / count;
+		if (stride < 20 || stride > 30 || stride % 2)
+			return 1;
+	}
+	/* Validate the complete array before changing slot or button state. */
+	for (i = 0; i < count; i++) {
+		const u8 *finger = data + offset + i * stride;
+
+		if (!finger[0] || finger[0] >= 32 || finger[1] > 7 ||
+		    seen & BIT(finger[0]))
+			return 1;
+		seen |= BIT(finger[0]);
+	}
+	for (i = 0; i < count; i++) {
+		const u8 *finger = data + offset + i * stride;
+		int slot = input_mt_get_slot_by_key(input, finger[0]);
+		int orientation = J314_TP_MAX_FINGER_ORIENTATION -
+				  (s16)get_unaligned_le16(finger + 16);
+		bool down = finger[1] == 3 || finger[1] == 4;
+
+		if (slot < 0)
+			continue;
+		input_mt_slot(input, slot);
+		input_mt_report_slot_state(input, MT_TOOL_FINGER, down);
+		if (!down)
+			continue;
+		input_report_abs(input, ABS_MT_POSITION_X,
+				 (s16)get_unaligned_le16(finger + 4));
+		input_report_abs(input, ABS_MT_POSITION_Y,
+				 -(s16)get_unaligned_le16(finger + 6));
+		/* The wire ellipse carries radii; input reports axis diameters. */
+		input_report_abs(input, ABS_MT_TOUCH_MAJOR,
+				 get_unaligned_le16(finger + 12) * 2);
+		input_report_abs(input, ABS_MT_TOUCH_MINOR,
+				 get_unaligned_le16(finger + 14) * 2);
+		input_report_abs(input, ABS_MT_WIDTH_MAJOR,
+				 get_unaligned_le16(finger + 12) * 2);
+		input_report_abs(input, ABS_MT_WIDTH_MINOR,
+				 get_unaligned_le16(finger + 14) * 2);
+		/* Fold the ellipse axis into +/- pi/2, measured from vertical. */
+		if (orientation > J314_TP_MAX_FINGER_ORIENTATION)
+			orientation -= 2 * J314_TP_MAX_FINGER_ORIENTATION;
+		else if (orientation < -J314_TP_MAX_FINGER_ORIENTATION)
+			orientation += 2 * J314_TP_MAX_FINGER_ORIENTATION;
+		input_report_abs(input, ABS_MT_ORIENTATION, orientation);
+	}
+	input_mt_sync_frame(input);
+	input_report_key(input, BTN_LEFT, data[23] & 1);
+	input_sync(input);
+	return 1;
+}
+
 static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size)
 {
@@ -774,6 +854,9 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	const size_t hdr_sz = sizeof(struct tp_header);
 	const size_t touch_sz = sizeof(struct tp_finger);
 	u8 map_contacs[MAX_CONTACTS];
+
+	if (msc->neo_mtp)
+		return magicmouse_raw_event_neo_mtp(hdev, report, data, size);
 
 	// hid_warn(hdev, "%s\n", __func__);
 	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
@@ -1080,14 +1163,16 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 * inverse of the reported Y.
 	 */
 
-	input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
+	if (!msc->neo_mtp)
+		input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
 
 	/*
 	 * This makes libinput recognize this as a PressurePad and
 	 * stop trying to use pressure for touch size. Pressure unit
 	 * seems to be ~grams on these touchpads.
 	 */
-	input_abs_set_res(input, ABS_MT_PRESSURE, 1);
+	if (!msc->neo_mtp)
+		input_abs_set_res(input, ABS_MT_PRESSURE, 1);
 
 	/* finger orientation */
 	input_set_abs_params(input, ABS_MT_ORIENTATION, -J314_TP_MAX_FINGER_ORIENTATION,
@@ -1115,7 +1200,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 */
 	__clear_bit(EV_REP, input->evbit);
 
-	error = input_mt_init_slots(input, MAX_CONTACTS, mt_flags);
+	error = input_mt_init_slots(input, msc->neo_mtp ? 32 : MAX_CONTACTS, mt_flags);
 	if (error)
 		return error;
 
@@ -1329,6 +1414,9 @@ static int magicmouse_probe(struct hid_device *hdev,
 	// internal trackpad use a data format use input ops to avoid
 	// conflicts with the report ID.
 	if (id->bus == BUS_HOST) {
+		msc->neo_mtp = hdev->dev.parent &&
+			of_device_is_compatible(hdev->dev.parent->of_node,
+						"apple,t8140-dockchannel-hid");
 		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
 		msc->input_ops.setup_input = magicmouse_setup_input_mtp;
 	} else if (id->bus == BUS_SPI) {

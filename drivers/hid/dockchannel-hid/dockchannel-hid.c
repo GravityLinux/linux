@@ -12,8 +12,10 @@
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hid.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/soc/apple/dockchannel.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -23,11 +25,14 @@
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
 
-#define MAX_INTERFACES 16
+#define MAX_INTERFACES 32
 
-/* Data + checksum */
-#define MAX_PKT_SIZE (0xffff + 4)
+/* Complete frame, including the largest aligned body and its checksum. */
+#define MAX_PKT_SIZE (8 + 0xfffc + 4)
+#define DCHID_RING_SIZE SZ_2M
+#define DCHID_RING_HEADER_SIZE 8
 
+#define DCHID_CHANNEL_NOTIFY 0x00
 #define DCHID_CHANNEL_CMD 0x11
 #define DCHID_CHANNEL_REPORT 0x12
 
@@ -75,6 +80,7 @@ struct dchid_init_hdr {
 #define INIT_PRODUCT_NAME	7
 
 #define CMD_RESET_INTERFACE 0x40
+#define CMD_REGISTER_RING 0x91
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
@@ -151,7 +157,7 @@ struct dchid_iface {
 
 	int index;
 	const char *name;
-	const struct device_node *of_node;
+	struct device_node *of_node;
 
 	uint8_t tx_seq;
 	bool deferred;
@@ -163,6 +169,7 @@ struct dchid_iface {
 	size_t hid_desc_len;
 
 	struct gpio_desc *gpio;
+	struct gpio_desc *reset_gpio;
 	char gpio_name[MAX_GPIO_NAME];
 	int gpio_id;
 
@@ -182,6 +189,13 @@ struct dockchannel_hid {
 	struct dockchannel *dc;
 	struct device_link *helper_link;
 
+	struct mutex ring_mutex;
+	bool use_ring;
+	bool ring_registered;
+	int ring_error;
+	void *ring;
+	dma_addr_t ring_dma;
+	u32 ring_read;
 	bool id_ready;
 	struct dchid_stm_id device_id;
 	char serial[64];
@@ -245,6 +259,19 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	if (!iface->of_node) {
 		dev_warn(dchid->dev, "No OF node for subdevice %s, ignoring.", name);
 		return NULL;
+	}
+
+	if (of_property_present(iface->of_node, "reset-gpios")) {
+		/* Keep AFE reset asserted until the provisioning release phase. */
+		iface->reset_gpio = devm_fwnode_gpiod_get_index(dchid->dev,
+			&iface->of_node->fwnode, "reset", 0, GPIOD_OUT_HIGH, name);
+		if (IS_ERR(iface->reset_gpio)) {
+			dev_err(dchid->dev, "Failed to request %s reset GPIO: %pe\n",
+				name, iface->reset_gpio);
+			destroy_workqueue(iface->wq);
+			of_node_put(iface->of_node);
+			return NULL;
+		}
 	}
 
 	dchid->ifaces[index] = iface;
@@ -371,8 +398,71 @@ static int dchid_enable_interface(struct dchid_iface *iface)
 static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
 	u8 msg[] = { CMD_RESET_INTERFACE, 1, iface->index, state };
+	u8 msg2[] = { CMD_RESET_INTERFACE, 2, iface->index, state, 0, 0, 0, 0, 0 };
+	int ret;
 
-	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (!iface->dchid->use_ring)
+		return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
+	if (iface->reset_gpio && state != 0 && state != 2)
+		return -EINVAL;
+
+	/*
+	 * T8132 boot capture: state 0 then 2, each with byte 4 equal to 0
+	 * then 1. This is only the observed provisioning sequence, not a
+	 * contract for suspend, wake, or arbitrary interface power changes.
+	 */
+	ret = dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
+	if (ret < 0)
+		return ret;
+	if (iface->reset_gpio) {
+		/* J616c macOS: prepare, change the SMC AFE reset, then commit.
+		 * Assertion includes a 50 ms hold; release is committed directly.
+		 */
+		ret = gpiod_set_value_cansleep(iface->reset_gpio, state == 0);
+		if (ret)
+			return ret;
+		if (state == 0)
+			msleep(50);
+	}
+	msg2[4] = 1;
+	return dchid_comm_cmd(iface->dchid, msg2, sizeof(msg2));
+}
+
+static int dchid_register_ring(struct dockchannel_hid *dchid)
+{
+	struct {
+		u8 cmd;
+		u8 reserved[2];
+		u64 addr;
+		u32 size;
+	} __packed msg = {
+		.cmd = CMD_REGISTER_RING,
+		.addr = dchid->ring_dma,
+		.size = DCHID_RING_SIZE,
+	};
+	/* Observed in both macOS and standalone T8132 bringup before 0x91. */
+	u8 prepare[] = { 0xc1, 0x02 };
+	int ret = 0;
+
+	if (!dchid->use_ring)
+		return 0;
+
+	mutex_lock(&dchid->ring_mutex);
+	ret = dchid->ring_error;
+	if (!dchid->ring_registered) {
+		ret = dchid_comm_cmd(dchid, prepare, sizeof(prepare));
+		if (ret < 0) {
+			mutex_unlock(&dchid->ring_mutex);
+			return ret;
+		}
+		/* The registration ACK itself arrives through the ring. */
+		dma_wmb();
+		WRITE_ONCE(dchid->ring_registered, true);
+		ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
+		dchid->ring_error = ret;
+	}
+	mutex_unlock(&dchid->ring_mutex);
+	return ret;
 }
 
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
@@ -458,6 +548,11 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
 
+	if (iface->dchid->use_ring) {
+		dev_err_once(iface->dchid->dev, "T8132 SMC reset GPIO operation is not established\n");
+		return -EOPNOTSUPP;
+	}
+
 	if (iface->gpio)
 		return 0;
 
@@ -491,14 +586,17 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	dev_info(iface->dchid->dev, "Starting interface %s\n", iface->name);
 
 	iface->starting = true;
+	ret = dchid_register_ring(iface->dchid);
+	if (ret < 0)
+		goto err;
 
 	/* Look to see if we need firmware */
 	ret = dchid_get_firmware(iface, &fw, &size);
 	if (ret < 0)
 		goto err;
 
-	/* If we need a GPIO, make sure we have it. */
-	if (iface->gpio_id) {
+	/* T8132 startup does not use the older host GPIO reset. */
+	if (!iface->dchid->use_ring && iface->gpio_id) {
 		ret = dchid_request_gpio(iface);
 		if (ret < 0)
 			goto err;
@@ -517,8 +615,12 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		dchid_reset_interface(iface, 0);
-		dchid_reset_interface(iface, 2);
+		ret = dchid_reset_interface(iface, 0);
+		if (ret < 0)
+			goto err;
+		ret = dchid_reset_interface(iface, 2);
+		if (ret < 0)
+			goto err;
 	}
 
 	return 0;
@@ -563,6 +665,7 @@ static int dchid_open(struct hid_device *hdev)
 
 		if (!wait_for_completion_timeout(&iface->ready, msecs_to_jiffies(START_TIMEOUT_MS))) {
 			dev_err(iface->dchid->dev, "iface %s start timed out\n", iface->name);
+			iface->starting = false;
 			return -ETIMEDOUT;
 		}
 	}
@@ -851,7 +954,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 			break;
 	}
 
-	if (hdr->more_packets)
+	if (hdr->more_packets || (dchid->use_ring && !iface->hid_desc))
 		return;
 
 	/* We need to enable STM first, since it'll give us the device IDs */
@@ -959,7 +1062,7 @@ static void dchid_packet_work(struct work_struct *ws)
 	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
 		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
 			shdr->length, work->hdr.length - sizeof(*shdr));
-		return;
+		goto done;
 	}
 
 	switch (type) {
@@ -974,6 +1077,7 @@ static void dchid_packet_work(struct work_struct *ws)
 		break;
 	}
 
+done:
 	kfree(work);
 }
 
@@ -1014,76 +1118,157 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 
 	iface->resp_size = shdr->length;
 	iface->out_report = -1;
-	iface->retcode = shdr->retcode;
+	iface->retcode = hdr->pad >> 8 ? -EIO : shdr->retcode;
 	complete(&iface->out_complete);
+}
+
+/* Return the complete frame size, or reject a lost framing boundary. */
+static int dchid_frame_size(const struct dchid_hdr *hdr)
+{
+	size_t length = hdr->length;
+
+	if (hdr->hdr_len != sizeof(*hdr) || !IS_ALIGNED(length, 4))
+		return -EPROTO;
+	return sizeof(*hdr) + length + sizeof(u32);
+}
+
+/*
+ * Both receive transports pass complete frames here. Header bytes 6/7 and
+ * application padding are opaque, checksum-covered data, not required zeroes.
+ */
+static int dchid_dispatch(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
+			  void *data, bool fifo)
+{
+	struct dchid_iface *iface;
+	struct dchid_work *work;
+	u32 checksum;
+
+	checksum = dchid_checksum(hdr, sizeof(*hdr));
+	checksum += dchid_checksum(data, hdr->length + 4);
+	if (checksum != U32_MAX) {
+		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x\n",
+			hdr->iface, checksum);
+		return 0;
+	}
+
+	if (dchid->use_ring && hdr->channel == DCHID_CHANNEL_NOTIFY) {
+		/* A FIFO notification has no application subheader or report ID. */
+		return fifo && !hdr->length && hdr->iface == IFACE_COMM;
+	}
+
+	if (hdr->iface >= MAX_INTERFACES || hdr->length < sizeof(struct dchid_subhdr))
+		return 0;
+	if (((struct dchid_subhdr *)data)->length >
+	    hdr->length - sizeof(struct dchid_subhdr))
+		return 0;
+	iface = dchid->ifaces[hdr->iface];
+	if (!iface) {
+		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr->iface);
+		return 0;
+	}
+
+	switch (hdr->channel) {
+	case DCHID_CHANNEL_CMD:
+		dchid_handle_ack(iface, hdr, data);
+		return 0;
+	case DCHID_CHANNEL_REPORT:
+		break;
+	default:
+		dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
+			 hdr->channel);
+		break;
+	}
+
+	work = kzalloc(sizeof(*work) + hdr->length, GFP_KERNEL);
+	if (!work)
+		return 0;
+	work->hdr = *hdr;
+	work->iface = iface;
+	memcpy(work->data, data, hdr->length);
+	INIT_WORK(&work->work, dchid_packet_work);
+	queue_work(iface->wq, &work->work);
+	return 0;
+}
+
+static void dchid_ring_copy(struct dockchannel_hid *dchid, void *dst,
+			    u32 offset, size_t length)
+{
+	size_t first = min_t(size_t, length,
+			     DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE - offset);
+	void *data = dchid->ring + DCHID_RING_HEADER_SIZE;
+
+	memcpy(dst, data + offset, first);
+	memcpy(dst + first, data, length - first);
+}
+
+static int dchid_drain_ring(struct dockchannel_hid *dchid)
+{
+	const u32 capacity = DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE;
+	u32 *indices = dchid->ring;
+	u32 producer, consumer, available;
+	int size;
+
+	if (!READ_ONCE(dchid->ring_registered))
+		return -EPROTO;
+
+	while (1) {
+		producer = READ_ONCE(indices[0]);
+		consumer = READ_ONCE(indices[1]);
+		if (producer >= capacity || consumer != dchid->ring_read ||
+		    !IS_ALIGNED(producer, 4))
+			return -EPROTO;
+		/* Read only the bytes published by this producer snapshot. */
+		dma_rmb();
+		available = producer >= consumer ? producer - consumer :
+			    capacity - consumer + producer;
+		if (available < sizeof(struct dchid_hdr))
+			return 0;
+		dchid_ring_copy(dchid, dchid->pkt_buf, consumer,
+				sizeof(struct dchid_hdr));
+		size = dchid_frame_size((void *)dchid->pkt_buf);
+		if (size < 0)
+			return size;
+		if (available < size)
+			return 0;
+		dchid_ring_copy(dchid, dchid->pkt_buf, consumer, size);
+		dchid_dispatch(dchid, (void *)dchid->pkt_buf,
+			       dchid->pkt_buf + sizeof(struct dchid_hdr), false);
+		consumer += size;
+		if (consumer >= capacity)
+			consumer -= capacity;
+		dchid->ring_read = consumer;
+		/* All frame reads must complete before the producer can reuse it. */
+		mb();
+		WRITE_ONCE(indices[1], consumer);
+		cond_resched();
+	}
+	return 0;
 }
 
 static void dchid_handle_packet(void *cookie, size_t avail)
 {
 	struct dockchannel_hid *dchid = cookie;
 	struct dchid_hdr hdr;
-	struct dchid_work *work;
-	struct dchid_iface *iface;
-	u32 checksum;
+	int ret;
 
 	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
 		dev_err(dchid->dev, "Read failed (header)\n");
 		return;
 	}
-
 	if (hdr.hdr_len != sizeof(hdr)) {
 		dev_err(dchid->dev, "Bad header length %d\n", hdr.hdr_len);
 		goto done;
 	}
-
-	if (dockchannel_recv(dchid->dc, dchid->pkt_buf, hdr.length + 4) != (hdr.length + 4)) {
+	if (dockchannel_recv(dchid->dc, dchid->pkt_buf, hdr.length + 4) != hdr.length + 4) {
 		dev_err(dchid->dev, "Read failed (body)\n");
 		goto done;
 	}
 
-	checksum = dchid_checksum(&hdr, sizeof(hdr));
-	checksum += dchid_checksum(dchid->pkt_buf, hdr.length + 4);
-
-	if (checksum != 0xffffffff) {
-		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x != 0xffffffff\n",
-			hdr.iface, checksum);
-		goto done;
+	if (dchid_dispatch(dchid, &hdr, dchid->pkt_buf, true)) {
+		ret = dchid_drain_ring(dchid);
+		if (ret < 0)
+			dev_err(dchid->dev, "Receive ring failed: %d\n", ret);
 	}
-
-
-	if (hdr.iface >= MAX_INTERFACES) {
-		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
-	}
-
-	iface = dchid->ifaces[hdr.iface];
-
-	if (!iface) {
-		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr.iface);
-		goto done;
-	}
-
-	switch (hdr.channel) {
-		case DCHID_CHANNEL_CMD:
-			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
-			goto done;
-		case DCHID_CHANNEL_REPORT:
-			break;
-		default:
-			dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
-				 hdr.channel);
-			break;
-	}
-
-	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
-	if (!work)
-		return;
-
-	work->hdr = hdr;
-	work->iface = iface;
-	memcpy(work->data, dchid->pkt_buf, hdr.length);
-	INIT_WORK(&work->work, dchid_packet_work);
-
-	queue_work(iface->wq, &work->work);
 
 done:
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
@@ -1091,10 +1276,10 @@ done:
 
 static int dockchannel_hid_probe(struct platform_device *pdev)
 {
+	struct fwnode_handle *stm;
 	struct device *dev = &pdev->dev;
 	struct dockchannel_hid *dchid;
 	struct device_node *child, *helper;
-	struct fwnode_handle *stm;
 	struct platform_device *helper_pdev;
 	struct property *prop;
 	int ret;
@@ -1109,9 +1294,18 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	/* Retain the generic STM-less setup used by the shared platform tree. */
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
 	fwnode_handle_put(stm);
+	mutex_init(&dchid->ring_mutex);
+	dchid->use_ring = of_device_is_compatible(dev->of_node, "apple,t8132-dockchannel-hid") ||
+			  of_device_is_compatible(dev->of_node, "apple,t8140-dockchannel-hid");
+	/* Neo has no STM interface from which to obtain common HID IDs. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dockchannel-hid")) {
+		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
+		dchid->id_ready = true;
+	}
 
 	/*
 	 * First make sure all the GPIOs are available, in cased we need to defer.
@@ -1123,12 +1317,15 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		for_each_property_of_node(child, prop) {
 			size_t len = strlen(prop->name);
 			struct gpio_desc *gpio;
+			const char *con_id = prop->name;
 
-			if (len < 12 || strncmp("apple,", prop->name, 6) ||
+			if (!strcmp(prop->name, "reset-gpios"))
+				con_id = "reset";
+			else if (len < 12 || strncmp("apple,", prop->name, 6) ||
 			    strcmp("-gpios", prop->name + len - 6))
 				continue;
 
-			gpio = fwnode_gpiod_get_index(&child->fwnode, prop->name, 0, GPIOD_ASIS,
+			gpio = fwnode_gpiod_get_index(&child->fwnode, con_id, 0, GPIOD_ASIS,
 						      prop->name);
 			if (IS_ERR_OR_NULL(gpio)) {
 				if (PTR_ERR(gpio) == -EPROBE_DEFER) {
@@ -1174,7 +1371,14 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (IS_ERR_OR_NULL(dchid->dc)) {
 		return PTR_ERR(dchid->dc);
 	}
-	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
+	if (dchid->use_ring) {
+		dchid->ring = dmam_alloc_coherent(dev, DCHID_RING_SIZE, &dchid->ring_dma,
+						  GFP_KERNEL);
+		if (!dchid->ring)
+			return -ENOMEM;
+		memset(dchid->ring, 0, DCHID_RING_SIZE);
+	}
+	dchid->new_iface_wq = alloc_workqueue("dchid-new", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
@@ -1196,6 +1400,8 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
+	{ .compatible = "apple,t8132-dockchannel-hid" },
+	{ .compatible = "apple,t8140-dockchannel-hid" },
 	{ .compatible = "apple,dockchannel-hid" },
 	{},
 };

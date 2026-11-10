@@ -16,6 +16,8 @@
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/pm_wakeirq.h>
+#include <linux/pm_wakeup.h>
 
 #define DOCKCHANNEL_MAX_IRQ	32
 
@@ -210,6 +212,14 @@ int dockchannel_await(struct dockchannel *dockchannel,
 }
 EXPORT_SYMBOL(dockchannel_await);
 
+static void dockchannel_clear_wake_irq(void *data)
+{
+	struct device *dev = data;
+
+	dev_pm_clear_wake_irq(dev);
+	device_init_wakeup(dev, false);
+}
+
 struct dockchannel *dockchannel_init(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -258,6 +268,20 @@ struct dockchannel *dockchannel_init(struct platform_device *pdev)
 					"apple-dockchannel-rx", dockchannel);
 	if (ret)
 		return ERR_PTR(dev_err_probe(dev, ret, "Failed to request RX IRQ"));
+
+	if (of_property_read_bool(dev->of_node, "wakeup-source")) {
+		ret = device_init_wakeup(dev, true);
+		if (ret)
+			return ERR_PTR(ret);
+		ret = dev_pm_set_wake_irq(dev, dockchannel->rx_irq);
+		if (ret) {
+			device_init_wakeup(dev, false);
+			return ERR_PTR(ret);
+		}
+		ret = devm_add_action_or_reset(dev, dockchannel_clear_wake_irq, dev);
+		if (ret)
+			return ERR_PTR(ret);
+	}
 
 	return dockchannel;
 }
@@ -308,11 +332,19 @@ static void dockchannel_irq_unmask(struct irq_data *data)
 	writel_relaxed(val | BIT(hwirq), dcc->irq_base + IRQ_MASK);
 }
 
+static int dockchannel_irq_set_wake(struct irq_data *data, unsigned int on)
+{
+	struct dockchannel_common *dcc = irq_data_get_irq_chip_data(data);
+
+	return irq_set_irq_wake(dcc->irq, on);
+}
+
 static const struct irq_chip dockchannel_irqchip = {
 	.name = "dockchannel-irqc",
 	.irq_ack = dockchannel_irq_ack,
 	.irq_mask = dockchannel_irq_mask,
 	.irq_unmask = dockchannel_irq_unmask,
+	.irq_set_wake = dockchannel_irq_set_wake,
 };
 
 static int dockchannel_irq_domain_map(struct irq_domain *d, unsigned int virq,
@@ -348,7 +380,7 @@ static int dockchannel_probe(struct platform_device *pdev)
 	writel_relaxed(0, dcc->irq_base + IRQ_MASK);
 	writel_relaxed(~0, dcc->irq_base + IRQ_FLAG);
 
-	dcc->domain = irq_domain_add_linear(dev->of_node, DOCKCHANNEL_MAX_IRQ,
+	dcc->domain = irq_domain_create_linear(of_fwnode_handle(dev->of_node), DOCKCHANNEL_MAX_IRQ,
 					    &dockchannel_irq_domain_ops, dcc);
 	if (!dcc->domain)
 		return -ENOMEM;
