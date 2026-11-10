@@ -157,9 +157,9 @@ impl<T, B: Backend> Lock<T, B> {
         try_pin_init!(Self {
             // SAFETY: We are just forwarding the initialization across a
             // cast away from UnsafeCell, so the pin_init_from_closure and
-            // __pinned_init() requirements are in sync.
+            // raw_try_init() requirements are in sync.
             data <- unsafe { pin_init::pin_init_from_closure(move |slot: *mut UnsafeCell<T>| {
-                t.__pinned_init(slot as *mut T)
+                pin_init::raw_try_init(slot as *mut T, t)
             })},
             _pin: PhantomPinned,
             // SAFETY: `slot` is valid while the closure is called and both `name` and `key` have

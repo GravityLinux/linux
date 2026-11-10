@@ -45,6 +45,7 @@ struct tas2764_priv {
 
 	bool dac_powered;
 	bool unmuted;
+	bool protection_failed;
 
 	struct {
 		int tx_mode;
@@ -125,6 +126,9 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	unsigned int val;
 	int ret;
 
+	if (READ_ONCE(tas2764->protection_failed))
+		return -EIO;
+
 	if (tas2764->dac_powered)
 		val = tas2764->unmuted ?
 			TAS2764_PWR_CTRL_ACTIVE : TAS2764_PWR_CTRL_MUTE;
@@ -172,6 +176,9 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
+
+	if (READ_ONCE(tas2764->protection_failed))
+		return -EIO;
 
 	ret = regulator_enable(tas2764->sdz_reg);
 
@@ -858,6 +865,62 @@ static void tas2764_codec_remove(struct snd_soc_component *component)
 
 	regulator_disable(tas2764->sdz_reg);
 }
+
+/* Machine-level protection owns gain controls before the card is exposed. */
+int tas2764_set_protected_attenuation(struct snd_soc_component *component,
+				    unsigned int attenuation)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	unsigned int actual;
+	int ret;
+
+	/* A protection client requires a physical fail-closed shutdown line. */
+	if (!tas->sdz_gpio)
+		return -EOPNOTSUPP;
+	if (attenuation > TAS2764_DVC_MAX)
+		return -EINVAL;
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+
+	ret = regmap_write(tas->regmap, TAS2764_DVC, attenuation);
+	if (!ret)
+		ret = regmap_read_bypassed(tas->regmap, TAS2764_DVC, &actual);
+	if (!ret && actual != attenuation)
+		ret = -EIO;
+	if (ret) {
+		WRITE_ONCE(tas->protection_failed, true);
+		gpiod_set_value_cansleep(tas->sdz_gpio, 0);
+		dev_err(tas->dev, "protection gain write/readback failed; amplifier disabled\n");
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tas2764_set_protected_attenuation);
+
+int tas2764_get_protected_attenuation(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	unsigned int value;
+	int ret;
+
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+	ret = regmap_read_bypassed(tas->regmap, TAS2764_DVC, &value);
+	return ret ? ret : value;
+}
+EXPORT_SYMBOL_GPL(tas2764_get_protected_attenuation);
+
+int tas2764_check_fault(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	unsigned int value;
+	int ret;
+
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+	ret = regmap_read_bypassed(tas->regmap, TAS2764_REG(0, 0x42), &value);
+	return ret ? ret : value ? -EIO : 0;
+}
+EXPORT_SYMBOL_GPL(tas2764_check_fault);
 
 static DECLARE_TLV_DB_SCALE(tas2764_digital_tlv, 1100, 50, 0);
 static DECLARE_TLV_DB_SCALE(tas2764_playback_volume, -10050, 50, 1);

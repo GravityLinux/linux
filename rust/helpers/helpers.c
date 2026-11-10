@@ -71,6 +71,7 @@
 #include "gpu.c"
 #include "interrupt.c"
 #include "io.c"
+#include "iosys_map.c"
 #include "irq.c"
 #include "jump_label.c"
 #include "kunit.c"

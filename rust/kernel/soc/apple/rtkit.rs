@@ -51,9 +51,28 @@ pub trait Buffer {
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>>;
 }
 
+/// Opt-in system endpoint protocol variants, fixed when an RTKit client is created.
+#[derive(Clone, Copy)]
+pub struct Quirks(u32);
+
+impl Quirks {
+    /// Use the default RTKit protocol.
+    pub const NONE: Self = Self(0);
+
+    /// Start and acknowledge the crash-buffer exchange before completing boot.
+    pub const EARLY_CRASHLOG: Self =
+        Self(bindings::apple_rtkit_quirks_APPLE_RTKIT_QUIRK_EARLY_CRASHLOG);
+
+    /// Omit the size field when replying to an oslog buffer allocation request.
+    pub const OSLOG_NO_SIZE: Self = Self(bindings::apple_rtkit_quirks_APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE);
+}
+
 /// Callback operations for an RTKit client.
 #[vtable]
 pub trait Operations {
+    /// Protocol variants required by this client. The default preserves normal RTKit boot.
+    const QUIRKS: Quirks = Quirks::NONE;
+
     /// Arbitrary user context type.
     type Data: ForeignOwnable + Send + Sync;
 
@@ -205,6 +224,7 @@ unsafe extern "C" fn shmem_destroy_callback<T: Operations>(
 
 impl<T: Operations> RtKit<T> {
     const VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        quirks: T::QUIRKS.0,
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),
@@ -266,6 +286,13 @@ impl<T: Operations> RtKit<T> {
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
+    }
+
+    /// Quiesces the host interface and puts the coprocessor to sleep.
+    /// Callers must retain firmware-accessible memory if this fails.
+    pub fn shutdown(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_shutdown(self.rtk) })
     }
 
     /// Starts a non-system endpoint.

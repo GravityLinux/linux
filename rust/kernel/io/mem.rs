@@ -10,7 +10,6 @@ use crate::{
         Device, //
     },
     devres::DevresLt,
-    devres::Devres,
     impl_flags,
     io::{
         self,
@@ -302,6 +301,21 @@ impl<'a, const SIZE: usize> IoMem<'a, SIZE> {
         Ok(IoMem { dev, io })
     }
 
+    /// Returns a checked MMIO address for an access emitted by inline assembly.
+    ///
+    /// The caller must keep this mapping borrowed while using the address and
+    /// provide the ordering required by the register protocol.
+    pub fn io_addr<T>(&self, offset: usize) -> Result<usize> {
+        if offset.checked_add(core::mem::size_of::<T>()).ok_or(EINVAL)? > self.io.size() {
+            return Err(EINVAL);
+        }
+        let addr = self.io.addr().checked_add(offset).ok_or(EINVAL)?;
+        if addr % core::mem::align_of::<T>() != 0 {
+            return Err(EINVAL);
+        }
+        Ok(addr)
+    }
+
     /// Consume the `IoMem` and register it as a device-managed resource.
     ///
     /// The returned [`DevresIoMem`] can outlive the original borrow and be stored in driver data.
@@ -423,6 +437,23 @@ impl Mem {
     /// Returns the size of this mapped memory block.
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Borrows a bounded byte range as ordinary RAM for IO-agnostic APIs.
+    pub fn as_iosys_map(
+        &mut self,
+        offset: usize,
+        size: usize,
+    ) -> Result<super::IoSysMap<'_, super::Region>> {
+        if offset.checked_add(size).ok_or(EINVAL)? > self.size {
+            return Err(EINVAL);
+        }
+        // SAFETY: The checked range is within this owned mapping.
+        let base = unsafe { self.ptr().add(offset) };
+        let region = super::Region::ptr_try_from_raw_parts_mut(base, size)?;
+        // SAFETY: This mapping owns the checked, aligned RAM range, and the
+        // returned view cannot outlive this borrow.
+        Ok(super::IoSysMap::Sys(unsafe { super::SysMem::new(region) }))
     }
 }
 
