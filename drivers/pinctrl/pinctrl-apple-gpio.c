@@ -66,6 +66,23 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_DRIVE_STRENGTH1 GENMASK(23, 22)
 #define REG_IRQ(g, x)        (0x800 + 0x40 * (g) + 4 * ((x) >> 5))
 
+static bool apple_gpio_reg_accessible(struct device *dev, unsigned int reg)
+{
+	int n = of_property_count_u32_elems(dev->of_node, "gpio-reserved-ranges");
+	unsigned int pin = reg / sizeof(u32);
+	int i;
+
+	for (i = 0; i + 1 < n; i += 2) {
+		u32 start, count;
+
+		of_property_read_u32_index(dev->of_node, "gpio-reserved-ranges", i, &start);
+		of_property_read_u32_index(dev->of_node, "gpio-reserved-ranges", i + 1, &count);
+		if (pin >= start && pin - start < count)
+			return false;
+	}
+	return true;
+}
+
 static const struct regmap_config regmap_config = {
 	.reg_bits = 32,
 	.val_bits = 32,
@@ -75,6 +92,8 @@ static const struct regmap_config regmap_config = {
 	.num_reg_defaults_raw = 512,
 	.use_relaxed_mmio = true,
 	.use_raw_spinlock = true,
+	.readable_reg = apple_gpio_reg_accessible,
+	.writeable_reg = apple_gpio_reg_accessible,
 };
 
 /* No locking needed to mask/unmask IRQs as the interrupt mode is per pin-register. */
@@ -475,7 +494,14 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pctl->base))
 		return PTR_ERR(pctl->base);
 
-	pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base, &regmap_config);
+	{
+		struct regmap_config config = regmap_config;
+
+		/* Cache only implemented pins; reserved pins may fault on reads. */
+		config.max_register = REG_GPIO(npins - 1);
+		config.num_reg_defaults_raw = npins;
+		pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base, &config);
+	}
 	if (IS_ERR(pctl->map))
 		return dev_err_probe(&pdev->dev, PTR_ERR(pctl->map),
 				     "Failed to create regmap\n");
