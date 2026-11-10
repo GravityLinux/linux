@@ -307,10 +307,18 @@ static bool has_impdef_pmuv3(const struct arm64_cpu_capabilities *entry, int sco
 	return is_midr_in_range_list(apple_cpus);
 }
 
+/* Later Apple cores with the same broken SEIS but no IMPDEF PMUv3 traps */
+static const struct midr_range apple_broken_seis_cpus[] = {
+	MIDR_ALL_VERSIONS(MIDR_APPLE_M4_DONAN_ECORE),
+	MIDR_ALL_VERSIONS(MIDR_APPLE_M4_DONAN_PCORE),
+	{},
+};
+
 static bool has_broken_gic_v3_seis(const struct arm64_cpu_capabilities *entry, int scope)
 {
 	return (is_kernel_in_hyp_mode() &&
-		is_midr_in_range_list(apple_cpus) &&
+		(is_midr_in_range_list(apple_cpus) ||
+		 is_midr_in_range_list(apple_broken_seis_cpus)) &&
 		(read_sysreg_s(SYS_ICH_VTR_EL2) & ICH_VTR_EL2_SEIS));
 }
 

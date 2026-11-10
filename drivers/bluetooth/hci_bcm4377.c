@@ -2228,6 +2228,10 @@ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
 	bcm4377->taurus_beamforming_cal_blob =
 		of_get_property(np, "brcm,taurus-bf-cal-blob",
 				&bcm4377->taurus_beamforming_cal_size);
+	if (bcm4377->hw->id == 0x4388) {
+		/* BCM4388 never uses the non-beamforming calibration. */
+		return bcm4377->taurus_beamforming_cal_blob ? 0 : -ENOENT;
+	}
 	if (!bcm4377->taurus_beamforming_cal_blob) {
 		dev_err(&bcm4377->pdev->dev,
 			"no brcm,taurus-bf-cal-blob property\n");
@@ -2396,6 +2400,8 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LE_CODED);
 	if (bcm4377->hw->broken_le_ext_adv_report_phy)
 		hci_set_quirk(hdev, HCI_QUIRK_FIXUP_LE_EXT_ADV_REPORT_PHY);
+
+	hci_set_brcm_capable(hdev);
 
 	pci_set_drvdata(pdev, bcm4377);
 	hci_set_drvdata(hdev, bcm4377);
