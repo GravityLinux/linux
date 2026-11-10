@@ -53,14 +53,19 @@
 
 			trips {
 				cpu_warm: cpu-warm {
-					temperature = <90000>;
+					temperature = <105000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 				cpu_hot: cpu-hot {
-					temperature = <95000>;
+					temperature = <110000>;
 					hysteresis = <5000>;
 					type = "passive";
+				};
+				cpu_critical: cpu-critical {
+					temperature = <120000>;
+					hysteresis = <5000>;
+					type = "critical";
 				};
 			};
 
@@ -74,17 +79,17 @@
 				};
 				map-hot {
 					trip = <&cpu_hot>;
-					/*
-					 * E: 8 OPPs, P: 20 OPPs, including turbo entries.
-					 * cpufreq cooling counts those entries with boost
-					 * either on or off. State 7/19 selects 900/912 MHz.
-					 * Equal lower/upper limits clamp immediately.
-					 */
-					cooling-device = <&cpu_e0 7 7>, <&cpu_e1 7 7>,
-							 <&cpu_e2 7 7>, <&cpu_e3 7 7>,
-							 <&cpu_e4 7 7>, <&cpu_e5 7 7>,
-							 <&cpu_p0 19 19>, <&cpu_p1 19 19>,
-							 <&cpu_p2 19 19>, <&cpu_p3 19 19>;
+					/* P cores start cooling at the lower warm trip. */
+					cooling-device = <&cpu_p0 0 THERMAL_NO_LIMIT>,
+							 <&cpu_p1 0 THERMAL_NO_LIMIT>,
+							 <&cpu_p2 0 THERMAL_NO_LIMIT>,
+							 <&cpu_p3 0 THERMAL_NO_LIMIT>,
+							 <&cpu_e0 0 THERMAL_NO_LIMIT>,
+							 <&cpu_e1 0 THERMAL_NO_LIMIT>,
+							 <&cpu_e2 0 THERMAL_NO_LIMIT>,
+							 <&cpu_e3 0 THERMAL_NO_LIMIT>,
+							 <&cpu_e4 0 THERMAL_NO_LIMIT>,
+							 <&cpu_e5 0 THERMAL_NO_LIMIT>;
 				};
 			};
 		};
