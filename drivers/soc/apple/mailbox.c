@@ -28,12 +28,13 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/mailbox.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
-#include "mailbox.h"
 
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_ASC_MBOX_CONTROL_EMPTY BIT(17)
+#define APPLE_ASC_MBOX_CONTROL_ENABLE BIT(0)
 
 #define APPLE_ASC_MBOX_A2I_CONTROL 0x110
 #define APPLE_ASC_MBOX_A2I_SEND0 0x800
@@ -252,6 +253,21 @@ int apple_mbox_start(struct apple_mbox *mbox)
 		return ret;
 
 	/*
+	 * A firmware handoff can leave the I2A FIFO enabled with stale read and
+	 * write pointers from the previous RTKit client.  T8132 DCP firmware does
+	 * not consume a new INIT message until the AP has reinitialized its receive
+	 * FIFO.  Native clients reset only OUTBOX (I2A) here; resetting A2I would
+	 * race the IOP-owned read pointer and could discard an AP message.
+	 */
+	if (of_property_read_bool(mbox->dev->of_node,
+				  "apple,reset-recv-fifo-on-start")) {
+		writel_relaxed(APPLE_ASC_MBOX_CONTROL_EMPTY |
+			       APPLE_ASC_MBOX_CONTROL_ENABLE,
+			       mbox->regs + mbox->hw->i2a_control);
+		readl_relaxed(mbox->regs + mbox->hw->i2a_control);
+	}
+
+	/*
 	 * Only some variants of this mailbox HW provide interrupt control
 	 * at the mailbox level. We therefore need to handle enabling/disabling
 	 * interrupts at the main interrupt controller anyway for hardware that
@@ -441,7 +457,16 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 	.irq_bit_send_empty = APPLE_M3_MBOX_IRQ_A2I_EMPTY,
 };
 
+
+static const struct apple_mbox_hw apple_mbox_neo_proxy_hw = {
+    .control_full = BIT(16), .control_empty = BIT(17),
+    .a2i_control = 0x0, .a2i_send0 = 0x180, .a2i_send1 = 0x188,
+    .i2a_control = 0x4, .i2a_recv0 = 0x1b0, .i2a_recv1 = 0x1b8,
+    .has_irq_controls = false,
+};
 static const struct of_device_id apple_mbox_of_match[] = {
+    { .compatible = "apple,neo-aop-proxy-mailbox", .data = &apple_mbox_neo_proxy_hw },
+
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },

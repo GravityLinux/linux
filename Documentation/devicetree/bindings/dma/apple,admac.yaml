@@ -39,7 +39,6 @@ properties:
               - apple,t6031-admac
           - const: apple,t8122-admac
       - const: apple,t8122-admac
-      - const: apple,t8132-admac
 
   reg:
     maxItems: 1
@@ -47,8 +46,7 @@ properties:
   '#dma-cells':
     const: 1
     description:
-      Clients specify a single cell with channel number. Logical IDs alternate
-      TX and RX, including T8132 controllers with separate register banks.
+      Clients specify a single cell with channel number.
 
   dma-channels:
     maximum: 32

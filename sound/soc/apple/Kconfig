@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menu "Apple"
 
+config SND_SOC_APPLE_AOP_AUDIO
+	tristate "AOP audio driver"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on RUST
+	select APPLE_AOP
+	select SND_DMAENGINE_PCM
+	select SND_SOC_TAS2764 if I2C
+	select I2C_APPLE if ARCH_APPLE && I2C
+	select REGULATOR_FIXED_VOLTAGE if REGULATOR
+	help
+	  This option enables an ASoC driver for sound devices connected to the AOP
+	  co-processor on ARM Macs. This includes the built-in microphone on those
+	  machines, with protected AOP-configured speaker playback on supported
+	  boards when the amplifier dependencies are enabled.
+
 config SND_SOC_APPLE_MCA
 	tristate "Apple Silicon MCA driver"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -48,6 +63,23 @@ config SND_SOC_APPLE_T8132_SPEAKER
 	  routing and protected PCM copies. This driver can be built into
 	  the kernel or as the snd-t8132-speaker module.
 
+config SND_SOC_APPLE_NEO_MIC
+	bool "Apple T8140/T8142 AOP microphone capture"
+	depends on ARCH_APPLE
+	select APPLE_RTKIT
+	select APPLE_MAILBOX
+	select SND_PCM
+	select PM_GENERIC_DOMAINS if PM
+	help
+	  Microphone capture on T8140/T8142 using the resident AOP firmware.
+	  This also supplies the transport used by the protected speaker driver.
+
+config SND_SOC_APPLE_NEO_SPEAKER
+	bool "Apple T8140/T8142 protected speaker playback"
+	depends on SND_SOC_APPLE_NEO_MIC && GPIOLIB
+	help
+	  Neo speaker PCM with a fixed 3/256 gain cap, thermal admission and
+	  amplifier-first cutoff. The cap remains deliberately conservative.
 config SND_SOC_APPLE_J713_HEADPHONES
 	tristate "Apple J713 headphones"
 	depends on ARCH_APPLE && ARM64_16K_PAGES && I2C && GPIOLIB && OF
@@ -60,5 +92,13 @@ config SND_SOC_APPLE_J713_HEADPHONES
 	  Headphone-only playback and jack detection on the M4 MacBook Air J713.
 	  Uses MCA frontend/port 2, ADMAC TX2 and the CS42L84 codec. No speaker
 	  amplifier, speaker PCM or speaker protection model is instantiated.
+
+config SND_SOC_APPLE_AOP_SPEAKER_CODECS
+	bool "ASoC codecs for protected AOP speaker playback"
+	depends on SND_SOC_APPLE_NEO_SPEAKER && I2C
+	select SND_SOC_TAS2764
+	help
+	  Connect DT-described SN012776 codecs to the protected AOP PCM.
+	  Boards without audio-codecs retain the existing raw PCM card.
 
 endmenu
