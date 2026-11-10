@@ -45,10 +45,10 @@ MODULE_PARM_DESC(enable, "Register the power-down idle state (default: on; 0 tur
 
 static char *cpus;
 module_param(cpus, charp, 0444);
-MODULE_PARM_DESC(cpus, "CPUs that may power down in idle, as a cpulist (default: all)");
+MODULE_PARM_DESC(cpus, "CPUs that may power down in idle, as a cpulist (default: all); the others poll");
 
 static struct cpumask apple_m4_idle_cpus;
-static bool apple_m4_idle_nop;
+static struct cpumask apple_m4_poll_cpus;
 
 /* Measured: a wake from the state adds about 13 us to a cross-CPU round trip. */
 static unsigned int exit_latency_us = 20;
@@ -152,19 +152,21 @@ static __cpuidle int apple_m4_enter_pwrdown(struct cpuidle_device *dev,
 	return index;
 }
 
+#define APPLE_M4_POLL_STATE {					\
+	.enter			= apple_m4_enter_poll,		\
+	.exit_latency		= 0,				\
+	.target_residency	= 0,				\
+	.power_usage		= UINT_MAX,			\
+	.name			= "POLL",			\
+	.desc			= "CPU polling",		\
+	.flags			= CPUIDLE_FLAG_POLLING,		\
+}
+
 static struct cpuidle_driver apple_m4_idle_driver = {
 	.name = "apple_m4_idle",
 	.owner = THIS_MODULE,
 	.states = {
-		[STATE_POLL] = {
-			.enter			= apple_m4_enter_poll,
-			.exit_latency		= 0,
-			.target_residency	= 0,
-			.power_usage		= UINT_MAX,
-			.name			= "POLL",
-			.desc			= "CPU polling",
-			.flags			= CPUIDLE_FLAG_POLLING,
-		},
+		[STATE_POLL] = APPLE_M4_POLL_STATE,
 		[STATE_PWRDOWN] = {
 			.enter			= apple_m4_enter_pwrdown,
 			/* tick_freeze() replaces the normal broadcast entry. */
@@ -188,6 +190,20 @@ static struct cpuidle_driver apple_m4_idle_driver = {
 	.state_count = STATE_COUNT,
 };
 
+/*
+ * CPUs left out by cpus= keep polling: without a cpuidle driver they would
+ * fall back to the default idle, whose WFI loses their registers.
+ */
+static struct cpuidle_driver apple_m4_poll_driver = {
+	.name = "apple_m4_poll",
+	.owner = THIS_MODULE,
+	.states = {
+		[STATE_POLL] = APPLE_M4_POLL_STATE,
+	},
+	.safe_state_index = STATE_POLL,
+	.state_count = 1,
+};
+
 static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 {
 	struct cpuidle_state *pd = &apple_m4_idle_driver.states[STATE_PWRDOWN];
@@ -196,10 +212,6 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	pd->exit_latency = exit_latency_us;
 	pd->target_residency = target_residency_us;
 
-	/*
-	 * The other CPUs get no cpuidle driver and keep the default idle,
-	 * which idle=nop keeps from executing WFI.
-	 */
 	cpumask_copy(&apple_m4_idle_cpus, cpu_possible_mask);
 	if (cpus && cpulist_parse(cpus, &apple_m4_idle_cpus)) {
 		pr_err("invalid cpus=%s\n", cpus);
@@ -208,20 +220,21 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	cpumask_and(&apple_m4_idle_cpus, &apple_m4_idle_cpus, cpu_possible_mask);
 	if (cpumask_empty(&apple_m4_idle_cpus))
 		return -EINVAL;
-	/*
-	 * Once polling is off, the CPUs left out fall back to the default idle,
-	 * whose WFI only idle=nop keeps them from executing.
-	 */
-	if (!cpumask_equal(&apple_m4_idle_cpus, cpu_possible_mask) &&
-	    !apple_m4_idle_nop) {
-		pr_err("cpus=%s needs idle=nop on the command line\n", cpus);
-		return -EINVAL;
-	}
 	apple_m4_idle_driver.cpumask = &apple_m4_idle_cpus;
 
 	ret = cpuidle_register(&apple_m4_idle_driver, NULL);
 	if (ret)
 		return ret;
+
+	cpumask_andnot(&apple_m4_poll_cpus, cpu_possible_mask, &apple_m4_idle_cpus);
+	if (!cpumask_empty(&apple_m4_poll_cpus)) {
+		apple_m4_poll_driver.cpumask = &apple_m4_poll_cpus;
+		ret = cpuidle_register(&apple_m4_poll_driver, NULL);
+		if (ret) {
+			cpuidle_unregister(&apple_m4_idle_driver);
+			return ret;
+		}
+	}
 
 	/*
 	 * The kernel boots T8132 polling in idle (see setup_arch()), because
@@ -276,8 +289,6 @@ static int __init apple_m4_cpuidle_init(void)
 		pr_warn("hlt given: WFI loses state on T8132, not registering\n");
 		return 0;
 	}
-
-	apple_m4_idle_nop = apple_m4_cmdline_has("idle=nop");
 
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
