@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple Mac mini (M4, 2024)
+ *
+ * target-type: J773g
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8132.dtsi"
+#include "t8132-jxxx.dtsi"
+#include "t8132-gpu.dtsi"
+
+/ {
+	compatible = "apple,j773g", "apple,t8132", "apple,arm-platform";
+	model = "Apple Mac mini (M4, 2024)";
+
+	/* Protected mono internal speaker. */
+	speaker-audio {
+		compatible = "apple,j773g-speaker";
+		apple,mca = <&mca>;
+		apple,codec = <&speaker_amp>;
+	};
+
+	aliases {
+		ethernet0 = &ethernet0;
+		sio = &sio;
+	};
+};
+
+/* Persistent console capture for early T8132 bring-up failures.  Keep this
+ * near the top of RAM, outside m1n1's kernel/initramfs load area. */
+&{/reserved-memory} {
+	ramoops@103e0000000 {
+		compatible = "ramoops";
+		reg = <0x103 0xe0000000 0x0 0x200000>;
+		record-size = <0x40000>;
+		console-size = <0x100000>;
+		pmsg-size = <0x40000>;
+	};
+};
+
+/*
+ * Keep the power-domains used for the HDMI port on.
+ */
+&framebuffer0 {
+	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
+
+&sio {
+	status = "okay";
+};
+
+&dpaudio0 {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dcpext0_mbox {
+	status = "okay";
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dptxphy {
+	status = "okay";
+};
+
+&dcp {
+	status = "okay";
+	/* Expose the primary and overlay surfaces. */
+	apple,iomfb-surfaces = <1 1 0 0>;
+	apple,iomfb-surface-order = <0 1>;
+	apple,iomfb-primary-surface = <0>;
+	apple,connector-type = "HDMI-A";
+	phys = <&dptxphy>;
+	phy-names = "dp-phy";
+	apple,dptx-phy = <4>;
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+};
+
+/* The internal SSD is part of the M4 mini Linux bring-up environment. */
+&nvme {
+	status = "okay";
+};
+
+/*
+ * Provide labels for the USB type C ports.
+ */
+
+&typec0 {
+	label = "USB-C Back-middle";
+};
+
+&typec1 {
+	label = "USB-C Back-left";
+};
+
+// The front ports are on dwc/atcphy2 via a hub
+
+&nub_spmi_a0 {
+	hpm3: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			<64 IRQ_TYPE_EDGE_RISING>,
+			<69 IRQ_TYPE_EDGE_RISING>,
+			<71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec3: connector {
+			label = "USB-C Back-right";
+			compatible = "usb-c-connector";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					typec3_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_3_hs>;
+					};
+				};
+				port@1 {
+					reg = <1>;
+					typec3_connector_ss: endpoint {
+						remote-endpoint = <&atcphy3_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy3 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy3_typec_lanes: endpoint {
+				remote-endpoint = <&typec3_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy3_usb3: endpoint {
+				remote-endpoint = <&dwc3_3_ss>;
+			};
+		};
+	};
+};
+
+&dwc3_3 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_3_hs: endpoint {
+				remote-endpoint = <&typec3_connector_hs>;
+			};
+		};
+		port@1 {
+			reg = <1>;
+			dwc3_3_ss: endpoint {
+				remote-endpoint = <&atcphy3_usb3>;
+			};
+		};
+	};
+};
+
+/* The two front ports are behind a permanently attached host-only hub. */
+&dwc3_2 {
+	dr_mode = "host";
+	/delete-property/ role-switch-default-mode;
+};
+
+&atcphy2 {
+	apple,fixed-usb3;
+	apple,fixed-lane-swap;
+	/delete-property/ orientation-switch;
+	/delete-property/ mode-switch;
+};
+
+&pinctrl_ap {
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <101 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <198 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
+	};
+};
+
+&wifi0 {
+	brcm,board-type = "apple,sakhalin";
+};
+
+&bluetooth0 {
+       brcm,board-type = "apple,sakhalin";
+};
+
+&port02 {
+	bus-range = <2 2>;
+	status = "okay";
+	ethernet0: ethernet@0,0 {
+		reg = <0x20000 0x0 0x0 0x0 0x0>;
+		/* To be filled by the loader */
+		local-mac-address = [00 10 18 00 00 00];
+	};
+};
+
+&pcie2_dart {
+        status = "okay";
+};
+
+&pcie0 {
+	iommu-map = <0x100 &pcie0_dart 1 1>,
+	            <0x200 &pcie2_dart 1 1>;
+};
+
+#include "hwmon-common.dtsi"
+#include "hwmon-mini.dtsi"
+
+&i2c3 {
+	status = "okay";
+};
+
+&dart_audio {
+	status = "okay";
+};
+
+&admac {
+	status = "okay";
+};
+
+&mca {
+	status = "okay";
+};
+
+&i2c3 {
+	speaker_amp: amplifier@38 {
+		compatible = "ti,sn012776";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		shutdown-gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+	};
+};

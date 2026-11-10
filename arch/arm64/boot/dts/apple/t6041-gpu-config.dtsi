@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* G16C configuration nodes. m1n1 supplies every board-dependent value.
+ * Keep this separate from the SoC's mailbox/MMIO/memory resource nodes. */
+/ {
+    gpu_g16c_opp: opp-table-gpu-g16c {
+        compatible = "operating-points-v2";
+        opp00 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp01 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp02 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp03 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp04 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp05 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp06 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp07 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp08 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp09 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+        opp10 {
+            opp-hz = /bits/ 64 <0>;
+            apple,alternate-opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0 0 0 0>;
+            apple,sram-microvolt = <0 0 0 0>;
+            apple,perf-index = <0 0>;
+            apple,relative-power = <0 0>;
+        };
+    };
+    gpu_g16c_cs_opp: opp-table-gpu-g16c-cs {
+        compatible = "operating-points-v2";
+        opp00 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp01 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp02 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp03 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp04 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp05 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp06 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+        opp07 {
+            opp-hz = /bits/ 64 <0>;
+            opp-microvolt = <0>;
+        };
+    };
+};
+
+&gpu {
+    operating-points-v2 = <&gpu_g16c_opp>;
+    apple,cs-opp = <&gpu_g16c_cs_opp>;
+};

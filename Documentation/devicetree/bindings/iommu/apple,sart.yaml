@@ -33,6 +33,8 @@ properties:
           - enum:
               - apple,t6020-sart
               - apple,t8112-sart
+              - apple,t8122-sart
+              - apple,t8132-sart
           - const: apple,t6000-sart
       - enum:
           - apple,t6000-sart

@@ -34,9 +34,25 @@ struct apple_rtkit_shmem {
 	void *private;
 };
 
+/**
+ * enum apple_rtkit_quirks - opt-in system endpoint protocol variants
+ * @APPLE_RTKIT_QUIRK_EARLY_CRASHLOG: Start the crashlog endpoint before
+ *     acknowledging its endpoint map, acknowledge firmware-owned crash buffers,
+ *     and wait for the buffer exchange before requesting AP power on.
+ * @APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE: Omit the size field from replies allocating
+ *     an oslog buffer; the reply contains only the type and page address.
+ *
+ * Clients select these at initialization. Zero preserves the default protocol.
+ */
+enum apple_rtkit_quirks {
+	APPLE_RTKIT_QUIRK_EARLY_CRASHLOG = 1U << 0,
+	APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE = 1U << 1,
+};
+
 /*
  * Struct to represent implementation-specific RTKit operations.
  *
+ * @quirks:        System endpoint protocol variants, fixed for this instance.
  * @crashed:       Called when the co-processor has crashed. Runs in process
  *                 context.
  * @recv_message:  Function called when a message from RTKit is received
@@ -56,6 +72,7 @@ struct apple_rtkit_shmem {
  *                 context.
  */
 struct apple_rtkit_ops {
+	u32 quirks;
 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
@@ -78,6 +95,13 @@ struct apple_rtkit;
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
+/*
+ * Frees internal RTKit state allocated by devm_apple_rtkit_init().
+ *
+ * @dev:	Pointer to the device node this coprocessor is assocated with
+ * @rtk:	Internal RTKit state initialized by devm_apple_rtkit_init()
+ */
+void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk);
 
 /*
  * Non-devm version of devm_apple_rtkit_init. Must be freed with
@@ -178,5 +202,13 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
  * @rtk:            RTKit reference
  */
 int apple_rtkit_poll(struct apple_rtkit *rtk);
+
+/*
+ * Checks if an endpoint with a given index exists
+ *
+ * @rtk:            RTKit reference
+ * @ep:             endpoint to check for
+ */
+bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep);
 
 #endif /* _LINUX_APPLE_RTKIT_H_ */

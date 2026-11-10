@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Minimal T6041 CPU/interrupt/GPU bring-up description. Peripheral support is
+ * intentionally added only with its own hardware evidence. GPU calibration,
+ * OPPs and reserved firmware ranges are supplied by m1n1, never read as ADT
+ * by the Linux driver. Addresses: clean J616c ADT and source-qualified shim.
+ */
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+/ {
+    compatible = "apple,t6041", "apple,arm-platform";
+    #address-cells = <2>;
+    #size-cells = <2>;
+    aliases { gpu = &gpu; serial0 = &serial0; };
+    cpus {
+        #address-cells = <2>;
+        #size-cells = <0>;
+        cpu0: cpu@0 {
+            compatible = "apple,sawtooth";
+            device_type = "cpu";
+            reg = <0 0x0>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu1: cpu@1 {
+            compatible = "apple,sawtooth";
+            device_type = "cpu";
+            reg = <0 0x1>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu2: cpu@2 {
+            compatible = "apple,sawtooth";
+            device_type = "cpu";
+            reg = <0 0x2>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu3: cpu@3 {
+            compatible = "apple,sawtooth";
+            device_type = "cpu";
+            reg = <0 0x3>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu4: cpu@10100 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10100>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu5: cpu@10101 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10101>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu6: cpu@10102 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10102>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu7: cpu@10103 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10103>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu8: cpu@10104 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10104>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu9: cpu@10105 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10105>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu10: cpu@10200 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10200>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu11: cpu@10201 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10201>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu12: cpu@10202 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10202>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu13: cpu@10203 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10203>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu14: cpu@10204 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10204>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+        cpu15: cpu@10205 {
+            compatible = "apple,everest";
+            device_type = "cpu";
+            reg = <0 0x10205>;
+#ifdef M1N1_MONITOR
+            enable-method = "psci";
+#else
+            enable-method = "spin-table";
+#endif
+            cpu-release-addr = <0 0>;
+        };
+    };
+#ifdef M1N1_MONITOR
+    /* Test transport only: m1n1 implements PSCI CPU_ON over HVC. */
+    psci { compatible = "arm,psci-1.0"; method = "hvc"; };
+#endif
+    timer {
+        compatible = "arm,armv8-timer";
+        interrupt-parent = <&aic>;
+        interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+                     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+                     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+                     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+    };
+    clkref: clock-ref {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+    };
+    soc {
+        compatible = "simple-bus";
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        nonposted-mmio;
+        aic: interrupt-controller@502400000 {
+            compatible = "apple,t6041-aic3", "apple,t8122-aic3";
+            #interrupt-cells = <3>;
+            interrupt-controller;
+            reg = <5 0x02400000 0 0x1cc000>, <5 0x02440000 0 0x4000>;
+            reg-names = "core", "event";
+            affinities {
+                e-core-pmu-affinity {
+                    apple,fiq-index = <AIC_CPU_PMU_E>;
+                    cpus = <&cpu0 &cpu1 &cpu2 &cpu3>;
+                };
+                p-core-pmu-affinity {
+                    apple,fiq-index = <AIC_CPU_PMU_P>;
+                    cpus = <&cpu4 &cpu5 &cpu6 &cpu7 &cpu8 &cpu9
+                            &cpu10 &cpu11 &cpu12 &cpu13 &cpu14 &cpu15>;
+                };
+            };
+        };
+        serial0: serial@429200000 {
+            compatible = "apple,s5l-uart";
+            reg = <4 0x29200000 0 0x4000>;
+            reg-io-width = <4>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1559 IRQ_TYPE_LEVEL_HIGH>;
+            clocks = <&clkref>, <&clkref>;
+            clock-names = "uart", "clk_uart_baud0";
+        };
+        gpu: gpu@288000000 {
+            compatible = "apple,agx-t6041", "apple,agx-g16c";
+            reg = <2 0x88000000 0 0x3758000>, <2 0x8a600000 0 0x4000>;
+            reg-names = "sgx", "asc";
+            mboxes = <&agx_mbox>;
+            mbox-names = "primary";
+            /* Enable explicitly in the probe test after powering both GPU and
+             * ASC through m1n1. Permanent PMGR ownership is still required. */
+            status = "disabled";
+        };
+        agx_mbox: mailbox@28a608000 {
+            compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+            reg = <2 0x8a608000 0 0x4000>;
+            #mbox-cells = <0>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1501 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1502 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1503 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1504 IRQ_TYPE_LEVEL_HIGH>;
+            interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+        };
+    };
+};
+#include "t6041-gpu-memory.dtsi"
+#include "t6041-gpu-config.dtsi"

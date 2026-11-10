@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/dts-v1/;
+#include "t6041.dtsi"
+/ {
+    compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
+    model = "Apple MacBook Pro (16-inch, M4 Max, 2024)";
+    chassis-type = "laptop";
+    chosen { stdout-path = "serial0:115200n8"; };
+    memory@800000000 { device_type = "memory"; reg = <8 0 0 0>; };
+};
