@@ -584,6 +584,7 @@ int tb_domain_freeze_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_freeze_noirq, "thunderbolt_apple");
 
 int tb_domain_thaw_noirq(struct tb *tb)
 {
@@ -597,6 +598,7 @@ int tb_domain_thaw_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_thaw_noirq, "thunderbolt_apple");
 
 void tb_domain_complete(struct tb *tb)
 {
