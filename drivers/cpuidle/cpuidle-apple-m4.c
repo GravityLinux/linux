@@ -31,6 +31,8 @@
 #include <linux/sched/idle.h>
 #include <linux/string.h>
 
+#include <asm/cpuidle.h>
+
 enum idle_state {
 	STATE_POLL,
 	STATE_PWRDOWN,
@@ -227,7 +229,7 @@ static int apple_m4_cpuidle_probe(struct platform_device *pdev)
 	 * goes through this driver, whose only other state polls, stop forcing
 	 * the poll loop.
 	 */
-	cpu_idle_poll_ctrl(false);
+	apple_t8132_release_poll_idle();
 
 	pr_info("registered power-down idle on CPUs %*pbl (exit %u us, residency %u us)\n",
 		cpumask_pr_args(&apple_m4_idle_cpus), exit_latency_us,
