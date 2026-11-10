@@ -5,9 +5,12 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
 
 #include "multi-die-cpp.h"
 
@@ -35,14 +38,14 @@
 
 #define DIE
 #define DIE_NO 0
+#define SOC_NODE soc
 
-&soc {
-	#include "t6031-die0.dtsi"
-	#include "t6031-dieX.dtsi"
-};
-
+#include "t6031-die0.dtsi"
+#include "t6031-dieX.dtsi"
 #include "t6031-gpio-pins.dtsi"
+#include "t6031-nvme.dtsi"
 #include "t6031-pmgr.dtsi"
 
 #undef DIE
 #undef DIE_NO
+#undef SOC_NODE

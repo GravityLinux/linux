@@ -21,6 +21,7 @@
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -28,6 +29,7 @@
 #include <linux/of_platform.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/swab.h>
 #include <linux/types.h>
@@ -75,10 +77,16 @@
 
 #define DART_T8020_STREAMS_ENABLE 0xfc
 
+#define DART_T8020_REMAP       	0x80
+
+#define DART_REMAP_MASK(sid)  GENMASK(7 + (8 * (sid % 4)), 8 * (sid % 4))
+#define DART_REMAP(dart, sid) ((dart)->regs + DART_T8020_REMAP + ((sid) & ~0x3))
+
 #define DART_T8020_TCR                  0x100
 #define DART_T8020_TCR_TRANSLATE_ENABLE BIT(7)
 #define DART_T8020_TCR_BYPASS_DART      BIT(8)
 #define DART_T8020_TCR_BYPASS_DAPF      BIT(12)
+#define DART_T8020_TCR_REMAP_ENABLE     BIT(24)
 
 #define DART_T8020_TTBR       0x200
 #define DART_T8020_USB4_TTBR  0x400
@@ -134,7 +142,7 @@
 
 #define DART_T8110_TCR                  0x1000
 #define DART_T8110_TCR_REMAP            GENMASK(11, 8)
-#define DART_T8110_TCR_REMAP_EN         BIT(7)
+#define DART_T8110_TCR_REMAP_ENABLE     BIT(7)
 #define DART_T8110_TCR_FOUR_LEVEL       BIT(3)
 #define DART_T8110_TCR_BYPASS_DAPF      BIT(2)
 #define DART_T8110_TCR_BYPASS_DART      BIT(1)
@@ -159,10 +167,13 @@ enum dart_type {
 	DART_T8110,
 };
 
+struct apple_dart;
+
 struct apple_dart_hw {
 	enum dart_type type;
 	irqreturn_t (*irq_handler)(int irq, void *dev);
 	int (*invalidate_tlb)(struct apple_dart_stream_map *stream_map);
+	void (*enable_remap)(struct apple_dart *dart, int sid, int remap_to);
 
 	u32 oas;
 	enum io_pgtable_fmt fmt;
@@ -201,6 +212,11 @@ struct apple_dart_hw {
  * @lock: lock for hardware operations involving this dart
  * @pgsize: pagesize supported by this DART
  * @supports_bypass: indicates if this DART supports bypass mode
+ * @locked: indicates if this DART is locked
+ * @sid_remap: optional requestor SID to translation SID mapping
+ * @dapf: optional DAPF (physical access filter) register block
+ * @dapf_ranges: inclusive [start, end] physical ranges the DAPF allows
+ * @dapf_count: number of @dapf_ranges entries
  * @sid2group: maps stream ids to iommu_groups
  * @iommu: iommu core device
  */
@@ -219,15 +235,29 @@ struct apple_dart {
 	u32 ias;
 	u32 oas;
 	u32 pgsize;
+	bool sid_exceptions;
 	u32 num_streams;
 	u32 supports_bypass : 1;
 	u32 four_level : 1;
+	u32 locked : 1;
+
+	dma_addr_t dma_min;
+	dma_addr_t dma_max;
+
+	u8 *sid_remap;
+	DECLARE_BITMAP(bypass_sids, DART_MAX_STREAMS);
+
+	void __iomem *dapf;
+	u64 *dapf_ranges;
+	unsigned int dapf_count;
 
 	struct iommu_group *sid2group[DART_MAX_STREAMS];
 	struct iommu_device iommu;
 
 	u32 save_tcr[DART_MAX_STREAMS];
 	u32 save_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
+
+	u64 *locked_ttbr[DART_MAX_STREAMS][DART_MAX_TTBR];
 };
 
 /*
@@ -267,6 +297,7 @@ struct apple_dart_domain {
 	struct io_pgtable_ops *pgtbl_ops;
 
 	bool finalized;
+	u64 mask;
 	struct mutex init_lock;
 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 
@@ -284,6 +315,14 @@ struct apple_dart_domain {
 struct apple_dart_master_cfg {
 	/* Intersection of DART capabilitles */
 	u32 supports_bypass : 1;
+	u32 locked : 1;
+
+	/*
+	 * DMA aperture start and end to be overridden by "iommus"' phandle
+	 * args. By default determined by DART's ias but may be outside of it.
+	 */
+	dma_addr_t dma_min;
+	dma_addr_t dma_max;
 
 	struct apple_dart_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 };
@@ -314,15 +353,24 @@ apple_dart_hw_enable_translation(struct apple_dart_stream_map *stream_map, int l
 {
 	struct apple_dart *dart = stream_map->dart;
 	u32 tcr = dart->hw->tcr_enabled;
-	int sid;
+	int sid, remap_to;
 
 	if (levels == 4)
 		tcr |= dart->hw->tcr_4level;
 
 	WARN_ON(levels != 3 && levels != 4);
 	WARN_ON(levels == 4 && !dart->four_level);
-	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(tcr, dart->regs + DART_TCR(dart, sid));
+
+	/* Search for first enabled sid and enable translation. */
+	sid = find_first_bit(stream_map->sidmap, dart->num_streams);
+	if (sid >= dart->num_streams)
+		return;
+	writel(tcr, dart->regs + DART_TCR(dart, sid));
+
+	/* Enable remapping for the remaining used sids. */
+	remap_to = sid++;
+	for_each_set_bit_from(sid, stream_map->sidmap, dart->num_streams)
+		dart->hw->enable_remap(dart, sid, remap_to);
 }
 
 static void apple_dart_hw_disable_dma(struct apple_dart_stream_map *stream_map)
@@ -330,6 +378,7 @@ static void apple_dart_hw_disable_dma(struct apple_dart_stream_map *stream_map)
 	struct apple_dart *dart = stream_map->dart;
 	int sid;
 
+	/* This will also disable remap enabled in apple_dart_hw_enable_translation(). */
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
 		writel(dart->hw->tcr_disabled, dart->regs + DART_TCR(dart, sid));
 }
@@ -353,10 +402,17 @@ static void apple_dart_hw_set_ttbr(struct apple_dart_stream_map *stream_map,
 	int sid;
 
 	WARN_ON(paddr & ((1 << dart->hw->ttbr_shift) - 1));
-	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		writel(dart->hw->ttbr_valid |
-		       (paddr >> dart->hw->ttbr_shift) << dart->hw->ttbr_addr_field_shift,
-		       dart->regs + DART_TTBR(dart, sid, idx));
+	/* Search for the first used stream and set its TTBR. All other sids
+	 * of this DART are handled via the remap feature and must not set a
+	 * valid TTBR.
+	 */
+	sid = find_first_bit(stream_map->sidmap, dart->num_streams);
+	if (sid >= dart->num_streams)
+		return;
+
+	writel(dart->hw->ttbr_valid |
+	       (paddr >> dart->hw->ttbr_shift) << dart->hw->ttbr_addr_field_shift,
+	       dart->regs + DART_TTBR(dart, sid, idx));
 }
 
 static void apple_dart_hw_clear_ttbr(struct apple_dart_stream_map *stream_map,
@@ -376,6 +432,82 @@ apple_dart_hw_clear_all_ttbrs(struct apple_dart_stream_map *stream_map)
 
 	for (i = 0; i < stream_map->dart->hw->ttbr_count; ++i)
 		apple_dart_hw_clear_ttbr(stream_map, i);
+}
+
+static int
+apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
+{
+	struct apple_dart *dart = stream_map->dart;
+	int sid;
+
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		u32 ttbr;
+		phys_addr_t phys;
+		u64 *l1_tbl;
+
+		ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
+
+		if (!(ttbr & dart->hw->ttbr_valid)) {
+			dev_err(dart->dev, "Invalid ttbr[%u] for locked dart\n",
+				idx);
+			return -EIO;
+		}
+
+		ttbr &= ~dart->hw->ttbr_valid;
+
+		if (dart->hw->ttbr_addr_field_shift)
+			ttbr >>= dart->hw->ttbr_addr_field_shift;
+		phys = ((phys_addr_t) ttbr) << dart->hw->ttbr_shift;
+
+		l1_tbl = devm_memremap(dart->dev, phys, dart->pgsize,
+				       MEMREMAP_WB);
+		if (!l1_tbl)
+			return -ENOMEM;
+
+		dart->locked_ttbr[sid][idx] = l1_tbl;
+	}
+
+	return 0;
+}
+
+static int
+apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map,
+				u8 idx)
+{
+	struct apple_dart *dart = stream_map->dart;
+	int sid;
+
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		/* TODO: locked L1 table might need to be restored to boot state */
+		if (dart->locked_ttbr[sid][idx]) {
+			memset(dart->locked_ttbr[sid][idx], 0, dart->pgsize);
+			devm_memunmap(dart->dev, dart->locked_ttbr[sid][idx]);
+		}
+		dart->locked_ttbr[sid][idx] = NULL;
+	}
+
+	return 0;
+}
+
+static int
+apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
+			  struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	int sid;
+
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		for (int idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u64 *ttbrep = dart->locked_ttbr[sid][idx];
+			u64 *ptep = cfg->apple_dart_cfg.ttbr[idx];
+			if (!ttbrep || !ptep)
+				continue;
+			for (int entry = 0; entry < dart->pgsize / sizeof(*ptep); entry++)
+				ttbrep[entry] = ptep[entry];
+		}
+	}
+
+	return 0;
 }
 
 static int
@@ -433,7 +565,6 @@ apple_dart_t8110_hw_tlb_command(struct apple_dart_stream_map *stream_map,
 
 		if (ret)
 			break;
-
 	}
 
 	spin_unlock_irqrestore(&dart->lock, flags);
@@ -462,18 +593,66 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID);
 }
 
+static void
+apple_dart_t8020_hw_enable_remap(struct apple_dart *dart, int sid, int remap_to)
+{
+	u32 remap = readl(DART_REMAP(dart, sid));
+	remap = (remap & ~DART_REMAP_MASK(sid)) |
+		field_prep(DART_REMAP_MASK(sid), remap_to);
+	writel(remap, DART_REMAP(dart, sid));
+
+	u32 tcr = FIELD_PREP(DART_T8020_TCR_REMAP_ENABLE, 1) |
+		  FIELD_PREP(DART_T8020_TCR_TRANSLATE_ENABLE, 1);
+	writel(tcr, dart->regs + DART_TCR(dart, sid));
+}
+
+static void
+apple_dart_t8110_hw_enable_remap(struct apple_dart *dart, int sid, int remap_to)
+{
+	u32 tcr = FIELD_PREP(DART_T8110_TCR_REMAP, remap_to) |
+		  FIELD_PREP(DART_T8110_TCR_REMAP_ENABLE, 1);
+	writel(tcr, dart->regs + DART_TCR(dart, sid));
+}
+
+static bool apple_dart_is_locked(struct apple_dart *dart)
+{
+	return !!(readl(dart->regs + dart->hw->lock) & dart->hw->lock_bit);
+}
+
+/*
+ * DAPF entries are 0x40 apart: control at +0x0, start and inclusive end at
+ * +0x8/+0x10 and an enable word at +0x20. The control and enable values are
+ * the ones the ADT's dapf-instance tables use for every range.
+ */
+#define DART_DAPF_STRIDE	0x40
+#define DART_DAPF_CTRL		0x00
+#define DART_DAPF_ATTR		0x04
+#define DART_DAPF_START		0x08
+#define DART_DAPF_END		0x10
+#define DART_DAPF_ENABLE	0x20
+#define DART_DAPF_CTRL_ALLOW	0x31
+
+static void apple_dart_dapf_program(struct apple_dart *dart)
+{
+	for (unsigned int i = 0; i < dart->dapf_count; i++) {
+		void __iomem *e = dart->dapf + i * DART_DAPF_STRIDE;
+
+		writel(0, e + DART_DAPF_ATTR);
+		writeq(dart->dapf_ranges[2 * i], e + DART_DAPF_START);
+		writeq(dart->dapf_ranges[2 * i + 1], e + DART_DAPF_END);
+		writel(DART_DAPF_CTRL_ALLOW, e + DART_DAPF_CTRL);
+		writel(1, e + DART_DAPF_ENABLE);
+	}
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
-	u32 config;
 	struct apple_dart_stream_map stream_map;
 	int i;
 
-	config = readl(dart->regs + dart->hw->lock);
-	if (config & dart->hw->lock_bit) {
-		dev_err(dart->dev, "DART is locked down until reboot: %08x\n",
-			config);
-		return -EINVAL;
-	}
+	/* Remapped requestors require writable TCRs, including after power loss. */
+	if (dart->sid_remap && apple_dart_is_locked(dart))
+		return -EPERM;
 
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -481,15 +660,49 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 
+	/*
+	 * Alias TCRs belong to the DART, not to a domain. All domain stream maps
+	 * contain only canonical target SIDs, so attach/detach cannot overwrite
+	 * these registers. Their TTBRs remain clear.
+	 */
+	if (dart->sid_remap) {
+		for (i = 0; i < dart->num_streams; i++) {
+			if (dart->sid_remap[i] == i)
+				continue;
+			writel(DART_T8110_TCR_REMAP_ENABLE |
+			       FIELD_PREP(DART_T8110_TCR_REMAP, dart->sid_remap[i]),
+			       dart->regs + DART_TCR(dart, i));
+		}
+	}
+
+	/* ISP firmware uses an untranslated MMIO stream, retaining DAPF checks. */
+	if (dart->hw->type == DART_T8110) {
+		unsigned int sid;
+		for_each_set_bit(sid, dart->bypass_sids, dart->num_streams)
+			writel(DART_T8110_TCR_BYPASS_DART,
+			       dart->regs + DART_TCR(dart, sid));
+	}
+
 	/* enable all streams globally since TCR is used to control isolation */
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
 		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
 
 	/* clear any pending errors before the interrupt is unmasked */
-	writel(readl(dart->regs + dart->hw->error), dart->regs + dart->hw->error);
+	if (dart->sid_exceptions) {
+		for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+			writel(readl(dart->regs + 0x4000 + 4 * i),
+			       dart->regs + 0x4000 + 4 * i);
+		writel(U32_MAX, dart->regs + 0x164);
+	} else {
+		writel(readl(dart->regs + dart->hw->error), dart->regs + dart->hw->error);
+	}
 
 	if (dart->hw->type == DART_T8110)
 		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
+
+	/* The filter loses its contents with the DART's power domain. */
+	if (dart->dapf)
+		apple_dart_dapf_program(dart);
 
 	return dart->hw->invalidate_tlb(&stream_map);
 }
@@ -499,6 +712,8 @@ static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 	int i, j;
 	struct apple_dart_atomic_stream_map *domain_stream_map;
 	struct apple_dart_stream_map stream_map;
+	struct io_pgtable_cfg *pgtbl_cfg =
+		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
 	for_each_stream_map(i, domain, domain_stream_map) {
 		stream_map.dart = domain_stream_map->dart;
@@ -506,7 +721,13 @@ static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 		for (j = 0; j < BITS_TO_LONGS(stream_map.dart->num_streams); j++)
 			stream_map.sidmap[j] = atomic_long_read(&domain_stream_map->sidmap[j]);
 
+		WARN_ON(pm_runtime_get_sync(stream_map.dart->dev) < 0);
+
+		if (stream_map.dart->locked)
+			apple_dart_hw_sync_locked(pgtbl_cfg, &stream_map);
+
 		stream_map.dart->hw->invalidate_tlb(&stream_map);
+		pm_runtime_put(stream_map.dart->dev);
 	}
 }
 
@@ -537,7 +758,7 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	if (!ops)
 		return 0;
 
-	return ops->iova_to_phys(ops, iova);
+	return ops->iova_to_phys(ops, iova & dart_domain->mask);
 }
 
 static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -551,8 +772,8 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
 	if (!ops)
 		return -ENODEV;
 
-	return ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot, gfp,
-			      mapped);
+	return ops->map_pages(ops, iova & dart_domain->mask, paddr, pgsize,
+			      pgcount, prot, gfp, mapped);
 }
 
 static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
@@ -563,7 +784,8 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct io_pgtable_ops *ops = dart_domain->pgtbl_ops;
 
-	return ops->unmap_pages(ops, iova, pgsize, pgcount, gather);
+	return ops->unmap_pages(ops, iova & dart_domain->mask, pgsize, pgcount,
+				gather);
 }
 
 static void
@@ -571,12 +793,18 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 			     struct apple_dart_stream_map *stream_map)
 {
 	int i;
+	struct apple_dart *dart = stream_map->dart;
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i)
-		apple_dart_hw_set_ttbr(stream_map, i,
-				       pgtbl_cfg->apple_dart_cfg.ttbr[i]);
+	/* enable all streams globally since TCR is used to control isolation */
+	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+		writel(U32_MAX, dart->regs + dart->hw->enable_streams + 4 * i);
+
+	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i) {
+		u64 ttbr = virt_to_phys(pgtbl_cfg->apple_dart_cfg.ttbr[i]);
+		apple_dart_hw_set_ttbr(stream_map, i, ttbr);
+	}
 	for (; i < stream_map->dart->hw->ttbr_count; ++i)
 		apple_dart_hw_clear_ttbr(stream_map, i);
 
@@ -585,11 +813,31 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	stream_map->dart->hw->invalidate_tlb(stream_map);
 }
 
+static void
+apple_dart_setup_translation_locked(struct apple_dart_domain *domain,
+				    struct apple_dart_stream_map *stream_map)
+{
+	int i;
+	struct io_pgtable_cfg *pgtbl_cfg =
+		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
+
+	/* Locked DARTs are set up by the bootloader. */
+	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i)
+		apple_dart_hw_map_locked_ttbr(stream_map, i);
+	for (; i < stream_map->dart->hw->ttbr_count; ++i)
+		apple_dart_hw_unmap_locked_ttbr(stream_map, i);
+
+	apple_dart_hw_sync_locked(pgtbl_cfg, stream_map);
+	stream_map->dart->hw->invalidate_tlb(stream_map);
+}
+
 static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 				      struct apple_dart_master_cfg *cfg)
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
+	u32 ias = min_t(u32, dart->ias, fls64(cfg->dma_max));
+	dma_addr_t dma_max = cfg->dma_max;
 	int ret = 0;
 	int i, j;
 
@@ -610,11 +858,47 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 
 	pgtbl_cfg = (struct io_pgtable_cfg){
 		.pgsize_bitmap = dart->pgsize,
-		.ias = dart->ias,
+		.ias = ias,
 		.oas = dart->oas,
 		.coherent_walk = 1,
 		.iommu_dev = dart->dev,
 	};
+
+	if (dart->locked) {
+		unsigned long *sidmap;
+		int sid;
+		u32 ttbr;
+
+		/* Locked DARTs can only have a single stream bound */
+		sidmap = cfg->stream_maps[0].sidmap;
+		sid = find_first_bit(sidmap, dart->num_streams);
+
+		WARN_ON((sid < 0) || bitmap_weight(sidmap, dart->num_streams) > 1);
+		ttbr = readl(dart->regs + DART_TTBR(dart, sid, 0));
+
+		WARN_ON(!(ttbr & dart->hw->ttbr_valid));
+
+		/* If the DART is locked, we need to keep the translation level count. */
+		if (dart->hw->tcr_4level && dart->ias > 36) {
+			if (readl(dart->regs + DART_TCR(dart, sid)) & dart->hw->tcr_4level) {
+				if (ias < 37) {
+					dev_info(dart->dev, "Expanded to ias=37 due to lock\n");
+					pgtbl_cfg.ias = 37;
+				}
+			} else if (ias > 36) {
+				dev_info(dart->dev, "Limited to ias=36 due to lock\n");
+				pgtbl_cfg.ias = 36;
+				if (cfg->dma_min == 0 && dma_max == DMA_BIT_MASK(dart->ias)) {
+					dma_max = DMA_BIT_MASK(pgtbl_cfg.ias);
+				} else if ((cfg->dma_min ^ dma_max) & ~DMA_BIT_MASK(36)) {
+					dev_err(dart->dev,
+						"Invalid DMA range for locked 3-level PT\n");
+					ret = -ENOMEM;
+					goto done;
+				}
+			}
+		}
+	}
 
 	dart_domain->pgtbl_ops = alloc_io_pgtable_ops(dart->hw->fmt, &pgtbl_cfg,
 						      &dart_domain->domain);
@@ -623,10 +907,10 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		goto done;
 	}
 
+	dart_domain->mask = DMA_BIT_MASK(pgtbl_cfg.ias);
 	dart_domain->domain.pgsize_bitmap = pgtbl_cfg.pgsize_bitmap;
-	dart_domain->domain.geometry.aperture_start = 0;
-	dart_domain->domain.geometry.aperture_end =
-		(dma_addr_t)DMA_BIT_MASK(pgtbl_cfg.ias);
+	dart_domain->domain.geometry.aperture_start = cfg->dma_min;
+	dart_domain->domain.geometry.aperture_end = dma_max;
 	dart_domain->domain.geometry.force_aperture = true;
 
 	dart_domain->finalized = true;
@@ -680,17 +964,29 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 
+	for_each_stream_map(i, cfg, stream_map)
+		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
 	if (ret)
-		return ret;
+		goto err;
 
 	ret = apple_dart_domain_add_streams(dart_domain, cfg);
 	if (ret)
-		return ret;
+		goto err;
 
+	for_each_stream_map(i, cfg, stream_map) {
+		if (!stream_map->dart->locked)
+			apple_dart_setup_translation(dart_domain, stream_map);
+		else
+			apple_dart_setup_translation_locked(dart_domain,
+							    stream_map);
+	}
+
+err:
 	for_each_stream_map(i, cfg, stream_map)
-		apple_dart_setup_translation(dart_domain, stream_map);
-	return 0;
+		pm_runtime_put(stream_map->dart->dev);
+	return ret;
 }
 
 static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
@@ -704,8 +1000,17 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 	if (!cfg->supports_bypass)
 		return -EINVAL;
 
+	if (cfg->locked)
+		return -EINVAL;
+
+	for_each_stream_map(i, cfg, stream_map)
+		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+
 	for_each_stream_map(i, cfg, stream_map)
 		apple_dart_hw_enable_bypass(stream_map);
+
+	for_each_stream_map(i, cfg, stream_map)
+		pm_runtime_put(stream_map->dart->dev);
 	return 0;
 }
 
@@ -726,8 +1031,17 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 	struct apple_dart_stream_map *stream_map;
 	int i;
 
+	if (cfg->locked)
+		return -EINVAL;
+
+	for_each_stream_map(i, cfg, stream_map)
+		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+
 	for_each_stream_map(i, cfg, stream_map)
 		apple_dart_hw_disable_dma(stream_map);
+
+	for_each_stream_map(i, cfg, stream_map)
+		pm_runtime_put(stream_map->dart->dev);
 	return 0;
 }
 
@@ -746,20 +1060,28 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 	struct apple_dart_stream_map *stream_map;
 	int i;
 
-	if (!cfg)
+	if (!dev_iommu_fwspec_get(dev) || !cfg)
 		return ERR_PTR(-ENODEV);
 
 	for_each_stream_map(i, cfg, stream_map)
-		device_link_add(
-			dev, stream_map->dart->dev,
-			DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER);
+		device_link_add(dev, stream_map->dart->dev,
+			DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_SUPPLIER |
+			DL_FLAG_RPM_ACTIVE);
 
 	return &cfg->stream_maps[0].dart->iommu;
 }
 
 static void apple_dart_release_device(struct device *dev)
 {
+	int i, j;
+	struct apple_dart_stream_map *stream_map;
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+
+	for_each_stream_map(j, cfg, stream_map) {
+		if (stream_map->dart->locked)
+			for (i = 0; i < stream_map->dart->hw->ttbr_count; ++i)
+				apple_dart_hw_unmap_locked_ttbr(stream_map, i);
+	}
 
 	kfree(cfg);
 }
@@ -803,13 +1125,53 @@ static int apple_dart_of_xlate(struct device *dev,
 	struct platform_device *iommu_pdev = of_find_device_by_node(args->np);
 	struct apple_dart *dart = platform_get_drvdata(iommu_pdev);
 	struct apple_dart *cfg_dart;
+	dma_addr_t dma_max = dart->dma_max;
+	dma_addr_t dma_min = dart->dma_min;
 	int i, sid;
 
 	put_device(&iommu_pdev->dev);
 
-	if (args->args_count != 1)
+	if ((args->args_count != 1 && args->args_count != 5) ||
+	    args->args[0] >= dart->num_streams)
 		return -EINVAL;
+
 	sid = args->args[0];
+	/* Aliases must share both the translation context and IOMMU group. */
+	if (dart->sid_remap)
+		sid = dart->sid_remap[sid];
+
+	if (args->args_count == 5) {
+		dma_addr_t length = ((dma_addr_t)args->args[3] << 32) | args->args[4];
+
+		if (!length)
+			return -EINVAL;
+
+		if (dma_min != 0 || dma_max != DMA_BIT_MASK(dart->ias))
+			dev_err(dev, "still using legacy \"apple,dma-range\" property\n");
+
+		dma_min = ((dma_addr_t)args->args[1] << 32) | args->args[2];
+
+		if (!IS_ALIGNED(dma_min, dart->pgsize) ||
+		    !IS_ALIGNED(length, dart->pgsize)) {
+			dev_err(dev, "Unaligned DMA window %pad, %pad (0x%x)\n",
+				&dma_min, &length, dart->pgsize);
+			return -EINVAL;
+		}
+		if (check_add_overflow(dma_min, length - 1, &dma_max)) {
+			dev_err(dev, "DMA window length (%pad) overflows range for start %pad\n",
+				&length, &dma_min);
+			return -EINVAL;
+		}
+
+		/*
+		 * Ensure that the DMA window does not exceed the DART's ias.
+		 */
+		if ((dma_min ^ dma_max) & ~DMA_BIT_MASK(dart->ias)) {
+			dev_err(dev, "Invalid DMA window for ias=%d\n",
+				dart->ias);
+			return -EINVAL;
+		}
+	}
 
 	if (!cfg) {
 		cfg = kzalloc_obj(*cfg);
@@ -817,6 +1179,20 @@ static int apple_dart_of_xlate(struct device *dev,
 			return -ENOMEM;
 		/* Will be ANDed with DART capabilities */
 		cfg->supports_bypass = true;
+		/* Will be ORed with DART capabilities*/
+		cfg->locked = false;
+		/* Will be merged with other DARTs to the common range. */
+		cfg->dma_min = dma_min;
+		cfg->dma_max = dma_max;
+	} else {
+		if (dma_min >= cfg->dma_max || cfg->dma_min >= dma_max) {
+			dev_err(dev, "non-overlapping DMA windows: %pad..%pad, %pad..%pad\n",
+				&dma_min, &dma_max,
+				&cfg->dma_min, &cfg->dma_max);
+			return -EINVAL;
+		}
+		cfg->dma_min = max(dma_min, cfg->dma_min);
+		cfg->dma_max = min(dma_max, cfg->dma_max);
 	}
 	dev_iommu_priv_set(dev, cfg);
 
@@ -829,6 +1205,7 @@ static int apple_dart_of_xlate(struct device *dev,
 	}
 
 	cfg->supports_bypass &= dart->supports_bypass;
+	cfg->locked |= dart->locked;
 
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
 		if (cfg->stream_maps[i].dart == dart) {
@@ -963,6 +1340,16 @@ out:
 	return res;
 }
 
+static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
+{
+	switch (cap) {
+	case IOMMU_CAP_DEFERRED_FLUSH:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
@@ -970,6 +1357,8 @@ static int apple_dart_def_domain_type(struct device *dev)
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
+		return IOMMU_DOMAIN_DMA;
+	if (cfg->locked)
 		return IOMMU_DOMAIN_DMA;
 
 	return 0;
@@ -1001,14 +1390,15 @@ static void apple_dart_get_resv_regions(struct device *dev,
 }
 
 static const struct iommu_ops apple_dart_iommu_ops = {
+	.capable = apple_dart_capable,
 	.identity_domain = &apple_dart_identity_domain,
 	.blocked_domain = &apple_dart_blocked_domain,
+	.def_domain_type = apple_dart_def_domain_type,
 	.domain_alloc_paging = apple_dart_domain_alloc_paging,
 	.probe_device = apple_dart_probe_device,
 	.release_device = apple_dart_release_device,
 	.device_group = apple_dart_device_group,
 	.of_xlate = apple_dart_of_xlate,
-	.def_domain_type = apple_dart_def_domain_type,
 	.get_resv_regions = apple_dart_get_resv_regions,
 	.owner = THIS_MODULE,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
@@ -1071,6 +1461,23 @@ static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 	u64 addr = addr_lo | (((u64)addr_hi) << 32);
 	u8 stream_idx = FIELD_GET(DART_T8110_ERROR_STREAM, error);
 
+	if (dart->sid_exceptions) {
+		u32 pending;
+		unsigned int word;
+		bool handled = false;
+		for (word = 0; word < BITS_TO_U32(dart->num_streams); word++) {
+			pending = readl(dart->regs + 0x4000 + 4 * word);
+			if (!pending)
+				continue;
+			dev_err_ratelimited(dart->dev, "DART SID exceptions word %u: %#x\n",
+					    word, pending);
+			writel(pending, dart->regs + 0x4000 + 4 * word);
+			handled = true;
+		}
+		if (handled)
+			writel(U32_MAX, dart->regs + 0x164);
+		return handled ? IRQ_HANDLED : IRQ_NONE;
+	}
 	if (!(error & DART_T8110_ERROR_FLAG))
 		return IRQ_NONE;
 
@@ -1102,6 +1509,109 @@ static irqreturn_t apple_dart_t8110_irq(int irq, void *dev)
 	return IRQ_HANDLED;
 }
 
+static irqreturn_t apple_dart_irq(int irq, void *dev)
+{
+	irqreturn_t ret;
+	struct apple_dart *dart = dev;
+
+	WARN_ON(pm_runtime_get_sync(dart->dev) < 0);
+	ret = dart->hw->irq_handler(irq, dev);
+	pm_runtime_put(dart->dev);
+	return ret;
+}
+
+static int apple_dart_parse_sid_remap(struct apple_dart *dart)
+{
+	struct device *dev = dart->dev;
+	const struct property *prop;
+	const __be32 *map;
+	int count, i;
+	u32 source, target;
+
+	prop = of_find_property(dev->of_node, "apple,sid-remap", NULL);
+	if (!prop)
+		return 0;
+
+	if (dart->hw->type != DART_T8110)
+		return dev_err_probe(dev, -EINVAL,
+				     "SID remapping requires a T8110 DART\n");
+	if (dart->locked)
+		return dev_err_probe(dev, -EPERM,
+				     "SID remapping is unsupported on locked DARTs\n");
+	if (!prop->value || prop->length <= 0 ||
+	    prop->length % (2 * sizeof(*map)))
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,sid-remap must contain SID pairs\n");
+
+	count = prop->length / (2 * sizeof(*map));
+	if (count >= dart->num_streams)
+		return dev_err_probe(dev, -EINVAL, "Too many SID remaps\n");
+
+	dart->sid_remap = devm_kmalloc(dev, dart->num_streams, GFP_KERNEL);
+	if (!dart->sid_remap)
+		return -ENOMEM;
+	for (i = 0; i < dart->num_streams; i++)
+		dart->sid_remap[i] = i;
+
+	map = prop->value;
+	for (i = 0; i < count; i++) {
+		source = be32_to_cpup(map++);
+		target = be32_to_cpup(map++);
+
+		if (source >= dart->num_streams || target >= dart->num_streams ||
+		    !FIELD_FIT(DART_T8110_TCR_REMAP, target) || source == target)
+			return dev_err_probe(dev, -EINVAL,
+					     "Invalid SID remap %u -> %u\n",
+					     source, target);
+		if (dart->sid_remap[source] != source)
+			return dev_err_probe(dev, -EINVAL,
+					     "Duplicate SID remap for %u\n", source);
+
+		dart->sid_remap[source] = target;
+	}
+
+	/* Reject chains (including cycles), regardless of property ordering. */
+	for (i = 0; i < dart->num_streams; i++) {
+		target = dart->sid_remap[i];
+		if (dart->sid_remap[target] != target)
+			return dev_err_probe(dev, -EINVAL,
+					     "Chained SID remap through %u\n", target);
+	}
+
+	return 0;
+}
+
+static int apple_dart_parse_dapf(struct platform_device *pdev,
+				 struct apple_dart *dart)
+{
+	struct device *dev = &pdev->dev;
+	struct resource *res;
+	int count;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dapf");
+	if (!res)
+		return 0;
+
+	count = of_property_count_u64_elems(dev->of_node, "apple,dapf-ranges");
+	if (count <= 0 || count % 2 ||
+	    count / 2 * DART_DAPF_STRIDE > resource_size(res)) {
+		dev_err(dev, "invalid apple,dapf-ranges\n");
+		return -EINVAL;
+	}
+
+	dart->dapf = devm_ioremap_resource(dev, res);
+	if (IS_ERR(dart->dapf))
+		return PTR_ERR(dart->dapf);
+
+	dart->dapf_ranges = devm_kcalloc(dev, count, sizeof(u64), GFP_KERNEL);
+	if (!dart->dapf_ranges)
+		return -ENOMEM;
+
+	dart->dapf_count = count / 2;
+	return of_property_read_u64_array(dev->of_node, "apple,dapf-ranges",
+					  dart->dapf_ranges, count);
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -1109,6 +1619,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	struct resource *res;
 	struct apple_dart *dart;
 	struct device *dev = &pdev->dev;
+	u64 dma_range[2];
 
 	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
 	if (!dart)
@@ -1140,6 +1651,14 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_irq_safe(dev);
+
+	ret = devm_pm_runtime_enable(dev);
+	if (ret)
+		goto err_clk_disable;
+
 	dart_params[0] = readl(dart->regs + DART_PARAMS1);
 	dart_params[1] = readl(dart->regs + DART_PARAMS2);
 	dart->pgsize = 1 << FIELD_GET(DART_PARAMS1_PAGE_SHIFT, dart_params[0]);
@@ -1160,21 +1679,73 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->oas = FIELD_GET(DART_T8110_PARAMS3_PA_WIDTH, dart_params[2]);
 		dart->num_streams = FIELD_GET(DART_T8110_PARAMS4_NUM_SIDS, dart_params[3]);
 		dart->four_level = dart->ias > 36;
+		/* T8132 keeps the established error-register handling. */
+		dart->sid_exceptions = resource_size(res) >= 0x4004 &&
+			(dart_params[2] & 0xffff) >= 0x202 &&
+			!of_device_is_compatible(dev->of_node, "apple,t8132-dart");
 		break;
 	}
 
-	if (dart->num_streams > DART_MAX_STREAMS) {
-		dev_err(&pdev->dev, "Too many streams (%d > %d)\n",
-			dart->num_streams, DART_MAX_STREAMS);
+	dart->dma_min = 0;
+	dart->dma_max = DMA_BIT_MASK(dart->ias);
+
+	ret = of_property_read_u64_array(dev->of_node, "apple,dma-range", dma_range, 2);
+	if (ret == -EINVAL) {
+		ret = 0;
+	} else if (ret) {
+		goto err_clk_disable;
+	} else {
+		dart->dma_min = dma_range[0];
+		dart->dma_max = dma_range[0] + dma_range[1] - 1;
+		if ((dart->dma_min ^ dart->dma_max) & ~DMA_BIT_MASK(dart->ias)) {
+			dev_err(&pdev->dev, "Invalid DMA range for ias=%d\n",
+				dart->ias);
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dev_info(&pdev->dev, "Limiting DMA range to %pad..%pad\n",
+				&dart->dma_min, &dart->dma_max);
+	}
+
+	if (of_find_property(dev->of_node, "apple,bypass-sids", NULL)) {
+		int count = of_property_count_u32_elems(dev->of_node, "apple,bypass-sids");
+		u32 sid;
+		if (dart->hw->type != DART_T8110 || count <= 0) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		for (int i = 0; i < count; i++) {
+			ret = of_property_read_u32_index(dev->of_node, "apple,bypass-sids", i, &sid);
+			if (ret || sid >= dart->num_streams || sid >= DART_MAX_STREAMS) {
+				ret = -EINVAL;
+				goto err_clk_disable;
+			}
+			set_bit(sid, dart->bypass_sids);
+		}
+	}
+
+	if (!dart->num_streams || dart->num_streams > DART_MAX_STREAMS) {
+		dev_err(&pdev->dev, "Invalid stream count %u\n", dart->num_streams);
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
 
-	ret = apple_dart_hw_reset(dart);
+	dart->locked = apple_dart_is_locked(dart);
+	ret = apple_dart_parse_sid_remap(dart);
 	if (ret)
 		goto err_clk_disable;
 
-	ret = request_irq(dart->irq, dart->hw->irq_handler, IRQF_SHARED,
+	ret = apple_dart_parse_dapf(pdev, dart);
+	if (ret)
+		goto err_clk_disable;
+
+	if (!dart->locked) {
+		ret = apple_dart_hw_reset(dart);
+		if (ret)
+			goto err_clk_disable;
+	}
+
+	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
 			  "apple-dart fault handler", dart);
 	if (ret)
 		goto err_clk_disable;
@@ -1190,11 +1761,13 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_sysfs_remove;
 
+	pm_runtime_put(dev);
+
 	dev_info(
 		&pdev->dev,
-		"DART [pagesize %x, %d streams, bypass support: %d, bypass forced: %d, AS %d -> %d] initialized\n",
+		"DART [pagesize %x, %d streams, bypass support: %d, bypass forced: %d, locked: %d, AS %d -> %d] initialized\n",
 		dart->pgsize, dart->num_streams, dart->supports_bypass,
-		dart->pgsize > PAGE_SIZE, dart->ias, dart->oas);
+		dart->pgsize > PAGE_SIZE, dart->locked, dart->ias, dart->oas);
 	return 0;
 
 err_sysfs_remove:
@@ -1202,6 +1775,7 @@ err_sysfs_remove:
 err_free_irq:
 	free_irq(dart->irq, dart);
 err_clk_disable:
+	pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 
 	return ret;
@@ -1211,7 +1785,9 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
-	apple_dart_hw_reset(dart);
+	if (!dart->locked)
+		apple_dart_hw_reset(dart);
+
 	free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
@@ -1224,6 +1800,7 @@ static const struct apple_dart_hw apple_dart_hw_t8103 = {
 	.type = DART_T8020,
 	.irq_handler = apple_dart_t8020_irq,
 	.invalidate_tlb = apple_dart_t8020_hw_invalidate_tlb,
+	.enable_remap = apple_dart_t8020_hw_enable_remap,
 	.oas = 36,
 	.fmt = APPLE_DART,
 	.max_sid_count = 16,
@@ -1250,6 +1827,7 @@ static const struct apple_dart_hw apple_dart_hw_t8103_usb4 = {
 	.type = DART_T8020,
 	.irq_handler = apple_dart_t8020_irq,
 	.invalidate_tlb = apple_dart_t8020_hw_invalidate_tlb,
+	.enable_remap = apple_dart_t8020_hw_enable_remap,
 	.oas = 36,
 	.fmt = APPLE_DART,
 	.max_sid_count = 64,
@@ -1276,6 +1854,7 @@ static const struct apple_dart_hw apple_dart_hw_t6000 = {
 	.type = DART_T6000,
 	.irq_handler = apple_dart_t8020_irq,
 	.invalidate_tlb = apple_dart_t8020_hw_invalidate_tlb,
+	.enable_remap = apple_dart_t8020_hw_enable_remap,
 	.oas = 42,
 	.fmt = APPLE_DART2,
 	.max_sid_count = 16,
@@ -1302,6 +1881,7 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.type = DART_T8110,
 	.irq_handler = apple_dart_t8110_irq,
 	.invalidate_tlb = apple_dart_t8110_hw_invalidate_tlb,
+	.enable_remap = apple_dart_t8110_hw_enable_remap,
 	.fmt = APPLE_DART2,
 	.max_sid_count = 256,
 
@@ -1329,7 +1909,15 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 
+	/* Locked DARTs can't be restored so skip saving their registers. */
+	if (dart->locked)
+		return 0;
+
 	for (sid = 0; sid < dart->num_streams; sid++) {
+		/* Reset owns alias TCRs and keeps their TTBRs empty. */
+		if (dart->sid_remap && dart->sid_remap[sid] != sid)
+			continue;
+
 		dart->save_tcr[sid] = readl(dart->regs + DART_TCR(dart, sid));
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			dart->save_ttbr[sid][idx] =
@@ -1345,6 +1933,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
+	/* Locked DARTs can't be restored, and they should not need it */
+	if (dart->locked)
+		return 0;
+
 	ret = apple_dart_hw_reset(dart);
 	if (ret) {
 		dev_err(dev, "Failed to reset DART on resume\n");
@@ -1352,6 +1944,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	}
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (dart->sid_remap && dart->sid_remap[sid] != sid)
+			continue;
+
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			writel(dart->save_ttbr[sid][idx],
 			       dart->regs + DART_TTBR(dart, sid, idx));
@@ -1361,7 +1956,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume);
+static DEFINE_RUNTIME_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume, NULL);
 
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
@@ -1377,7 +1972,7 @@ static struct platform_driver apple_dart_driver = {
 		.name			= "apple-dart",
 		.of_match_table		= apple_dart_of_match,
 		.suppress_bind_attrs    = true,
-		.pm			= pm_sleep_ptr(&apple_dart_pm_ops),
+		.pm			= pm_ptr(&apple_dart_pm_ops),
 	},
 	.probe	= apple_dart_probe,
 	.remove = apple_dart_remove,
