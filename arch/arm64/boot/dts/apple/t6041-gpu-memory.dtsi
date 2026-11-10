@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* m1n1 fills these reservations before Linux reserves/allocates any GPU RAM. */
+/ {
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        gpu_g16c_ttbs: uat-ttbs { reg = <0 0 0 0>; no-map; status = "disabled"; };
+        gpu_g16c_tables: uat-pagetables { reg = <0 0 0 0>; no-map; status = "disabled"; };
+        gpu_g16c_l2: uat-l2 { reg = <0 0 0 0>; no-map; status = "disabled"; };
+        gpu_g16c_handoff: uat-handoff { reg = <0 0 0 0>; no-map; status = "disabled"; };
+        gpu_g16c_firmware: gpu-firmware { reg = <0 0 0 0>; no-map; status = "disabled"; };
+    };
+};
+
+&gpu {
+    memory-region = <&gpu_g16c_ttbs>, <&gpu_g16c_tables>, <&gpu_g16c_l2>,
+                    <&gpu_g16c_handoff>, <&gpu_g16c_firmware>;
+    memory-region-names = "ttbs", "pagetables", "l2", "handoff", "firmware";
+};

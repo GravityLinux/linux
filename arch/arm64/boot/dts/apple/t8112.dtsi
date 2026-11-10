@@ -1441,10 +1441,6 @@
 				compatible = "apple,smc-hwmon";
 			};
 
-			smc_hwmon: hwmon {
-				compatible = "apple,smc-hwmon";
-			};
-
 			rtc {
 				compatible = "apple,smc-rtc";
 				nvmem-cells = <&rtc_offset>;

@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Neo resources/report IDs from live J700 ADT.
+ * Report bits are soc-device TABLE INDICES, not PMGR id1 - 1.
+ * ISP: firmware ID7 at index11; DISP ID8 at12; DISPEXT ID9 at13.
+ * Use the existing Asahi PMP-v2 protocol driver. No native startup replay.
+ */
+/ {
+	aliases {
+		pmp = &pmp;
+	};
+};
+
+&soc {
+	pmp_dart: iommu@300300000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x3 0x00300000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 827 IRQ_TYPE_LEVEL_HIGH>;
+		/* Native PMP CPU MMIO streams; retain the DAPF filters. */
+		apple,bypass-sids = <12 14>;
+		power-domains = <&ps_pmp>;
+	};
+
+	pmp_mbox: mailbox@300e08000 {
+		compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x00e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 823 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 825 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 826 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+	};
+
+	pmp: pmp@300500000 {
+		compatible = "apple,t8140-pmp-v2", "apple,t6000-pmp-v2";
+		reg = <0x3 0x00500000 0 0xa0000>,
+		      <0x3 0x00e00000 0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		power-domains = <&ps_pmp>;
+		/* kboot transfers board/DRAM IDs and native ADT tunables. */
+		status = "disabled";
+	};
+
+	pmp_report: pmp-report@3003c0000 {
+		compatible = "apple,t8140-pmp-v2-report";
+		reg = <0x3 0x003c0000 0 0x30000>;
+		/* Per-record flags distinguish notifications from acknowledged reports. */
+		apple,pmp = <&pmp>;
+		power-domains = <&ps_pms_sram>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pmp_report_isp: report@b {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <11>;
+			label = "pmp-isp";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_isp_sys>;
+		};
+
+		pmp_report_disp: report@c {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <12>;
+			label = "pmp-disp";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_disp_cpu>;
+			apple,always-on;
+		};
+
+		pmp_report_dispext: report@d {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <13>;
+			label = "pmp-dispext";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_dispext0_cpu>;
+		};
+	};
+};
+
+/* PMP requires the PMC register bank independently of display activity. */
+&ps_pmp {
+	power-domains = <&ps_pmc>;
+};
+
+/* Preserve every ISP power domain while routing its system request via PMP. */
+&isp {
+	power-domains = <&pmp_report_isp>, <&ps_isp_cpu>,
+		<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>, <&ps_isp_fe>,
+		<&ps_isp_dprx>, <&ps_isp_secure>, <&ps_isp_sts0>, <&ps_isp_sts1>,
+		<&ps_isp_pearl>, <&ps_isp_be>, <&ps_isp_clr>,
+		<&ps_isp_cvd>, <&ps_isp_cvm>;
+};
+
+&dcp {
+	power-domains = <&pmp_report_disp>;
+};
+
+&dcpext0 {
+	power-domains = <&pmp_report_dispext>;
+};

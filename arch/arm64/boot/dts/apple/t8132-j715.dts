@@ -30,6 +30,35 @@
 	};
 };
 
+&dcp {
+	status = "okay";
+
+	panel: panel {
+		compatible = "apple,panel-j715", "apple,panel";
+		width-mm = <327>;
+		height-mm = <211>;
+		adj-height-mm = <204>;
+		apple,max-brightness = <500>;
+	};
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
 &fpwm1 {
 	status = "okay";
 };
