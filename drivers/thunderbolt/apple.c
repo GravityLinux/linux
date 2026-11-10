@@ -89,10 +89,12 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec_mux.h>
@@ -633,6 +635,29 @@ static void apple_nhi_remove(struct platform_device *pdev)
 	wait_for_completion(&anhi->nhi.domain_released);
 }
 
+/*
+ * The NHI only exists while ACIO is up, so these run only when ACIO keeps the link across
+ * suspend-to-idle (see apple_cio_prepare()). Routers, paths and tunnels stay as they are,
+ * so only the control channel is paused, as for a hibernation freeze. This runs in the
+ * normal suspend phase because the DART behind the rings resets and restores its streams
+ * in its own resume callback, which runs before ours and must not see the rings active.
+ */
+static int apple_nhi_suspend(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_freeze_noirq(anhi->tb);
+}
+
+static int apple_nhi_resume(struct device *dev)
+{
+	struct apple_nhi *anhi = dev_get_drvdata(dev);
+
+	return tb_domain_thaw_noirq(anhi->tb);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_nhi_pm_ops, apple_nhi_suspend, apple_nhi_resume);
+
 static const struct of_device_id apple_nhi_match[] = {
 	{
 		.compatible = "apple,t8103-usb4-nhi",
@@ -645,6 +670,7 @@ static struct platform_driver apple_nhi_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-nhi",
 		.of_match_table = apple_nhi_match,
+		.pm = pm_sleep_ptr(&apple_nhi_pm_ops),
 	},
 	.probe = apple_nhi_probe,
 	.remove = apple_nhi_remove,
@@ -1016,13 +1042,28 @@ static void apple_cio_remove(struct platform_device *pdev)
 		apple_cio_stop(acio);
 }
 
+/*
+ * Whether an active link can stay up across this system sleep. Bringing ACIO back needs the
+ * full bootstrap, and the tunnelled devices would be removed in between, so ACIO, its
+ * children, the Type-C PHY and the port controller all have to keep power and state. ACIO
+ * keeps its own domains below and the PHY keeps its domain for an active USB4/Thunderbolt
+ * mode, but only J713 suspend-to-idle is known to leave the rest of the port alone: its
+ * port controller keeps the contract and mode, and dwc3-apple keeps an initialized
+ * controller for the tunnelled USB 3 path. Deeper sleep states cut power to everything.
+ */
+static bool apple_cio_can_keep_link(void)
+{
+	return of_machine_is_compatible("apple,j713") &&
+	       pm_suspend_target_state == PM_SUSPEND_TO_IDLE;
+}
+
 static int apple_cio_prepare(struct device *dev)
 {
 	struct apple_cio *acio = dev_get_drvdata(dev);
 
 	guard(mutex)(&acio->lock);
 
-	if (acio->current_cable_info) {
+	if (acio->current_cable_info && !apple_cio_can_keep_link()) {
 		dev_err(dev, "unable to suspend while a USB4/Thunderbolt connection is active\n");
 		return -EBUSY;
 	}
@@ -1030,8 +1071,38 @@ static int apple_cio_prepare(struct device *dev)
 	return 0;
 }
 
+static int apple_cio_suspend(struct device *dev)
+{
+	struct apple_cio *acio = dev_get_drvdata(dev);
+	int i;
+
+	guard(mutex)(&acio->lock);
+
+	if (!acio->current_cable_info)
+		return 0;
+
+	/* A cable that came up after apple_cio_prepare() */
+	if (!apple_cio_can_keep_link()) {
+		dev_err(dev, "unable to suspend while a USB4/Thunderbolt connection is active\n");
+		return -EBUSY;
+	}
+
+	/*
+	 * Keep the link, the NHI and the PCIe tunnel running. genpd would otherwise power the
+	 * ACIO domains off in the noirq phase once their virtual devices suspend, and the
+	 * children would SError on resume. Those devices are suppliers of ACIO while it is
+	 * up, so they suspend after this callback.
+	 */
+	for (i = 0; i < acio->pd_list->num_pds; i++)
+		device_set_awake_path(acio->pd_list->pd_devs[i]);
+
+	dev_info(dev, "keeping the USB4/Thunderbolt link up across suspend-to-idle\n");
+	return 0;
+}
+
 static const struct dev_pm_ops apple_cio_pm_ops = {
 	.prepare = apple_cio_prepare,
+	.suspend = apple_cio_suspend,
 };
 
 static const struct of_device_id apple_acio_match[] = {
