@@ -282,6 +282,7 @@ enum tipd_hw_variant {
 	TIPD_VARIANT_CD321X,
 	TIPD_VARIANT_TPS6598X,
 	TIPD_VARIANT_TPS25750,
+	TIPD_VARIANT_TPS66993,
 	TIPD_VARIANT_SN201202X,
 	TIPD_VARIANT_MAX,
 };
@@ -302,6 +303,7 @@ struct tipd_data {
 	int (*init)(struct tps6598x *tps);
 	int (*switch_power_state)(struct tps6598x *tps, u8 target_state);
 	bool (*read_data_status)(struct tps6598x *tps);
+	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
 };
@@ -380,6 +382,7 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	bool hpd_irq_asserted;
 
 	struct typec_thunderbolt_switch *tbt_switch;
 

@@ -78,6 +78,7 @@ static const struct dev_pm_ops tps6598x_pm_ops = {
 
 static const struct of_device_id tps6598x_of_match[] = {
 	{ .compatible = "ti,tps6598x", (void *)TIPD_VARIANT_TPS6598X},
+	{ .compatible = "ti,tps66993", (void *)TIPD_VARIANT_TPS66993},
 	{ .compatible = "apple,cd321x",  (void *)TIPD_VARIANT_CD321X},
 	{ .compatible = "ti,tps25750",  (void *)TIPD_VARIANT_TPS25750},
 	{}
