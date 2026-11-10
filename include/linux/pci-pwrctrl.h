@@ -59,6 +59,10 @@ int pci_pwrctrl_create_devices(struct device *parent);
 void pci_pwrctrl_destroy_devices(struct device *parent);
 int pci_pwrctrl_power_on_devices(struct device *parent);
 void pci_pwrctrl_power_off_devices(struct device *parent);
+int pci_pwrctrl_create_device(struct device_node *np, struct device *parent);
+void pci_pwrctrl_destroy_device(struct device_node *np);
+int pci_pwrctrl_power_on_device(struct device_node *np);
+void pci_pwrctrl_power_off_device(struct device_node *np);
 #else
 static inline int pci_pwrctrl_create_devices(struct device *parent) { return 0; }
 static void pci_pwrctrl_destroy_devices(struct device *parent) { }
