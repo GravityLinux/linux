@@ -4,6 +4,8 @@
 
 #include <asm/proc-fns.h>
 
+void apple_t8132_release_poll_idle(void);
+
 #ifdef CONFIG_ARM64_PSEUDO_NMI
 #include <asm/arch_gicv3.h>
 
