@@ -138,6 +138,8 @@ static const struct dev_pm_ops simple_pm_bus_pm_ops = {
 
 static const struct of_device_id simple_pm_bus_of_match[] = {
 	{ .compatible = "simple-pm-bus", },
+	/* PMGR children own the registers; bind the container for fw_devlink. */
+	{ .compatible = "apple,t8132-pmgr", .data = ONLY_BUS },
 	{ .compatible = "simple-bus",	.data = ONLY_BUS },
 	{ .compatible = "simple-mfd",	.data = ONLY_BUS },
 	{ .compatible = "isa",		.data = ONLY_BUS },

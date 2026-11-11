@@ -404,9 +404,10 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	/*
 	 * create a shadow copy here to make sure the co-processor isn't able
 	 * to change the log while we're dumping it. this also ensures
-	 * the buffer is in normal memory and not iomem for e.g. the SMC
+	 * the buffer is in normal memory and not iomem for e.g. the SMC.
+	 * No I/O: the crashed co-processor may be the one backing writeback.
 	 */
-	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_KERNEL);
+	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_NOIO);
 	if (bfr) {
 		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0,
 				   rtk->crashlog_buffer.size);
@@ -450,6 +451,17 @@ static void apple_rtkit_system7_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->system7_buffer,
 						 APPLE_RTKIT_EP_UNKNOWN7, msg);
+		break;
+	/*
+	 * Endpoint 7 follows the IOReport protocol: a buffer request, then
+	 * reports that are answered by echoing them back.  PMP sends these
+	 * once it is running.
+	 */
+	case 0x8:
+	case 0xc:
+		dev_dbg(rtk->dev, "RTKit: system endpoint 7 message %llx, acked\n", msg);
+		apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_UNKNOWN7, msg,
+					 NULL, false);
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown system endpoint 7 message: %llx\n",
