@@ -1719,12 +1719,19 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 	msgbuf->max_ioctlrespbuf = BRCMF_MSGBUF_MAX_IOCTLRESPBUF_POST;
 	msgbuf->max_eventbuf = BRCMF_MSGBUF_MAX_EVENTBUF_POST;
 
+	/*
+	 * Packet buffers stay mapped bidirectionally, as they effectively were
+	 * before the direction was stored. The BCM4388 firmware accesses
+	 * both pools in both directions: with TX device-read-only it traps
+	 * with "H2D DMA data transfer error", and with only TX widened it
+	 * still dies once association starts.
+	 */
 	msgbuf->tx_pktids = brcmf_msgbuf_init_pktids(NR_TX_PKTIDS,
-						     DMA_TO_DEVICE);
+						     DMA_BIDIRECTIONAL);
 	if (!msgbuf->tx_pktids)
 		goto fail;
 	msgbuf->rx_pktids = brcmf_msgbuf_init_pktids(NR_RX_PKTIDS,
-						     DMA_FROM_DEVICE);
+						     DMA_BIDIRECTIONAL);
 	if (!msgbuf->rx_pktids)
 		goto fail;
 
