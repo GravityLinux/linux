@@ -394,10 +394,27 @@ static __init const u8 *get_bootargs_cmdline(const void *fdt, int node)
 	return strlen(prop) ? prop : NULL;
 }
 
+/*
+ * Apple M4 (T8132) cores lose their state in WFI, and WFET/WFIT are WFI with a
+ * timeout. Behave as if "arm64.nowfxt" were given, so neither the kernel nor
+ * userspace (HWCAP2_WFXT) uses them; the command line can still override it.
+ */
+static __init void apply_cpu_quirks(void)
+{
+	static char const nowfxt[] __initconst = "arm64.nowfxt";
+	u32 model = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
+
+	if (model == MIDR_APPLE_M4_DONAN_ECORE ||
+	    model == MIDR_APPLE_M4_DONAN_PCORE)
+		__parse_cmdline(nowfxt, true);
+}
+
 static __init void parse_cmdline(const void *fdt, int chosen)
 {
 	static char const cmdline[] __initconst = CONFIG_CMDLINE;
 	const u8 *prop = get_bootargs_cmdline(fdt, chosen);
+
+	apply_cpu_quirks();
 
 	if (IS_ENABLED(CONFIG_CMDLINE_FORCE) || !prop)
 		__parse_cmdline(cmdline, true);
