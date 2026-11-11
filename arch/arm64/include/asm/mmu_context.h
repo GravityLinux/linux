@@ -25,6 +25,7 @@
 #include <asm/cputype.h>
 #include <asm/sysreg.h>
 #include <asm/tlbflush.h>
+#include <asm/p3s/mmu.h>
 
 extern bool rodata_full;
 
@@ -62,19 +63,29 @@ static inline void cpu_switch_mm(pgd_t *pgd, struct mm_struct *mm)
 }
 
 /*
- * Ensure TCR.T0SZ is set to the provided value.
+ * __cpu_set_tcr_geometry - Update TCR_EL1 TG0 and T0SZ fields if changed
+ * @geometry: Target TCR_TG0_* | TCR_T0SZ(...) bitmask
  */
-static inline void __cpu_set_tcr_t0sz(unsigned long t0sz)
+static inline void __cpu_set_tcr_geometry(unsigned long geometry)
 {
 	unsigned long tcr = read_sysreg(tcr_el1);
 
-	if ((tcr & TCR_EL1_T0SZ_MASK) == t0sz)
+	if ((tcr & (TCR_EL1_TG0_MASK | TCR_EL1_T0SZ_MASK)) == geometry)
 		return;
 
-	tcr &= ~TCR_EL1_T0SZ_MASK;
-	tcr |= t0sz;
+	tcr &= ~(TCR_EL1_TG0_MASK | TCR_EL1_T0SZ_MASK);
+	tcr |= geometry;
 	write_sysreg(tcr, tcr_el1);
 	isb();
+}
+
+/*
+ * Ensure TCR.T0SZ is set to the provided value, and TG0 matches the host
+ * kernel translation granule when installing kernel page tables in TTBR0.
+ */
+static inline void __cpu_set_tcr_t0sz(unsigned long t0sz)
+{
+	__cpu_set_tcr_geometry(TCR_TG0_KERNEL | t0sz);
 }
 
 /*
@@ -171,6 +182,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 
 	/* pkey 0 is the default, so always reserve it. */
 	mm->context.pkey_allocation_map = BIT(0);
+	mm_init_new_context(tsk, mm);
 
 	return 0;
 }
@@ -185,6 +197,7 @@ static inline void arch_dup_pkeys(struct mm_struct *oldmm,
 static inline int arch_dup_mmap(struct mm_struct *oldmm, struct mm_struct *mm)
 {
 	arch_dup_pkeys(oldmm, mm);
+	mm_dup_mmap(oldmm, mm);
 
 	return 0;
 }

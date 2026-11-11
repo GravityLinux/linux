@@ -1077,7 +1077,11 @@ static inline pgoff_t folio_pgoff(const struct folio *folio)
 static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return (address - vma->vm_start) >> PAGE_SHIFT;
+	unsigned int shift = mm_pte_shift(vma->vm_mm);
+
+	if (address >= vma->vm_start)
+		return (address - vma->vm_start) >> shift;
+	return -((vma->vm_start - address) >> shift);
 }
 
 /**
@@ -1094,7 +1098,7 @@ static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 static inline pgoff_t linear_page_index(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return linear_page_delta(vma, address) + vma_start_pgoff(vma);
+	return vma_linear_page_index(vma, address);
 }
 
 static inline pgoff_t __linear_anon_page_index(const struct vm_area_struct *vma,

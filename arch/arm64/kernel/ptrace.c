@@ -14,6 +14,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task_stack.h>
 #include <linux/mm.h>
+#include <linux/p3s/mm.h>
 #include <linux/nospec.h>
 #include <linux/smp.h>
 #include <linux/ptrace.h>
@@ -1335,6 +1336,11 @@ static int pac_mask_get(struct task_struct *target,
 
 	if (!system_supports_address_auth())
 		return -EINVAL;
+
+	if (mm_is_p3s_4k(target->mm)) {
+		uregs.data_mask = GENMASK_ULL(54, VA_BITS_4KB);
+		uregs.insn_mask = uregs.data_mask;
+	}
 
 	return membuf_write(&to, &uregs, sizeof(uregs));
 }

@@ -99,8 +99,8 @@ void xacct_add_tsk(struct taskstats *stats, struct task_struct *p)
 	mm = get_task_mm(p);
 	if (mm) {
 		/* adjust to KB unit */
-		stats->hiwater_rss   = get_mm_hiwater_rss(mm) * PAGE_SIZE / KB;
-		stats->hiwater_vm    = get_mm_hiwater_vm(mm)  * PAGE_SIZE / KB;
+		stats->hiwater_rss   = mm_pages_to_kb(mm, get_mm_hiwater_rss(mm));
+		stats->hiwater_vm    = mm_pages_to_kb(mm, get_mm_hiwater_vm(mm));
 		mmput(mm);
 	}
 	stats->read_char	= p->ioac.rchar & KB_MASK;
@@ -140,8 +140,10 @@ static void __acct_update_integrals(struct task_struct *tsk,
 	 * The final unit reported to userspace is Mbyte-usecs,
 	 * the rest of the math is done in xacct_add_tsk.
 	 */
-	tsk->acct_rss_mem1 += delta * get_mm_rss(tsk->mm) >> 10;
-	tsk->acct_vm_mem1 += delta * READ_ONCE(tsk->mm->total_vm) >> 10;
+	tsk->acct_rss_mem1 += delta *
+		mm_kernel_pages(tsk->mm, get_mm_rss(tsk->mm)) >> 10;
+	tsk->acct_vm_mem1 += delta *
+		mm_kernel_pages(tsk->mm, READ_ONCE(tsk->mm->total_vm)) >> 10;
 }
 
 /**

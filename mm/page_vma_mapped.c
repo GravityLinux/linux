@@ -6,6 +6,7 @@
 #include <linux/leafops.h>
 
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 static inline bool not_found(struct page_vma_mapped_walk *pvmw)
 {
@@ -187,6 +188,7 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
 {
 	struct vm_area_struct *vma = pvmw->vma;
 	struct mm_struct *mm = vma->vm_mm;
+	P3S_CONTEXT_REMOTE_MM(mm);
 	unsigned long end;
 	spinlock_t *ptl;
 	pte_t pteval;
@@ -368,6 +370,8 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		pvmw.address = vma_anon_address(vma, pgoff, 1);
 	else
 		pvmw.address = vma_filebacked_address(vma, pgoff, 1);
+	if (folio_test_anon(folio))
+		p3s_anon_rmap_skip(vma, folio, &pvmw.address);
 	if (pvmw.address == -EFAULT)
 		goto out;
 	if (!page_vma_mapped_walk(&pvmw))

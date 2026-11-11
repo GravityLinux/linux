@@ -68,6 +68,7 @@
 #include "swap.h"
 #include "page_alloc.h"
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 static int sysctl_memory_failure_early_kill __read_mostly;
 
@@ -337,6 +338,7 @@ static void shake_page(struct page *page)
 static unsigned long dev_pagemap_mapping_shift(struct vm_area_struct *vma,
 		unsigned long address)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	unsigned long ret = 0;
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -548,13 +550,15 @@ static void collect_procs_anon(const struct folio *folio,
 {
 	struct task_struct *tsk;
 	struct anon_vma *av;
-	pgoff_t pgoff;
+	pgoff_t pgoff, pgoff_end;
 
 	av = folio_lock_anon_vma_read(folio, NULL);
 	if (av == NULL)	/* Not actually mapped anymore */
 		return;
 
 	pgoff = page_pgoff(folio, page);
+	pgoff_end = pgoff;
+	p3s_anon_rmap_range(folio, av, &pgoff, &pgoff_end);
 	rcu_read_lock();
 	for_each_process(tsk) {
 		struct vm_area_struct *vma;
@@ -564,7 +568,7 @@ static void collect_procs_anon(const struct folio *folio,
 
 		if (!t)
 			continue;
-		anon_rmap_tree_foreach(vmac, av, pgoff, pgoff) {
+		anon_rmap_tree_foreach(vmac, av, pgoff, pgoff_end) {
 			vma = vmac->vma;
 			if (vma->vm_mm != t->mm)
 				continue;
@@ -1742,7 +1746,7 @@ static void unmap_and_kill(struct list_head *to_kill, unsigned long pfn,
 		 * mapping being torn down is communicated in siginfo, see
 		 * kill_proc()
 		 */
-		loff_t start = ((loff_t)index << PAGE_SHIFT) & ~(size - 1);
+		loff_t start = ((loff_t)index << PAGE_SHIFT_KERNEL) & ~(size - 1);
 
 		unmap_mapping_range(mapping, start, size, 0);
 	}

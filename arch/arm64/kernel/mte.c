@@ -489,8 +489,9 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 			WARN_ON_ONCE(!page_mte_tagged(page) && !is_zero_page(page));
 
 		/* limit access to the end of the page */
-		offset = offset_in_page(addr);
-		tags = min(len, (PAGE_SIZE - offset) / MTE_GRANULE_SIZE);
+		offset = vma_folio_offset(vma, addr);
+		tags = min(len, (vma_page_size(vma) -
+				 vma_offset_in_page(vma, addr)) / MTE_GRANULE_SIZE);
 
 		maddr = page_address(page);
 		if (write) {

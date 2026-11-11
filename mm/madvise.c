@@ -38,6 +38,7 @@
 
 #include "internal.h"
 #include "swap.h"
+#include <linux/p3s_user_pages.h>
 
 #define __MADV_SET_ANON_VMA_NAME (-1)
 
@@ -245,7 +246,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		struct address_space *mapping)
 {
 	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
-	pgoff_t end_index = linear_page_index(vma, end) - 1;
+	pgoff_t end_index = linear_page_index(vma, end - 1);
 	struct folio *folio;
 	struct swap_io_ctx ctx = {};
 
@@ -261,8 +262,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		if (!softleaf_is_swap(entry))
 			continue;
 
-		addr = vma->vm_start +
-			((xas.xa_index - vma_start_pgoff(vma)) << PAGE_SHIFT);
+		addr = vma_pgoff_to_address(vma, xas.xa_index);
 		xas_pause(&xas);
 		rcu_read_unlock();
 
@@ -326,8 +326,7 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
 	 */
 	mark_mmap_lock_dropped(madv_behavior);
 	get_file(file);
-	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+	offset = vma_file_offset_at(vma, start);
 	mmap_read_unlock(mm);
 	vfs_fadvise(file, offset, end - start, POSIX_FADV_WILLNEED);
 	fput(file);
@@ -349,11 +348,16 @@ static inline bool can_do_file_pageout(struct vm_area_struct *vma)
 	       file_permission(vma->vm_file, MAY_WRITE) == 0;
 }
 
-static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+static inline int madvise_folio_pte_batch(struct vm_area_struct *vma,
+					  unsigned long addr, unsigned long end,
 					  struct folio *folio, pte_t *ptep,
 					  pte_t *ptentp)
 {
 	int max_nr = (end - addr) / PAGE_SIZE;
+
+	if (vma_is_p3s_4k(vma))
+		return p3s_madvise_folio_pte_batch(vma, addr, end,
+						    folio, ptep, ptentp);
 
 	return folio_pte_batch_flags(folio, NULL, ptep, ptentp, max_nr,
 				     FPB_MERGE_YOUNG_DIRTY);
@@ -493,9 +497,10 @@ restart:
 		 * fail to split a folio, leave it in place and advance to the
 		 * next pte in the range.
 		 */
-		if (folio_test_large(folio)) {
-			nr = madvise_folio_pte_batch(addr, end, folio, pte, &ptent);
-			if (nr < folio_nr_pages(folio)) {
+		if (folio_test_large(folio) || vma_is_p3s_4k(vma)) {
+			nr = madvise_folio_pte_batch(vma, addr, end, folio,
+						     pte, &ptent);
+			if (nr < vma_folio_nr_ptes(vma, folio)) {
 				int err;
 
 				if (folio_maybe_mapped_shared(folio))
@@ -526,11 +531,12 @@ restart:
 		/*
 		 * Do not interfere with other mappings of this folio and
 		 * non-LRU folio. If we have a large folio at this point, we
-		 * know it is fully mapped so if its mapcount is the same as its
-		 * number of pages, it must be exclusive.
+		 * know it is fully mapped so if its mapcount is the same as
+		 * the number of PTEs in the batch, it must be exclusive.
 		 */
 		if (!folio_test_lru(folio) ||
-		    folio_mapcount(folio) != folio_nr_pages(folio))
+		    (folio_mapcount(folio) != nr &&
+		     !vma_folio_slices_exclusive(vma, folio)))
 			continue;
 
 		if (pageout_anon_only_filter && !folio_test_anon(folio))
@@ -670,8 +676,8 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 	pte_t *start_pte, *pte, ptent;
 	struct folio *folio;
 	int nr_swap = 0;
-	unsigned long next;
-	int nr, max_nr;
+	unsigned long next, start = addr;
+	int nr, nr_mapped, max_nr;
 
 	next = pmd_addr_end(addr, end);
 	if (pmd_trans_huge(*pmd))
@@ -686,6 +692,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 	lazy_mmu_mode_enable();
 	for (; addr != end; pte += nr, addr += PAGE_SIZE * nr) {
 		nr = 1;
+		nr_mapped = 1;
 		ptent = ptep_get(pte);
 
 		if (pte_none(ptent))
@@ -722,9 +729,14 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 		 * fail to split a folio, leave it in place and advance to the
 		 * next pte in the range.
 		 */
-		if (folio_test_large(folio)) {
-			nr = madvise_folio_pte_batch(addr, end, folio, pte, &ptent);
-			if (nr < folio_nr_pages(folio)) {
+		if (folio_test_large(folio) || vma_is_p3s_4k(vma)) {
+			nr = madvise_folio_pte_batch(vma, addr, end, folio,
+						     pte, &ptent);
+			nr_mapped = nr;
+			if (!p3s_folio_slices_in_range(vma, start, addr, end,
+						       pte, folio, &nr_mapped))
+				continue;
+			if (nr < vma_folio_nr_ptes(vma, folio)) {
 				int err;
 
 				if (folio_maybe_mapped_shared(folio))
@@ -755,10 +767,10 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				continue;
 			/*
 			 * If we have a large folio at this point, we know it is
-			 * fully mapped so if its mapcount is the same as its
-			 * number of pages, it must be exclusive.
+			 * fully mapped so if its mapcount is the same as the
+			 * number of PTEs in the batch, it must be exclusive.
 			 */
-			if (folio_mapcount(folio) != folio_nr_pages(folio)) {
+			if (folio_mapcount(folio) != nr_mapped) {
 				folio_unlock(folio);
 				continue;
 			}
@@ -1030,8 +1042,7 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
 	if (!vma_is_shared_maywrite(vma))
 		return -EACCES;
 
-	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+	offset = vma_file_offset_at(vma, start);
 
 	/*
 	 * Filesystem's fallocate may need to take i_rwsem.  We need to
@@ -1191,7 +1202,7 @@ static long madvise_guard_install(struct madvise_behavior *madv_behavior)
 
 		if (err == 0) {
 			unsigned long nr_expected_pages =
-				PHYS_PFN(range->end - range->start);
+				(range->end - range->start) >> PAGE_SHIFT;
 
 			VM_WARN_ON(nr_pages != nr_expected_pages);
 			return 0;
@@ -2027,6 +2038,7 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
 			      int behavior)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	ssize_t ret = 0;
 	size_t total_len;
 	struct mmu_gather tlb;

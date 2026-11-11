@@ -84,6 +84,13 @@ impl VmaRef {
         unsafe { (*self.as_ptr()).__bindgen_anon_1.__bindgen_anon_1.vm_start }
     }
 
+    /// Whether the mapping starts at a native-page boundary with no slice offset.
+    #[inline]
+    pub fn starts_at_kernel_page(&self) -> bool {
+        // SAFETY: The type invariants guarantee a valid VMA and at least its read lock.
+        unsafe { bindings::vma_starts_at_kernel_page(self.as_ptr()) }
+    }
+
     /// Returns the (exclusive) end address of the virtual memory area.
     #[inline]
     pub fn end(&self) -> usize {

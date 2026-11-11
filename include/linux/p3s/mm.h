@@ -1,0 +1,327 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_P3S_MM_H
+#define _LINUX_P3S_MM_H
+
+#include <linux/kernel.h>
+#include <linux/personality.h>
+#include <linux/p3s/const.h>
+
+struct file;
+struct mm_struct;
+struct task_struct;
+
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+
+#define VM_COMMIT_SHIFT PAGE_SHIFT_4KB
+
+/*
+ * Boot-time command-line 4KB mode (p3s=):
+ * P3S_4K_MODE_OFF:       Standard behavior (controlled via personality)
+ * P3S_4K_MODE_ON:        Force 4KB pages for all processes after boot
+ * P3S_4K_MODE_ALTERNATE: Alternate 4KB (odd PIDs) and 16KB (even PIDs)
+ *                        for stress testing
+ */
+enum p3s_4k_mode {
+	P3S_4K_MODE_OFF = 0,
+	P3S_4K_MODE_ON = 1,
+	P3S_4K_MODE_ALTERNATE = 2,
+};
+
+extern enum p3s_4k_mode p3s_4k_mode;
+
+static inline bool personality_4kb_pages(unsigned long pers)
+{
+	return !!(pers & ADDR_PAGE_SIZE_4KB);
+}
+
+static inline unsigned int mm_pte_shift(const struct mm_struct *mm)
+{
+	return (mm && mm->context.pte_shift) ? mm->context.pte_shift :
+					       PAGE_SHIFT_KERNEL;
+}
+
+static inline void mm_set_pte_shift(struct mm_struct *mm, unsigned int shift)
+{
+	if (mm)
+		mm->context.pte_shift = shift;
+}
+
+static inline void mm_init_pte_shift(struct mm_struct *mm,
+				     const struct task_struct *p)
+{
+	const struct task_struct *tsk = p ? p : current;
+	bool use_4kb = false;
+
+	/*
+	 * fork(): @p is the new child and dup_mmap() copies the parent's page
+	 * tables into @mm, so keep the parent's page size from the start. The
+	 * policy below only applies to the new mm of an execve().
+	 */
+	if (p && p != current && current->mm) {
+		mm_set_pte_shift(mm, mm_pte_shift(current->mm));
+		return;
+	}
+
+	/*
+	 * In ALTERNATE mode, assign 4KB to odd PIDs and 16KB to even PIDs
+	 * based strictly on PID parity rather than inheriting parent pte_shift,
+	 * ensuring child tasks alternate regardless of what init or parent ran.
+	 */
+	if (system_state >= SYSTEM_RUNNING) {
+		if (tsk && personality_4kb_pages(tsk->personality))
+			use_4kb = true;
+		else if (p3s_4k_mode == P3S_4K_MODE_ON)
+			use_4kb = true;
+		else if (p3s_4k_mode == P3S_4K_MODE_ALTERNATE &&
+			 tsk && (tsk->pid & 1))
+			use_4kb = true;
+	}
+
+	mm_set_pte_shift(mm, use_4kb ? PAGE_SHIFT_4KB : PAGE_SHIFT_KERNEL);
+}
+
+/*
+ * mm_reader_pages - Express a page count of @mm in pages of the reader
+ * @mm: mm_struct the pages belong to
+ * @nr: Number of pages of mm_pte_size(@mm) bytes
+ *
+ * /proc/<pid>/statm and /proc/<pid>/stat report memory in pages, which the
+ * reading task converts with its own page size. Scale @nr from the page
+ * size of @mm to that of current, rounding up, so that 4KB compatibility
+ * and native readers both see the right amount of memory.
+ */
+static inline unsigned long mm_reader_pages(const struct mm_struct *mm,
+					    unsigned long nr)
+{
+	unsigned int shift = mm_pte_shift(mm);
+	unsigned int reader = mm_pte_shift(current->mm);
+
+	if (shift >= reader)
+		return nr << (shift - reader);
+	return DIV_ROUND_UP(nr, 1UL << (reader - shift));
+}
+
+#else /* !CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
+
+#define VM_COMMIT_SHIFT PAGE_SHIFT_KERNEL
+
+static inline unsigned int mm_pte_shift(const struct mm_struct *mm)
+{
+	return PAGE_SHIFT_KERNEL;
+}
+
+static inline void mm_set_pte_shift(struct mm_struct *mm, unsigned int shift)
+{
+}
+
+static inline void mm_init_pte_shift(struct mm_struct *mm,
+				     const struct task_struct *p)
+{
+}
+
+static inline unsigned long mm_reader_pages(const struct mm_struct *mm,
+					    unsigned long nr)
+{
+	return nr;
+}
+
+#endif /* CONFIG_ARM64_PER_PROCESS_PAGE_SIZE */
+
+static inline unsigned long mm_pte_size(const struct mm_struct *mm)
+{
+	return _AC(1, UL) << mm_pte_shift(mm);
+}
+
+static inline unsigned long mm_pte_mask(const struct mm_struct *mm)
+{
+	return ~(mm_pte_size(mm) - 1);
+}
+
+/*
+ * Check if the address space is operating in 4KB backward-compatibility mode
+ * on the 16KB host kernel (i.e. mm_pte_shift(mm) != PAGE_SHIFT_KERNEL).
+ */
+static inline bool mm_is_p3s_4k(const struct mm_struct *mm)
+{
+	return mm_pte_shift(mm) != PAGE_SHIFT_KERNEL;
+}
+
+/* Limit 4KB mmap randomization to one eighth of its user VA window. */
+static inline unsigned long mm_mmap_rnd_mask(const struct mm_struct *mm)
+{
+	return mm_is_p3s_4k(mm) ? (1UL << MMAP_RND_BITS_4KB) - 1 : ~0UL;
+}
+
+/*
+ * p3s_err - Log a P3S error against the current task, ratelimited
+ */
+#define p3s_err(fmt, ...)						\
+	pr_err_ratelimited("p3s [%i (%s)]: " fmt, task_pid_nr(current),	\
+			   current->comm, ##__VA_ARGS__)
+
+/*
+ * p3s_4k_unsupported - Check if a feature is unsupported for @mm
+ * @mm: mm_struct the calling feature would operate on
+ *
+ * Features that cannot work in a 4KB compatibility mm refuse to run for
+ * it. Returns mm_is_p3s_4k(@mm) and logs the refusal with the name of the
+ * calling function, so that refusals hit in production can be identified.
+ */
+#define p3s_4k_unsupported(mm)						\
+({									\
+	bool __p3s_4k = mm_is_p3s_4k(mm);				\
+									\
+	if (unlikely(__p3s_4k))						\
+		p3s_err("%s: unsupported in 4KB compatibility mode\n",	\
+			__func__);					\
+	__p3s_4k;							\
+})
+
+static inline unsigned long mm_pmd_size(const struct mm_struct *mm)
+{
+	return mm_is_p3s_4k(mm) ? PMD_SIZE_4KB : PMD_SIZE;
+}
+
+static inline unsigned long mm_pgdir_size(const struct mm_struct *mm)
+{
+	return mm_is_p3s_4k(mm) ? PGDIR_SIZE_4KB : PGDIR_SIZE;
+}
+
+/* pmd_addr_end() and pgd_addr_end() in the page table geometry of @mm */
+static inline unsigned long mm_pmd_addr_end(const struct mm_struct *mm,
+					    unsigned long addr, unsigned long end)
+{
+	unsigned long boundary = (addr + mm_pmd_size(mm)) & ~(mm_pmd_size(mm) - 1);
+
+	return boundary - 1 < end - 1 ? boundary : end;
+}
+
+static inline unsigned long mm_pgd_addr_end(const struct mm_struct *mm,
+					    unsigned long addr, unsigned long end)
+{
+	unsigned long boundary = (addr + mm_pgdir_size(mm)) & ~(mm_pgdir_size(mm) - 1);
+
+	return boundary - 1 < end - 1 ? boundary : end;
+}
+
+static inline unsigned int mm_slices_per_page(const struct mm_struct *mm)
+{
+	return 1U << (PAGE_SHIFT_KERNEL - mm_pte_shift(mm));
+}
+
+/*
+ * mm_kernel_pages - Express a page count of @mm in kernel pages
+ * @mm: mm_struct the pages belong to
+ * @nr: Number of pages of mm_pte_size(@mm) bytes
+ *
+ * The RSS and VM counters of a 4KB compatibility mm count 4KB pages. Code
+ * that converts them with PAGE_SIZE, or accumulates them across tasks,
+ * must first convert them to kernel pages. Rounds up.
+ */
+static inline unsigned long mm_kernel_pages(const struct mm_struct *mm,
+					    unsigned long nr)
+{
+	return DIV_ROUND_UP(nr, mm_slices_per_page(mm));
+}
+
+/* Convert native-page counts to the units used by @mm. */
+static inline unsigned long mm_pages_from_kernel(const struct mm_struct *mm,
+						 unsigned long nr)
+{
+	return nr * mm_slices_per_page(mm);
+}
+
+/* Global commitment counters use the smallest supported process page size. */
+static inline long vm_commit_mm_pages(const struct mm_struct *mm, long pages)
+{
+	return pages * (1L << (mm_pte_shift(mm) - VM_COMMIT_SHIFT));
+}
+
+static inline long vm_commit_native_pages(long pages)
+{
+	return pages * (1L << (PAGE_SHIFT_KERNEL - VM_COMMIT_SHIFT));
+}
+
+static inline unsigned long mm_offset_in_page(const struct mm_struct *mm,
+					      unsigned long addr)
+{
+	return addr & (mm_pte_size(mm) - 1);
+}
+
+static inline bool mm_pte_aligned(const struct mm_struct *mm,
+				  unsigned long addr)
+{
+	return !mm_offset_in_page(mm, addr);
+}
+
+static inline unsigned long mm_pages_to_kb(const struct mm_struct *mm,
+					   unsigned long nr)
+{
+	return nr << (mm_pte_shift(mm) - 10);
+}
+
+static inline unsigned long mm_phys_pfn(const struct mm_struct *mm,
+					phys_addr_t x)
+{
+	return (unsigned long)(x >> mm_pte_shift(mm));
+}
+
+extern unsigned long stack_guard_gap;
+
+static inline unsigned long mm_stack_guard_gap(const struct mm_struct *mm)
+{
+	return (stack_guard_gap >> PAGE_SHIFT_KERNEL) << mm_pte_shift(mm);
+}
+
+/*
+ * mm_mmap_pgoff - vm_pgoff for the page offset passed to mmap()
+ * @mm: Pointer to struct mm_struct
+ * @file: File being mapped, or NULL for an anonymous mapping
+ * @pgoff: Page offset passed to mmap in process page units
+ *
+ * A 4KB process passes @pgoff in 4KB pages, but vm_pgoff counts 16KB file
+ * pages. Split @pgoff into the file page, @pgoff >> P3S_SLICE_SHIFT, which
+ * is returned here, and the slice of that page, @pgoff & P3S_SLICE_MASK,
+ * which mm_mmap_slice_off() returns for vm_slice_off.
+ *
+ * For example, @pgoff = 5 is in file page 5 >> P3S_SLICE_SHIFT = 1, at
+ * slice 5 & P3S_SLICE_MASK = 1:
+ *
+ *                                            @pgoff
+ *                                               ▼
+ *              ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+ *  4KB pages   │  0  │  1  │  2  │  3  │  4  │  5  │  6  │  7  │
+ *              ├─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┤
+ *  4KB slices  │  0  │  1  │  2  │  3  │  0  │  1  │  2  │  3  │
+ *              ├─────┴─────┴─────┴─────┼─────┴─────┴─────┴─────┤
+ *  16KB file   │           0           │           1           │
+ *  pages       └───────────────────────┴───────────────────────┘
+ *
+ * Anonymous mappings and other processes keep @pgoff unchanged. An
+ * anonymous 4KB VMA counts 4KB pages (see vma_linear_page_index()).
+ */
+static inline pgoff_t mm_mmap_pgoff(const struct mm_struct *mm,
+				    const struct file *file, pgoff_t pgoff)
+{
+	return (mm_is_p3s_4k(mm) && file) ? (pgoff >> P3S_SLICE_SHIFT) : pgoff;
+}
+
+/*
+ * mm_mmap_slice_off - vm_slice_off for the page offset passed to mmap()
+ * @mm: Pointer to struct mm_struct
+ * @file: File being mapped, or NULL for an anonymous mapping
+ * @pgoff: Page offset passed to mmap in process page units
+ *
+ * For a 4KB process, 4KB page @pgoff is slice @pgoff & P3S_SLICE_MASK of
+ * file page mm_mmap_pgoff(), and this returns that slice (see the diagram
+ * at mm_mmap_pgoff()). Returns 0 for anonymous mappings and other
+ * processes.
+ */
+static inline unsigned short mm_mmap_slice_off(const struct mm_struct *mm,
+					       const struct file *file,
+					       pgoff_t pgoff)
+{
+	return (mm_is_p3s_4k(mm) && file) ? (pgoff & P3S_SLICE_MASK) : 0;
+}
+
+#endif /* _LINUX_P3S_MM_H */

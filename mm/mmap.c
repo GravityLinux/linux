@@ -58,6 +58,7 @@
 #include <trace/events/mmap.h>
 
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 #ifndef arch_mmap_check
 #define arch_mmap_check(addr, len, flags)	(0)
@@ -187,7 +188,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 	 * expansion area
 	 */
 	vma_iter_init(&vmi, mm, oldbrk);
-	next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);
+	next = vma_find(&vmi, newbrk + PAGE_SIZE + mm_stack_guard_gap(mm));
 	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
 		goto out;
 
@@ -585,12 +586,19 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 	struct file *file = NULL;
 	unsigned long retval;
 
+	if ((flags & MAP_HUGETLB) && p3s_4k_unsupported(current->mm))
+		return -EINVAL;
+
 	if (!(flags & MAP_ANONYMOUS)) {
 		audit_mmap_fd(fd, flags);
 		file = fget(fd);
 		if (!file)
 			return -EBADF;
 		if (is_file_hugepages(file)) {
+			if (p3s_4k_unsupported(current->mm)) {
+				retval = -EINVAL;
+				goto out_fput;
+			}
 			len = ALIGN(len, huge_page_size(hstate_file(file)));
 		} else if (unlikely(flags & MAP_HUGETLB)) {
 			retval = -EINVAL;
@@ -678,6 +686,8 @@ static inline unsigned long stack_guard_placement(vma_flags_t vma_flags)
 unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info)
 {
 	unsigned long addr;
+
+	p3s_adjust_unmapped_area_info(info);
 
 	if (info->flags & VM_UNMAPPED_AREA_TOPDOWN)
 		addr = unmapped_area_topdown(info);
@@ -952,7 +962,7 @@ find_vma_prev(struct mm_struct *mm, unsigned long addr,
 }
 
 /* enforced gap between the expanding stack and other mappings. */
-unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
+unsigned long stack_guard_gap = 256UL << PAGE_SHIFT_KERNEL;
 
 static int __init cmdline_parse_stack_guard_gap(char *p)
 {
@@ -961,7 +971,7 @@ static int __init cmdline_parse_stack_guard_gap(char *p)
 
 	val = simple_strtoul(p, &endptr, 10);
 	if (!*endptr)
-		stack_guard_gap = val << PAGE_SHIFT;
+		stack_guard_gap = val << PAGE_SHIFT_KERNEL;
 
 	return 1;
 }
@@ -1287,6 +1297,7 @@ unsigned long tear_down_vmas(struct mm_struct *mm, struct vma_iterator *vmi,
 /* Release all mmaps. */
 void exit_mmap(struct mm_struct *mm)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	struct mmu_gather tlb;
 	struct vm_area_struct *vma;
 	unsigned long nr_accounted = 0;
@@ -1338,7 +1349,7 @@ destroy:
 	__mt_destroy(&mm->mm_mt);
 	trace_exit_mmap(mm);
 	mmap_write_unlock(mm);
-	vm_unacct_memory(nr_accounted);
+	vm_unacct_memory_mm(mm, nr_accounted);
 }
 
 /*
@@ -1869,7 +1880,7 @@ loop_out:
 			flush_cache_mm(mm);
 			unmap_region(&unmap);
 			charge = tear_down_vmas(mm, &vmi, tmp, end);
-			vm_unacct_memory(charge);
+			vm_unacct_memory_mm(mm, charge);
 		}
 		__mt_destroy(&mm->mm_mt);
 		/*
@@ -1895,6 +1906,6 @@ fail_nomem_policy:
 	vm_area_free(tmp);
 fail_nomem:
 	retval = -ENOMEM;
-	vm_unacct_memory(charge);
+	vm_unacct_memory_mm(mm, charge);
 	goto loop_out;
 }

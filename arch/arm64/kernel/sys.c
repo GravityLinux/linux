@@ -17,6 +17,7 @@
 
 #include <asm/cpufeature.h>
 #include <asm/syscall.h>
+#include <linux/p3s_user_pages.h>
 
 SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
 		unsigned long, prot, unsigned long, flags,
