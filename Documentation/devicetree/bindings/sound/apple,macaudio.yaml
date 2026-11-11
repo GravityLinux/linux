@@ -20,6 +20,7 @@ properties:
           - apple,j274-macaudio
           - apple,j293-macaudio
           - apple,j314-macaudio
+          - apple,j713-macaudio
       - const: apple,macaudio
 
   "#address-cells":

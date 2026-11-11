@@ -80,6 +80,18 @@ config SND_SOC_APPLE_NEO_SPEAKER
 	help
 	  Neo speaker PCM with a fixed 3/256 gain cap, thermal admission and
 	  amplifier-first cutoff. The cap remains deliberately conservative.
+config SND_SOC_APPLE_J713_HEADPHONES
+	tristate "Apple J713 headphones"
+	depends on ARCH_APPLE && ARM64_16K_PAGES && I2C && GPIOLIB && OF
+	depends on DMADEVICES
+	select SND_PCM
+	select SND_SOC_APPLE_MCA
+	select SND_SOC_CS42L84
+	select APPLE_ADMAC
+	help
+	  Headphone-only playback and jack detection on the M4 MacBook Air J713.
+	  Uses MCA frontend/port 2, ADMAC TX2 and the CS42L84 codec. No speaker
+	  amplifier, speaker PCM or speaker protection model is instantiated.
 
 config SND_SOC_APPLE_AOP_SPEAKER_CODECS
 	bool "ASoC codecs for protected AOP speaker playback"

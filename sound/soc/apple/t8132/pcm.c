@@ -3,11 +3,13 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/uio.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include <sound/soc.h>
+#include <sound/jack.h>
 #include <sound/pcm_params.h>
 #include <sound/dmaengine_pcm.h>
 #include "../../codecs/tas2764.h"
@@ -16,6 +18,7 @@
 #include "progress.h"
 
 #define SPEAKER_FMT (SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_IF | SND_SOC_DAIFMT_CBC_CFC)
+#define HEADPHONE_FMT (SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_IB_IF | SND_SOC_DAIFMT_CBC_CFC)
 #define MONITOR_MS 20
 #define MAX_BUFFER_FRAMES 8192 /* 32 KiB of mono S24 in 32 bits */
 #define MAX_PERIOD_FRAMES 1024
@@ -43,8 +46,10 @@ MODULE_PARM_DESC(power_margin_pct, "Multiplier on the electrical power bound, pe
 
 struct j773g_audio {
 	struct snd_soc_card card;
-	struct snd_soc_dai_link links[2];
-	struct snd_soc_dai_link_component cpus[2], codecs[2], platforms[2];
+	struct snd_soc_dai_link links[4];
+	struct snd_soc_dai_link_component cpus[4], codecs[4], platforms[2];
+	struct snd_soc_jack jack;
+	struct snd_soc_jack_pin jack_pin;
 	struct mutex lock;
 	struct delayed_work monitor;
 	struct snd_pcm_substream *stream;
@@ -355,6 +360,61 @@ static int speaker_be_init(struct snd_soc_pcm_runtime *rtd)
 	return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_codec(rtd, 0), 1, 0, 1, 32);
 }
 
+static int headphone_fe_init(struct snd_soc_pcm_runtime *rtd)
+{
+	int ret = snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_cpu(rtd, 0), 3, 0, 2, 32);
+
+	if (ret)
+		return ret;
+	return snd_soc_dai_set_bclk_ratio(snd_soc_rtd_to_cpu(rtd, 0), 250);
+}
+
+static int headphone_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_RATE, 48000);
+
+	if (ret < 0)
+		return ret;
+	ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_CHANNELS, 2);
+	if (ret < 0)
+		return ret;
+	/* Only the 24-bit receive configuration is validated for this TDM link. */
+	return snd_pcm_hw_constraint_mask64(runtime, SNDRV_PCM_HW_PARAM_FORMAT,
+					    SNDRV_PCM_FMTBIT_S24_LE);
+}
+
+static const struct snd_soc_ops headphone_ops = {
+	.startup = headphone_startup,
+};
+
+static int headphone_be_init(struct snd_soc_pcm_runtime *rtd)
+{
+	struct j773g_audio *a = snd_soc_card_get_drvdata(rtd->card);
+	struct snd_soc_dai *dai = snd_soc_rtd_to_codec(rtd, 0);
+	int ret;
+
+	ret = snd_soc_dai_set_sysclk(dai, 0, 12000000, SND_SOC_CLOCK_IN);
+	if (ret)
+		return ret;
+	ret = snd_soc_dai_set_tdm_slot(dai, 0, 3, 2, 32);
+	if (ret)
+		return ret;
+	a->jack_pin = (struct snd_soc_jack_pin) {
+		.pin = "Headphone", .mask = SND_JACK_HEADPHONE,
+	};
+	ret = snd_soc_card_jack_new_pins(rtd->card, "Headphone Jack", SND_JACK_HEADPHONE,
+				       &a->jack, &a->jack_pin, 1);
+	if (ret)
+		return ret;
+	return snd_soc_component_set_jack(dai->component, &a->jack, NULL);
+}
+
+static void headphone_be_exit(struct snd_soc_pcm_runtime *rtd)
+{
+	snd_soc_component_set_jack(snd_soc_rtd_to_codec(rtd, 0)->component, NULL, NULL);
+}
+
 static int speaker_volume_info(struct snd_kcontrol *k, struct snd_ctl_elem_info *u)
 {
 	u->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
@@ -395,11 +455,14 @@ static const struct snd_kcontrol_new speaker_controls[] = {{
 
 static const struct snd_soc_dapm_widget speaker_widgets[] = {
 	SND_SOC_DAPM_SPK("Speaker", NULL),
+	SND_SOC_DAPM_HP("Headphone", NULL),
 };
 
 static const struct snd_soc_dapm_route speaker_routes[] = {
 	{ "I2S0 TX", NULL, "PCM0 TX" },
 	{ "Speaker", NULL, "OUT" },
+	{ "I2S2 TX", NULL, "PCM2 TX" },
+	{ "Headphone", NULL, "Jack HP" },
 };
 
 static int speaker_fixup_controls(struct snd_soc_card *card)
@@ -429,7 +492,7 @@ static int speaker_fixup_controls(struct snd_soc_card *card)
 	int i, ret;
 
 	for_each_card_rtds(card, rtd)
-		if (rtd->dai_link->no_pcm)
+		if (rtd->dai_link == &a->links[1])
 			codec = snd_soc_rtd_to_codec(rtd, 0)->component;
 	if (!codec)
 		return -ENODEV;
@@ -499,11 +562,36 @@ static void speaker_put_node(void *node)
 	of_node_put(node);
 }
 
+/*
+ * Building the card's PCMs requests MCA DMA channels from ADMAC. If ADMAC has
+ * not bound yet, ASoC parks the card and only retries it when another ASoC
+ * component registers, which a late DMA controller never triggers. Defer
+ * the whole probe instead, so the driver core retries once ADMAC binds.
+ */
+static int speaker_wait_for_dma(struct device *dev, struct device_node *mca)
+{
+	struct device_node *np = of_parse_phandle(mca, "dmas", 0);
+	struct platform_device *dma;
+	bool bound;
+
+	if (!np)
+		return 0;
+	dma = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!dma)
+		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for the audio DMA controller\n");
+	bound = device_is_bound(&dma->dev);
+	put_device(&dma->dev);
+	if (!bound)
+		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for the audio DMA controller\n");
+	return 0;
+}
+
 static int speaker_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct j773g_audio *a;
-	struct device_node *mca, *codec;
+	struct device_node *mca, *codec, *headphone;
 	int ret;
 
 	a = devm_kzalloc(dev, sizeof(*a), GFP_KERNEL);
@@ -518,6 +606,9 @@ static int speaker_probe(struct platform_device *pdev)
 	if (!mca)
 		return -EINVAL;
 	ret = devm_add_action_or_reset(dev, speaker_put_node, mca);
+	if (ret)
+		return ret;
+	ret = speaker_wait_for_dma(dev, mca);
 	if (ret)
 		return ret;
 	codec = of_parse_phandle(dev->of_node, "apple,codec", 0);
@@ -555,10 +646,47 @@ static int speaker_probe(struct platform_device *pdev)
 		.fixup_controls = speaker_fixup_controls,
 		.component_chaining = true, .fully_routed = true,
 		.controls = speaker_controls, .num_controls = ARRAY_SIZE(speaker_controls),
-		.dapm_widgets = speaker_widgets, .num_dapm_widgets = ARRAY_SIZE(speaker_widgets),
-		.dapm_routes = speaker_routes, .num_dapm_routes = ARRAY_SIZE(speaker_routes),
+		.dapm_widgets = speaker_widgets, .num_dapm_widgets = 1,
+		.dapm_routes = speaker_routes, .num_dapm_routes = 2,
 	};
 	snd_soc_card_set_drvdata(&a->card, a);
+	headphone = of_parse_phandle(dev->of_node, "apple,headphone-codec", 0);
+	if (headphone) {
+		ret = devm_add_action_or_reset(dev, speaker_put_node, headphone);
+		if (ret)
+			return ret;
+		a->cpus[2] = (struct snd_soc_dai_link_component){
+			.of_node = mca, .dai_name = "mca-pcm-2",
+		};
+		a->cpus[3] = (struct snd_soc_dai_link_component){
+			.of_node = mca, .dai_name = "mca-i2s-2",
+		};
+		a->codecs[2] = a->codecs[0];
+		a->codecs[3] = (struct snd_soc_dai_link_component){
+			.of_node = headphone, .dai_name = "cs42l84",
+		};
+		a->links[2] = (struct snd_soc_dai_link){
+			.name = "Headphones", .stream_name = "Headphones",
+			.dynamic = 1, .playback_only = 1, .nonatomic = 1,
+			.dpcm_merged_rate = 1, .dpcm_merged_chan = 1, .dpcm_merged_format = 1,
+			.dai_fmt = HEADPHONE_FMT, .init = headphone_fe_init,
+			.ops = &headphone_ops,
+			.cpus = &a->cpus[2], .num_cpus = 1,
+			.codecs = &a->codecs[2], .num_codecs = 1,
+			.platforms = a->platforms, .num_platforms = 1,
+		};
+		a->links[3] = (struct snd_soc_dai_link){
+			.name = "Headphone Codec", .stream_name = "Headphone Codec",
+			.no_pcm = 1, .playback_only = 1,
+			.dai_fmt = HEADPHONE_FMT,
+			.init = headphone_be_init, .exit = headphone_be_exit,
+			.cpus = &a->cpus[3], .num_cpus = 1,
+			.codecs = &a->codecs[3], .num_codecs = 1,
+		};
+		a->card.num_links = 4;
+		a->card.num_dapm_widgets = ARRAY_SIZE(speaker_widgets);
+		a->card.num_dapm_routes = ARRAY_SIZE(speaker_routes);
+	}
 	ret = devm_snd_soc_register_component(dev, &speaker_component, NULL, 0);
 	if (ret)
 		return ret;

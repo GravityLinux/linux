@@ -98,6 +98,32 @@ static const char *volume_control_names[] = {
 #define SSM3515_0DB (255 - 64) /* +24dB max, steps of 3/8 dB */
 #define SSM3515_DB(x) (SSM3515_0DB + (8 * (x) / 3))
 
+/*
+ * Frontend layout for MCA controllers whose clusters divide a fixed 24 MHz
+ * reference (T8132). Only 250 fs at 48 kHz divides it evenly, so every
+ * frontend uses that frame. As on macOS, the speakers and their V/I sense
+ * share cluster 0 (the sense capture follows the speaker clocks) and the
+ * headphone jack uses cluster 2.
+ */
+struct macaudio_fe_layout {
+	const char *cpu;		/* frontend DAI */
+	unsigned int slots;		/* TDM slots */
+	unsigned int slot_width;
+	bool speakers;			/* takes the speaker clock inversion */
+};
+
+struct macaudio_mca_layout {
+	struct macaudio_fe_layout fe[3];	/* Primary, Secondary, Speaker Sense */
+	unsigned int bclk_ratio;
+	unsigned int rate;
+	u64 formats;			/* playback sample formats */
+	unsigned int speaker_inv;	/* clock inversion of the speaker links */
+	bool headset_capture;
+	bool codec_rx_tdm;		/* the jack codec takes its slots as rx_mask */
+	const struct snd_soc_dapm_route *routes;
+	unsigned int num_routes;
+};
+
 struct ma_codec_idle {
 	int idle_mode;
 	u32 idle_mask;
@@ -109,6 +135,7 @@ struct macaudio_snd_data {
 	int jack_plugin_state;
 
 	const struct macaudio_platform_cfg *cfg;
+	const struct macaudio_mca_layout *mca;
 	bool has_speakers;
 	bool has_sense;
 	bool has_safety;
@@ -117,6 +144,7 @@ struct macaudio_snd_data {
 	struct macaudio_link_props {
 		/* frontend props */
 		unsigned int bclk_ratio;
+		unsigned int tdm_slots, tdm_slot_width;	/* 0: from bclk_ratio */
 		bool is_sense;
 
 		/* backend props */
@@ -508,6 +536,28 @@ static int macaudio_get_codec_idle_props(struct device_node *np,
 	return 0;
 }
 
+static void macaudio_apply_fe_layout(struct macaudio_snd_data *ma)
+{
+	const struct macaudio_mca_layout *l = ma->mca;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(macaudio_fe_links); i++) {
+		struct snd_soc_dai_link *link = &ma->card.dai_link[i];
+		struct macaudio_link_props *props = &ma->link_props[i];
+
+		link->cpus->dai_name = l->fe[i].cpu;
+		props->tdm_slots = l->fe[i].slots;
+		props->tdm_slot_width = l->fe[i].slot_width;
+		if (!props->is_sense)
+			props->bclk_ratio = l->bclk_ratio;
+		if (l->fe[i].speakers)
+			link->dai_fmt = (link->dai_fmt & ~SND_SOC_DAIFMT_INV_MASK) |
+					l->speaker_inv;
+		if (!props->is_sense && !link->playback_only && !l->headset_capture)
+			link->playback_only = 1;
+	}
+}
+
 static int macaudio_parse_of(struct macaudio_snd_data *ma)
 {
 	struct device_node *codec = NULL;
@@ -580,6 +630,9 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 
 	for (i = 0; i < num_links; i++)
 		card->dai_link[i].id = i;
+
+	if (ma->mca)
+		macaudio_apply_fe_layout(ma);
 
 	/* We might disable the speakers, so count again */
 	num_links = ARRAY_SIZE(macaudio_fe_links);
@@ -684,6 +737,10 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (ret)
 				goto err_free;
 
+			if (speakers && ma->mca)
+				link->dai_fmt = (link->dai_fmt & ~SND_SOC_DAIFMT_INV_MASK) |
+						ma->mca->speaker_inv;
+
 			link_props->is_speakers = speakers;
 			link_props->is_headphones = !speakers;
 
@@ -781,6 +838,18 @@ static int macaudio_get_runtime_bclk_ratio(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+/*
+ * The sense capture runs at the speaker rate. With a fixed-rate layout it can
+ * also be configured before the speakers first play.
+ */
+static unsigned int macaudio_sense_rate(struct macaudio_snd_data *ma,
+					struct snd_soc_dai *cpu_dai)
+{
+	if (cpu_dai->symmetric_rate || !ma->mca)
+		return cpu_dai->symmetric_rate;
+	return ma->mca->rate;
+}
+
 static int macaudio_dpcm_hw_params(struct snd_pcm_substream *substream,
 				   struct snd_pcm_hw_params *params)
 {
@@ -794,7 +863,7 @@ static int macaudio_dpcm_hw_params(struct snd_pcm_substream *substream,
 	int i;
 
 	if (props->is_sense) {
-		rate->min = rate->max = cpu_dai->symmetric_rate;
+		rate->min = rate->max = macaudio_sense_rate(ma, cpu_dai);
 		return 0;
 	}
 
@@ -802,7 +871,7 @@ static int macaudio_dpcm_hw_params(struct snd_pcm_substream *substream,
 	if (props->is_speakers) {
 		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 			/* Sense PCM: keep the existing BE rate (0 if not already running) */
-			rate->min = rate->max = cpu_dai->symmetric_rate;
+			rate->min = rate->max = macaudio_sense_rate(ma, cpu_dai);
 
 			return 0;
 		} else {
@@ -840,6 +909,14 @@ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
 	struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
 	int max_rate, ret;
 
+	if (ma->mca) {
+		ret = snd_pcm_hw_constraint_single(substream->runtime,
+						   SNDRV_PCM_HW_PARAM_RATE,
+						   ma->mca->rate);
+		if (ret < 0)
+			return ret;
+	}
+
 	if (props->is_sense) {
 		/*
 		 * Sense stream will not return data while playback is inactive,
@@ -847,6 +924,14 @@ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
 		 */
 		substream->wait_time = MAX_SCHEDULE_TIMEOUT;
 		return 0;
+	}
+
+	if (ma->mca) {
+		ret = snd_pcm_hw_constraint_mask64(substream->runtime,
+						   SNDRV_PCM_HW_PARAM_FORMAT,
+						   ma->mca->formats);
+		if (ret < 0)
+			return ret;
 	}
 
 	ret = snd_pcm_hw_constraint_minmax(substream->runtime,
@@ -987,6 +1072,11 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 	nslots = __fls(mask) + 1;
 
 	if (rtd->dai_link->num_codecs == 1) {
+		/* A TDM jack codec receives the playback slots */
+		if (props->is_headphones && ma->mca && ma->mca->codec_rx_tdm)
+			return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_codec(rtd, 0), 0,
+							mask, nslots, MACAUDIO_SLOTWIDTH);
+
 		ret = snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_codec(rtd, 0), mask,
 					       0, nslots, MACAUDIO_SLOTWIDTH);
 
@@ -1058,6 +1148,25 @@ static int macaudio_fe_init(struct snd_soc_pcm_runtime *rtd)
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
 	int nslots = props->bclk_ratio / MACAUDIO_SLOTWIDTH;
+
+	if (props->tdm_slots) {
+		unsigned int mask = GENMASK(props->tdm_slots - 1, 0);
+		int ret;
+
+		/*
+		 * The frame is fixed. Set it here so that a capture-only link
+		 * (the sense, which hw_params gives no bit clock ratio) can be
+		 * configured before playback has run.
+		 */
+		ret = snd_soc_dai_set_bclk_ratio(snd_soc_rtd_to_cpu(rtd, 0), ma->mca->bclk_ratio);
+		if (ret)
+			return ret;
+		/* Claim only this link's directions: links may share a DAI */
+		return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_cpu(rtd, 0),
+						rtd->dai_link->capture_only ? 0 : mask,
+						rtd->dai_link->playback_only ? 0 : mask,
+						props->tdm_slots, props->tdm_slot_width);
+	}
 
 	if (props->is_sense)
 		return snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_cpu(rtd, 0), 0, 0xffff, 16, 16);
@@ -1540,6 +1649,36 @@ static const struct snd_soc_dapm_route macaudio_dapm_routes[] = {
 	{ "PCM2 RX", NULL, "Speaker Sense Capture" },
 };
 
+static const struct snd_soc_dapm_route macaudio_t8132_dapm_routes[] = {
+	{ "Speaker Playback Mux", "Primary", "PCM2 TX" },
+	{ "Speaker Playback Mux", "Secondary", "PCM0 TX" },
+	{ "Speaker Playback", NULL, "Speaker Playback Mux"},
+
+	{ "Headphone Playback Mux", "Primary", "PCM2 TX" },
+	{ "Headphone Playback Mux", "Secondary", "PCM0 TX" },
+	{ "Headphone Playback", NULL, "Headphone Playback Mux"},
+
+	/* Sense rides on the speaker cluster; there is no headset capture yet */
+	{ "PCM0 RX", NULL, "Speaker Sense Capture" },
+};
+
+static const struct macaudio_mca_layout macaudio_t8132_layout = {
+	.fe = {
+		{ .cpu = "mca-pcm-2", .slots = 2, .slot_width = 32 },
+		{ .cpu = "mca-pcm-0", .slots = 4, .slot_width = 32, .speakers = true },
+		/* 8 x 16 bits: V and I of up to four amps */
+		{ .cpu = "mca-pcm-0", .slots = 8, .slot_width = 16, .speakers = true },
+	},
+	.bclk_ratio = 250,
+	.rate = 48000,
+	.formats = SNDRV_PCM_FMTBIT_S24_LE,
+	/* the amps launch sense data on the falling edge (macOS TDM_CFG4) */
+	.speaker_inv = SND_SOC_DAIFMT_NB_IF,
+	.codec_rx_tdm = true,
+	.routes = macaudio_t8132_dapm_routes,
+	.num_routes = ARRAY_SIZE(macaudio_t8132_dapm_routes),
+};
+
 /*	enable	amp		speakers	stereo	gain	safe_vol */
 struct macaudio_platform_cfg macaudio_j180_cfg = {
 	false,	AMP_SN012776,	SPKR_1W1T,	false,	10,	-20,
@@ -1587,6 +1726,28 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
 	false,	AMP_NONE,	SPKR_NONE,	false,	0,	0,
 };
+
+static const struct macaudio_mca_layout *macaudio_find_mca_layout(struct device *dev)
+{
+	struct of_phandle_args args;
+	bool t8132 = false;
+
+	for_each_available_child_of_node_scoped(dev->of_node, np) {
+		struct device_node *cpu = of_get_child_by_name(np, "cpu");
+
+		if (!cpu)
+			continue;
+		if (!of_parse_phandle_with_args(cpu, "sound-dai", "#sound-dai-cells",
+						0, &args)) {
+			t8132 = of_device_is_compatible(args.np, "apple,t8132-mca");
+			of_node_put(args.np);
+		}
+		of_node_put(cpu);
+		break;
+	}
+
+	return t8132 ? &macaudio_t8132_layout : NULL;
+}
 
 /*
  * DT compatible/ID table rules:
@@ -1643,6 +1804,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j713    -       sn012776    15      2× 1W+1T (T8132 layout) */
+	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j413_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
@@ -1691,6 +1854,12 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		data->cfg = &macaudio_fallback_cfg;
 
 	card->fixup_controls = macaudio_fixup_controls;
+
+	data->mca = macaudio_find_mca_layout(dev);
+	if (data->mca) {
+		card->dapm_routes = data->mca->routes;
+		card->num_dapm_routes = data->mca->num_routes;
+	}
 
 	ret = macaudio_parse_of(data);
 	if (ret)

@@ -956,6 +956,16 @@ static int admac_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, err,
 				     "unable to trigger reset\n");
 
+	/* Split-bank controllers whose power Linux controls are set up at
+	 * probe. Coprocessor-switched ones (the AOP and LEAP ADMACs on M4,
+	 * described without power-domains) may be gated until their client
+	 * wakes AOP; those are set up on first use. */
+	if (ad->split_channels &&
+	    of_property_present(pdev->dev.of_node, "power-domains")) {
+		writel_relaxed(0x18080001, ad->base + REG_CTL);
+		ad->ctl_initialized = true;
+	}
+
 	err = request_irq(irq, admac_interrupt, 0, dev_name(&pdev->dev), ad);
 	if (err) {
 		dev_err_probe(&pdev->dev, err,
