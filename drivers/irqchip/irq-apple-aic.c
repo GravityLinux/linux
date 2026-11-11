@@ -47,6 +47,7 @@
 
 #include <linux/bits.h>
 #include <linux/bitfield.h>
+#include <linux/cpu_pm.h>
 #include <linux/cpuhotplug.h>
 #include <linux/io.h>
 #include <linux/irqchip.h>
@@ -856,14 +857,13 @@ static int __init aic_init_smp(struct aic_irq_chip *irqc, struct device_node *no
 	return 0;
 }
 
-static int aic_init_cpu(unsigned int cpu)
+/*
+ * Mask the hard-wired per-CPU FIQ sources. This is all of the per-CPU setup
+ * except clearing a pending fast IPI, so it is also safe to repeat after the
+ * CPU has lost its state.
+ */
+static void aic_mask_cpu_fiq_sources(void)
 {
-	/* Mask all hard-wired per-CPU IRQ/FIQ sources */
-
-	/* Pending Fast IPI FIQs */
-	if (static_branch_likely(&use_fast_ipi))
-		write_sysreg_s(IPI_SR_PENDING, SYS_IMP_APL_IPI_SR_EL1);
-
 	/* Timer FIQs */
 	sysreg_clear_set(cntp_ctl_el0, 0, ARCH_TIMER_CTRL_IT_MASK);
 	sysreg_clear_set(cntv_ctl_el0, 0, ARCH_TIMER_CTRL_IT_MASK);
@@ -887,6 +887,64 @@ static int aic_init_cpu(unsigned int cpu)
 		sysreg_clear_set_s(SYS_IMP_APL_UPMCR0_EL1, UPMCR0_IMODE,
 				   FIELD_PREP(UPMCR0_IMODE, UPMCR0_IMODE_OFF));
 	}
+}
+
+static DEFINE_PER_CPU(u64, aic_vm_tmr_fiq_ena);
+
+/*
+ * On M4, a CPU that idled in a state-losing WFI comes back with its general
+ * purpose registers cleared. Whether its implementation-defined registers
+ * survive is untested, so redo the per-CPU setup, which is harmless if they
+ * did, and put back
+ * the guest timer FIQ enables, which follow the per-CPU irq mask state. The
+ * timer owners reprogram the timers after us, and so does a PMU driver that
+ * owns PMCR0, since this notifier is registered first.
+ *
+ * Nothing shows that a pending fast IPI survives the reset. The vIPI flags are
+ * in memory, so unless one is still pending, raise one to this CPU: a
+ * spurious IPI only runs an empty ipi_mux_process(), a lost one could leave a
+ * cross-CPU call waiting forever.
+ */
+static int aic_cpu_pm_notify(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	bool vhe = is_kernel_in_hyp_mode();
+
+	switch (action) {
+	case CPU_PM_ENTER:
+		if (vhe)
+			__this_cpu_write(aic_vm_tmr_fiq_ena,
+					 read_sysreg_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2));
+		break;
+	case CPU_PM_EXIT:
+	case CPU_PM_ENTER_FAILED:
+		aic_mask_cpu_fiq_sources();
+		if (vhe)
+			sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0,
+					   __this_cpu_read(aic_vm_tmr_fiq_ena) &
+					   (VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P));
+		isb();
+		if (static_branch_likely(&use_fast_ipi) &&
+		    !(read_sysreg_s(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING))
+			aic_ipi_send_fast(smp_processor_id());
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block aic_cpu_pm_nb = {
+	.notifier_call = aic_cpu_pm_notify,
+};
+
+static int aic_init_cpu(unsigned int cpu)
+{
+	/* Mask all hard-wired per-CPU IRQ/FIQ sources */
+
+	/* Pending Fast IPI FIQs */
+	if (static_branch_likely(&use_fast_ipi))
+		write_sysreg_s(IPI_SR_PENDING, SYS_IMP_APL_IPI_SR_EL1);
+
+	aic_mask_cpu_fiq_sources();
 
 	/* Commit all of the above */
 	isb();
@@ -989,6 +1047,17 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		goto err_unmap;
 
 	irqc->info = *(struct aic_info *)match->data;
+
+	/*
+	 * T8132 currently uses suspend-to-idle with AIC still powered. There
+	 * is no separate hardware wake mask to program: generic IRQ PM keeps
+	 * only the IRQs selected by enable_irq_wake() unmasked and reports the
+	 * first one through pm_system_irq_wakeup(). Without this flag, the
+	 * absent irq_set_wake callback rejects those wake sources with ENXIO.
+	 * This does not unmask any IRQ or provide a deeper SoC sleep path.
+	 */
+	if (of_device_is_compatible(node, "apple,t8132-aic3"))
+		aic2_chip.flags |= IRQCHIP_SKIP_SET_WAKE;
 
 	aic_irqc = irqc;
 
@@ -1098,6 +1167,9 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	cpuhp_setup_state(CPUHP_AP_IRQ_APPLE_AIC_STARTING,
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
+	/* Only M4 (T8132) idles through states that lose the per-CPU setup. */
+	if (of_machine_is_compatible("apple,t8132"))
+		cpu_pm_register_notifier(&aic_cpu_pm_nb);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {
