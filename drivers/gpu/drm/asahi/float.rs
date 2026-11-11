@@ -44,6 +44,32 @@ struct F32U {
 }
 
 impl F32 {
+    /// Firmware wire representation.
+    pub(crate) const fn to_bits(self) -> u32 {
+        self.0
+    }
+
+    /// Truncate a nonnegative finite value to an unsigned firmware field.
+    pub(crate) fn to_u32_checked(self) -> Option<u32> {
+        let bits = self.to_bits();
+        if bits & 0x8000_0000 != 0 && bits & 0x7fff_ffff != 0 {
+            return None;
+        }
+        let exp = ((bits >> 23) & 255) as i32 - 127;
+        if exp < 0 {
+            return Some(0);
+        }
+        if exp > 31 {
+            return None;
+        }
+        let frac = (bits & 0x7f_ffff) | 0x80_0000;
+        Some(if exp >= 23 {
+            frac << (exp - 23)
+        } else {
+            frac >> (23 - exp)
+        })
+    }
+
     /// Convert a raw 32-bit representation into an F32
     pub(crate) const fn from_bits(u: u32) -> F32 {
         F32(u)

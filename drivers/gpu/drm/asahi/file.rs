@@ -251,18 +251,17 @@ impl File {
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
-                xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1)
-                    .__pinned_init(raw_vms)?;
+                pin_init::raw_try_init(raw_vms,
+                    xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1))?;
 
                 let raw_queues = addr_of_mut!((*slot).queues);
-                xarray::XArray::<Arc<Mutex<KBox<dyn queue::Queue>>>>::new(
-                    xarray::AllocKind::Alloc1,
-                )
-                .__pinned_init(raw_queues)?;
+                pin_init::raw_try_init(raw_queues,
+                    xarray::XArray::<Arc<Mutex<KBox<dyn queue::Queue>>>>::new(
+                        xarray::AllocKind::Alloc1))?;
 
                 let raw_objects = addr_of_mut!((*slot).objects);
-                xarray::XArray::<KBox<Object>>::new(xarray::AllocKind::Alloc1)
-                    .__pinned_init(raw_objects)?;
+                pin_init::raw_try_init(raw_objects,
+                    xarray::XArray::<KBox<Object>>::new(xarray::AllocKind::Alloc1))?;
 
                 (*slot).id = id;
                 Ok(())
@@ -337,7 +336,7 @@ impl File {
             *(params.core_masks.get_mut(i).ok_or(EIO)?) = (*mask).into();
         }
 
-        if *module_parameters::fault_control.value() == 0xb {
+        if module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
 

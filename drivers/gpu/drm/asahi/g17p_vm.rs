@@ -1,0 +1,1007 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+//! Cold source-built firmware address space. This is not a userspace VM yet.
+//! Fixed placements are confined to the validated DT reservations; all other
+//! backing belongs to Memory. Firmware-private top-table entries survive.
+
+use super::{
+    g17p_image::Image, g17p_initgraph, g17p_layout, g17p_memory::Memory, g17p_opening as opening,
+    g17p_platform::Platform, g17p_topology as topology,
+};
+use kernel::{device, prelude::*};
+
+const PAGE: u64 = 0x4000;
+const ADDRESS: u64 = 0x0000_ffff_ffff_c000;
+const SECONDARY: u64 = 0x40000;
+pub(crate) const TIMESTAMP_BASE: u64 = 0xfffffc2181400000;
+pub(crate) const TIMESTAMP_SIZE: u64 = 0x4000000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    G16C,
+    G17P,
+}
+
+pub(super) type BootTables = KVec<(u64, usize, KVVec<u8>)>;
+
+pub(crate) struct Vm {
+    placement: Placement,
+    context_high: Option<[u64; 2]>,
+    boot_restore: Option<BootTables>,
+    g16c_graph_started: bool,
+    roots: [u64; 3],
+    tables: KVec<u64>,
+    claims: KVec<(u64, usize)>,
+    leaves: usize,
+}
+
+fn target(group: usize, path: &[usize]) -> Option<u64> {
+    topology::TABLE_TARGETS
+        .iter()
+        .find(|(g, p, _)| *g == group && *p == path)
+        .map(|(_, _, pa)| *pa)
+}
+
+fn native(va: u64) -> Option<u64> {
+    topology::LEAF_RUNS
+        .iter()
+        .find_map(|&(first, pa, count, stride)| {
+            let index = va.checked_sub(first)? / PAGE;
+            (index < count as u64).then(|| (pa as i64 + index as i64 * stride) as u64)
+        })
+}
+
+impl Vm {
+    /// New Max queue storage is admitted only through its prepared graph.
+    /// Session additionally requires Phase::Running before calling the builder.
+    pub(super) fn require_g16c_graph(&self) -> Result {
+        if self.placement != Placement::G16C || !self.g16c_graph_started {
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+
+    /// G16C owns separate low/high roots for each initial GPU context;
+    /// firmware retains its bootloader-provided high root. No TTBS publication.
+    pub(super) fn g16c(firmware: u64, low: [u64; 2], high: [u64; 2]) -> Result<Self> {
+        let roots = [low[0], low[1], firmware];
+        let all = [low[0], low[1], firmware, high[0], high[1]];
+        for (i, &page) in all.iter().enumerate() {
+            if page == 0 || page >= 1 << 42 || page & !ADDRESS != 0 || all[..i].contains(&page) {
+                return Err(EINVAL);
+            }
+        }
+        let mut vm = Self {
+            placement: Placement::G16C,
+            context_high: Some(high),
+            boot_restore: None,
+            g16c_graph_started: false,
+            roots,
+            tables: KVec::new(),
+            claims: KVec::new(),
+            leaves: 0,
+        };
+        for page in all {
+            vm.track_boot_table(page)?;
+        }
+        Ok(vm)
+    }
+
+    pub(super) fn track_boot_table(&mut self, page: u64) -> Result {
+        if page == 0 || page & !ADDRESS != 0 {
+            return Err(EINVAL);
+        }
+        if !self.tables.contains(&page) {
+            self.tables.push(page, GFP_KERNEL)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn boot_context_roots(&self, slot: usize) -> Result<[u64; 2]> {
+        if slot >= 2 || self.roots[slot] == 0 || self.roots[2] == 0 {
+            return Err(EINVAL);
+        }
+        Ok([
+            self.roots[slot],
+            self.context_high.map_or(self.roots[2], |roots| roots[slot]),
+        ])
+    }
+
+    pub(super) fn retain_boot_tables(&mut self, tables: BootTables) {
+        self.boot_restore = Some(tables);
+    }
+
+    pub(super) fn take_g16c_boot_tables(&mut self) -> Result<BootTables> {
+        if self.placement != Placement::G16C || self.g16c_graph_started {
+            return Err(EBUSY);
+        }
+        self.boot_restore.take().ok_or(EINVAL)
+    }
+
+    pub(super) fn begin_g16c_graph(&mut self) -> Result {
+        if self.placement != Placement::G16C
+            || self.boot_restore.is_none()
+            || self.g16c_graph_started
+        {
+            return Err(EBUSY);
+        }
+        // RTKit may already have mapped its own buffers through this VM.
+        // Mapping count is not a graphics-publication/construction state.
+        self.g16c_graph_started = true;
+        Ok(())
+    }
+
+    /// After firmware has stopped, invalidate this GPU's context entries
+    /// before their retained roots can be freed. Caller performs the global
+    /// UAT invalidation when true is returned. Neo's existing path is unchanged.
+    pub(crate) fn invalidate_g16c_boot_contexts(
+        &self,
+        memory: &mut Memory,
+        ttbs: u64,
+    ) -> Result<bool> {
+        if self.placement != Placement::G16C || self.boot_restore.is_none() {
+            return Ok(false);
+        }
+        memory.zero(ttbs, 64 * 16)?;
+        memory.clean(ttbs, 64 * 16)?;
+        Ok(true)
+    }
+
+    /// After firmware/GPU access has stopped, detach every borrowed-table link
+    /// to owned RAM before dropping Memory. Also supports aborting a completed
+    /// cold construction. Neo has no borrowed-table transaction in this path.
+    pub(crate) fn restore_boot_tables(&mut self, memory: &mut Memory) -> Result {
+        let Some(tables) = self.boot_restore.as_ref() else {
+            return Ok(());
+        };
+        for (table, _, bytes) in tables.iter().rev() {
+            memory.write(*table, bytes)?;
+            memory.clean(*table, PAGE as usize)?;
+        }
+        self.roots = [0; 3];
+        self.context_high = None;
+        self.boot_restore = None;
+        Ok(())
+    }
+    pub(crate) fn firmware_root(&self) -> u64 {
+        self.roots[2]
+    }
+    pub(crate) fn build(
+        dev: &device::Device,
+        memory: &mut Memory,
+        platform: &Platform,
+        image: &Image,
+    ) -> Result<Self> {
+        let mut vm = Self {
+            placement: Placement::G17P,
+            context_high: None,
+            boot_restore: None,
+            g16c_graph_started: false,
+            roots: [
+                target(0, &[]).ok_or(EINVAL)?,
+                target(1, &[]).ok_or(EINVAL)?,
+                target(2, &[]).ok_or(EINVAL)?,
+            ],
+            tables: KVec::new(),
+            claims: KVec::new(),
+            leaves: 0,
+        };
+        for group in 0..2 {
+            vm.table(memory, group, &[])?;
+        }
+        // Preserve each firmware instance's own code/data mappings and shared
+        // L2 link. Match UAT.clear_stale_kernel_roots() for G15 and later.
+        for delta in [0, SECONDARY] {
+            let from = platform.regions[1].base + delta;
+            let to = vm.roots[2] + delta;
+            memory.zero(to, PAGE as usize)?;
+            for index in 0..(if delta == 0 { 3 } else { PAGE / 8 }) {
+                let word = memory.read64(from + index * 8)?;
+                if index < 3 && word & 3 != 3 {
+                    return Err(EINVAL);
+                }
+                if index == 2 && word & ADDRESS != topology::SHARED_L2 {
+                    return Err(EINVAL);
+                }
+                memory.write64(to + index * 8, word)?;
+            }
+            memory.clean(to, PAGE as usize)?;
+            vm.tables.push(to, GFP_KERNEL)?;
+        }
+        vm.tables.push(topology::SHARED_L2, GFP_KERNEL)?;
+        for &(group, path, _) in topology::TABLE_TARGETS {
+            if group == 2
+                && path.len() == 2
+                && memory.read64(topology::SHARED_L2 + path[1] as u64 * 8)? != 0
+            {
+                return Err(EBUSY);
+            }
+        }
+        // Arena allocation order is part of the native placement policy.
+        for (index, object) in g17p_initgraph::OBJECT_LAYOUT.iter().enumerate() {
+            let va = image.graph.addresses[index];
+            let pa = vm.backing(memory, va, object.size)?;
+            memory.write(pa, image.object(index)?)?;
+            memory.clean(pa, object.size)?;
+            vm.span(memory, 2, va, pa, object.size, object.pte_flags)?;
+            dev_info!(
+                dev,
+                "G17P: {} DVA {:#x} PA {:#x}+{:#x}\n",
+                object.name,
+                va,
+                pa,
+                object.size
+            );
+        }
+        for (_, register) in g17p_layout::REGISTERS {
+            let offset = register.address & (PAGE - 1);
+            if offset != register.physical & (PAGE - 1) {
+                return Err(EINVAL);
+            }
+            let size = (offset + register.size as u64 + PAGE - 1) & !(PAGE - 1);
+            // Install device PTEs only; never CPU-map or clear these registers.
+            vm.span(
+                memory,
+                2,
+                register.address - offset,
+                register.physical - offset,
+                size as usize,
+                0x00c0_0000_0000_0447,
+            )?;
+        }
+        // The Python context constructor allocates each page independently,
+        // before extent filling. The render view is distinct and remains blank
+        // at publication; context 0 later aliases the generated high view.
+        for (kind, &(high, low)) in opening::CONTEXTS.iter().enumerate() {
+            for index in 0..opening::CONTEXT_PAGES {
+                for (group, first, flags) in [
+                    (2, high, 0x00c0_0000_0000_044b),
+                    (1, low, 0x00c0_0000_0000_0c8b),
+                ] {
+                    let pa = memory.allocate(PAGE as usize)?;
+                    if index == 0 && group == 2 {
+                        memory.write(pa, &opening::context(kind).ok_or(EINVAL)?)?;
+                    }
+                    memory.clean(pa, PAGE as usize)?;
+                    vm.span(
+                        memory,
+                        group,
+                        first + index as u64 * PAGE,
+                        pa,
+                        PAGE as usize,
+                        flags,
+                    )?;
+                }
+            }
+        }
+        let channel = memory.allocate(PAGE as usize)?;
+        memory.write(channel, &opening::channel_control())?;
+        memory.clean(channel, PAGE as usize)?;
+        vm.span(
+            memory,
+            2,
+            opening::CHANNEL_CONTROL,
+            channel,
+            PAGE as usize,
+            0x00c0_0000_0000_0443,
+        )?;
+
+        // Zero-backed render address-space shape. No fixture workload bytes
+        // are installed. Actual caller BOs replace their own mappings later.
+        let mut render = 0;
+        for &(first, count, flags) in topology::RENDER_RUNS {
+            for index in 0..count {
+                let va = first + index as u64 * PAGE;
+                if vm.lookup(memory, 1, va)?.is_none() {
+                    let pa = memory.allocate(PAGE as usize)?;
+                    memory.clean(pa, PAGE as usize)?;
+                    vm.span(memory, 1, va, pa, PAGE as usize, flags)?;
+                }
+                render += 1;
+            }
+        }
+        for va in opening::EXTRA_RENDER {
+            let pa = memory.allocate(PAGE as usize)?;
+            memory.clean(pa, PAGE as usize)?;
+            vm.span(memory, 1, va, pa, PAGE as usize, 0x00c0_0000_0000_0c8b)?;
+            render += 1;
+        }
+        // map_firmware_extent(): retain existing objects; fill the remaining
+        // source shape with fresh zeroes. Split at native PA discontinuities.
+        let mut extent = 0;
+        for &(first, count, flags) in topology::FIRMWARE_RUNS {
+            let mut index = 0;
+            while index < count {
+                let va = first + index as u64 * PAGE;
+                if vm.lookup(memory, 2, va)?.is_some() {
+                    index += 1;
+                    continue;
+                }
+                let mut pages = 1;
+                while index + pages < count {
+                    let next = va + pages as u64 * PAGE;
+                    if vm.lookup(memory, 2, next)?.is_some() {
+                        break;
+                    }
+                    match (native(next - PAGE), native(next)) {
+                        (None, None) => (),
+                        (Some(a), Some(b)) if b == a + PAGE => (),
+                        _ => break,
+                    }
+                    pages += 1;
+                }
+                let size = pages * PAGE as usize;
+                let pa = vm.backing(memory, va, size)?;
+                memory.clean(pa, size)?;
+                let attributes = 0x0080_0000_0000_0443 | (flags & ((7 << 2) | (1 << 54)));
+                vm.span(memory, 2, va, pa, size, attributes)?;
+                extent += pages;
+                index += pages;
+            }
+        }
+        let mut aliases = 0;
+        for &(first, count, high) in topology::CONTEXT0_PEERS {
+            for index in 0..count {
+                let low = first + index as u64 * PAGE;
+                let high = high + index as u64 * PAGE;
+                let pa = vm.lookup(memory, 2, high)?.ok_or(EINVAL)? & ADDRESS;
+                let flags = topology::CONTEXT0_RUNS
+                    .iter()
+                    .find(|(start, count, _)| low >= *start && low < *start + *count as u64 * PAGE)
+                    .ok_or(EINVAL)?
+                    .2;
+                vm.span(memory, 0, low, pa, PAGE as usize, flags)?;
+                if vm.lookup(memory, 0, low)? != Some(pa | flags) {
+                    return Err(EIO);
+                }
+                aliases += 1;
+            }
+        }
+        for (low, high) in image.graph.primary_aliases() {
+            if vm.lookup(memory, 0, low)?.ok_or(EINVAL)? & ADDRESS
+                != vm.lookup(memory, 2, high)?.ok_or(EINVAL)? & ADDRESS
+            {
+                return Err(EIO);
+            }
+        }
+        vm.write(memory, 2, opening::SUPPORT, &opening::support())?;
+        vm.write(memory, 2, opening::STATE, &2u32.to_le_bytes())?;
+        // The Python compute bootstrap keeps these cold render-owner records
+        // even while both render queues are empty. Omitting them permits the
+        // first CL command but later CL work retires without command status.
+        vm.write(memory, 0, 0x7001838000, &opening::resource_record())?;
+        vm.write(memory, 0, 0x7001840000, &opening::dispatch_record())?;
+        vm.write(memory, 2, 0xfffffc20015e8000, &opening::dispatch_record())?;
+        for (index, address) in [0xfffffc20c07d0000, 0xfffffc20c07f8000]
+            .into_iter()
+            .enumerate()
+        {
+            vm.write(memory, 2, address, &opening::current_jobs(index == 1))?;
+        }
+        // Stage both control rings before publishing initdata, with the same
+        // already-consumed prefix as the current partial Python entrypoint.
+        for (slot, channels) in image.graph.channels.iter().enumerate() {
+            let control = &channels[12];
+            vm.write(memory, 2, control.ring, &opening::message(slot == 1))?;
+            for va in control.states {
+                vm.write(memory, 2, va, &1u32.to_le_bytes())?;
+            }
+        }
+        for index in 2..64 {
+            let word = memory.read64(vm.roots[2] + index * 8)?;
+            if word != 0 {
+                memory.write64(vm.roots[2] + SECONDARY + index * 8, word)?;
+            }
+        }
+        for table in &vm.tables {
+            memory.clean(*table, PAGE as usize)?;
+        }
+        // bind_contexts(macos_table=True), then the separate context-0 root:
+        // slots 0/1 tagged 0/1. Capture root enumeration is not a HW slot ID.
+        memory.zero(platform.regions[0].base, 64 * 16)?;
+        for (slot, low) in [(0u64, vm.roots[0]), (1, vm.roots[1])] {
+            memory.write64(platform.regions[0].base + slot * 16, (slot << 48) | low | 1)?;
+            memory.write64(
+                platform.regions[0].base + slot * 16 + 8,
+                (slot << 48) | vm.roots[2] | 1,
+            )?;
+        }
+        memory.clean(platform.regions[0].base, 64 * 16)?;
+        dev_info!(dev, "G17P: source VM ready: {} leaves, {} tables, {} extent pages, {} context-0 aliases, {} render pages; roots {:#x}/{:#x}/{:#x}\n",
+            vm.leaves, vm.tables.len(), extent, aliases, render, vm.roots[0], vm.roots[1], vm.roots[2]);
+        Ok(vm)
+    }
+
+    pub(crate) fn physical(&self, memory: &Memory, group: usize, va: u64) -> Result<u64> {
+        let offset = va & (PAGE - 1);
+        Ok((self.lookup(memory, group, va - offset)?.ok_or(EINVAL)? & ADDRESS) + offset)
+    }
+    /// Ordinary independent render roots only borrow these immutable cold
+    /// Source leaves. Capture once at boot; no executable leaf is read.
+    pub(crate) fn render_fallback_leaves(&self, memory: &Memory) -> Result<KVec<(u64, u64)>> {
+        let mut leaves = KVec::new();
+        if self.placement == Placement::G16C {
+            return Ok(leaves);
+        }
+        for &(base, count, _) in topology::RENDER_RUNS {
+            for index in 0..count {
+                let va = base + index as u64 * PAGE;
+                leaves.push((va, self.physical(memory, 1, va)?), GFP_KERNEL)?;
+            }
+        }
+        Ok(leaves)
+    }
+
+    /// Live source-owned leaf, including its attributes. Never substitute a
+    /// bootstrap placement table for this lookup after a mapping transition.
+    pub(crate) fn pte(&self, memory: &Memory, group: usize, va: u64) -> Result<u64> {
+        Ok(self.lookup(memory, group, va)?.unwrap_or(0))
+    }
+    pub(crate) fn leaf_record(&self, memory: &Memory, group: usize, va: u64) -> Result<(u64, u64)> {
+        let indices = Self::indices(group, va)?;
+        let mut table = self.roots[group];
+        for index in indices[..2].iter().copied() {
+            let pte = memory.word64(table + index as u64 * 8)?.load();
+            if pte & 3 != 3 {
+                return Err(EINVAL);
+            }
+            table = pte & ADDRESS;
+        }
+        let address = table + indices[2] as u64 * 8;
+        let pte = memory.word64(address)?.load();
+        if pte & 3 != 3 {
+            return Err(EINVAL);
+        }
+        Ok((address, pte))
+    }
+
+    /// Quiescent replacements of already-present source-owned leaves. Validate
+    /// every old PTE and prepare every RAM word before breaking any mapping.
+    /// Old physical allocations remain owned by Memory until firmware stops.
+    pub(crate) fn rebind_pages(
+        &self,
+        memory: &Memory,
+        changes: &[(usize, u64, u64, u64)],
+    ) -> Result {
+        let mut stores = KVec::new();
+        for (i, &(group, va, old, new)) in changes.iter().enumerate() {
+            if changes[..i].iter().any(|r| r.0 == group && r.1 == va)
+                || old & 3 != 3
+                || new & 3 != 3
+                || [old, new].into_iter().any(|pte| {
+                    pte & ADDRESS == 0
+                        || pte & ADDRESS >= 1 << 42
+                        || pte & !(ADDRESS | 0x00c0000000000fff) != 0
+                })
+                || self.lookup(memory, group, va)? != Some(old)
+            {
+                return Err(EINVAL);
+            }
+            // Replacements name retained RAM owners, never device mappings.
+            memory.word64(old & ADDRESS)?;
+            memory.word64(new & ADDRESS)?;
+            let indices = Self::indices(group, va)?;
+            let mut table = self.roots[group];
+            for index in indices[..2].iter().copied() {
+                if !self.tables.contains(&table) {
+                    return Err(EINVAL);
+                }
+                let pte = memory.read64(table + index as u64 * 8)?;
+                if pte & 3 != 3 {
+                    return Err(EINVAL);
+                }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) {
+                return Err(EINVAL);
+            }
+            if old != new {
+                stores.push(
+                    (memory.word64(table + indices[2] as u64 * 8)?, new),
+                    GFP_KERNEL,
+                )?;
+            }
+        }
+        // All remaining operations are infallible. No page-table walker can
+        // observe a valid-to-valid replacement with stale physical backing.
+        for (word, _) in &stores {
+            word.store(0);
+        }
+        Self::invalidate_gpu();
+        for (word, new) in &stores {
+            word.store(*new);
+        }
+        Self::invalidate_gpu();
+        Ok(())
+    }
+
+    /// Native scheduler generations keep their ABI DVAs and PTE attributes,
+    /// but must not reuse the bootstrap's physical scheduler/completion pages.
+    pub(crate) fn freshen_firmware(&self, memory: &mut Memory, pages: &[u64]) -> Result {
+        let mut changes = KVec::new();
+        // Resolve the complete owned mapping set before allocating new owners.
+        for (i, &va) in pages.iter().enumerate() {
+            if pages[..i].contains(&va) {
+                return Err(EINVAL);
+            }
+            let old = self.lookup(memory, 2, va)?.ok_or(EINVAL)?;
+            changes.push((2, va, old, 0), GFP_KERNEL)?;
+        }
+        for row in &mut changes {
+            let pa = memory.allocate(PAGE as usize)?;
+            memory.clean(pa, PAGE as usize)?;
+            row.3 = pa | (row.2 & !ADDRESS);
+        }
+        self.rebind_pages(memory, &changes)
+    }
+
+    pub(crate) fn invalidate_gpu() {
+        super::g17p_memory::sync();
+        // SAFETY: Called under exclusive runtime access, after checked,
+        // quiescent UAT replacements. Global invalidation includes aliases in
+        // contexts zero through three and the source-owned roots/aliases.
+        unsafe {
+            core::arch::asm!(
+                ".inst 0xd508811f",
+                "dsb sy",
+                "isb",
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    /// Driver-owned RAM fields only. Each page is separately translated and
+    /// bounded by Memory, then cleaned before a mailbox can expose the write.
+    pub(crate) fn write(&self, memory: &mut Memory, group: usize, va: u64, bytes: &[u8]) -> Result {
+        va.checked_add(bytes.len() as u64).ok_or(EINVAL)?;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let at = va + offset as u64;
+            let size = (bytes.len() - offset).min((PAGE - (at & (PAGE - 1))) as usize);
+            let pa = self.physical(memory, group, at)?;
+            // Every earlier host store through this API was cleaned. Preserve
+            // adjacent firmware-owned bytes when a partial cache line is now
+            // updated, particularly split counters and scheduler slots.
+            memory.invalidate(pa, size)?;
+            memory.write(pa, &bytes[offset..offset + size])?;
+            memory.clean(pa, size)?;
+            offset += size;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_tables(&self, memory: &Memory) -> Result {
+        for &table in &self.tables {
+            memory.clean(table, PAGE as usize)?;
+        }
+        super::g17p_memory::sync();
+        Ok(())
+    }
+
+    /// The timestamp registry retains the caller's pinned backing before
+    /// installing this alias, including on a partial failure.
+    pub(crate) fn timestamp_page(&mut self, memory: &mut Memory, va: u64, pa: u64) -> Result {
+        if !(TIMESTAMP_BASE..TIMESTAMP_BASE + TIMESTAMP_SIZE).contains(&va) {
+            return Err(EINVAL);
+        }
+        // Source iomap_at_root defaults: OS=1, UXN=1, AF=1, AP=1,
+        // AttrIndex=Shared (2), VALID/TYPE=1; global mapping.
+        self.span(memory, 2, va, pa, PAGE as usize, 0x00c000000000044b)
+    }
+
+    pub(crate) fn unmap_timestamp(&self, memory: &Memory, va: u64, pages: &[u64]) -> Result {
+        let mut words = KVec::with_capacity(pages.len(), GFP_KERNEL)?;
+        if va & (PAGE - 1) != 0
+            || va < TIMESTAMP_BASE
+            || va.checked_add(pages.len() as u64 * PAGE).ok_or(EINVAL)?
+                > TIMESTAMP_BASE + TIMESTAMP_SIZE
+        {
+            return Err(EINVAL);
+        }
+        for (index, &pa) in pages.iter().enumerate() {
+            let at = va + index as u64 * PAGE;
+            if self.lookup(memory, 2, at)? != Some(pa | 0x00c000000000044b) {
+                return Err(EIO);
+            }
+            let indices = Self::indices(2, at)?;
+            let mut table = self.roots[2];
+            for offset in indices[..2].iter().copied() {
+                if !self.tables.contains(&table) {
+                    return Err(EIO);
+                }
+                let pte = memory.read64(table + offset as u64 * 8)?;
+                if pte & 3 != 3 {
+                    return Err(EIO);
+                }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) {
+                return Err(EIO);
+            }
+            let leaf = table + indices[2] as u64 * 8;
+            words.push((leaf, memory.word64(leaf)?), GFP_KERNEL)?;
+        }
+        // All backing and leaf ownership checks precede the first store.
+        for (_, word) in &words {
+            word.store(0);
+        }
+        Self::invalidate_gpu();
+        for (leaf, _) in &words {
+            if memory.read64(*leaf)? != 0 {
+                return Err(EIO);
+            }
+        }
+        Ok(())
+    }
+
+    /// Extend driver-owned firmware storage before first-work publication.
+    pub(crate) fn ensure_firmware(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result {
+        let first = va & !(PAGE - 1);
+        let end = va
+            .checked_add(size as u64)
+            .and_then(|v| v.checked_add(PAGE - 1))
+            .ok_or(EINVAL)?
+            & !(PAGE - 1);
+        for at in (first..end).step_by(PAGE as usize) {
+            if self.lookup(memory, 2, at)?.is_some() {
+                continue;
+            }
+            let pa = memory.allocate(PAGE as usize)?;
+            memory.clean(pa, PAGE as usize)?;
+            let flags = if (0xfffffc20c0000000..0xfffffc20d0000000).contains(&at) {
+                0x00c0000000000443
+            } else {
+                0x00c000000000044b
+            };
+            self.span(memory, 2, at, pa, PAGE as usize, flags)?;
+        }
+        Ok(())
+    }
+
+    /// Exact existing descriptor alias identity. A reused finite slot needs
+    /// neither a PTE store nor a global table clean/TLBI when this matches.
+    pub(crate) fn firmware_alias_matches(&self, memory: &Memory,
+        high: u64, low: u64, size: usize) -> Result<bool> {
+        if (high ^ low) & (PAGE - 1) != 0 { return Err(EINVAL); }
+        let first = high & !(PAGE - 1);
+        let end = high.checked_add(size as u64)
+            .and_then(|v| v.checked_add(PAGE - 1)).ok_or(EINVAL)? & !(PAGE - 1);
+        for at in (first..end).step_by(PAGE as usize) {
+            let Some(pte) = self.lookup(memory, 2, at)? else { return Ok(false); };
+            let alias = (low & !(PAGE - 1)) + at - first;
+            if self.lookup(memory, 0, alias)? != Some((pte & ADDRESS) | 0x0080000000000c8b) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Explicit first-work replacement of the source-owned context-0 alias.
+    /// Also used for a new, quiescent compute owner after render completion.
+    pub(crate) fn alias_firmware(
+        &mut self,
+        memory: &mut Memory,
+        high: u64,
+        low: u64,
+        size: usize,
+    ) -> Result {
+        if (high ^ low) & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        self.ensure_firmware(memory, high, size)?;
+        let first = high & !(PAGE - 1);
+        let end = high
+            .checked_add(size as u64)
+            .and_then(|v| v.checked_add(PAGE - 1))
+            .ok_or(EINVAL)?
+            & !(PAGE - 1);
+        for at in (first..end).step_by(PAGE as usize) {
+            let pa = self.physical(memory, 2, at)?;
+            self.span_inner(
+                memory,
+                0,
+                (low & !(PAGE - 1)) + at - first,
+                pa,
+                PAGE as usize,
+                0x0080000000000c8b,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Fresh command-status storage, matching the shim's post-render scan.
+    pub(crate) fn fresh_firmware_page(&mut self, memory: &mut Memory, first: u64) -> Result<u64> {
+        if first & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let mut address = first;
+        while self.lookup(memory, 2, address)?.is_some() {
+            address = address.checked_add(PAGE).ok_or(ENOMEM)?;
+        }
+        self.ensure_firmware(memory, address, PAGE as usize)?;
+        Ok(address)
+    }
+
+    /// A transport pool allocation belongs to Memory before it becomes
+    /// reachable. Existing mappings are never overwritten or adopted.
+    pub(crate) fn transport_backing(&mut self, memory: &mut Memory, address: u64) -> Result<u64> {
+        self.transport_backing_with_attributes(memory, address, 0x00c0000000000443)
+    }
+
+    /// Relocated firmware objects preserve their Source cache attributes.
+    /// Firmware-only queues use Normal; CPU/GPU shared counters use Shared.
+    /// Moving a shared object to the c0000000 aperture never licenses caching
+    /// its host-updated counts as a firmware-only object.
+    pub(crate) fn transport_backing_with_attributes(
+        &mut self, memory: &mut Memory, address: u64, attributes: u64,
+    ) -> Result<u64> {
+        if !matches!(attributes, 0x00c0000000000443 | 0x00c000000000044b)
+            || address & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        for offset in [0, PAGE] {
+            if self.lookup(memory, 2, address + offset)?.is_some() {
+                return Err(EBUSY);
+            }
+        }
+        let pa = memory.allocate(2 * PAGE as usize)?;
+        memory.clean(pa, 2 * PAGE as usize)?;
+        self.span(
+            memory,
+            2,
+            address,
+            pa,
+            2 * PAGE as usize,
+            attributes,
+        )?;
+        self.flush_tables(memory)?;
+        // SAFETY: Publish the owned absent-to-present GPU mappings before
+        // redirecting the retired queue, as map_firmware_existing_at does.
+        unsafe {
+            core::arch::asm!(
+                ".inst 0xd508811f",
+                "dsb sy",
+                "isb",
+                options(nostack, preserves_flags)
+            );
+        }
+        Ok(pa)
+    }
+
+    /// Reclassify a source-owned submission leaf before first publication.
+    /// The initial extent may describe an older read-only status alias at
+    /// this DVA; the new leaf is firmware-writable, as in alloc_at().
+    pub(crate) fn submission_leaf(&mut self, memory: &mut Memory, va: u64) -> Result {
+        if va & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        self.ensure_firmware(memory, va, PAGE as usize)?;
+        let pa = self.physical(memory, 2, va)?;
+        let flags = if (0xfffffc20c0000000..0xfffffc20d0000000).contains(&va) {
+            0x00c0000000000443
+        } else {
+            0x00c000000000044b
+        };
+        self.span_inner(memory, 2, va, pa, PAGE as usize, flags, true)
+    }
+
+    /// First-partial synchronization/index alias, with the retained render
+    /// page canonical. Later source writes and GPU writes share this backing.
+    pub(crate) fn render_firmware_alias(
+        &mut self,
+        memory: &mut Memory,
+        low: u64,
+        high: u64,
+    ) -> Result {
+        if (low | high) & (PAGE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let pa = self.physical(memory, 1, low)?;
+        let flags = if high >= 0xfffffc20c0000000 {
+            0x00c0000000000443
+        } else {
+            0x00c000000000044b
+        };
+        self.span_inner(memory, 2, high, pa, PAGE as usize, flags, true)
+    }
+
+    fn backing(&mut self, memory: &mut Memory, va: u64, size: usize) -> Result<u64> {
+        if va & (PAGE - 1) != 0 || size == 0 || size % PAGE as usize != 0 {
+            return Err(EINVAL);
+        }
+        if self.placement == Placement::G16C {
+            return memory.allocate(size);
+        }
+        let candidate = native(va).filter(|&pa| {
+            (0..size)
+                .step_by(PAGE as usize)
+                .all(|offset| native(va + offset as u64) == Some(pa + offset as u64))
+                && topology::RESERVATIONS
+                    .iter()
+                    .any(|&(base, len)| pa >= base && pa + size as u64 <= base + len)
+                && !self
+                    .claims
+                    .iter()
+                    .any(|&(base, len)| pa < base + len as u64 && base < pa + size as u64)
+                && !topology::TABLE_TARGETS
+                    .iter()
+                    .any(|&(_, _, table)| table >= pa && table < pa + size as u64)
+                && !(self.roots[2] + SECONDARY >= pa
+                    && self.roots[2] + SECONDARY < pa + size as u64)
+        });
+        let pa = if let Some(pa) = candidate {
+            self.claims.push((pa, size), GFP_KERNEL)?;
+            memory.zero(pa, size)?;
+            pa
+        } else {
+            memory.allocate(size)?
+        };
+        Ok(pa)
+    }
+
+    fn table(&mut self, memory: &mut Memory, group: usize, path: &[usize]) -> Result<u64> {
+        let fixed = if self.placement == Placement::G17P {
+            target(group, path)
+        } else {
+            None
+        };
+        let pa = if let Some(pa) = fixed {
+            pa
+        } else {
+            memory.allocate(PAGE as usize)?
+        };
+        if self.tables.contains(&pa) {
+            return Err(EEXIST);
+        }
+        memory.zero(pa, PAGE as usize)?;
+        memory.clean(pa, PAGE as usize)?;
+        self.tables.push(pa, GFP_KERNEL)?;
+        Ok(pa)
+    }
+
+    fn indices(group: usize, va: u64) -> Result<[usize; 3]> {
+        if group > 2
+            || va & (PAGE - 1) != 0
+            || (if group == 2 {
+                va < 0xffff_fc20_0000_0000 || va >= 0xffff_fc30_0000_0000
+            } else {
+                va >= 1 << 42
+            })
+        {
+            return Err(EINVAL);
+        }
+        Ok([
+            ((va >> 36) & 63) as usize,
+            ((va >> 25) & 2047) as usize,
+            ((va >> 14) & 2047) as usize,
+        ])
+    }
+
+    fn lookup(&self, memory: &Memory, group: usize, va: u64) -> Result<Option<u64>> {
+        let indices = Self::indices(group, va)?;
+        let mut table = self.roots[group];
+        for (level, index) in indices.into_iter().enumerate() {
+            if !self.tables.contains(&table) {
+                return Err(EINVAL);
+            }
+            let pte = memory.read64(table + index as u64 * 8)?;
+            if pte & 1 == 0 {
+                return Ok(None);
+            }
+            if pte & 3 != 3 {
+                return Err(EINVAL);
+            }
+            if level == 2 {
+                return Ok(Some(pte));
+            }
+            table = pte & ADDRESS;
+        }
+        Err(EINVAL)
+    }
+
+    /// Max-only preparation installs at most EMPTY parent tables. No leaf,
+    /// existing binding, producer or context root is replaced. ENOMEM can be
+    /// retried at the same VA; completed parents remain valid and bounded.
+    pub(super) fn prepare_g16c_empty(
+        &mut self, memory: &mut Memory, group: usize, va: u64, size: usize,
+    ) -> Result {
+        self.require_g16c_graph()?;
+        if size == 0 || size % PAGE as usize != 0 { return Err(EINVAL); }
+        va.checked_add(size as u64).ok_or(EINVAL)?;
+        for offset in (0..size).step_by(PAGE as usize) {
+            if self.lookup(memory, group, va + offset as u64)?.is_some() { return Err(EBUSY); }
+        }
+        for offset in (0..size).step_by(PAGE as usize) {
+            let indices = Self::indices(group, va + offset as u64)?;
+            let mut table = self.roots[group];
+            // Reserve ownership metadata before allocating either child.
+            self.tables.reserve(2, GFP_KERNEL)?;
+            for level in 0..2 {
+                if !self.tables.contains(&table) { return Err(EIO); }
+                let at = table + indices[level] as u64 * 8;
+                let mut pte = memory.read64(at)?;
+                if pte & 1 == 0 {
+                    let child = self.table(memory, group, &indices[..level + 1])?;
+                    pte = child | 3;
+                    memory.write64(at, pte)?;
+                    memory.clean(at, 8)?;
+                }
+                if pte & 3 != 3 { return Err(EIO); }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) { return Err(EIO); }
+        }
+        Ok(())
+    }
+
+    pub(super) fn span(
+        &mut self,
+        memory: &mut Memory,
+        group: usize,
+        va: u64,
+        pa: u64,
+        size: usize,
+        flags: u64,
+    ) -> Result {
+        self.span_inner(memory, group, va, pa, size, flags, false)
+    }
+    fn span_inner(
+        &mut self,
+        memory: &mut Memory,
+        group: usize,
+        va: u64,
+        pa: u64,
+        size: usize,
+        flags: u64,
+        replace: bool,
+    ) -> Result {
+        if size == 0
+            || size % PAGE as usize != 0
+            || pa & !ADDRESS != 0
+            || flags & ADDRESS != 0
+            || flags & 3 != 3
+        {
+            return Err(EINVAL);
+        }
+        va.checked_add(size as u64).ok_or(EINVAL)?;
+        pa.checked_add(size as u64)
+            .filter(|end| *end <= 1 << 42)
+            .ok_or(EINVAL)?;
+        for offset in (0..size).step_by(PAGE as usize) {
+            let indices = Self::indices(group, va + offset as u64)?;
+            let mut table = self.roots[group];
+            for level in 0..2 {
+                if !self.tables.contains(&table) {
+                    return Err(EINVAL);
+                }
+                let at = table + indices[level] as u64 * 8;
+                let mut pte = memory.read64(at)?;
+                if pte & 1 == 0 {
+                    let child = self.table(memory, group, &indices[..level + 1])?;
+                    pte = child | 3;
+                    memory.write64(at, pte)?;
+                }
+                if pte & 3 != 3 {
+                    return Err(EINVAL);
+                }
+                table = pte & ADDRESS;
+            }
+            if !self.tables.contains(&table) {
+                return Err(EINVAL);
+            }
+            let at = table + indices[2] as u64 * 8;
+            let expected = (pa + offset as u64) | flags;
+            let prior = memory.read64(at)?;
+            if !replace && prior & 1 != 0 && prior != expected {
+                return Err(EEXIST);
+            }
+            memory.write64(at, expected)?;
+            if memory.read64(at)? != expected {
+                return Err(EIO);
+            }
+            self.leaves += usize::from(prior & 1 == 0);
+        }
+        Ok(())
+    }
+}

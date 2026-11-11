@@ -33,6 +33,19 @@ properties:
       - description: GPU coprocessor control registers
       - description: GPU block MMIO registers
 
+  apple,firmware-sw-interrupt:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Physical software interrupt address selected by the bootloader for
+      the G16C firmware MMIO register table. The firmware maps its 16 KiB page.
+
+  apple,active-mcc-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description:
+      Bootloader supplied mask of active memory cache controller windows
+      for the G16C firmware MMIO register table.
+
   reg-names:
     items:
       - const: asc

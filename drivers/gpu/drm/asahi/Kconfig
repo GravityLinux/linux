@@ -16,13 +16,17 @@ config DRM_ASAHI
 	depends on MMU
 	depends on IOMMU_SUPPORT
 	depends on PAGE_SIZE_16KB
+	depends on PM
+	select APPLE_MAILBOX
 	select APPLE_PMP_REPORT
 	select RUST_DRM_SCHED
 	select RUST_DRM_GEM_SHMEM_HELPER
 	select RUST_DRM_GPUVM
 	select RUST_APPLE_RTKIT
 	help
-	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
+	  Rust DRM driver for Apple AGX GPUs in the M1 and M2 SoC families,
+	  M4, M4 Max, and A18 Pro (MacBook Neo). Device-tree matching selects
+	  the appropriate firmware backend.
 
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"
