@@ -7,6 +7,7 @@
 #include <linux/efi.h>
 #include <linux/export.h>
 #include <asm/tlbflush.h>
+#include <asm/p3s/pgtable.h>
 
 static inline bool mm_is_user(struct mm_struct *mm)
 {
@@ -17,6 +18,8 @@ static inline bool mm_is_user(struct mm_struct *mm)
 	 * on the PTL. But kernel mappings can't tolerate faults.
 	 */
 	if (unlikely(mm_is_efi(mm)))
+		return false;
+	if (!contpte_is_enabled(mm))
 		return false;
 	return mm != &init_mm;
 }

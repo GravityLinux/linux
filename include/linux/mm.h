@@ -3396,7 +3396,7 @@ int __account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc,
 			const struct task_struct *task, bool bypass_rlim);
 
 struct kvec;
-struct page *get_dump_page(unsigned long addr, int *locked);
+struct page *get_dump_page(unsigned long addr, int *locked, unsigned long *page_offset);
 
 bool folio_mark_dirty(struct folio *folio);
 bool folio_mark_dirty_lock(struct folio *folio);
@@ -3547,7 +3547,7 @@ static inline void reset_mm_hiwater_rss(struct mm_struct *mm)
 static inline void setmax_mm_hiwater_rss(unsigned long *maxrss,
 					 struct mm_struct *mm)
 {
-	unsigned long hiwater_rss = get_mm_hiwater_rss(mm);
+	unsigned long hiwater_rss = mm_kernel_pages(mm, get_mm_hiwater_rss(mm));
 
 	if (*maxrss < hiwater_rss)
 		*maxrss = hiwater_rss;
@@ -3710,8 +3710,8 @@ static inline pud_t *pud_alloc(struct mm_struct *mm, p4d_t *p4d,
 
 static inline pmd_t *pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 {
-	return (unlikely(pud_none(*pud)) && __pmd_alloc(mm, pud, address))?
-		NULL: pmd_offset(pud, address);
+	return (unlikely(pud_none(*pud)) && __pmd_alloc(mm, pud, address)) ?
+		NULL : mm_pmd_offset(mm, pud, address);
 }
 #endif /* CONFIG_MMU */
 
@@ -4361,7 +4361,7 @@ struct vm_area_struct *vma_lookup(struct mm_struct *mm, unsigned long addr)
 static inline unsigned long stack_guard_start_gap(const struct vm_area_struct *vma)
 {
 	if (vma->vm_flags & VM_GROWSDOWN)
-		return stack_guard_gap;
+		return mm_stack_guard_gap(vma->vm_mm);
 
 	/* See reasoning around the VM_SHADOW_STACK definition */
 	if (vma->vm_flags & VM_SHADOW_STACK)
@@ -4386,7 +4386,7 @@ static inline unsigned long vm_end_gap(const struct vm_area_struct *vma)
 	unsigned long vm_end = vma->vm_end;
 
 	if (vma->vm_flags & VM_GROWSUP) {
-		vm_end += stack_guard_gap;
+		vm_end += mm_stack_guard_gap(vma->vm_mm);
 		if (vm_end < vma->vm_end)
 			vm_end = -PAGE_SIZE;
 	}
@@ -4395,7 +4395,7 @@ static inline unsigned long vm_end_gap(const struct vm_area_struct *vma)
 
 static inline unsigned long vma_pages(const struct vm_area_struct *vma)
 {
-	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
+	return (vma->vm_end - vma->vm_start) >> mm_pte_shift(vma->vm_mm);
 }
 
 /**
@@ -4436,7 +4436,8 @@ static inline pgoff_t vma_start_pgoff(const struct vm_area_struct *vma)
  */
 static inline pgoff_t vma_end_pgoff(const struct vm_area_struct *vma)
 {
-	return vma_start_pgoff(vma) + vma_pages(vma);
+	/* P3S: a 4KB file VMA can end partway through a 16KB file page. */
+	return vma_start_pgoff(vma) + vma_pgoff_pages(vma);
 }
 
 /**

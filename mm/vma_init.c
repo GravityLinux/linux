@@ -54,6 +54,7 @@ static void vm_area_init_from(const struct vm_area_struct *src,
 	__vma_set_anon_pgoff(dest, vma_start_anon_pgoff(src));
 	dest->vm_file = src->vm_file;
 	dest->vm_private_data = src->vm_private_data;
+	vma_set_slice_off(dest, vma_slice_off(src));
 	vm_flags_init(dest, src->vm_flags);
 	memcpy(&dest->vm_page_prot, &src->vm_page_prot,
 	       sizeof(dest->vm_page_prot));

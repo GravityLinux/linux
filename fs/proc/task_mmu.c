@@ -18,6 +18,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
+#include <linux/p3s/shmem.h>
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
 #include <linux/minmax.h>
@@ -28,6 +29,8 @@
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
+#include <linux/p3s/proc.h>
+#include <linux/p3s_user_pages.h>
 
 #define SENTINEL_VMA_END	-1
 #define SENTINEL_VMA_GATE	-2
@@ -38,6 +41,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 {
 	unsigned long text, lib, swap, anon, file, shmem;
 	unsigned long hiwater_vm, total_vm, hiwater_rss, total_rss;
+	P3S_CONTEXT_REMOTE_MM(mm);
 
 	anon = get_mm_counter_sum(mm, MM_ANONPAGES);
 	file = get_mm_counter_sum(mm, MM_FILEPAGES);
@@ -66,7 +70,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 	SEQ_PUT_DEC("VmPeak:\t", hiwater_vm);
 	SEQ_PUT_DEC(" kB\nVmSize:\t", total_vm);
 	SEQ_PUT_DEC(" kB\nVmLck:\t", mm->locked_vm);
-	SEQ_PUT_DEC(" kB\nVmPin:\t", atomic64_read(&mm->pinned_vm));
+	SEQ_PUT_DEC(" kB\nVmPin:\t", mm_pinned_vm_pages(mm));
 	SEQ_PUT_DEC(" kB\nVmHWM:\t", hiwater_rss);
 	SEQ_PUT_DEC(" kB\nVmRSS:\t", total_rss);
 	SEQ_PUT_DEC(" kB\nRssAnon:\t", anon);
@@ -88,6 +92,8 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 
 unsigned long task_vsize(struct mm_struct *mm)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
+
 	return PAGE_SIZE * mm->total_vm;
 }
 
@@ -95,13 +101,15 @@ unsigned long task_statm(struct mm_struct *mm,
 			 unsigned long *shared, unsigned long *text,
 			 unsigned long *data, unsigned long *resident)
 {
-	*shared = get_mm_counter_sum(mm, MM_FILEPAGES) +
-			get_mm_counter_sum(mm, MM_SHMEMPAGES);
-	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
-								>> PAGE_SHIFT;
-	*data = mm->data_vm + mm->stack_vm;
-	*resident = *shared + get_mm_counter_sum(mm, MM_ANONPAGES);
-	return mm->total_vm;
+	P3S_CONTEXT_REMOTE_MM(mm);
+
+	*shared = mm_reader_pages(mm, get_mm_counter_sum(mm, MM_FILEPAGES) +
+			get_mm_counter_sum(mm, MM_SHMEMPAGES));
+	*text = mm_reader_pages(mm, (round_up(mm->end_code, mm_pte_size(mm)) -
+			round_down(mm->start_code, mm_pte_size(mm))) >> mm_pte_shift(mm));
+	*data = mm_reader_pages(mm, mm->data_vm + mm->stack_vm);
+	*resident = *shared + mm_reader_pages(mm, get_mm_counter_sum(mm, MM_ANONPAGES));
+	return mm_reader_pages(mm, mm->total_vm);
 }
 
 #ifdef CONFIG_NUMA
@@ -508,7 +516,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 
 		dev = inode->i_sb->s_dev;
 		ino = inode->i_ino;
-		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+		pgoff = vma_file_offset(vma);
 	}
 
 	start = vma->vm_start;
@@ -748,7 +756,7 @@ static int do_procmap_query(struct mm_struct *mm, void __user *uarg)
 	if (vma->vm_file) {
 		const struct inode *inode = file_user_inode(vma->vm_file);
 
-		karg.vma_offset = ((__u64)vma->vm_pgoff) << PAGE_SHIFT;
+		karg.vma_offset = vma_file_offset(vma);
 		karg.dev_major = MAJOR(inode->i_sb->s_dev);
 		karg.dev_minor = MINOR(inode->i_sb->s_dev);
 		karg.inode = inode->i_ino;
@@ -946,7 +954,7 @@ static void smaps_page_accumulate(struct mem_size_stats *mss,
 
 static void smaps_account(struct mem_size_stats *mss, struct page *page,
 		bool compound, bool young, bool dirty, bool locked,
-		bool present)
+		bool present, int nr_local)
 {
 	struct folio *folio = page_folio(page);
 	int i, nr = compound ? compound_nr(page) : 1;
@@ -1007,13 +1015,19 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
 	for (i = 0; i < nr; i++, page++) {
 		unsigned long pss = PAGE_SIZE << PSS_SHIFT;
 
+		/*
+		 * P3S: each 4KB PTE that maps a slice of a 16KB page adds one
+		 * to its mapcount. Only this mm maps the page if no more than
+		 * its nr_local PTEs do. Share the 16KB page among all of them,
+		 * up to the PAGE_SIZE that this PTE maps.
+		 */
 		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT)) {
 			mapcount = folio_precise_page_mapcount(folio, page);
-			exclusive = mapcount < 2;
+			exclusive = mapcount <= nr_local;
 		}
 
 		if (mapcount >= 2)
-			pss /= mapcount;
+			pss = min(pss, (PAGE_SIZE_KERNEL << PSS_SHIFT) / mapcount);
 		smaps_page_accumulate(mss, folio, PAGE_SIZE, pss,
 				dirty, locked, exclusive);
 	}
@@ -1025,6 +1039,11 @@ static int smaps_pte_hole(unsigned long addr, unsigned long end,
 {
 	struct mem_size_stats *mss = walk->private;
 	struct vm_area_struct *vma = walk->vma;
+
+	if (vma_is_p3s_4k(vma)) {
+		mss->swap += vma_shmem_swap_usage(vma, addr, end);
+		return 0;
+	}
 
 	mss->swap += shmem_partial_swap_usage(walk->vma->vm_file->f_mapping,
 					      linear_page_index(vma, addr),
@@ -1072,10 +1091,11 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 			mss->swap += PAGE_SIZE;
 			mapcount = swp_swapcount(entry);
 			if (mapcount >= 2) {
-				u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
+				u64 pss_delta = (u64)PAGE_SIZE_KERNEL << PSS_SHIFT;
 
 				do_div(pss_delta, mapcount);
-				mss->swap_pss += pss_delta;
+				mss->swap_pss += min(pss_delta,
+						     (u64)PAGE_SIZE << PSS_SHIFT);
 			} else {
 				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
 			}
@@ -1089,7 +1109,8 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	if (!page)
 		return;
 
-	smaps_account(mss, page, false, young, dirty, locked, present);
+	smaps_account(mss, page, false, young, dirty, locked, present,
+		      pte_present(ptent) ? vma_slice_ptes(vma, pte, addr, page) : 1);
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -1127,7 +1148,7 @@ static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
 		mss->file_thp += HPAGE_PMD_SIZE;
 
 	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd),
-		      locked, present);
+		      locked, present, 1);
 }
 #else
 static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
@@ -1468,7 +1489,7 @@ static int show_smap(struct seq_file *m, void *v)
 
 	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
 	SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
-	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
+	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", p3s_vma_mmu_pagesize(vma));
 	seq_puts(m, " kB\n");
 
 	__show_smap(m, &mss, false);
@@ -1974,10 +1995,15 @@ static int add_to_pagemap(pagemap_entry_t *pme, struct pagemapread *pm)
 	return 0;
 }
 
-static bool __folio_page_mapped_exclusively(struct folio *folio, struct page *page)
+/* P3S: @nr_local is the number of PTEs of this mm that map @page. */
+static bool __folio_page_mapped_exclusively(struct folio *folio, struct page *page,
+					    int nr_local)
 {
-	if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
-		return folio_precise_page_mapcount(folio, page) == 1;
+	if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT)) {
+		int mapcount = folio_precise_page_mapcount(folio, page);
+
+		return mapcount >= 1 && mapcount <= nr_local;
+	}
 	return !folio_maybe_mapped_shared(folio);
 }
 
@@ -2022,8 +2048,9 @@ out:
 }
 
 static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
-		struct vm_area_struct *vma, unsigned long addr, pte_t pte)
+		struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
 {
+	pte_t pte = ptep_get(ptep);
 	u64 frame = 0, flags = 0;
 	struct page *page = NULL;
 	struct folio *folio;
@@ -2033,7 +2060,7 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 
 	if (pte_present(pte)) {
 		if (pm->show_pfn)
-			frame = pte_pfn(pte);
+			frame = vma_phys_pfn(vma, __pte_to_phys(pte));
 		flags |= PM_PRESENT;
 		page = vm_normal_page(vma, addr, pte);
 		if (pte_soft_dirty(pte))
@@ -2076,7 +2103,8 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 		if (!folio_test_anon(folio))
 			flags |= PM_FILE;
 		if ((flags & PM_PRESENT) &&
-		    __folio_page_mapped_exclusively(folio, page))
+		    __folio_page_mapped_exclusively(folio, page,
+				vma_slice_ptes(vma, ptep, addr, page)))
 			flags |= PM_MMAP_EXCLUSIVE;
 	}
 
@@ -2148,7 +2176,7 @@ populate_pagemap:
 		pagemap_entry_t pme;
 
 		if (folio && (flags & PM_PRESENT) &&
-		    __folio_page_mapped_exclusively(folio, page))
+		    __folio_page_mapped_exclusively(folio, page + idx, 1))
 			cur_flags |= PM_MMAP_EXCLUSIVE;
 
 		pme = make_pme(frame, cur_flags);
@@ -2196,7 +2224,7 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
 	for (; addr < end; pte++, addr += PAGE_SIZE) {
 		pagemap_entry_t pme;
 
-		pme = pte_to_pagemap_entry(pm, vma, addr, ptep_get(pte));
+		pme = pte_to_pagemap_entry(pm, vma, addr, pte);
 		err = add_to_pagemap(&pme, pm);
 		if (err)
 			break;
@@ -2311,6 +2339,7 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 	unsigned long start_vaddr;
 	unsigned long end_vaddr;
 	int ret = 0, copied = 0;
+	P3S_CONTEXT_REMOTE_MM(mm);
 
 	if (!mm || !mmget_not_zero(mm))
 		goto out;
@@ -3230,6 +3259,7 @@ static long do_pagemap_scan(struct mm_struct *mm, unsigned long uarg)
 	unsigned long walk_start;
 	size_t n_ranges_out = 0;
 	int ret;
+	P3S_CONTEXT_REMOTE_MM(mm);
 
 	ret = pagemap_scan_get_args(&p.arg, uarg);
 	if (ret)

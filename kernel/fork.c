@@ -111,6 +111,7 @@
 #include <linux/tick.h>
 #include <linux/unwind_deferred.h>
 #include <linux/pgalloc.h>
+#include <linux/p3s.h>
 #include <linux/uaccess.h>
 
 #include <asm/mmu_context.h>
@@ -1184,6 +1185,8 @@ EXPORT_SYMBOL_IF_KUNIT(mm_alloc);
 
 static inline void __mmput(struct mm_struct *mm)
 {
+	{ /* P3S remote MM context scope: must end before mmdrop() frees @mm */
+	P3S_CONTEXT_REMOTE_MM(mm);
 	VM_BUG_ON(atomic_read(&mm->mm_users));
 
 	uprobe_clear_state(mm);
@@ -1202,6 +1205,7 @@ static inline void __mmput(struct mm_struct *mm)
 		module_put(mm->binfmt->module);
 	lru_gen_del_mm(mm);
 	futex_hash_free(mm);
+	} /* end P3S remote MM context scope */
 	mmdrop(mm);
 }
 
@@ -1578,6 +1582,9 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 
 	tsk->mm = NULL;
 	tsk->active_mm = NULL;
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+	tsk->p3s_remote_mm = NULL;
+#endif
 
 	/*
 	 * Are we cloning a kernel thread?

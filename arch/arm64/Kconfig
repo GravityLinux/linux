@@ -1530,6 +1530,27 @@ config ARM64_64K_PAGES
 
 endchoice
 
+config ARM64_PER_PROCESS_PAGE_SIZE
+	bool "Per-process page size support"
+	# Ensure a uniform 3-level page table walk (PGTABLE_LEVELS = 3) in both
+	# native 16KB and compat-4KB modes:
+	# - ARM64_VA_BITS_47 is the current 16KB configuration used in Android
+	#   (3 levels, 128TB VA).
+	# - 39-bit VA is the current 4KB configuration used in Android
+	#   (3 levels, 512GB VA).
+	# Both configurations naturally use 3-level page tables
+	# (PGD -> PMD -> PTE), allowing native and compat modes to share
+	# the same compile-time folded P4D/PUD structures and traversal
+	# code paths.
+	depends on ARM64_16K_PAGES && ARM64_VA_BITS_47 && MMU && !COMPAT
+	default n
+	help
+	  Allows native 16KB kernels to execute processes mapped with 4KB
+	  translation granules. This is useful for running legacy 4KB
+	  binaries on hardware that performs better with 16KB page size.
+
+	  If unsure, say N.
+
 choice
 	prompt "Virtual address space size"
 	default ARM64_VA_BITS_52

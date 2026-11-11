@@ -25,6 +25,10 @@ typedef struct {
 	void		*vdso;
 	unsigned long	flags;
 	u8		pkey_allocation_map;
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+	/* Process virtual page shift (PAGE_SHIFT_4KB or PAGE_SHIFT_KERNEL) */
+	u8		pte_shift;
+#endif
 } mm_context_t;
 
 /*

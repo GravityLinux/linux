@@ -15,6 +15,7 @@
 #include <linux/pagemap.h>
 #include <linux/syscalls.h>
 #include <linux/sched.h>
+#include <linux/p3s_user_pages.h>
 
 /*
  * MS_SYNC syncs the entire file - including mappings.
@@ -86,7 +87,7 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 			goto out_unlock;
 		}
 		file = vma->vm_file;
-		fstart = (loff_t)linear_page_index(vma, start) << PAGE_SHIFT;
+		fstart = vma_file_offset_at(vma, start);
 		fend = fstart + (min(end, vma->vm_end) - start) - 1;
 		start = vma->vm_end;
 		if ((flags & MS_SYNC) && file &&

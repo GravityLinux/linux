@@ -13,7 +13,7 @@ struct core_vma_metadata {
 	unsigned long start, end;
 	vm_flags_t flags;
 	unsigned long dump_size;
-	unsigned long pgoff;
+	unsigned long pgoff; /* File offset in process page-size units. */
 	struct file   *file;
 };
 

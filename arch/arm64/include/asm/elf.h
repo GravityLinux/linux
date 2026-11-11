@@ -120,14 +120,16 @@
 #define compat_elf_read_implies_exec(ex, stk)	(stk == EXSTACK_DEFAULT)
 
 #define CORE_DUMP_USE_REGSET
-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
+#define ELF_EXEC_PAGESIZE	PAGE_SIZE_KERNEL
 
 /*
  * This is the base location for PIE (ET_DYN with INTERP) loads. On
  * 64-bit, this is above 4GB to leave the entire 32-bit address
  * space open for things that want to use the area for 32-bit pointers.
  */
-#ifdef CONFIG_ARM64_FORCE_52BIT
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+#define ELF_ET_DYN_BASE		(2 * mm_default_map_window(current->mm) / 3)
+#elif defined(CONFIG_ARM64_FORCE_52BIT)
 #define ELF_ET_DYN_BASE		(2 * TASK_SIZE_64 / 3)
 #else
 #define ELF_ET_DYN_BASE		(2 * DEFAULT_MAP_WINDOW_64 / 3)

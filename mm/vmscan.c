@@ -72,6 +72,7 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/vmscan.h>
+#include <linux/p3s_user_pages.h>
 
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
@@ -2261,7 +2262,7 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 	inactive = lruvec_page_state(lruvec, NR_LRU_BASE + inactive_lru);
 	active = lruvec_page_state(lruvec, NR_LRU_BASE + active_lru);
 
-	gb = (inactive + active) >> (30 - PAGE_SHIFT);
+	gb = (inactive + active) >> (30 - PAGE_SHIFT_KERNEL);
 	if (gb)
 		inactive_ratio = int_sqrt(10 * gb);
 	else
@@ -4272,6 +4273,7 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
 	struct lru_gen_mm_state *mm_state;
 	unsigned long max_seq;
 	int gen;
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 
 	lockdep_assert_held(pvmw->ptl);
 	VM_WARN_ON_ONCE_FOLIO(folio_test_lru(folio), folio);
@@ -7971,7 +7973,7 @@ int user_proactive_reclaim(char *buf,
 	buf = strstrip(buf);
 
 	old_buf = buf;
-	nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;
+	nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE_KERNEL;
 	if (buf == old_buf)
 		return -EINVAL;
 

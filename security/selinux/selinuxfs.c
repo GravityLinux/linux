@@ -245,7 +245,8 @@ static int sel_mmap_handle_status(struct file *filp,
 	BUG_ON(!status);
 
 	/* only allows one page from the head */
-	if (vma->vm_pgoff > 0 || size != PAGE_SIZE)
+	if (vma_file_offset(vma) ||
+	    size != (vma_is_p3s_4k(vma) ? vma_page_size(vma) : PAGE_SIZE))
 		return -EIO;
 	/* disallow writable mapping */
 	if (vma->vm_flags & VM_WRITE)
@@ -406,7 +407,7 @@ static vm_fault_t sel_mmap_policy_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	offset = vmf->pgoff << PAGE_SHIFT;
-	if (offset >= roundup(plm->len, PAGE_SIZE))
+	if (vma_file_offset_at(vmf->vma, vmf->address) >= plm->len)
 		return VM_FAULT_SIGBUS;
 
 	page = vmalloc_to_page(plm->data + offset);

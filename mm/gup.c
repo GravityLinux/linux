@@ -27,6 +27,7 @@
 
 #include "internal.h"
 #include "swap.h"
+#include <linux/p3s_user_pages.h>
 
 static inline void sanity_check_pinned_pages(struct page **pages,
 					     unsigned long npages)
@@ -1356,6 +1357,7 @@ static long __get_user_pages(struct mm_struct *mm,
 		unsigned int gup_flags, struct page **pages,
 		int *locked)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	long ret = 0, i = 0;
 	struct vm_area_struct *vma = NULL;
 	unsigned long page_mask = 0;
@@ -1653,6 +1655,7 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
 						int *locked,
 						unsigned int flags)
 {
+	P3S_CONTEXT_REMOTE_MM(mm);
 	long ret, pages_done;
 	bool must_unlock = false;
 
@@ -2172,6 +2175,7 @@ EXPORT_SYMBOL(fault_in_readable);
  * get_dump_page() - pin user page in memory while writing it to core dump
  * @addr: user address
  * @locked: a pointer to an int denoting whether the mmap sem is held
+ * @page_offset: returns the byte offset of @addr in the pinned native page
  *
  * Returns struct page pointer of user page pinned for dump,
  * to be freed afterwards by put_page().
@@ -2184,13 +2188,40 @@ EXPORT_SYMBOL(fault_in_readable);
  * Called without mmap_lock (takes and releases the mmap_lock by itself).
  */
 #ifdef CONFIG_ELF_CORE
-struct page *get_dump_page(unsigned long addr, int *locked)
+struct page *get_dump_page(unsigned long addr, int *locked, unsigned long *page_offset)
 {
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	bool must_unlock = false;
 	struct page *page;
 	int ret;
 
-	ret = __get_user_pages_locked(current->mm, addr, 1, &page, locked,
+	*page_offset = 0;
+	if (mm_is_p3s_4k(mm)) {
+		/*
+		 * The offset needs the VMA: look it up and get the page under
+		 * one mmap_lock hold. If the caller does not hold the lock,
+		 * take it and set *locked so that GUP neither takes nor drops
+		 * it; without FOLL_UNLOCKABLE, a fault cannot drop it either.
+		 */
+		if (!*locked) {
+			if (mmap_read_lock_killable(mm))
+				return NULL;
+			*locked = 1;
+			must_unlock = true;
+		}
+		/* No VMA, e.g. the gate area: GUP handles it with offset 0. */
+		vma = vma_lookup(mm, addr);
+		if (vma)
+			*page_offset = vma_folio_offset(vma, addr);
+	}
+
+	ret = __get_user_pages_locked(mm, addr, 1, &page, locked,
 				      FOLL_FORCE | FOLL_DUMP | FOLL_GET);
+	if (must_unlock && *locked) {
+		mmap_read_unlock(mm);
+		*locked = 0;
+	}
 	return (ret == 1) ? page : NULL;
 }
 #endif /* CONFIG_ELF_CORE */
@@ -3122,7 +3153,7 @@ static inline void gup_fast_pgd_range(unsigned long addr, unsigned long end,
  */
 static bool gup_fast_permitted(unsigned long start, unsigned long end)
 {
-	return true;
+	return current->mm && !mm_is_p3s_4k(current->mm);
 }
 #endif
 
@@ -3438,7 +3469,7 @@ long memfd_pin_folios(struct file *memfd, loff_t start, loff_t end,
 		      pgoff_t *offset)
 {
 	unsigned int flags, nr_folios, nr_found;
-	unsigned int i, pgshift = PAGE_SHIFT;
+	unsigned int i, pgshift = PAGE_SHIFT_KERNEL;
 	pgoff_t start_idx, end_idx;
 	struct folio *folio = NULL;
 	struct folio_batch fbatch;
