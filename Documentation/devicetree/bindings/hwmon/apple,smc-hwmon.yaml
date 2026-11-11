@@ -40,6 +40,28 @@ properties:
   compatible:
     const: apple,smc-hwmon
 
+  '#thermal-sensor-cells':
+    const: 0
+
+  apple,thermal-sensor-keys:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 16
+    uniqueItems: true
+    items:
+      pattern: '^T[A-Za-z0-9]{3}$'
+    description: |
+      Required temperature keys whose maximum is the thermal sensor value.
+      The identities are independent of the optional hwmon channel order.
+      A matching thermal zone must have passive cooling trips. After three
+      failed aggregate reads, the provider uses the highest passive trip as
+      a conservative control temperature until three complete reads succeed.
+      This fault control value does not replace individual hwmon readings.
+
+dependencies:
+  '#thermal-sensor-cells': ['apple,thermal-sensor-keys']
+  apple,thermal-sensor-keys: ['#thermal-sensor-cells']
+
 patternProperties:
   "^current-[A-Za-z0-9]{4}$":
     $ref: "#/$defs/sensor"
