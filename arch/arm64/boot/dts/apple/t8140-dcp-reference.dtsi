@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* MacBook Neo display register windows and stream IDs from the J700 ADT. */
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	reserved-memory {
+		neo_scanout: scanout-pool {
+			compatible = "shared-dma-pool";
+			phandle = <&neo_scanout>;
+			no-map;
+			/* The loader selects the available display carveout. */
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	/* Allow the DARTs' firmware address windows above 32 bits. */
+	dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+	disp0_dart: iommu@412300000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x4 0x12300000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@412340000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x4 0x12340000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		status = "disabled";
+	};
+
+	dcp_mbox: mailbox@412e08000 {
+		compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x12e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 679 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 680 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 681 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	pmgr_dcp: power-management@302800000 {
+		reg = <0x3 0x02800000 0 0xbc000>;
+		#apple,bw-scratch-cells = <3>;
+	};
+
+	pmgr_dcp_doorbell: power-management@302868000 {
+		reg = <0x3 0x02868000 0 4>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	dcp: dcp@412e00000 {
+		compatible = "apple,t8140-dcp", "apple,dcp";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		power-domains = <&ps_disp_cpu>;
+		iommus = <&dcp_dart 23>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4";
+		reg = <0x4 0x12e00000 0 0x4000>,
+		      <0x4 0x10000000 0 0xafc000>,
+		      <0x4 0x12240000 0 0x10000>,
+		      <0x4 0x123a8000 0 0x4000>,
+		      <0x4 0x123ac000 0 0x4000>,
+		      <0x4 0x12800000 0 0x800000>;
+		apple,bw-scratch = <&pmgr_dcp 0 5 0x20000>;
+		apple,bw-doorbell = <&pmgr_dcp_doorbell 0 6>;
+		apple,iomfb-surfaces = <1 0 0 0>;
+		clocks = <&clkref>;
+		phandle = <&dcp>;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+			phandle = <&disp0_piodma>;
+		};
+
+		panel {
+			compatible = "apple,panel";
+			/* ADT dot-pitch is 219 dpi; native pixels are 2408x1506. */
+			width-mm = <279>;
+			height-mm = <175>;
+			/* Upper brightness observed in the complete native sweep. */
+			apple,max-brightness = <420>;
+		};
+	};
+
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
+		apple,scanout-memory-is-nomap;
+		phandle = <&display>;
+	};
+};

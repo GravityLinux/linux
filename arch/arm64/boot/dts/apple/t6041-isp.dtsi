@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Max ISP resource and mailbox topology observed under native macOS. */
+/ {
+	aliases { isp = &isp; };
+};
+
+
+&{/soc} {
+	isp_dart0: iommu@5828c0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <5 0x828c0000 0 0xc000>;
+		#iommu-cells = <5>;
+		/* Native ISP requestor aliases share the firmware domain. */
+		apple,sid-remap = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		interrupts-extended = <&aic AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	isp_dart1: iommu@5828e0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <5 0x828e0000 0 0xc000>;
+		#iommu-cells = <5>;
+		/* Native ISP requestor aliases share the firmware domain. */
+		apple,sid-remap = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		interrupts-extended = <&aic AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pmp_report_isp_sys>;
+	};
+	isp_dart2: iommu@582900000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <5 0x82900000 0 0xc000>;
+		#iommu-cells = <5>;
+		/* Native ISP requestor aliases share the firmware domain. */
+		apple,sid-remap = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		interrupts-extended = <&aic AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pmp_report_isp_sys>;
+	};
+
+	isp: isp@580000000 {
+		compatible = "apple,t6041-isp";
+		reg = <5 0x80000000 0 0x2000000>,
+		      <5 0x82924000 0 0x100>,
+		      <5 0x829241d0 0 0x100>,
+		      <5 0x82924458 0 0x100>;
+		reg-names = "coproc", "mbox", "gpio", "mbox2";
+		iommus = <&isp_dart0 0 0x100 0 0x300 0>,
+			 <&isp_dart1 0 0x100 0 0x300 0>,
+			 <&isp_dart2 0 0x100 0 0x300 0>;
+		interrupts-extended = <&aic AIC_IRQ 646 IRQ_TYPE_LEVEL_HIGH>;
+		/* Sensor power stays firmware-controlled, as in the native trace. */
+		power-domains = <&ps_isp_block0>, <&ps_isp_block1>,
+			<&ps_isp_block2>, <&ps_isp_block3>,
+			<&ps_isp_block4>, <&ps_isp_block5>;
+		apple,pmp-report = <&pmp_report>;
+		apple,platform-id = <5>;
+		apple,dart-vm-size = <0x300 0>;
+		apple,temporal-filter = <0>;
+		status = "okay";
+
+		sensor-presets {
+			/* Native config 0 reads the 3072 x 3024 sensor area.
+			 * This initial centered crop exposes a basic 1280x720 mode.
+			 */
+			preset0 {
+				apple,config-index = <0>;
+				apple,input-size = <3072 3024>;
+				apple,output-size = <1280 720>;
+				apple,crop = <0 648 3072 1728>;
+			};
+		};
+	};
+};
+
+#include "isp-common.dtsi"

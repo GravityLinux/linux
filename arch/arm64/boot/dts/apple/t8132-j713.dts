@@ -11,11 +11,67 @@
 
 #include "t8132.dtsi"
 #include "t8132-jxxx.dtsi"
+#include "t8132-mtp.dtsi"
+#include "t8132-gpu.dtsi"
+#include "t8132-aop.dtsi"
+#include "t8132-isp.dtsi"
+#include "t8132-j713-thermal.dtsi"
 #include <dt-bindings/leds/common.h>
 
 / {
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M4, 2025)";
+
+	aliases {
+		keyboard = &keyboard;
+		/* m1n1 maps the iBoot-provided MTP segments through this alias. */
+		mtp = &mtp;
+		/*
+		 * No external display support yet. m1n1 enables every DCP behind a
+		 * dcpextN alias that the ADT lists, but not its DARTs or mailbox;
+		 * appledrm then never finishes init and boot blocks before userspace.
+		 */
+		/delete-property/ dcpext0;
+		/delete-property/ dcpext1;
+	};
+
+	sound {
+		compatible = "apple,j713-macaudio", "apple,macaudio";
+		model = "MacBook Air J713";
+
+		dai-link@0 {
+			link-name = "Speakers";
+			/*
+			 * The MCA receives sense data from both ports at once, and
+			 * a port's line keeps its last level after its amps' slots.
+			 * As in the ADT amp-tx-zd-config, the first amp on each
+			 * port drives zeros in the other port's slots.
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-2 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-slot-tx-idle-mask-2 = <0xff0f0f0f>;
+
+			cpu {
+				sound-dai = <&mca 0>, <&mca 1>;
+			};
+			codec {
+				sound-dai = <&amp_left_woofer>, <&amp_left_tweeter>,
+					    <&amp_right_woofer>, <&amp_right_tweeter>;
+			};
+		};
+
+		dai-link@1 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
 
 	led-controller {
 		compatible = "pwm-leds";
@@ -30,6 +86,539 @@
 	};
 };
 
+&dcp {
+	status = "okay";
+
+	panel: panel {
+		compatible = "apple,panel-j713", "apple,panel";
+		/*
+		 * Unverified on J713: dimensions and brightness are taken from
+		 * the M2 MacBook Air 13" (J413), which uses a 13.6" panel of the
+		 * same size.
+		 */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		apple,max-brightness = <525>;
+	};
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+/*
+ * The firmware-owned display CPU domain is locked on T8132; referencing it
+ * holds simpledrm back until the deferred-probe timeout. Use the managed
+ * display FE domain, as J773g does.
+ */
+&framebuffer0 {
+	power-domains = <&ps_disp_fe>, <&ps_dptx_phy>;
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
 &fpwm1 {
 	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	status = "okay";
+	wakeup-source;
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j713.bin";
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp-accel {
+	};
+
+	mtp {
+	};
+};
+
+/*
+ * J713 has two USB-C ports (ATC0, ATC1). ATC2/ATC3 don't exist: the ADT lists
+ * their power states without PS registers, so turning them on only fails.
+ */
+&dwc3_2 {
+	status = "disabled";
+};
+
+&dwc3_2_dart_0 {
+	status = "disabled";
+};
+
+&dwc3_2_dart_1 {
+	status = "disabled";
+};
+
+&atcphy2 {
+	status = "disabled";
+};
+
+&dwc3_3 {
+	status = "disabled";
+};
+
+&dwc3_3_dart_0 {
+	status = "disabled";
+};
+
+&dwc3_3_dart_1 {
+	status = "disabled";
+};
+
+&atcphy3 {
+	status = "disabled";
+};
+
+&pmp_report_atc2 {
+	status = "disabled";
+};
+
+&pmp_report_atc3_common {
+	status = "disabled";
+};
+
+&ps_atc2_common {
+	status = "disabled";
+};
+
+&ps_atc2_pcie {
+	status = "disabled";
+};
+
+&ps_atc2_cio {
+	status = "disabled";
+};
+
+&ps_atc2_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc2_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc2_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc2_usb {
+	status = "disabled";
+};
+
+&ps_atc3_common {
+	status = "disabled";
+};
+
+&ps_atc3_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio {
+	status = "disabled";
+};
+
+&ps_atc3_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc3_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc3_usb {
+	status = "disabled";
+};
+
+/*
+ * The J713 radio module is "garden" (ADT /arm-io/wlan module-instance).
+ * m1n1 adds the antenna SKU, MAC address and calibration from the ADT.
+ */
+&wifi0 {
+	brcm,board-type = "apple,garden";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,garden";
+};
+
+/*
+ * The internal eDP panel is driven through the DPTX PHY. DCP needs it
+ * powered: without it the panel stays dark (backlight only), DPTX reports
+ * FIFO errors, and DCP crashes on power-off touching the PHY registers.
+ */
+&dptxphy {
+	status = "okay";
+};
+
+&dcp {
+	phys = <&dptxphy>;
+	phy-names = "dp-phy";
+	apple,dptx-phy = <4>;
+};
+
+#include "hwmon-common.dtsi"
+#include "hwmon-laptop.dtsi"
+
+/*
+ * J713 SoC sensors, identified on the Air by behavior: under an all-core CPU
+ * load Tp0f is among the hottest of the Tp keys (49 -> 106 C), and the PP0b/VP0b/IP0b rail follows
+ * the load (1.5 -> 10 W, 0.61 -> 0.97 V, 2.4 -> 10.3 A; V * I matches P).
+ * PMVR from hwmon-common doesn't exist on this SMC and is skipped.
+ */
+&smc_hwmon {
+	temperature-Tp0f {
+		apple,key-id = "Tp0f";
+		label = "CPU Temperature";
+	};
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "CPU Rail Power";
+	};
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "CPU Rail Voltage";
+	};
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "CPU Rail Current";
+	};
+};
+
+/*
+ * Research (t8132-pmp-votes): run PMP with steady votes for everything the
+ * system uses; the GPU vote follows its genpd (t8132-gpu.dtsi).
+ */
+&pmp_report_boot_f {
+	apple,always-on;
+};
+
+&pmp_report_boot_10 {
+	apple,always-on;
+};
+
+&pmp_report_atc0_common {
+	apple,always-on;
+};
+
+&pmp_report_atc1 {
+	apple,always-on;
+};
+
+&pmp_report_boot_18 {
+	apple,always-on;
+};
+
+&pmp_report_disp {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni0 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni1 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni3 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni4 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni5 {
+	apple,always-on;
+};
+
+&pmp_report_ans {
+	apple,always-on;
+};
+
+&pmp_report_pcie {
+	apple,always-on;
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+
+&dart_audio {
+	status = "okay";
+};
+
+&admac {
+	status = "okay";
+};
+
+/* Built-in microphones: three PDM mics behind AOP (ADT audio-hp-mic, 48 kHz). */
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_admac {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
+};
+
+&mca {
+	status = "okay";
+	/* Speakers and their sense on cluster 0, the jack on cluster 2 */
+	dmas = <&admac 0>, <&admac 1>, <&admac 4>;
+	dma-names = "tx0a", "rx0b", "tx2a";
+};
+
+/*
+ * Speakers: four SN012776 amplifiers on i2c3 (ADT audio-speaker*) with one
+ * shared SDZ line (AP GPIO 15). The sound card's codec order gives the ADT
+ * rx_slot TX slots (0x38 0, 0x3b 1, 0x39 2, 0x3c 3); V/I sense slots are the
+ * ADT speaker-config ones. The left pair is on MCA port 0 and the right pair on
+ * port 1, both fed from cluster 0. Output stays at the macaudio safe limit
+ * until speakersafetyd runs.
+ */
+/ {
+	speaker_sdz_supply: regulator-speaker-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "speaker-sdz";
+		gpio = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <2000>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	amp_left_woofer: amplifier@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <0>;
+		ti,imon-slot-no = <2>;
+	};
+
+	amp_left_tweeter: amplifier@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <8>;
+		ti,imon-slot-no = <10>;
+	};
+
+	amp_right_woofer: amplifier@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <4>;
+		ti,imon-slot-no = <6>;
+	};
+
+	amp_right_tweeter: amplifier@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <12>;
+		ti,imon-slot-no = <14>;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+#include "t8132-usb4.dtsi"
+
+#include "isp-common.dtsi"
+
+&isp {
+	/*
+	 * ADT isp "sensor-type" is 23. Asahi uses sensor-type as the boot
+	 * argument platform-id; unconfirmed for J713.
+	 */
+	apple,platform-id = <23>;
+
+	sensor-presets {
+		/*
+		 * Assumes the M4 Max's 12 MP Center Stage sensor (0x958): config 0
+		 * reads 3072 x 3024 and a centred 16:9 crop gives 1280x720, as in
+		 * t6041-isp.dtsi. Check against the CONFIG_GET dump at probe.
+		 */
+		preset0 {
+			apple,config-index = <0>;
+			apple,input-size = <3072 3024>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 648 3072 1728>;
+		};
+	};
+};
+
+/*
+ * Release DT: the camera stays off. Disable the ISP, its DARTs and every
+ * ISP power domain, including the always-on ISP_SYS and PMP ISP report, so
+ * nothing camera-related is powered or touched at boot. The ISP domains
+ * are only used by the ISP and its DARTs.
+ */
+&isp {
+	status = "disabled";
+};
+
+&isp_dart0 {
+	status = "disabled";
+};
+
+&isp_dart1 {
+	status = "disabled";
+};
+
+&isp_dart2 {
+	status = "disabled";
+};
+
+&pmp_report_isp {
+	status = "disabled";
+};
+
+&ps_isp_sys {
+	status = "disabled";
+};
+
+&ps_ispsens0 {
+	status = "disabled";
+};
+
+&ps_ispsens1 {
+	status = "disabled";
+};
+
+&ps_isp_cpu {
+	status = "disabled";
+};
+
+&ps_isp_cpu_core0 {
+	status = "disabled";
+};
+
+&ps_isp_cpu_core1 {
+	status = "disabled";
+};
+
+&ps_isp_fe {
+	status = "disabled";
+};
+
+&ps_isp_dprx {
+	status = "disabled";
+};
+
+&ps_isp_secure {
+	status = "disabled";
+};
+
+&ps_isp_sts0 {
+	status = "disabled";
+};
+
+&ps_isp_sts1 {
+	status = "disabled";
+};
+
+&ps_isp_pearl {
+	status = "disabled";
+};
+
+&ps_isp_be {
+	status = "disabled";
+};
+
+&ps_isp_clr {
+	status = "disabled";
+};
+
+&ps_isp_cvd {
+	status = "disabled";
+};
+
+&ps_isp_cvm {
+	status = "disabled";
 };

@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J616c AOP and LEAP microphone DMA. CPU addresses and stream topology
+ * verified through native macOS audio capture; m1n1 retains the firmware.
+ */
+/ {
+	aliases { aop = &aop; };
+};
+
+&{/soc} {
+	aop_mbox: mailbox@510608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <5 0x10608000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		/* ADT lists not-empty before empty within each mailbox pair. */
+		interrupts = <AIC_IRQ 710 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 711 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 712 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 713 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	aop_dart: iommu@510f00000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <5 0x10f00000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 734 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		/* EC0p=1 TiB in the existing T6020 AOP boot profile. */
+		apple,dma-range = <0x100 0x00014000 0x2ff 0xfffec000>;
+	};
+
+	aop_admac: dma-controller@513300000 {
+		compatible = "apple,t6041-admac", "apple,t8132-admac";
+		reg = <5 0x13300000 0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <18>;
+		interrupts-extended = <&aic AIC_IRQ 757 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 10>;
+	};
+
+	speaker_admac: dma-controller@513800000 {
+		compatible = "apple,t6041-admac", "apple,t8132-admac";
+		reg = <5 0x13800000 0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <26>;
+		interrupts-extended = <&aic AIC_IRQ 754 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 8>;
+	};
+
+	aop: aop@510c10000 {
+		compatible = "apple,t6041-aop", "apple,t6020-aop";
+		reg = <5 0x10c10000 0 0x2e0000>,
+		      <5 0x10600000 0 0x4000>;
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&aop_dart 0>;
+
+		aop_audio: audio {
+			compatible = "apple,t6041-aop-audio", "apple,t6030-aop-audio";
+			dmas = <&aop_admac 1>, <&speaker_admac 0>;
+			dma-names = "dma", "speaker-tx";
+			apple,protected-speakers;
+			speaker-enable-gpios = <&pinctrl_ap 54 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
