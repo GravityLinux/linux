@@ -69,8 +69,6 @@
 #define RSN_CAP_MFPR_MASK		BIT(6)
 #define RSN_CAP_MFPC_MASK		BIT(7)
 #define RSN_PMKID_COUNT_LEN		2
-#define DPP_AKM_SUITE_TYPE		2
-#define WLAN_AKM_SUITE_DPP		SUITE(WLAN_OUI_WFA, DPP_AKM_SUITE_TYPE)
 
 #define VNDR_IE_CMD_LEN			4	/* length of the set command
 						 * string :"add", "del" (+ NUL)
@@ -1894,7 +1892,7 @@ brcmf_set_key_mgmt(struct net_device *ndev, struct cfg80211_connect_params *sme)
 			else
 				profile->use_fwsup = BRCMF_PROFILE_FWSUP_ROAM;
 			break;
-		case WLAN_AKM_SUITE_DPP:
+		case WLAN_AKM_SUITE_WFA_DPP:
 			val = WFA_AUTH_DPP;
 			profile->use_fwsup = BRCMF_PROFILE_FWSUP_NONE;
 			break;
@@ -1908,9 +1906,6 @@ brcmf_set_key_mgmt(struct net_device *ndev, struct cfg80211_connect_params *sme)
 				profile->use_fwsup = BRCMF_PROFILE_FWSUP_1X;
 			else
 				profile->use_fwsup = BRCMF_PROFILE_FWSUP_ROAM;
-			break;
-		case WLAN_AKM_SUITE_WFA_DPP:
-			val = WFA_AUTH_DPP;
 			break;
 		default:
 			bphy_err(drvr, "invalid cipher group (%d)\n",
@@ -2271,14 +2266,15 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		bphy_err(drvr, "brcmf_set_sharedkey failed (%d)\n", err);
 		goto done;
 	}
-
 	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_FWSUP)) {
-		u32 akm = params->crypto.n_akm_suites ? params->crypto.akm_suites[0] : 0;
+		u32 akm = params->crypto.n_akm_suites ?
+			  params->crypto.akm_suites[0] : 0;
 		bool is_sae_akm = akm == WLAN_AKM_SUITE_SAE ||
 			akm == WLAN_AKM_SUITE_FT_OVER_SAE;
 
 		if (params->crypto.psk && !is_sae_akm &&
-		    profile->use_fwsup != BRCMF_PROFILE_FWSUP_SAE) {
+		    profile->use_fwsup != BRCMF_PROFILE_FWSUP_SAE &&
+		    profile->use_fwsup != BRCMF_PROFILE_FWSUP_PSK) {
 			if (WARN_ON(profile->use_fwsup !=
 				    BRCMF_PROFILE_FWSUP_NONE)) {
 				err = -EINVAL;
@@ -2287,6 +2283,7 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 			brcmf_dbg(INFO, "using PSK offload\n");
 			profile->use_fwsup = BRCMF_PROFILE_FWSUP_PSK;
 		}
+
 		if (profile->use_fwsup != BRCMF_PROFILE_FWSUP_NONE) {
 			/* enable firmware supplicant for this interface */
 			err = brcmf_fil_iovar_int_set(ifp, "sup_wpa", 1);
@@ -2297,7 +2294,9 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		} else {
 			err = brcmf_fil_iovar_int_set(ifp, "sup_wpa", 0);
 		}
-		if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK)
+
+		if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK &&
+		    params->crypto.psk)
 			err = brcmf_set_pmk(ifp, params->crypto.psk,
 					    BRCMF_WSEC_MAX_PSK_LEN);
 		else if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE &&
@@ -6465,7 +6464,7 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 	struct brcmf_cfg80211_profile *profile = &ifp->vif->profile;
 	struct brcmf_cfg80211_connect_info *conn_info = cfg_to_conn(cfg);
 	struct cfg80211_connect_resp_params conn_params;
-	bool authorized;
+	bool authorized = false;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -6475,12 +6474,8 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		if (completed) {
 			brcmf_get_assoc_ies(cfg, ifp);
 			brcmf_update_bss_info(cfg, ifp);
-			if ((profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) ||
-			    (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK)) {
-				cfg80211_port_authorized(ndev, profile->bssid,
-							 NULL, 0, GFP_KERNEL);
-				brcmf_dbg(CONN, "Report port authorized\n");
-			}
+			authorized = profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE ||
+				     profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK;
 			set_bit(BRCMF_VIF_STATUS_CONNECTED,
 				&ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_SUCCESS;
@@ -6496,17 +6491,19 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		conn_params.req_ie_len = conn_info->req_ie_len;
 		conn_params.resp_ie = conn_info->resp_ie;
 		conn_params.resp_ie_len = conn_info->resp_ie_len;
-		authorized = completed &&
-			     ((profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) ||
-			      (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK));
 		cfg80211_connect_done(ndev, &conn_params, GFP_KERNEL);
+		brcmf_dbg(CONN, "Report connect result - connection %s\n",
+			  completed ? "succeeded" : "failed");
+		/*
+		 * cfg80211 handles queued events in order and only accepts
+		 * port authorization once the connection is established, so
+		 * report it after the connect result.
+		 */
 		if (authorized) {
 			cfg80211_port_authorized(ndev, profile->bssid, NULL, 0,
 						 GFP_KERNEL);
 			brcmf_dbg(CONN, "Report port authorized\n");
 		}
-		brcmf_dbg(CONN, "Report connect result - connection %s\n",
-			  completed ? "succeeded" : "failed");
 	}
 	brcmf_dbg(TRACE, "Exit\n");
 	return 0;
@@ -6925,8 +6922,6 @@ static s32 brcmf_dongle_roam(struct brcmf_if *ifp)
 	if (err)
 		bphy_err(drvr, "WLC_SET_ROAM_TRIGGER error (%d)\n", err);
 
-	roam_delta[0] = cpu_to_le32(WL_ROAM_DELTA);
-	roam_delta[1] = cpu_to_le32(BRCM_BAND_ALL);
 	err = brcmf_fil_cmd_data_set(ifp, BRCMF_C_SET_ROAM_DELTA,
 				     (void *)roam_delta, sizeof(roam_delta));
 	if (err)
