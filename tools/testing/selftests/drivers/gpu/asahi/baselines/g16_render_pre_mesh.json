@@ -1,0 +1,9 @@
+{
+  "repository": "shared Max/Neo development history (integration/g16c-g17p)",
+  "commit": "3d31f71b36758761888146727495fd2bbeccd41f",
+  "path": "drivers/gpu/drm/asahi/g16_render.rs",
+  "sha256": "149c5703f5c252e0d050253e4bd7d1c522d929d9ceb537a3b6cbee22783c7eb7",
+  "license": "GPL-2.0-only",
+  "purpose": "Exact ordinary-render reference used by the qualified native mesh selftest before the feature history was squashed.",
+  "upstream_repository": "https://github.com/niklassheth/linux"
+}

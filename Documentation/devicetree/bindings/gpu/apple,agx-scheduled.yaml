@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/apple,agx-scheduled.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple multi-cluster G16 scheduled GPU (experimental)
+
+maintainers:
+  - Sasha Finkelstein <k@chaosmail.tech>
+
+description: |
+  Experimental T6040/T6041 support for the macOS 26.6.2 scheduled-work ABI.
+  m1n1 fills reserved memory, OPPs and typed board calibration properties.
+  The GPU and mailbox power domain must remain always on.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,agx-t6040
+          - enum: ["apple,agx-g16s", "apple,agx-g16c"]
+      - items:
+          - const: apple,agx-t6041
+          - const: apple,agx-g16c
+  reg:
+    items:
+      - description: GPU MMIO
+      - description: Firmware ASC registers
+  reg-names:
+    items:
+      - const: sgx
+      - const: asc
+  mboxes:
+    maxItems: 1
+  mbox-names:
+    items:
+      - const: primary
+  power-domains:
+    maxItems: 1
+  operating-points-v2: true
+  apple,cs-opp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+  memory-region:
+    minItems: 5
+    maxItems: 5
+  memory-region-names:
+    items:
+      - const: ttbs
+      - const: pagetables
+      - const: l2
+      - const: handoff
+      - const: firmware
+  apple,firmware-build:
+    $ref: /schemas/types.yaml#/definitions/string
+  apple,rtkit-private-vm-region:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - mbox-names
+  - memory-region
+  - memory-region-names
+  - operating-points-v2
+  - apple,cs-opp
+
+# Board calibration properties are populated by m1n1; their complete binding
+# remains experimental alongside this ABI. Linux never consumes the raw ADT.
+additionalProperties: true
+...

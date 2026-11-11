@@ -1545,7 +1545,7 @@ impl Uat {
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
 
-            let isolation = *module_parameters::robust_isolation.value() != 0;
+            let isolation = module_parameters::robust_isolation.value() != 0;
 
             self.slots.set_limit(if isolation {
                 NonZeroUsize::new(1)

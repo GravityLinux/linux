@@ -20,8 +20,78 @@ pub trait DriverFile {
     /// Open a new file (called when a client opens the DRM device).
     fn open(device: &drm::Device<Self::Driver, crate::drm::Registered>) -> Result<Pin<KBox<Self>>>;
 
+    /// Called once after associating the driver data with the DRM file, before
+    /// making the file available to userspace.
+    fn post_open(&self, _file: &File<Self>) where Self: Sized {}
+
     /// Get raw drm_file pointer
     fn as_raw(&self) -> *mut bindings::drm_file;
+
+    /// Whether the driver implements [`DriverFile::show_fdinfo`].
+    const HAS_SHOW_FDINFO: bool = false;
+
+    /// Print driver-specific `/proc/<pid>/fdinfo` keys for this client, after
+    /// the common `drm-driver` and `drm-client-id` keys (see
+    /// `Documentation/gpu/drm-usage-stats.rst`). Called only when
+    /// [`DriverFile::HAS_SHOW_FDINFO`] is set.
+    fn show_fdinfo(&self, _file: &File<Self>, _printer: &mut Printer)
+    where
+        Self: Sized,
+    {
+    }
+}
+
+/// Memory totals for one fdinfo region (`struct drm_memory_stats`), in bytes.
+#[derive(Clone, Copy, Default)]
+pub struct MemoryStats {
+    /// Memory shared with other clients.
+    pub shared: u64,
+    /// Memory private to this client.
+    pub private: u64,
+    /// Memory backed by pages.
+    pub resident: u64,
+    /// Resident memory that can be purged.
+    pub purgeable: u64,
+    /// Memory in use by an active submission.
+    pub active: u64,
+}
+
+/// The output of a [`DriverFile::show_fdinfo`] call (`struct drm_printer`).
+///
+/// # Invariants
+///
+/// `self.0` is a valid `struct drm_printer` for the lifetime of the value.
+pub struct Printer(*mut bindings::drm_printer);
+
+impl Printer {
+    /// Print the `drm-total-memory` family of keys for the GEM objects with
+    /// a handle in `file` (`drm_show_memory_stats()`).
+    pub fn gem_memory_stats<T: DriverFile>(&mut self, file: &File<T>) {
+        // SAFETY: `self.0` is valid by the type invariant and `file` is an
+        // open DRM file.
+        unsafe { bindings::drm_show_memory_stats(self.0, file.as_raw()) }
+    }
+
+    /// Print `drm-total-<region>` and `drm-shared-<region>`, and with
+    /// `resident` also `drm-resident-<region>`, for driver-owned memory
+    /// (`drm_print_memory_stats()`).
+    pub fn memory_stats(&mut self, stats: &MemoryStats, resident: bool, region: &CStr) {
+        let raw = bindings::drm_memory_stats {
+            shared: stats.shared,
+            private: stats.private,
+            resident: stats.resident,
+            purgeable: stats.purgeable,
+            active: stats.active,
+        };
+        let supported = if resident {
+            bindings::drm_gem_object_status_DRM_GEM_OBJECT_RESIDENT
+        } else {
+            0
+        };
+        // SAFETY: `self.0` is valid by the type invariant, `raw` lives for the
+        // call and `region` is a NUL-terminated string.
+        unsafe { bindings::drm_print_memory_stats(self.0, &raw, supported, region.as_char_ptr()) }
+    }
 }
 
 /// An open DRM File.
@@ -44,7 +114,8 @@ impl<T: DriverFile> File<T> {
         unsafe { &*ptr.cast() }
     }
 
-    pub(super) fn as_raw(&self) -> *mut bindings::drm_file {
+    /// Return the DRM core pointer, valid for this open file's lifetime.
+    pub fn as_raw(&self) -> *mut bindings::drm_file {
         self.0.get()
     }
 
@@ -88,7 +159,23 @@ impl<T: DriverFile> File<T> {
         // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid.
         unsafe { (*file.as_raw()).driver_priv = driver_priv.cast() };
 
+        file.inner().post_open(file);
+
         0
+    }
+
+    /// The show_fdinfo callback of a `struct drm_driver`.
+    pub(crate) extern "C" fn show_fdinfo_callback(
+        printer: *mut bindings::drm_printer,
+        raw_file: *mut bindings::drm_file,
+    ) {
+        // SAFETY: `drm_show_fdinfo()` calls this for an open file, whose
+        // `driver_priv` was set by `open_callback` and is released only by
+        // `postclose_callback`, after the last file reference is gone.
+        let file = unsafe { File::<T>::from_raw(raw_file) };
+        // INVARIANT: `drm_show_fdinfo()` passes a valid printer for the call.
+        let mut printer = Printer(printer);
+        file.inner().show_fdinfo(file, &mut printer);
     }
 
     /// The postclose callback of a `struct drm_file`.

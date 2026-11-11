@@ -526,7 +526,7 @@ impl Queue::ver {
         };
 
         // Rendering structures
-        let tvb_blocks = *module_parameters::initial_tvb_size.value();
+        let tvb_blocks = module_parameters::initial_tvb_size.value();
 
         ret.inner.buffer.ensure_blocks(tvb_blocks)?;
 

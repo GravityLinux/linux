@@ -1,0 +1,754 @@
+SPDX-License-Identifier: GPL-2.0-only
+Shared scratch lifecycle and ordinary repeat failure, 2026-10-27
+=============================================================
+
+Further isolation of the ordinary failure:
+- Baseline257 with ONLY firmware_dependencies=0 passes normal16 draws and
+  both compressed retained submissions at 1280x720 and 40x20, full pixels,
+  unbind and cold recovery (normal-v15-cpu-dependencies receipt). This is a
+  diagnostic; production firmware dependencies remain enabled.
+- The old resume-only249 and combined resume/start-guard260 both still fail
+  the second ordinary large submission. Neither candidate is promoted.
+- A separately tested Mesa VDM entry barrier emits the native-schema packet;
+  the actual recorder regression fails on old code and passes on the candidate.
+  Normal16 draws pass, but the second retained large submission STILL fails.
+  The candidate is preserved on Mesa snapshot/apple9-vdm-entry-investigation-
+  20261027 and restored out of production, not claimed as the timeout fix.
+  Receipts: normal-v14-resume249, -v16-combined-bindings and -v18-vdm-entry,
+  under dual-gpu-20261026/max-vulkan-retained-*.json.
+Pending render dependencies, their context binding/operand state and lifetime
+remain the next comparison against native and Neo. Do not infer a new scheduler
+or firmware topology difference from these failures.
+
+Max now uses Neo's eight-slot tilemap/heap rotation policy, with colocated
+heap metadata and persistent TPC backing. Both call the same scratch-offset
+helper. Max reserves the existing pool and work-slot preparation leases while
+clearing retired backing off-lock. This aligns lifetime policy; it does not
+claim to fix the outstanding timeout or introduce another scheduler.
+
+Kernel259 (Image-neo-lifecycle-v69) builds from 181 exact archived sources.
+On all16 Max CPUs, normal sixteen-draw 1280x720 sampling passes. With compression
+disabled for isolation, nine retained submissions at 1280x720 and nine at 40x20
+pass every pixel check, crossing the first scratch wrap, then cleanly unbind
+and cold-recover. The runtime verifies 66 actual guest file hashes.
+
+Importantly, the investigation now has an ORDINARY failure without geometry
+pressure: one instance, 1280x720, resubmit the same Vulkan command buffer.
+The first submission passes and the second times out with no growth tokens.
+It fails on both baseline257 (two cold runs) and scratch259. Baseline257 also
+passes two large retained submissions with compression disabled. Disabling
+compression changes the upload command topology too (render versus compute),
+so these results alone do NOT identify a compression implementation bug.
+The next comparison is the retained multi-render chain and binding lifecycle.
+
+Host checks compare 2048 complete Neo descriptors with the original a688 tag,
+1024 scratch selections, two native Max pointer progressions, 576 complete
+ten-image Max preparations, 480 original Neo dependency plans/Max records,
+660 ordered programs and 132 TIB encodings, plus retained storage geometry.
+The program gate's old full-read assertion was corrected to the established
+0x9c0/0x2240 descriptor bounds; every byte WITHIN each object still matches.
+Historical capture bytes and checksums are preserved.
+
+Evidence under bootloader-m4maxmbp/build/:
+  dual-gpu-20261026/max-vulkan-scratch-wrap-v9.json (259 ordinary repeat fails)
+  dual-gpu-20261026/max-vulkan-retained-normal-v10-baseline.json
+  dual-gpu-20261026/max-vulkan-retained-normal-v11-nocompress.json
+    (large repeat passes; later small test rejected invalid dimensions by host)
+  dual-gpu-20261026/max-vulkan-retained-normal-v12-shared-ring-nocompress.json
+    (both nine-submission sequences, unbind and recovery pass)
+  dual-gpu-20261026/max-vulkan-retained-normal-v13-compressed-repeat.json
+  m4max-gpu/neo-lifecycle-restoration-20261025/host-shared-scratch-*/
+Full Max/Neo parity and the thread goal remain incomplete.
+
+Pressure validation scope and current failures, 2026-10-27
+=======================================================
+
+Neo is a behavioral control, not a frozen driver. Shared bugs should be fixed
+for both platforms. Its saved original tag is a rollback/comparison reference.
+
+The retained Vulkan pressure test draws 200000 instances into an 8x4 target.
+It is deliberately synthetic: five TVB allocation requests occur within that
+draw, not across five separate workloads. Normal rendering success below must
+not be read as qualification of this pressure/partial-render path.
+
+Current Neo kernel257 passes the normal sixteen 1280x720 sampler draws and
+small retained submissions, but fails the first pressure draw. The original
+a6883c3 kernel fails the same heavy Vulkan case too. Reducing the instance count
+to 48217 reproduces the failure after ONE growth reply (8 to 18 blocks), before
+any second generation or concurrent-client stage. Disabling compression or
+forcing the existing fragment growth synchronization option did not fix it.
+Growth/partial rendering is the current lead, not an established root cause;
+kernel handling and Vulkan partial-load/store programs remain candidates.
+
+Max kernel257 has passed the entire same Vulkan sequence, including both
+retained clients' second submissions, but other runs fail. A cold normal draw
+has also failed once and passed on repetition. The eight-slot scratch candidate
+kernel258 likewise passes one full sequence and fails another paired run. It
+is archived separately and is NOT a demonstrated fix. No shared cause between
+the Neo single-growth failure and Max intermittent failure is established.
+
+Receipts in bootloader-m4maxmbp/build/dual-gpu-20261026/:
+neo-protected-vulkan-retained-v2.json (original Neo heavy failure),
+neo-current-vulkan-retained-v7-minimal-partial.json (one-growth failure),
+neo-current-vulkan-retained-v5-nocompress.json,
+neo-current-vulkan-retained-v6-sync-grow.json,
+max-current-vulkan-retained-v2.json and
+max-vulkan-retained-v8-baseline-cold.json (baseline full-sequence passes),
+max-scratch-vulkan-retained-v3.json and -v4.json (candidate mixed outcomes).
+
+Neo Vulkan fixes qualified, 2026-10-27
+====================================
+
+This supersedes the compression and cold-first-large-render limitations in
+older checkpoints below. The protected original kernel/tag is unchanged.
+
+Two independent defects were isolated:
+- Mesa's native Apple9 compute stream lacked consumer entry cache maintenance
+  after rendering. GPU timestamps established producer completion before the
+  bad readback; a full CDM entry barrier fixes the compressed-frame corruption.
+- Neo compute bootstrap stages a dormant 1x1 render graph. Adopting it for a
+  real caller never selected that geometry's scratch backing. Adoption now
+  uses the same scratch selection/validation as build and append, and the
+  existing off-lock preparation hooks include the dormant owner. No new wire
+  fields, scheduler, or firmware handshake are introduced.
+
+Hardware A/B uses the same spin-table monitor, all six CPUs, DTB, relocated
+byte-identical guest FDT and production Mesa runtime (67 actual guest hashes).
+Old shared kernel247 still fails a 1280x720 sampler workload as the FIRST
+render after three compute/transfer submissions. Candidate kernel248 passes
+that order, sixteen sampler draws, three compressed draw/readback frames,
+three repeated frames and clean unbind. There is no small/native render
+primer, compression override or CPU submission serialization. The old Mesa
+constructor also fails the actual recording regression while the fixed one
+passes. All181 remote built driver sources match kernel247 except the two
+adoption files; the local committed contents match those exact tested files.
+
+Test transport now uses stock Linux spin-table CPU nodes, not PSCI emulation.
+All five guest secondaries park before Linux starts. Keeping the FDT inside
+the monitor allocation aperture still reproduced a pre-GPU CPU0 fixed-FDT
+read abort; moving its identical bytes beside the guest Image booted all six
+CPUs in both A/B runs. The mechanism behind that placement sensitivity is
+not established; do not attribute that setup failure to the GPU driver.
+
+Authoritative receipts in bootloader-m4maxmbp/build/dual-gpu-20261026/:
+neo-adoption-and-entry-fix-spin-v2.json (candidate positive),
+neo-entry-fix-spin-old-kernel-v1.json (expected negative reproduced),
+neo-adoption-candidate-remote-audit-v1.json, corresponding raw monitor logs.
+Focused Neo Vulkan control is qualified; full Vulkan conformance, remaining
+Max lifecycle/fault issues and current browser regression remain separate.
+
+Neo control hardware validation, 2026-10-26
+===========================================
+
+Neo has now been tested on both the protected original kernel tag
+neo-known-good-2026-10-21 (a6883c3c6e5a, clean rebuild #248) and the shared
+kernel ea8c2e772 (#247). Same authored DTB, bootloader, monitor, initramfs,
+actual Vulkan runtime hashes and all six CPUs. Neither kernel contains the
+parked, uncompiled Max render-binding cache edits.
+
+Both pass the existing native render control: 32 renders, 256 exact complete
+128x128 R32F images, retained old images/guards, 128 timestamps and fences.
+Both also pass a cold Vulkan sequence without native-render warm-up:
+three compute/transfer submissions (257 output words + 63 guards each),
+three uncompressed draw/scissor/readback frames (703 pixels + guards each),
+and sixteen 1280x720 bindless-sampling draws with nonzero sampler selection.
+Both clean unbinds and exact-device cold recoveries pass.
+
+Vulkan userspace needed native G17P Apple9 path selection instead of legacy
+USC packets, test chip identification instead of an Apple M4 name check, and
+caller render-state allocation above the Neo initial TVB growth reservation.
+No Neo kernel source changes were needed for these passing controls.
+
+Compression remains an existing integration gap: the default/compressed
+second draw frame fails identically on BOTH original and shared kernels
+(pixel0 red=255, expected63); ASAHI_MESA_DEBUG=nocompress passes all frames.
+An earlier cold compressed sampler run on the shared kernel returned a
+firmware type4 report. Do not call this full Vulkan qualification or add a
+Max-only scheduler path to compensate. Use the passing native/uncompressed
+cases as the current control and investigate compression independently.
+
+Authoritative receipts in bootloader-m4maxmbp/build/dual-gpu-20261026/:
+qualified-neo-control-v1.json, neo-protected-kernel-manifest-v1.json,
+neo-protected-control-v1.json, neo-protected-cold-vulkan-v1.json,
+neo-current-cold-vulkan-v1.json and corresponding exact device logs.
+
+CORRECTION 2026-10-26: native descriptor bounds, kernel246
+
+This supersedes the later historical "NEW POINTER TOPOLOGY EVIDENCE" section.
+The supposed G16C cross-client extensions were an over-read into the next
+adjacent allocation. They are NOT additional fields or graph edges.
+
+Three independent paired native captures prove six exact virtual AND physical
+identities. Example in single-user-warm-pressure-phases-v1/pair:
+  B TA descriptor = fffffc20c0019380; +9c0 = fffffc20c0019d40 = A TA.
+  A FR descriptor = fffffc20c00b4480; +2240 = fffffc20c00b66c0 = B FR.
+All 56/64 supposed extension bytes are the adjacent descriptor's header.
+The other six unoccupied spans are zero. Actual G16C body sizes are 0x9c0 TA
+and 0x2240 FR, matching G17P. No G16C-only peer-link construction or new lifetime
+manager follows from these observations. The original Neo reuse conclusion
+stands more strongly; generation-specific field values/templates still apply.
+
+The bounded CPU DATA trace's17stores were normal writes to the next job header.
+The zero-TA, zero-FR, zero-all and pre-arm-zero firmware crashes corrupted a
+separately queued descriptor, and do not prove a special work handshake. The
+A-first/B-first rewrites likewise replaced job headers; their negative results
+are retained but their topology interpretation is withdrawn. A provisional
+peer codec/kernel245 was compiled and replayed but NEVER integrated into live
+submission and is removed. Its source is preserved in local v55 archive.
+
+Corrected source: macro-generated G16C/G17P sizes/assertions and Python encoder,
+OOM body validation, native descriptor builders/readers. Historical capture
+files remain byte-for-byte unchanged. Host gates:260whole descriptors including
+4independent native images,512originalNeo descriptors;576off-lock preparation
+cases;128whole OOM replies/adversarial identity checks;12boundary spans in3captures.
+No scheduler/ownership/context-binding policy changed in this correction.
+
+A working full warm-A -> warm-B -> pending-pair cold replay now exists against
+ONE resident firmware, with4changed correct outputs/2000guards/12retirements.
+Using the driver's production full12-write binding instead of native4-write
+resume also passes all these checks. That difference ALONE does not explain
+the earlier Linux timeout. Both runs recovered exactRID0/raw/N01 afterwards.
+
+Kernel246/Image-v56:181exact archived/local/remote sources, actualARM64object.
+Nativev1219 passes original short stable-raw/default pressure2, raw renderer,
+memory and unbind. Nativev1221 first warms all15pools then both retained200000-
+instance clients pass both generations/alloutputs/guards/timestamps. The test
+uses actual RAW async submit; both second submissions return before either FR
+retires. ZERO measured TA/FRstage overlap. Memory/unbind/all16CPUs/exactcoldPASS.
+Nativev1223 also passes owned high-ASID63 OOM7/error9, fence ENOMEM, failed
+dependency, independent retry, guards/memory/unbind/exactcold with246.
+This is a new passing run, NOT proof the earlier v1216timeout is fixed. Retained
+queued/lifetime/recycling/context-wrap/error and full-workload qualification
+remain open. Full goal ACTIVE; no new completed parity claim.
+
+Local evidence: bootloader build/m4max-gpu/neo-lifecycle-restoration-20261025/
+  descriptor-adjacency-correction-v1.json
+  host-correct-descriptor-{bounds,adjacency,OOM,preparation}-v1/summary.json
+  warm-pressure-phases-opaque-replay-v1/result.json
+  warm-pressure-full-rebind-replay-v1/result.json
+  kernel-neo-lifecycle-v56.json;tested-source-neo-lifecycle-v56.tar.gz
+  native-correct-descriptor-bounds246-v1.json
+  native-raw-paired-pressure246-v1.json
+The subsequent historical sections retain their original chronology; consult
+this correction before interpreting their "extension" or failed replay claims.
+
+Neo and M4 Max firmware topology and lifecycle comparison
+2026-10-25
+
+Conclusion
+
+The pointer topology and fundamental lifetime rules are very similar. The
+known working paths support one queue-generation and ownership implementation,
+with ABI-specific submission handling. They do not justify independent CPU
+schedulers or independent resource-lifetime implementations.
+
+Reference: original Neo driver at neo-known-good-2026-10-21,
+a6883c3c6e5aa42548543a5a7b82bb6e375d6922. Forty-six original source files were
+compared with Max's source-built protocol and working native captures, rather
+than relying only on the newer shared structs.
+
+Detailed read-only evidence is in the adjacent bootloader checkout:
+build/m4max-gpu/g16c-g17p-abi-comparison-20261025/
+  original-neo-provenance.json
+  original-neo/
+  topology-and-lifecycle.json
+  render-role-map.json
+
+Common pointer graph and lifetime rules
+
+* Firmware queues point to a pointer block, item ring, job list, and queue
+  context. Outer channel messages identify the queue and published work head.
+* Persistent execution contexts have low/high aliases of retained context
+  records. Records reference descriptors, queues, predecessor milestones,
+  and register arrays.
+* Compute descriptors reference scheduler/credit records, command streams,
+  save/operand state, completion destinations, timestamps, and pool support.
+* Render has corresponding work-state, scene, shared parameter/index-manager,
+  and empty-object roles. Tiling and fragment retain shared resources through
+  partial continuation and completion.
+* Dependencies name predecessor queue milestones. Producer identities remain
+  valid while consumers can still reference them.
+* Queue consumption, GPU completion, report processing, and CPU visibility are
+  separate conditions. Consumption alone does not authorize storage reuse.
+* Reconfiguration retires affected work, performs context cleanup, and then
+  re-registers or reuses retained storage. Logical closure does not immediately
+  free every object reachable by firmware.
+
+Render role correspondence
+
+Original Neo                      M4 Max
+Pool A selected work-state record Event-control object
+Pool B selected record            Scene
+Shared parameter/index object     Parameter manager
+Zero object                       Empty scene
+
+These are corresponding roles, not proof of identical mutation semantics for
+every firmware-written byte. The parameter-manager graph contains the same
+broad classes of page/index lists, block IDs, shared control, and counter state.
+
+Three observed firmware protocol differences
+
+1. Submission entry
+   Original Neo independent compute publishes descriptor, optional context
+   setup, and event on registration; later work publishes descriptor and event.
+   The qualified Max path publishes a Work15 wrapper and marker. Work15 selects
+   a persistent context-array record, which references the descriptor. The
+   wrapper and context-record concepts already exist in Neo; their use within
+   the submission sequence differs. The observed Max wrapped path does not
+   prove that every alternate direct-descriptor path is impossible.
+
+2. Context binding
+   Max's qualified path explicitly installs/resumes execution-context bindings
+   through SGX transactions. Neo ordinary independent-compute publication has
+   no equivalent per-publication host transaction. This is an ABI-specific
+   binding operation, not a second scheduling/lifetime model.
+
+3. Firmware peers, reports, and control protocols
+   Neo has two firmware instances; the qualified Max boot uses one. Completion
+   reports, pool registration metadata, and some control sequencing differ.
+   Growth replies retain Neo's first five words; Max additionally carries an
+   observed opaque sixth word. See the context-isolated test below.
+   Ownership still requires retaining the request owner, validating the reply,
+   and establishing retirement before reuse. Wire identity/encoding and the
+   observed protocol sequence must remain capture-backed.
+
+Implementation differences that are not established ABI requirements
+
+* Neo bundles an executable root/ASID, private operand storage, and firmware
+  queue within a retained compute generation. The Max port instead separates
+  VM Owner from Queue and largely fixes a pool within Owner. These are driver
+  ownership policies, not evidence that the ABIs require different schedulers.
+* The Max native capture proves that two queues share one operand pool. The
+  original queue later uses a different pool while its ASID, actual root
+  pointers, firmware queue, queue context, and context-array identity remain
+  unchanged. Pool, VM, and queue lifetime are independent identities.
+* Neo already implements off-lock preparation, exact seed revalidation,
+  generation selection, and producer dependency retention. Max bypasses or
+  reimplements portions of those paths.
+* Neo preserves firmware-written portions of reused context records. Max
+  currently writes complete records. This requires review and evidence, not
+  an assumption that Max requires a different lifecycle. It is not an identified
+  cause of the existing pre-wrap handoff timeout.
+* Original Neo conservatively retains published GEM backing until Session
+  teardown. Max adds more explicit per-owner retirement/reuse. This is added
+  implementation complexity, not a demonstrated firmware topology difference.
+* Max's global drain restrictions are conservative port restrictions, not an
+  established firmware-wide serialization requirement.
+
+Implication and limitation
+
+Use Neo's generation selection, preparation/commit, dependency retention,
+retirement, and reconfiguration machinery. Keep versioned fields and constant
+templates. Keep the three protocol differences above explicit underneath that
+common machinery. Do not infer lifetime ownership from numerical address
+placement or equate one pool with one VM or queue.
+
+This comparison does not identify the cause of the current short-incoming-job
+handoff timeout. It provides no evidence for a fundamental firmware limitation
+that requires independent Max scheduler/admission/lifetime managers.
+
+Operator direction, 2026-10-25
+
+Snapshot the existing Max integration before removing its divergent machinery.
+Retain separate behavioral paths only where the three protocol differences
+above justify them. Struct versioning and templating remain the means of
+representing differing fields, constants, and wire geometry.
+
+Context-isolated growth investigation, 2026-10-26
+
+A cold replay of the two-client single-user Metal capture executes the parent
+through ASID63 with its original ASID2 roots invalid. Both outputs, all six
+stage completions, inner/outer retirement and the fresh FList63 receipt pass.
+This does not exercise host growth and does not prove concurrent GPU intervals.
+
+Enabling host growth on that same graph reproduces the kernel's failure with
+the existing source shim's growth handler: two replies retire, then the tiler
+times out with poison output. The original Neo reply encoder reveals that the
+Max interpretation had mistaken first-context values, where VM, success and
+generation were all one. Both use the prefix [8, success, pool, VM, counter].
+The Max source was instead putting VM at +4 and generation at +12. Correcting
+those two words, while retaining all other source growth code and native
+graph bytes, passes three real ASID63 growth replies, both output/guard
+oracles, and every stage/transport completion. Kernel235 then passes native
+pressure in ASIDs63 and62: eight growth replies, both complete 200000-instance
+generations, output/guard/timestamp/prior-poison oracles, memory6313, clean
+unbind and cold recovery. A different-origin two-client run also passes all
+four generation oracles, but measures no overlapping GPU render intervals.
+No new scheduler path or ASID restriction is justified by this failure.
+
+Artifacts are in the adjacent bootloader build/m4max-gpu/
+neo-lifecycle-restoration-20261025/: native-ASID63-only-GPU-output-audit-v3.json,
+pressure-retained-reference-ASID63-source-growth-v1.json (negative), and
+pressure-retained-reference-ASID63-reply-order-v2.json (positive). The actual
+original Neo serializer now independently checks the first twenty bytes of
+128 generated Max replies, including non-one VM and generation values.
+
+Pool-milestone partial-render investigation, 2026-10-26
+
+Native child/parent descriptors target pool milestone1 even though their
+separate global lifecycle ordinals are0 and1. The port incorrectly used the
+global ordinal in descriptor next-item/next-work fields, tiling submission tag,
+and queue ordinal. Work15 and SKSM already used the pool-local milestone.
+Kernel236 corrects only these body counter projections and the compensating
+shared-tail calculation. A fresh pool2 after two prior renders now emits OOM7
+immediately, rather than stalling before the report. This follows Neo's
+existing index-versus-ordinal distinction; it adds no scheduling policy.
+
+That report exposes another first-context inference: OOM7 +4/+8 are fixed
+words0/1, not pool/VM. The actual context is at+24. The retained descriptor,
+manager, queue, event, stamp, installed roots and owner.parameter.slot prove
+pool ownership. Max's other report pointers still differ from Neo's report.
+The error9 reply itself is identical to Neo: kind9, success1, retained queue,
+and event counter. The previous port echoed context into success. Kernel237
+passes the actual pool2/ASID63 OOM, failed dependency, independent same-queue
+recovery,294884 guards per phase, memory6313, clean unbind and exact cold
+recovery. No separate Max OOM lifecycle is justified by either mistake.
+
+The native decoder gate rejects the previous source, checks the actual high-
+context report and128complete replies, and compares126whole64byte replies
+against the original tagged Neo encoder. Broader kernel237 regressions are
+recorded separately; no actual overlapping GPU intervals are inferred here.
+
+Shared cold parameter-pool preparation, kernel239, 2026-10-26
+
+Max now uses the existing Neo prepare_render_templates phase. The common
+PoolTemplateSeed/PreparedPoolTemplate containers carry G17P or G16C wire
+construction data. Max captures the selected owner, pool, ASID, exact private
+extent and table snapshot/root lease under the runtime mutex; the existing
+worker then allocates and serializes unpublished PB backing without borrowing
+Session, Vm or UserVm. Commit revalidates selection, identity, extent and root
+generation before preflight, adoption and installation. Stale work cannot
+publish a speculative graph. Dormant reuse keeps the normal retained path.
+No new scheduler, publication queue, hardware reservation or lifetime manager
+was added. Driver/firmware layouts and constants are unchanged.
+
+The original resource gate compares31230complete virtual pages/512296920bytes
+with the existing source constructor, including physical reuse, firmware DATA
+preservation and allocation rejection. It also calls the detached builder
+without any live VM/root argument and checks unchanged live state. Kernel239
+passes cold raw rendering, ASID63 OOM/dependent rejection/independent recovery,
+ASIDs63/62 pressure growth, Vulkan bindless rendering/nonzero samplers and
+compute transfers, moved private-window raw rendering, memory6313, clean
+unbind and exact cold recovery; both successful boots verify359guest hashes
+and all16CPUs. Original Neo35default/probe/scheduler/UAPI checks pass.
+
+The first draft238 incorrectly serialized descriptors between PB construction
+and geometry initialization, producing EINVAL before any GPU publication. Its
+negative and clean teardown are preserved. Final239 defers descriptor
+preparation until geometry exists. A later CPU startup stall was recovered
+with identical Image/DTB/initrd and all16CPUs, without attributing it to GPU.
+
+This removes bulk PB allocation from the runtime lock, not all cold Max
+allocation. Base Owner/operand backing, geometry and work/queue allocation
+still need the same common preparation contract. Actual GPU render overlap,
+same-pool producer/scene/status leases and final parity qualification remain.
+Artifacts: adjacent bootloader build/m4max-gpu/neo-lifecycle-restoration-20261025,
+Image-neo-lifecycle-v49, kernel-neo-lifecycle-v49b.json and its180-source archive,
+native-nonbootstrap-OOM239-v1.json and native-cold-template239-v1.json.
+
+Shared cold base-owner preparation, kernel240, 2026-10-26
+
+Max render now uses the same prepare_clients private-backing phase that Neo
+compute already uses. A per-job unpublished OwnerPrivateG16C holds only the
+root/private-range key and detached physical backing. The worker allocates,
+cleans and writes its20operand buffers,16MiB directory, table and private save
+state outside the runtime mutex. Admission rechecks the selected pool's need
+and the exact prepared root/range before adopting those pages. Fresh mappings
+preserve prepared DATA instead of clearing the entire image a second time.
+Pool IDs, ASID allocation, retained reuse, publication, retirement and backing
+retention policies are unchanged. Speculation made unnecessary by another
+worker is dropped with its unpublished client outside locking, as in Neo.
+
+The directory/table encoder is shared with the existing retained-owner reset
+path. An independent gate compiles the previous committed initializer from
+d138dcd9c and compares every byte of both complete owner images at7000000000
+and10e0000000, including all zeroed operand/save backing, support and dispatch
+DATA. Eight detached-allocation failures and six root/range mismatches reject.
+The existing31230page/512296920byte parameter-resource/rebind oracle still
+passes. Neo's35default/probe/scheduler/UAPI projection passes after explicitly
+projecting only the G16C arm/private guard and inert per-job storage field.
+
+Two actual240 boots verify359guest hashes/all16CPUs each. v1195 passes raw
+render, ASID63 OOM/dependent rejection/independent recovery and memory/unbind/
+cold recovery. v1198 passes all15physicalpools and allgrids, owncounterreuse,
+retained private-window move, original200000-instance pressure on retained
+pools, Vulkanbindless/nonzerosampler rendering and compute/transfers, return
+through all15pools, dependent mixed work, memory6313, clean unbind and exact
+cold recovery. Three known pre-GPU CPU startup stalls were preserved and
+recovered by identical retries. No lower CPU count or GPU-attribution claim.
+
+Artifact Image-neo-lifecycle-v50/manifest/archive-v50b has180exact current/
+remote/archive sources. The b refresh updates only the Neo projection host
+test; actual ARM64object/Image/UTS240 remain identical. Native receipts:
+native-nonbootstrap-OOM240-v1.json and native-minimal-pool-rebind240-v1.json.
+
+Geometry, transport/work-page allocation and clearing recycled private backing
+still need the common off-lock preparation contract. ActualGPUrender overlap,
+same-pool queued leases/context preservation and final parity remain unproven.
+
+Shared geometry preparation, kernel242, 2026-10-26
+
+Max geometry now uses the existing prepare_render_scratch phase. The common
+ScratchSeed/PreparedScratch containers carry G17P or G16C construction data;
+Neo's actual scratch encoder still matches the original tagged source. Max
+captures an owned root lease and a pure placement plan; allocation and cache
+cleaning borrow neither Session nor the live UAT tree. Commit checks physical
+pool quiescence, owner/ASID/root, previous geometry/cursor, compact extents and
+every destination/guard PTE before adoption. Changed plans retry without
+installing leaves. The normal stage checks readiness and no longer allocates
+geometry. The source address search, capacities, guards and wire pointers are
+unchanged. New geometry waits for the admitted caller/window rebind, as the
+original in-lock path did; it must not plan around a previous caller's leaves.
+
+The resource gate still compares31230complete virtual pages/512296920bytes
+against the existing source constructor, plus both complete base-owner images
+from the previous initializer. It directly allocates a captured geometry plan
+without a live root argument and rejects a newly occupied guard, foreign root
+and stale geometry cursor/state without changing installed leaves. Existing
+three allocation-failure boundaries and physical reuse checks still pass.
+Neo35default/probe/scheduler/UAPI and original scratch encoder projections pass.
+
+Actual242 boots v1202/v1203 each verify359guest hashes and all16CPUs. First
+passes raw render, owned ASID63 OOM/error9, failed dependency and independent
+same-queue recovery, memory6313/unbind/exactcold. Second passes all15physical
+pools/allgrids/counterreuse, private-window rebind, original200000-instance
+pressure on retained pools, Vulkanbindless/nonzerosampler+compute/transfers,
+return through all15pools, dependent mixed work, memory/unbind/exactcold. The
+v1201 pre-GPU CPU startup stall used an identical retry, without CPU lowering.
+Earlier241/v1199 passed the short native sequence before the caller/window
+ordering check was added; final production qualification uses242.
+
+Artifact Image-neo-lifecycle-v52/manifest/archive-v52 preserves180exact current/
+remote/archive sources, without a host-test-only refresh. Receipts are
+native-nonbootstrap-OOM242-v1.json and native-minimal-pool-rebind242-v1.json.
+Transport/work-page allocation, clearing recycled backing, actual GPU render
+overlap, same-pool queued ownership/context preservation and final parity
+remain open. No separate scheduler or geometry lifetime manager was added.
+
+Retained-private preparation reuse, kernel243, 2026-10-26
+
+The preparation predicate still requested a fresh176MiB base-owner graph for
+a new caller even when retained_render_index selected an existing physical
+root for the common PTE rebind. That backing was speculative and unused.
+The shared preparation query and admission now agree that a selected retained
+root needs no fresh private backing. Neither the root/window rebind nor any
+retirement/clear sequence changes. Native243/v1205 counts actual successful builder calls: exactly15fresh sets
+for15pools and ZERO additional sets after pool fill, through private-window
+rebind, retained pressure200000, Vulkanbindless/nonzerosampler+compute,
+returns through all15pools and dependent mixed work. All original output,
+guard/timestamp/prior-poison, memory6313, unbind and cold recovery checks pass.
+All16CPUs and359actualguesthashes are verified. Neo35defaults/probe/scheduler/
+UAPI and original scratch-encoder equality pass. No cold-allocation limit or
+reduced pool capacity is introduced. Firmware encoders/initializers remain
+byte-for-byte unchanged; only the preparation/admission classification and
+opt-in diagnostic count change.
+
+Image-neo-lifecycle-v53/manifest/archive-v53 preserves180exact current/remote/
+archive sources; source changes from242 are only schedule classification/log,
+the Session query and render admission predicate. Native receipt is
+native-minimal-pool-rebind243-v1.json. No broader GPU-overlap or cleared-buffer
+lifecycle qualification is inferred from this result.
+
+Bulk recycled clearing needs a separate ownership review. The Max window-move
+path currently retires firmware/TTBRs before clearing. retire_owner invalidates
+roots, marks queues non-live and detaches the render resource. A naive unlock
+between retirement and clear loses the old retained-render candidate, can let
+release_requested drop its client, and exposes partial clearing/reinitializing
+to allocation failure. ZeroSpan pinning alone does not reserve a pool or
+complete its directory/support reconstruction. Preserve these facts when
+reusing common PreparationReservation/render_prepare_leases; do not move bulk
+clears before retirement or add another lifetime manager without evidence.
+The existing Neo scratch clear only mutates reserved scratch, so applying it
+to entire Max operand directories requires the matching initialization and
+error/rollback ownership as well. No clearing-order change has been made.
+
+Shared transport/work preparation, kernel244, 2026-10-26
+
+Max render queue transport and wrapped-work RAM now allocate/clear through the
+existing common prepare_clients worker. QueueBackingG16C is twelve unpublished
+physical ranges; WorkBackingG16C is seven unpublished pages. Neither embeds a
+queue address or slot identity. Admission reselects the actual physical queue
+and work slot, validates/reserves the mappings and adopts ready backing; a
+missing plan retries without publication. Unused speculation drops outside
+locking. No new scheduler, producer queue or lifetime manager was introduced.
+The installed-root/alias checks, twelve queue mapping attributes, seven work
+mapping attributes, FIFO/context bytes and existing retained resets are unchanged.
+Small mapping-table/host-metadata allocations remain in commit; this is not a
+claim that every kernel allocation is outside the runtime lock.
+
+Whole-image gates compare48queue backing images/fourwholealiasimages against
+source QueueSet.create, check all96aliaspages and private permissions, preserve
+1.5MiBretainedscratch and rejectlatealiascollisions. Each fourprofile transport
+is supplied preallocated RAM; queue staging performs no further backing
+allocation. Seven complete work pages startzero and all7allocationfailure
+boundaries reject. Existing31230page/512296920byte resource and base-owner/
+geometry/failure/reuse oracles and35taggedNeo defaults/probe/scheduler/UAPI/
+original scratch encoder preservation checks pass.
+
+Native244 v1206 passes raw rendering, owned63 OOM/error9, dependent rejection,
+independent recovery, memory/unbind/cold. v1208 passesall15pools/allgrids,
+counterreuse/private-windowrebind/retainedpressure200000/Vulkanbindless+
+nonzerosamplers/compute+transfers/allpoolreturns/mixed/memory/unbind/cold.
+Exactly15freshbaseprivate sets remain sufficient. Both boots verify359guest
+hashes and all16CPUs. Image/manifest/archive-v54 preserve180exact current/
+remote/archive sources. No producer/control/wire encoder fields were changed.
+
+Additional warm-pool pair v1210:16rawclients populateall15pools, both pressure
+clients use7000000000 and retain all four original generation oracles. Both
+processes return0; timestamps showZERO R/Rstage overlaps. Host controller then
+hits NameError because its generated origin assertion lacked whitespace before
+for. Launched source and error are preserved; independent timestamp parsing
+and original-monitor write-only VUART continuation complete rawreturn/memory/
+unbind/exactcold recovery. Do not erase that orchestration error or call it a
+GPU fault. The reference receipt identifies the separate finishing script.
+
+ERRATUM to earlier handoff notes: g16c_drm_parameter_growth.c creates ONE VM
+and ONE queue per client before its two-generation loop, not a new VM for each
+generation. Each iteration allocates and binds a new timestamp BO/useralias,
+changing the immutable caller binding snapshot. Distinguish that root-rebind
+work from pure steady-state submission: a stable-binding variant should
+prebind both timestamp banks while preserving prior-bank poison and all output/
+guard/timestamp oracles. No firmware concurrency limitation is established.
+
+Remaining: safely prepare recycled clears/initialization with common leases,
+actual GPU render overlap, queued same-pool scene/status/producer ownership,
+firmware-owned context preservation acrosswraps, broad error/recovery/sustained/
+liveNeo/currentChromium/WebGPU finalparity. No full completion claim.
+
+Stable-binding paired submission investigation, kernel244, 2026-10-26
+
+The pressure client now has an opt-in G16C_STABLE_TIMESTAMP_BINDINGS=1 mode.
+It creates/maps BOTH timestamp banks before either generation, preserving one
+VM, one public queue and the complete user binding snapshot across generations.
+The original per-generation bank mode remains the default. All three complete
+arguments/color/query comparisons,294884guards,six GPU timestamps and the
+prior-bank3c poison checks remain, including cleanup and close checks.
+
+Native v1211(log1),v1212(log3) andv1214(log0) each pass both pressure200000
+clients/all4generation oracles, default pressure2, raw return, memory6313,
+unbind and exactRID0/raw/N01 recovery. Each verifies359actualguesthashes/all16
+CPUs. v1211/v1212 publication DATA shows both second generations reuse their
+own original pool/root and advance its milestone3->4. ZERO cross-client TA/FR
+interval overlaps are measured. Disabling logging does not establish overlap;
+verbose serial profiling itself adds milliseconds/message, so it cannot be
+used as a throughput baseline or proof of firmware serialization.
+
+REAL NEGATIVE: v1216, same kernel244 with an added read-only GET_TIME sample,
+passes both original warm-up generations but hits firmware timeout RX type4,
+grid7 during the paired second generations. Both return1 with GEM26 byte0
+zero instead ofexpected0x40. Keep the failure: this is NOT a passing overlap
+qualification and NOT merely an orchestration error. The GPU graph/scheduler
+was unchanged. The exact log/359guesthashes/source archive and RID0/raw/N01
+recovery are preserved in native-stable-render-pressure-overlap244-v5.json.
+A scheduling-sensitive paired failure is open; no cause is established yet.
+
+TIMING ERRATUM: tests/g17p_drm_wait.h replaces ioctl(ASAHI_SUBMIT) with a
+wrapper that creates an extra syncobj and waits for GPU completion. Thus the
+initial v1216 'submitted' clock sample is AFTER THAT WAIT, not raw kernel
+submit return. The public kernel submit path is asynchronous; do not attribute
+this helper's latency to it. New stable mode bypasses ONLY the test wrapper
+with g17p_raw_ioctl(ASAHI_SUBMIT), waits on its existing public timeline with
+a bounded15s deadline, and records its raw return before waiting. before=GPU
+clock sampled before seed copying/submission; returned=after raw submit;
+observed=after retirement/output checks. Default mode retains the old wrapper.
+The full output/guard/timestamp/poison/cleanup oracle suffix is source-identical
+except the opt-in clock report. Timing output is not proof of correct rendering.
+
+Harness negatives are preserved separately: v1213 known pre-GPU CPUstartup
+stall recovered with identical all16CPU images(v1214); v1215 was a confirmed
+preboot missing-initrd setup error after a C compile failure. Installed UAPI
+headers/correct uint64 casts and checked sequential packaging fix that setup.
+Historical v3 manifest was restored from its unchanged executable/initrd and
+original source audit after a generated v4 packager used the old receipt name.
+Preflight now checks actual initrd/Image hashes before any device access.
+None of these setup failures explains or removes the real v1216 GPU negative.
+
+Next protocol investigation must use the existing feature SOP: minimal own
+Metal workload, single-user/all16, intercept first kick while allowing macOS
+to publish the second, fullUAT capture containing both, correct changed-output
+cold plain replay, then source bisection. Existing retained-child/pressure-
+parent reference has separately verified sequential phases; that alone does
+NOT establish concurrent render behavior or justify inventing another lifetime
+manager. No production handshake change has been made from this investigation.
+
+Corrected raw-mode baseline qualification: nativev1218/all16/359guesthashes
+passes stable asynchronous pressure2(two generations), default pressure2,
+raw render return,memory6313,unbind and exactRID0/raw/N01 identity recovery.
+Both raw submit return samples precede even their compute stage starts; the
+before-to-return windows are674928ns(first) and56368ns(second), including seed
+copying and ioctl overhead. These are NOT GPU throughput or pure ioctl cost.
+No concurrent pressure qualification is claimed. v1217 was a confirmed CPU
+startup stall, recovered with identical image and all16CPUs. The current C-only
+manifest/archive-v54d audits180current/sparseHEAD/remote/archive sources while
+actual Image/object/UTS244 remainunchanged. The full preserved oracle suffix
+matches parent43c91e98c after projecting out the opt-in clock report.
+Tracked reference:g16c-g17p-stable-binding-pressure-kernel244-20261026.json.
+
+Native warmed two-client graph, 2026-10-26 (no kernel protocol change)
+
+Own Metal workload metal_g16c_warm_pressure_pair.m uses two retained processes.
+Each warms a private-indirect200000-instance one-pixel draw and verifies color,
+query200000 and500guards; both then submit a second draw from the same queues
+and resources. A is red withA5guards, B green with5Aguards. On Mac16,5, verified
+single-user/all16, both first and second generations pass. The combined-kick
+fullUAT is929153024bytes/56813pages with stable tables/contexts and all payload
+checksums verified. Both pending outputs were seeded; after forwarding the
+captured producers/kicks, both outputs changed correctly and all6CS/TA/FR
+driver stamps/innerqueues retired. This proves two pending submission groups
+work; it is NOT a measurement of simultaneous GPU render-stage overlap.
+
+The shared outer channels are6/7/8. Producer indices2->3->4 contain A and B
+entries. Holding physical producer3 requires returning logical3 to the guest
+when it rereads the cursor to fill B's next slot. The existing two-compute
+capture already implements this read shadow; the new mux reuses that policy.
+V1 lacked the read trap and stopped before a combined capture; V2 captures
+both groups correctly with9shadowedreads.72native objects match in the offline
+adapter fixture. In the ACTUAL combined capture,70producer-time objects match
+whole; the two A descriptor cores match but their G16C extensions change while
+B is published. Preserve that observation rather than masking the difference.
+
+BINDING EVIDENCE:96gated SGX writes comprise6initial12-write transactions plus
+6retained4-write resumes. All6selectors/tags, current queue scratch pointers,
+start-bank bits and48scratch alias pages are validated against the captured
+wrappers. The paired continuation uses only the4-write tail of each initial
+binding transaction. Current Max render publication always performs12writes;
+this is a concrete context-binding difference to bisect, not a justification
+for another scheduler/owner. Do not claim it caused Linuxv1216 until replay or
+native source testing proves that relationship.
+
+NEW POINTER TOPOLOGY EVIDENCE: A's G16C-only TA extension[9c0,9f8) and FR
+extension[2240,2280) arezero at its producer publication. At the combined kick,
+A TA+9d0/+9e0/+9e8/+9f0 and A FR+2260/+2268/+2270/+2278 contain the SAME four
+pointers. They equal B's own event_control,manager,scene,empty_scene quartet:
+B TA+10/+20/+28/+30 and B FR+20/+28/+30/+38. Specifically firstpointer equals
+B's event-control/scheduler across all3Bdescriptors. B's own extensions remain
+zero at this boundary.22U32words change,11each Aextension; all prior corebytes
+are unchanged. This is an actual cross-client graph edge in Max-specific
+layout fields already represented by #[ver(G == G16C)] extensions. Its scheduling,
+preemption,ownership and execution requirements are NOT yet established.
+Do not infer a whole separate lifecycle from pointer equality. Native proof:
+single-user-warm-pressure-pair-v2/native-cross-client-extension-topology.json.
+
+COLD NEGATIVE: warm-pressure-pair-opaque-replay-v1 restores all929153024APbytes,
+accepts cold initdata, replays the exact7retired native controls and96binding
+writes, then firmware crashes at work publication. No replay output is qualified.
+Opaque raw crash bytes are saved and have NOT been disassembled. Target recovered
+through exactRID0/raw/N01. Snapshot-after-warmup alone has not yet established
+how to reconstruct the resident retained runtime in plain m1n1. Next capture
+must preserve first warm A, then warm B, then the combined second-generation
+boundary so replay can reproduce the native lifecycle before any bisection.
+Once cold replay works, isolate full-init vs resume and zero vs native cross-
+client extensions independently. Do not start page bisection from a bad replay.
+
+HARNESS ERRORS RETAINED: nativeV2 controller stopped on a console substring
+assert because a kernel log swallowed the B PASS line. The hook independently
+verified both full outputs/all6retirements. A same-guest finisher proves original
+PAIR_PASS and original launchd wrapperpid486 exit0, then removes the own job.
+Legacy launchctl submit kept restarting after exit; a first finishing query
+missed the exit0 window and timed out while later attempts wrote7. Keep these
+later restarts separate from the original successful GPU/workload run. Original
+console/controller errors and the failed first finisher are preserved; the
+successful finisher-b/c and full-capture-v2 verifier identify their provenance.
+The exact own Preboot directories Hozph5,SUqz74 and olderLDiueu are all removed.
+No GUI,CPUlowering,Apple disassembly,new production handshake or extra lifetime
+manager was introduced. Full goal remains active and incomplete.
