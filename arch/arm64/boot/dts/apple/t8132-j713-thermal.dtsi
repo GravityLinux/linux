@@ -53,12 +53,12 @@
 
 			trips {
 				cpu_warm: cpu-warm {
-					temperature = <105000>;
+					temperature = <100000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 				cpu_hot: cpu-hot {
-					temperature = <110000>;
+					temperature = <105000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
