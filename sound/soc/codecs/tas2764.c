@@ -371,9 +371,16 @@ static int tas2764_hw_params(struct snd_pcm_substream *substream,
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
 
-	ret = tas2764_set_bitwidth(tas2764, params_format(params));
-	if (ret < 0)
-		return ret;
+	/*
+	 * The word length is the receive (playback) one. The V/I sense
+	 * capture has its own fixed 16-bit format and must not change it
+	 * under a running playback stream.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		ret = tas2764_set_bitwidth(tas2764, params_format(params));
+		if (ret < 0)
+			return ret;
+	}
 
 	return tas2764_set_samplerate(tas2764, params_rate(params));
 }

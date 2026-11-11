@@ -15,6 +15,9 @@ description: |
   Pro models. It has stereo DAC for playback, mono ADC for capture, and
   is somewhat similar to CS42L42 but with a different regmap.
 
+allOf:
+  - $ref: dai-common.yaml#
+
 properties:
   compatible:
     enum:
@@ -36,7 +39,7 @@ required:
   - compatible
   - reg
 
-additionalProperties: false
+unevaluatedProperties: false
 
 examples:
   - |

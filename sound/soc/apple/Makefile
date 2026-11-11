@@ -11,7 +11,7 @@ snd-soc-macaudio-objs	:= macaudio.o
 
 obj-$(CONFIG_SND_SOC_APPLE_MACAUDIO)	+= snd-soc-macaudio.o
 
-obj-$(CONFIG_SND_SOC_APPLE_T8132_SPEAKER) += t8132/
+obj-y += t8132/
 
 obj-$(CONFIG_SND_SOC_APPLE_NEO_MIC) += neo_secure.o neo_mic.o neo_pcm.o
 
