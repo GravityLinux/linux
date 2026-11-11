@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J616c PMP: native resource, mailbox and DMA topology. m1n1 supplies
+ * board calibration and tunables through the pmp alias.
+ */
+/ {
+	aliases { pmp = &pmp; };
+};
+
+&{/soc} {
+	pmp_report: power-management@5003c0000 {
+		compatible = "apple,t6041-pmp-v2-report";
+		reg = <5 0x003c0000 0 0x20000>;
+		power-domains = <&ps_pms_sram>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pmp_report_isp_sys: report@f {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <15>;
+			label = "pmp-isp-sys";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_isp_sys>;
+		};
+
+		pmp_report_disp: report@10 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <16>;
+			label = "pmp-disp";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_disp_fe>;
+			/* Keep the resident internal DCP/display active. */
+			apple,always-on;
+		};
+	};
+
+	pmp_dart: iommu@500300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <5 0x00300000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 389 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_pmp>;
+		apple,dma-range = <0x100 0x00014000 0xf 0xfffec000>;
+	};
+
+	pmp_mbox: mailbox@500e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <5 0x00e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 414 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 415 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 416 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 417 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+	};
+
+	pmp: pmp@500700000 {
+		compatible = "apple,t6041-pmp-v2";
+		reg = <5 0x00700000 0 0xe0000>,
+		      <5 0x00e00000 0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		power-domains = <&ps_pmp>;
+		status = "disabled";
+	};
+};

@@ -13,6 +13,12 @@ properties:
   compatible:
     oneOf:
       - const: apple,t8015-nvme-ans2
+      - const: apple,t8132-nvme-ans2
+      - items:
+          - enum:
+              - apple,t6041-nvme-ans2
+              - apple,t8140-nvme-ans2
+          - const: apple,t8132-nvme-ans2
       - items:
           - enum:
               - apple,t6020-nvme-ans2
@@ -27,14 +33,18 @@ properties:
           - const: apple,nvme-ans2
 
   reg:
+    minItems: 2
     items:
       - description: NVMe and NVMMU registers
       - description: ANS2 co-processor control registers
+      - description: T8132 ANS automatic-idle control register
 
   reg-names:
+    minItems: 2
     items:
       - const: nvme
       - const: ans
+      - const: idle
 
   resets:
     maxItems: 1
@@ -70,26 +80,44 @@ properties:
 
       The SART address filter is documented in iommu/apple,sart.yaml.
 
-if:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t6000-nvme-ans2
-          - apple,t6020-nvme-ans2
-then:
-  properties:
-    power-domains:
-      minItems: 3
-    power-domain-names:
-      minItems: 3
-else:
-  properties:
-    power-domains:
-      maxItems: 2
-    power-domain-names:
-      maxItems: 2
-
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6000-nvme-ans2
+              - apple,t6020-nvme-ans2
+              - apple,t6041-nvme-ans2
+    then:
+      properties:
+        power-domains:
+          minItems: 3
+        power-domain-names:
+          minItems: 3
+    else:
+      properties:
+        power-domains:
+          maxItems: 2
+        power-domain-names:
+          maxItems: 2
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-nvme-ans2
+    then:
+      properties:
+        reg:
+          minItems: 3
+        reg-names:
+          minItems: 3
+    else:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          maxItems: 2
 required:
   - compatible
   - reg

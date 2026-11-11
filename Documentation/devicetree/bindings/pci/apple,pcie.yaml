@@ -21,6 +21,9 @@ description: |
   separate from the port registers. In that case, there is one PHY
   register range per port register range.
 
+  On T8132, the internal controller also has an AXI control aperture,
+  named "axi", which permits automatic idle of the PCIe island.
+
   All root ports share a single ECAM space, but separate GPIOs are
   used to take the PCI devices on those ports out of reset.  Therefore
   the standard "reset-gpios" and "max-link-speed" properties appear on
@@ -45,24 +48,55 @@ properties:
           - const: apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
+      - items:
+          - const: apple,t8132-pcie
+          - const: apple,t6020-pcie
 
   reg:
     minItems: 3
     maxItems: 10
 
   reg-names:
-    minItems: 3
-    items:
-      - const: config
-      - const: rc
-      - const: port0
-      - const: port1
-      - const: port2
-      - const: port3
-      - const: phy0
-      - const: phy1
-      - const: phy2
-      - const: phy3
+    oneOf:
+      - minItems: 3
+        items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: port1
+          - const: port2
+      - items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: port1
+          - const: port2
+          - const: phy0
+          - const: phy1
+          - const: phy2
+      - items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: port1
+          - const: port2
+          - const: port3
+          - const: phy0
+          - const: phy1
+          - const: phy2
+          - const: phy3
+      - minItems: 9
+        maxItems: 9
+        items:
+          - const: config
+          - const: rc
+          - const: port0
+          - const: port1
+          - const: port2
+          - const: phy0
+          - const: phy1
+          - const: phy2
+          - const: axi
 
   ranges:
     minItems: 2
@@ -92,12 +126,20 @@ patternProperties:
     description: A single PCI root port
 
     properties:
+      compatible:
+        const: pciclass,0604
+
       reg:
         maxItems: 1
+
+      power-supply:
+        description: Regulator that supplies power to the devices on this port
 
       pwren-gpios:
         description: Optional GPIO to power on the device
         maxItems: 1
+
+      interrupt-controller: true
 
     required:
       - reset-gpios
@@ -105,6 +147,8 @@ patternProperties:
       - "#interrupt-cells"
       - interrupt-map-mask
       - interrupt-map
+
+    unevaluatedProperties: false
 
 required:
   - compatible
@@ -136,11 +180,43 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t6020-pcie
+            const: apple,t8132-pcie
+    then:
+      properties:
+        reg:
+          minItems: 9
+          maxItems: 9
+  - if:
+      allOf:
+        - properties:
+            compatible:
+              contains:
+                const: apple,t6020-pcie
+        - not:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8132-pcie
     then:
       properties:
         reg-names:
           minItems: 10
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pcie
+    then:
+      properties:
+        reg:
+          minItems: 8
+          maxItems: 8
+        reg-names:
+          minItems: 8
+          maxItems: 8
+        interrupts:
+          minItems: 3
+          maxItems: 3
 
 examples:
   - |

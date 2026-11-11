@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Three independent T6041 CPU DVFS domains. m1n1 fills the frequencies from
+ * each board's PMGR SRAM table; Linux consumes only standard FDT OPPs.
+ * Keep the last E step and the last two P steps behind the boost switch.
+ */
+/ {
+	cpu_e_opp: opp-table-cpu-e {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp01 { opp-hz = /bits/ 64 <0>; opp-level = <1>; };
+		opp02 { opp-hz = /bits/ 64 <0>; opp-level = <2>; };
+		opp03 { opp-hz = /bits/ 64 <0>; opp-level = <3>; };
+		opp04 { opp-hz = /bits/ 64 <0>; opp-level = <4>; };
+		opp05 { opp-hz = /bits/ 64 <0>; opp-level = <5>; };
+		opp06 { opp-hz = /bits/ 64 <0>; opp-level = <6>; };
+		opp07 { opp-hz = /bits/ 64 <0>; opp-level = <7>; turbo-mode; };
+	};
+	cpu_p0_opp: opp-table-cpu-p0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp01 { opp-hz = /bits/ 64 <0>; opp-level = <1>; };
+		opp02 { opp-hz = /bits/ 64 <0>; opp-level = <2>; };
+		opp03 { opp-hz = /bits/ 64 <0>; opp-level = <3>; };
+		opp04 { opp-hz = /bits/ 64 <0>; opp-level = <4>; };
+		opp05 { opp-hz = /bits/ 64 <0>; opp-level = <5>; };
+		opp06 { opp-hz = /bits/ 64 <0>; opp-level = <6>; };
+		opp07 { opp-hz = /bits/ 64 <0>; opp-level = <7>; };
+		opp08 { opp-hz = /bits/ 64 <0>; opp-level = <8>; };
+		opp09 { opp-hz = /bits/ 64 <0>; opp-level = <9>; };
+		opp10 { opp-hz = /bits/ 64 <0>; opp-level = <10>; };
+		opp11 { opp-hz = /bits/ 64 <0>; opp-level = <11>; };
+		opp12 { opp-hz = /bits/ 64 <0>; opp-level = <12>; };
+		opp13 { opp-hz = /bits/ 64 <0>; opp-level = <13>; };
+		opp14 { opp-hz = /bits/ 64 <0>; opp-level = <14>; };
+		opp15 { opp-hz = /bits/ 64 <0>; opp-level = <15>; };
+		opp16 { opp-hz = /bits/ 64 <0>; opp-level = <16>; };
+		opp17 { opp-hz = /bits/ 64 <0>; opp-level = <17>; };
+		opp18 { opp-hz = /bits/ 64 <0>; opp-level = <18>; };
+		opp19 { opp-hz = /bits/ 64 <0>; opp-level = <19>; turbo-mode; };
+		opp20 { opp-hz = /bits/ 64 <0>; opp-level = <20>; turbo-mode; };
+	};
+	cpu_p1_opp: opp-table-cpu-p1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp01 { opp-hz = /bits/ 64 <0>; opp-level = <1>; };
+		opp02 { opp-hz = /bits/ 64 <0>; opp-level = <2>; };
+		opp03 { opp-hz = /bits/ 64 <0>; opp-level = <3>; };
+		opp04 { opp-hz = /bits/ 64 <0>; opp-level = <4>; };
+		opp05 { opp-hz = /bits/ 64 <0>; opp-level = <5>; };
+		opp06 { opp-hz = /bits/ 64 <0>; opp-level = <6>; };
+		opp07 { opp-hz = /bits/ 64 <0>; opp-level = <7>; };
+		opp08 { opp-hz = /bits/ 64 <0>; opp-level = <8>; };
+		opp09 { opp-hz = /bits/ 64 <0>; opp-level = <9>; };
+		opp10 { opp-hz = /bits/ 64 <0>; opp-level = <10>; };
+		opp11 { opp-hz = /bits/ 64 <0>; opp-level = <11>; };
+		opp12 { opp-hz = /bits/ 64 <0>; opp-level = <12>; };
+		opp13 { opp-hz = /bits/ 64 <0>; opp-level = <13>; };
+		opp14 { opp-hz = /bits/ 64 <0>; opp-level = <14>; };
+		opp15 { opp-hz = /bits/ 64 <0>; opp-level = <15>; };
+		opp16 { opp-hz = /bits/ 64 <0>; opp-level = <16>; };
+		opp17 { opp-hz = /bits/ 64 <0>; opp-level = <17>; };
+		opp18 { opp-hz = /bits/ 64 <0>; opp-level = <18>; };
+		opp19 { opp-hz = /bits/ 64 <0>; opp-level = <19>; turbo-mode; };
+		opp20 { opp-hz = /bits/ 64 <0>; opp-level = <20>; turbo-mode; };
+	};
+};
+
+&{/soc} {
+	cpufreq_e: performance-controller@210e20000 {
+		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x10e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+	cpufreq_p0: performance-controller@211e20000 {
+		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x11e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+	cpufreq_p1: performance-controller@212e20000 {
+		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x12e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+};
+
+&cpu0 { operating-points-v2 = <&cpu_e_opp>; performance-domains = <&cpufreq_e>; };
+&cpu1 { operating-points-v2 = <&cpu_e_opp>; performance-domains = <&cpufreq_e>; };
+&cpu2 { operating-points-v2 = <&cpu_e_opp>; performance-domains = <&cpufreq_e>; };
+&cpu3 { operating-points-v2 = <&cpu_e_opp>; performance-domains = <&cpufreq_e>; };
+&cpu4 { operating-points-v2 = <&cpu_p0_opp>; performance-domains = <&cpufreq_p0>; };
+&cpu5 { operating-points-v2 = <&cpu_p0_opp>; performance-domains = <&cpufreq_p0>; };
+&cpu6 { operating-points-v2 = <&cpu_p0_opp>; performance-domains = <&cpufreq_p0>; };
+&cpu7 { operating-points-v2 = <&cpu_p0_opp>; performance-domains = <&cpufreq_p0>; };
+&cpu8 { operating-points-v2 = <&cpu_p0_opp>; performance-domains = <&cpufreq_p0>; };
+&cpu9 { operating-points-v2 = <&cpu_p0_opp>; performance-domains = <&cpufreq_p0>; };
+&cpu10 { operating-points-v2 = <&cpu_p1_opp>; performance-domains = <&cpufreq_p1>; };
+&cpu11 { operating-points-v2 = <&cpu_p1_opp>; performance-domains = <&cpufreq_p1>; };
+&cpu12 { operating-points-v2 = <&cpu_p1_opp>; performance-domains = <&cpufreq_p1>; };
+&cpu13 { operating-points-v2 = <&cpu_p1_opp>; performance-domains = <&cpufreq_p1>; };
+&cpu14 { operating-points-v2 = <&cpu_p1_opp>; performance-domains = <&cpufreq_p1>; };
+&cpu15 { operating-points-v2 = <&cpu_p1_opp>; performance-domains = <&cpufreq_p1>; };
