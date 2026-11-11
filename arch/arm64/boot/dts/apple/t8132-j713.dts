@@ -152,6 +152,8 @@
 
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j713.bin";
+		/* ADT function-afe-reset: SMC gP1c, active-low AFE reset. */
+		reset-gpios = <&smc_gpio 0x1c GPIO_ACTIVE_LOW>;
 	};
 
 	keyboard: keyboard {
