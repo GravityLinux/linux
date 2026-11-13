@@ -118,6 +118,13 @@ static void tas2764_reset(struct tas2764_priv *tas2764)
 	snd_soc_component_write(tas2764->component, TAS2764_SW_RST,
 				TAS2764_RST);
 	usleep_range(1000, 2000);
+
+	/* Reset clears SDOUT zero-fill even when the component is re-probed
+	 * without freeing the I2C private data. Force set_tdm_idle() to restore
+	 * it rather than trusting the configuration from the previous probe.
+	 */
+	tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_OFF;
+	tas2764->idle_slot_config.tx_mask = 0;
 }
 
 static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
