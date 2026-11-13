@@ -66,6 +66,12 @@ impl Platform {
         out[crate::g16_fw::MAIN_OFFSET..crate::g16_fw::MAIN_OFFSET + main.len()]
             .copy_from_slice(&main);
         put64(&mut out, 0x8ed0, 0xffff_fc20_000f_3440 + 0x80);
+        // All sensors in T8132's GPU metrology chain, including the sensors
+        // outside the fast-die controller's subset. Firmware needs this mask
+        // to configure the chain and resolve an incoming thermal alarm.
+        let mtr_sensor_mask = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5)
+            | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 13) | (1 << 14);
+        put64(&mut out, 0x8ed8, mtr_sensor_mask);
         put64(&mut out, 0xb698, 0xffff_fc20_c050_0000);
         self.power_data(&mut out)?;
         put32(&mut out, 0xb754, entropy);
