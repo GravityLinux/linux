@@ -60,7 +60,7 @@ module_param_named(force_vrr, dcp_force_vrr, bool, 0644);
 MODULE_PARM_DESC(force_vrr,
 		 "Force variable presentation scheduling on supported panels");
 
-bool hdmi_audio;
+bool hdmi_audio = true;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
 
