@@ -1311,7 +1311,27 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct snd_soc_pcm_runtime *rtd;
 	struct snd_soc_dai *dai;
+	struct snd_kcontrol *kctl;
 	int ret, i;
+
+	if (ma->cfg->tweeter_vol_limit) {
+		/* Codec instances share their static mixer-control templates.
+		 * Give each volume its own platform_max before applying
+		 * different ceilings to woofers and tweeters.
+		 */
+		list_for_each_entry(kctl, &card->snd_card->controls, list) {
+			struct soc_mixer_control *mc;
+
+			if (!snd_soc_control_matches(kctl,
+					volume_control_names[ma->cfg->amp]))
+				continue;
+			mc = devm_kmemdup(card->dev, (void *)kctl->private_value,
+					 sizeof(*mc), GFP_KERNEL);
+			if (!mc)
+				return -ENOMEM;
+			kctl->private_value = (unsigned long)mc;
+		}
+	}
 
 	/* Add the dynamic DAPM routes */
 	for_each_card_rtds(card, rtd) {
