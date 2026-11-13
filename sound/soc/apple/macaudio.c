@@ -81,6 +81,9 @@ struct macaudio_platform_cfg {
 	bool stereo;
 	int amp_gain;
 	int safe_vol;
+	/* Additional digital volume ceilings in dB; zero keeps the normal ceiling. */
+	int woofer_vol_limit;
+	int tweeter_vol_limit;
 };
 
 static const char *volume_control_names[] = {
@@ -256,20 +259,34 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
 	}
 };
 
-static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
+static int macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 {
 	int ret, max;
 	const char *name = volume_control_names[ma->cfg->amp];
 
 	if (!name) {
 		WARN_ON_ONCE(1);
-		return;
+		return -EINVAL;
+	}
+
+	if (unlock && ma->cfg->amp == AMP_SN012776 && ma->cfg->tweeter_vol_limit) {
+		ret = snd_soc_limit_volume(&ma->card, "* Woofer Speaker Volume",
+					  SN012776_DB(ma->cfg->woofer_vol_limit));
+		if (ret < 0)
+			goto error;
+
+		ret = snd_soc_limit_volume(&ma->card, "* Tweeter Speaker Volume",
+					  SN012776_DB(ma->cfg->tweeter_vol_limit));
+		if (ret < 0)
+			goto error;
+
+		return 0;
 	}
 
 	switch (ma->cfg->amp) {
 	case AMP_NONE:
 		WARN_ON_ONCE(1);
-		return;
+		return -EINVAL;
 	case AMP_TAS5770:
 		if (unlock)
 			max = TAS5770_0DB;
@@ -291,9 +308,11 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 	}
 
 	ret = snd_soc_limit_volume(&ma->card, name, max);
+error:
 	if (ret < 0)
 		dev_err(ma->card.dev, "Failed to %slock volume %s: %d\n",
 			unlock ? "un" : "", name, ret);
+	return ret < 0 ? ret : 0;
 }
 
 static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
@@ -334,6 +353,13 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 
 
 	if (unlock != ma->speaker_volume_unlocked) {
+		if (macaudio_vlimit_unlock(ma, unlock) < 0 && unlock) {
+			/* A partial or missing ceiling must never unlock the speakers. */
+			macaudio_vlimit_unlock(ma, false);
+			unlock = false;
+			reason = "Failed to apply volume limits";
+		}
+
 		if (unlock) {
 			dev_info(ma->card.dev, "Speaker volumes unlocked\n");
 		} else  {
@@ -341,7 +367,6 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 			ma->speaker_volume_was_locked = true;
 		}
 
-		macaudio_vlimit_unlock(ma, unlock);
 		ma->speaker_volume_unlocked = unlock;
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->speaker_lock_kctl->id);
@@ -1319,8 +1344,10 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 								  "Speaker Volume Unlock");
 
 		mutex_lock(&ma->volume_lock_mutex);
-		macaudio_vlimit_unlock(ma, false);
+		ret = macaudio_vlimit_unlock(ma, false);
 		mutex_unlock(&ma->volume_lock_mutex);
+		if (ret)
+			return ret;
 	}
 
 	return 0;
@@ -1711,6 +1738,18 @@ struct macaudio_platform_cfg macaudio_j413_cfg = {
 	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
 };
 
+static const struct macaudio_platform_cfg macaudio_j713_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	/* Temporary precaution while J713 speaker protection is validated. */
+	.woofer_vol_limit = -14,
+	.tweeter_vol_limit = -22,
+};
+
 struct macaudio_platform_cfg macaudio_j415_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1805,7 +1844,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* j713    -       sn012776    15      2× 1W+1T (T8132 layout) */
-	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j413_cfg },
+	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
