@@ -401,3 +401,54 @@
 &pmp_report_atc2 {
 	apple,always-on;
 };
+
+/* Experimental single-connector DP route: J773g ADT atc3-dpxbar/dcpext0. */
+&{/soc} {
+	atcphy3_dpxbar: mux@41b04c000 {
+		compatible = "apple,t8132-display-crossbar", "apple,t6020-display-crossbar";
+		reg = <0x4 0x1b04c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+	};
+};
+
+&dcpext0 {
+	status = "okay";
+	apple,connector-type = "DP";
+	apple,dptx-phy = <3>;
+	apple,typec-connector = <&typec3>;
+	mode-switch;
+	phys = <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "dp-phy";
+	mux-controls = <&atcphy3_dpxbar 0>;
+	mux-control-names = "dp-xbar";
+	/* ADT dp-switch-ufp-endpoint 1, port 0 (stream 0). */
+	mux-index = <2>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@1 {
+			reg = <1>;
+			dcpext0_typec3: endpoint {
+				remote-endpoint = <&typec3_dp_hpd>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec3_dp_hpd: endpoint {
+				remote-endpoint = <&dcpext0_typec3>;
+			};
+		};
+	};
+};
+
+/* Both engines consume the DRM master's scanout mappings. */
+&display {
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
+};
