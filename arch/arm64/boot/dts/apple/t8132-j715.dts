@@ -64,8 +64,11 @@
 		/* Generic macaudio fallback is jack-only; no speaker config. */
 		compatible = "apple,macaudio";
 		model = "MacBook Air J715 Headphones";
+		#address-cells = <1>;
+		#size-cells = <0>;
 
 		dai-link@0 {
+			reg = <0>;
 			link-name = "Headphone Jack";
 			cpu {
 				sound-dai = <&mca 2>;
