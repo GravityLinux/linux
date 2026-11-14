@@ -105,14 +105,22 @@ static int apple_pmp_report_read_device_flags(struct apple_pmp_report *rep)
 	}
 
 	count = len / PMP_SOC_DEVICE_SIZE;
-	rep->valid_mask = GENMASK_ULL(count - 1, 0);
+	rep->valid_mask = 0;
 	rep->ack_mask = 0;
 	for (i = 0; i < count; i++) {
+		u32 id = get_unaligned_le32(table + i * PMP_SOC_DEVICE_SIZE);
 		u32 flags = get_unaligned_le32(table + i * PMP_SOC_DEVICE_SIZE +
 					     PMP_SOC_DEVICE_FLAGS_OFFSET);
 
+		/* Records are not ordered by their one-based report IDs. */
+		if (!id || id > 64 || (rep->valid_mask & BIT_ULL(id - 1))) {
+			ret = dev_err_probe(dev, -EINVAL,
+					    "invalid PMP device ID %u\n", id);
+			goto out;
+		}
+		rep->valid_mask |= BIT_ULL(id - 1);
 		if (flags & PMP_SOC_DEVICE_ACK)
-			rep->ack_mask |= BIT_ULL(i);
+			rep->ack_mask |= BIT_ULL(id - 1);
 	}
 
 	dev_dbg(dev, "%u PMP records, acknowledgement mask %#llx\n", count, rep->ack_mask);
@@ -463,6 +471,7 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	u64 val, old;
 	int ret;
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&rep->lock, flags);
 	old = val = readq(rep->base + rep->offsets->tgt_read);
@@ -484,6 +493,10 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 		100,
 		50000);
 	if (ret) {
+		dev_err(ent->dev,
+			"report %u %s timed out: target=%#llx actual=%#llx\n",
+			ent->id, enable ? "on" : "off",
+			readq(rep->base + rep->offsets->tgt_read), val);
 		/* Restore this failed consumer's vote without changing other votes. */
 		spin_lock_irqsave(&rep->lock, flags);
 		val = readq(rep->base + rep->offsets->tgt_read);
