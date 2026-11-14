@@ -375,6 +375,57 @@ static bool dcp_vrr_capable(struct apple_dcp *dcp)
 	return false;
 }
 
+/* Firmware clocks are rounded independently of DRM, and CTA VICs describe
+ * both integer and 1000/1001 refresh variants. Only forgive those differences.
+ */
+static bool dcp_mode_clock_matches(int clock, int cea_clock)
+{
+	int fractional = DIV_ROUND_CLOSEST_ULL((u64)cea_clock * 1000, 1001);
+	int integer = DIV_ROUND_CLOSEST_ULL((u64)cea_clock * 1001, 1000);
+
+	return abs(clock - cea_clock) <= 1 ||
+		abs(clock - fractional) <= 1 || abs(clock - integer) <= 1;
+}
+
+static bool dcp_mode_requires_420(struct drm_connector *connector,
+				const struct drm_display_mode *mode)
+{
+	const struct drm_display_info *info = &connector->display_info;
+	unsigned long vic;
+
+	if (connector->ycbcr_420_allowed)
+		return false;
+
+	/* A missing EDID match is not evidence against a firmware mode. Only
+	 * compare with CTA timings explicitly advertised as 4:2:0-only.
+	 */
+	for_each_set_bit(vic, info->hdmi.y420_vdb_modes,
+			sizeof(info->hdmi.y420_vdb_modes) * 8) {
+		struct drm_display_mode *cea;
+		struct drm_display_mode candidate = *mode;
+		u32 sync_flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC |
+				 DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC;
+		bool match;
+
+		cea = drm_display_mode_from_cea_vic(connector->dev, vic);
+		if (!cea)
+			continue;
+
+		/* DCP omits polarities. Keep all other timing/scan flags. */
+		candidate.flags &= ~sync_flags;
+		candidate.flags |= cea->flags & sync_flags;
+		match = drm_mode_match(&candidate, cea,
+				       DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_FLAGS) &&
+			dcp_mode_clock_matches(mode->clock, cea->clock) &&
+			drm_mode_is_420_only(info, cea);
+		drm_mode_destroy(connector->dev, cea);
+		if (match)
+			return true;
+	}
+
+	return false;
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -383,20 +434,9 @@ int dcp_get_modes(struct drm_connector *connector)
 
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
-	int i;
+	int i, count = 0;
 
 	drm_connector_set_vrr_capable_property(connector, dcp_vrr_capable(dcp));
-
-	for (i = 0; i < dcp->nr_modes; ++i) {
-		mode = drm_mode_duplicate(dev, &dcp->modes[i].mode);
-
-		if (!mode) {
-			dev_err(dev->dev, "Failed to duplicate display mode\n");
-			return 0;
-		}
-
-		drm_mode_probed_add(connector, mode);
-	}
 
 	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
 	    !apple_connector->drm_edid) {
@@ -412,7 +452,28 @@ int dcp_get_modes(struct drm_connector *connector)
 	if (dcp->nr_modes && apple_connector->drm_edid)
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
 
-	return dcp->nr_modes;
+	for (i = 0; i < dcp->nr_modes; ++i) {
+		struct drm_display_mode *fw_mode = &dcp->modes[i].mode;
+
+		fw_mode->status = MODE_OK;
+		if (apple_connector->drm_edid &&
+		    dcp_mode_requires_420(connector, fw_mode)) {
+			fw_mode->status = MODE_NO_420;
+			continue;
+		}
+
+		mode = drm_mode_duplicate(dev, fw_mode);
+
+		if (!mode) {
+			dev_err(dev->dev, "Failed to duplicate display mode\n");
+			return 0;
+		}
+
+		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+
+	return count;
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
@@ -422,7 +483,8 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 	int i;
 
 	for (i = 0; i < dcp->nr_modes; ++i) {
-		if (drm_mode_match(mode, &dcp->modes[i].mode,
+		if (dcp->modes[i].mode.status == MODE_OK &&
+		    drm_mode_match(mode, &dcp->modes[i].mode,
 				   DRM_MODE_MATCH_TIMINGS |
 					   DRM_MODE_MATCH_CLOCK))
 			return &dcp->modes[i];

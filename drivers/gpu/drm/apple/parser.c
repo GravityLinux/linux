@@ -510,8 +510,11 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		}
 	}
 
-	/* T8132 keeps its qualified mode ranking without the preferred bonus. */
-	if (is_preferred && !dcp_is_t8132(handle->dcp))
+	/* Preserve the qualified T8132 HDMI/panel ranking. The new external
+	 * DisplayPort path can use the firmware's preferred timing.
+	 */
+	if (is_preferred && (!dcp_is_t8132(handle->dcp) ||
+			     handle->dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort))
 		*score |= (1L << 32);
 
 	if (out->sdr_rgb.score >= 0)
