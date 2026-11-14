@@ -695,6 +695,26 @@
 			};
 		};
 
+		dpaudio1: audio-controller-1 {
+			compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+			dmas = <&sio 0x66>;
+			dma-names = "tx";
+			power-domains = <&ps_dpa1>;
+			reset-domains = <&ps_dpa1>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					dpaudio1_dcp: endpoint {
+						remote-endpoint = <&dcpext0_audio>;
+					};
+				};
+			};
+		};
+
 		pmgr_dcp: power-management@382800000 {
 			reg = <0x3 0x82800000 0x0 0xbc000>;
 			reg-names = "dcp-fw-pmgr";
@@ -776,6 +796,16 @@
 			dispext0_piodma: piodma {
 				iommus = <&dispext0_dart 16>;
 				phandle = <&dispext0_piodma>;
+			};
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					dcpext0_audio: endpoint {
+						remote-endpoint = <&dpaudio1_dcp>;
+					};
+				};
 			};
 		};
 

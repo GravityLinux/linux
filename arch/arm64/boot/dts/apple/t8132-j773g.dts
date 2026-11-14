@@ -452,3 +452,8 @@
 &display {
 	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
 };
+
+/* ADT dcpext0 audio -> dp-audio1, SIO channel 0x66. */
+&dpaudio1 {
+	status = "okay";
+};
