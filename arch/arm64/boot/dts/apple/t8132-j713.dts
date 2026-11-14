@@ -14,7 +14,6 @@
 #include "t8132-j71x.dtsi"
 #include "t8132-aop.dtsi"
 #include "t8132-isp.dtsi"
-#include "t8132-j713-thermal.dtsi"
 
 / {
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
@@ -84,45 +83,6 @@
 
 &bluetooth0 {
 	brcm,board-type = "apple,garden";
-};
-
-#include "hwmon-common.dtsi"
-#include "hwmon-laptop.dtsi"
-
-/*
- * J713 SoC sensors, identified on the Air by behavior: under an all-core CPU
- * load Tp0f is among the hottest of the Tp keys (49 -> 106 C), and the PP0b/VP0b/IP0b rail follows
- * the load (1.5 -> 10 W, 0.61 -> 0.97 V, 2.4 -> 10.3 A; V * I matches P).
- * PMVR from hwmon-common doesn't exist on this SMC and is skipped.
- */
-&smc_hwmon {
-	temperature-Tp0f {
-		apple,key-id = "Tp0f";
-		label = "CPU Temperature";
-	};
-	/* Slow SMC temperature estimates; physical sensor locations are unknown. */
-	temperature-TVS0 {
-		label = "Chassis Estimate TVS0";
-		apple,key-id = "TVS0";
-	};
-
-	temperature-TVS1 {
-		label = "Chassis Estimate TVS1";
-		apple,key-id = "TVS1";
-	};
-
-	power-PP0b {
-		apple,key-id = "PP0b";
-		label = "CPU Rail Power";
-	};
-	voltage-VP0b {
-		apple,key-id = "VP0b";
-		label = "CPU Rail Voltage";
-	};
-	current-IP0b {
-		apple,key-id = "IP0b";
-		label = "CPU Rail Current";
-	};
 };
 
 &dart_audio {
@@ -358,3 +318,16 @@
 
 /* External DP wiring is build-tested; physical ports remain unqualified. */
 #include "t8132-air-dp-altmode.dtsi"
+
+&smc_hwmon {
+	/* Slow SMC temperature estimates; physical sensor locations are unknown. */
+	temperature-TVS0 {
+		label = "Chassis Estimate TVS0";
+		apple,key-id = "TVS0";
+	};
+
+	temperature-TVS1 {
+		label = "Chassis Estimate TVS1";
+		apple,key-id = "TVS1";
+	};
+};

@@ -4,6 +4,8 @@
 /*
  * The maximum of these load-responsive SMC keys covered every hottest Tp
  * reading in the cold and warm J713 mixed-load captures of 2026-10-28.
+ * J715: key identities and trip policy are guesses from J713, not ADT
+ * facts. Verify the keys return plausible temperatures before load tests.
  * Keep key identity independent of optional hwmon channel enumeration.
  */
 &smc_hwmon {
