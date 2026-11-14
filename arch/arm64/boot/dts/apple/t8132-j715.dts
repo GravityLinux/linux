@@ -37,5 +37,15 @@
 	};
 };
 
+/* ADT /arm-io/wlan module-instance is "kos", not J713's "garden". */
+&wifi0 {
+	brcm,board-type = "apple,kos";
+};
+
+/* Same combo module: Bluetooth board name inferred from wlan, as on J713. */
+&bluetooth0 {
+	brcm,board-type = "apple,kos";
+};
+
 /* External DP wiring is build-tested; physical ports remain unqualified. */
 #include "t8132-air-dp-altmode.dtsi"
