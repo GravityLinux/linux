@@ -11,24 +11,15 @@
 
 #include "t8132.dtsi"
 #include "t8132-jxxx.dtsi"
-#include "t8132-mtp.dtsi"
 #include "t8132-j71x.dtsi"
 #include "t8132-gpu.dtsi"
 #include "t8132-aop.dtsi"
 #include "t8132-isp.dtsi"
 #include "t8132-j713-thermal.dtsi"
-#include <dt-bindings/leds/common.h>
 
 / {
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M4, 2025)";
-
-	aliases {
-		keyboard = &keyboard;
-		/* m1n1 maps the iBoot-provided MTP segments through this alias. */
-		mtp = &mtp;
-
-	};
 
 	sound {
 		compatible = "apple,j713-macaudio", "apple,macaudio";
@@ -68,17 +59,6 @@
 		};
 	};
 
-	led-controller {
-		compatible = "pwm-leds";
-		led-0 {
-			pwms = <&fpwm1 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
-		};
-	};
 };
 
 &dcp {
@@ -100,53 +80,11 @@
 
 
 
-&fpwm1 {
-	status = "okay";
-};
 
-&mtp {
-	status = "okay";
-};
 
-&mtp_mbox {
-	status = "okay";
-};
 
-&mtp_dart {
-	status = "okay";
-};
 
-&mtp_dockchannel {
-	status = "okay";
-};
 
-&mtp_hid {
-	status = "okay";
-	wakeup-source;
-
-	multi-touch {
-		firmware-name = "apple/tpmtfw-j713.bin";
-		/* ADT function-afe-reset: SMC gP1c, active-low AFE reset. */
-		reset-gpios = <&smc_gpio 0x1c GPIO_ACTIVE_LOW>;
-	};
-
-	keyboard: keyboard {
-		hid-country-code = <0>;
-		apple,keyboard-layout-id = <0>;
-	};
-
-	stm {
-	};
-
-	actuator {
-	};
-
-	tp-accel {
-	};
-
-	mtp {
-	};
-};
 
 /*
  * The J713 radio module is "garden" (ADT /arm-io/wlan module-instance).
@@ -482,6 +420,13 @@
 
 &ps_isp_cvm {
 	status = "disabled";
+};
+
+&mtp_hid {
+	multi-touch {
+		/* Firmware packaging name is board-specific, not an ADT path. */
+		firmware-name = "apple/tpmtfw-j713.bin";
+	};
 };
 
 /* External DP wiring is build-tested; physical ports remain unqualified. */
