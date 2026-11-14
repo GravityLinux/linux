@@ -2301,7 +2301,7 @@ static void init_3(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_is_main_display(dcp, false, res_is_main_display, NULL);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 6, 0) && !defined(DCP_FW_T8142)
 static void init_notifications_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	dcp_first_client_open(dcp, false, init_3, NULL);
