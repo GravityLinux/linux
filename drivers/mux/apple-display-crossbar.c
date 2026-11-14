@@ -184,8 +184,9 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 	}
 
 	if (enable) {
-		dpxbar_set32(dpxbar, T602X_REG_030, state << 20);
-		dpxbar_set32(dpxbar, T602X_REG_030, state << 8);
+		dpxbar_mask32(dpxbar, T602X_REG_030,
+			      GENMASK(23, 20) | GENMASK(11, 8),
+			      (state << 20) | (state << 8));
 		udelay(10);
 
 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
