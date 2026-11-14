@@ -15,13 +15,16 @@ maintainers:
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,j274-macaudio
-          - apple,j293-macaudio
-          - apple,j314-macaudio
-          - apple,j713-macaudio
+    oneOf:
       - const: apple,macaudio
+        description: Generic jack-only configuration without speaker support.
+      - items:
+          - enum:
+              - apple,j274-macaudio
+              - apple,j293-macaudio
+              - apple,j314-macaudio
+              - apple,j713-macaudio
+          - const: apple,macaudio
 
   "#address-cells":
     const: 1
