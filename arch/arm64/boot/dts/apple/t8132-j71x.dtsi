@@ -9,6 +9,7 @@
 
 #include "t8132-mtp.dtsi"
 #include "t8132-gpu.dtsi"
+#include "t8132-aop.dtsi"
 #include <dt-bindings/leds/common.h>
 
 /*
@@ -314,7 +315,6 @@
 	status = "okay";
 };
 
-
 /*
  * The ADTs expose the same SMC, but do not enumerate its telemetry keys.
  * All keys/labels below are J713 observations or laptop conventions;
@@ -349,3 +349,44 @@
 	};
 };
 
+&dart_audio {
+	status = "okay";
+};
+
+&admac {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_admac {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/*
+ * ADT /arm-io/i2c1/audio-codec-output: cs42l84 at 0x4b, NUB GPIO 17
+ * reset and AP GPIO 98 IRQ. Audio-hp mic selectors/data-sources/reg and
+ * /arm-io/admac-leap-ns agree, including LEAP RX 1 and 48 kHz.
+ */
+&mca {
+	status = "okay";
+};
