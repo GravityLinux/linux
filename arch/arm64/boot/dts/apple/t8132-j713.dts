@@ -157,7 +157,6 @@
 	};
 };
 
-#include "t8132-usb4.dtsi"
 
 #include "isp-common.dtsi"
 

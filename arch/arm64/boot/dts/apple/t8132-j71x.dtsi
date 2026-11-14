@@ -390,3 +390,10 @@
 &mca {
 	status = "okay";
 };
+
+/*
+ * ADT /arm-io/acio0/1, acio-cpu0/1, apciec0/1 and their DARTs have
+ * identical reg/interrupts/power-gates. AOP GPIO 17/19 pinmux follows
+ * the working J713 USB4 configuration (J715 inference).
+ */
+#include "t8132-usb4.dtsi"
