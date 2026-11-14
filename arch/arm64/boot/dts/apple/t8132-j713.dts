@@ -100,14 +100,14 @@
 		apple,key-id = "Tp0f";
 		label = "CPU Temperature";
 	};
-	/* These follow CPU load over minutes, as the chassis does. */
+	/* Slow SMC temperature estimates; physical sensor locations are unknown. */
 	temperature-TVS0 {
-		label = "Chassis Temperature 0";
+		label = "Chassis Estimate TVS0";
 		apple,key-id = "TVS0";
 	};
 
 	temperature-TVS1 {
-		label = "Chassis Temperature 1";
+		label = "Chassis Estimate TVS1";
 		apple,key-id = "TVS1";
 	};
 
