@@ -714,6 +714,25 @@
 				};
 			};
 		};
+		dpaudio2: audio-controller-2 {
+			compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+			dmas = <&sio 0x68>;
+			dma-names = "tx";
+			power-domains = <&ps_dpa2>;
+			reset-domains = <&ps_dpa2>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					dpaudio2_dcp: endpoint {
+						remote-endpoint = <&dcpext1_audio>;
+					};
+				};
+			};
+		};
 
 		pmgr_dcp: power-management@382800000 {
 			reg = <0x3 0x82800000 0x0 0xbc000>;
@@ -1680,3 +1699,16 @@
 };
 
 #include "t8132-pmgr.dtsi"
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcp>;
+			};
+		};
+	};
+};
