@@ -148,5 +148,14 @@
 	};
 };
 
+&isp {
+	/*
+	 * ADT /arm-io/isp sensor-type = 24 (J713 is 23). Mapping that to
+	 * platform-id follows J713 and is unverified. No sensor presets
+	 * are guessed for this different platform. Camera stays disabled.
+	 */
+	apple,platform-id = <24>;
+};
+
 /* External DP wiring is build-tested; physical ports remain unqualified. */
 #include "t8132-air-dp-altmode.dtsi"
