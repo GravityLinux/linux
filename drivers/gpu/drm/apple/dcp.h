@@ -77,10 +77,13 @@ int dpavservep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);
 
 
+int dcp_typec_register(void);
+void dcp_typec_unregister(void);
+
 void __init dcp_register(void);
-void __exit dcp_unregister(void);
+void dcp_unregister(void);
 
 void __init dcp_audio_register(void);
-void __exit dcp_audio_unregister(void);
+void dcp_audio_unregister(void);
 
 #endif

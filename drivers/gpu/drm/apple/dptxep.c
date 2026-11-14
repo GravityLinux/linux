@@ -287,13 +287,14 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 	struct dptxport_apcall_lane_count *reply = reply_;
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
-	union phy_configure_opts phy_ops;
+	union phy_configure_opts phy_ops = {};
 	int ret;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
-	if (dptx_bypass_phy) {
+	/* An unassigned direct-DP engine has no PHY until a Type-C HPD. */
+	if (dptx_bypass_phy || (!dptx->atcphy && dcp_typec_managed(dcp))) {
 		dptx->lane_count = 4;
 		reply->retcode = cpu_to_le32(0);
 		reply->lane_count = cpu_to_le64(dptx->lane_count);
@@ -340,6 +341,13 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);
 
+	/* A two-lane DP assignment cannot accept a cached four-lane request. */
+	if (dcp->typec_port && lane_count > dptx->lane_count) {
+		retcode = 1;
+		lane_count = 0;
+		goto reply;
+	}
+
 	switch (lane_count) {
 	case 0 ... 2:
 	case 4:
@@ -365,6 +373,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		dptx->lane_count = lane_count;
 	}
 
+reply:
 	reply->retcode = cpu_to_le32(retcode);
 	reply->lane_count = cpu_to_le64(lane_count);
 
@@ -491,8 +500,7 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(of_property_present(service->ep->dcp->dev->of_node,
-							 "apple,typec-connector"));
+	reply->supported = cpu_to_le32(dcp_typec_managed(service->ep->dcp));
 	return 0;
 }
 
@@ -547,7 +555,7 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 
 	/* deactivate phy */
-	if (!dptx_bypass_phy)
+	if (!dptx_bypass_phy && !dcp_typec_managed(service->ep->dcp))
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
 
 	memcpy(reply, data, min(reply_size, data_size));

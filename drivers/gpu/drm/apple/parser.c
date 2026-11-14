@@ -514,7 +514,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	 * DisplayPort path can use the firmware's preferred timing.
 	 */
 	if (is_preferred && (!dcp_is_t8132(handle->dcp) ||
-			     handle->dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort))
+			     handle->dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort ||
+			     dcp_typec_managed(handle->dcp)))
 		*score |= (1L << 32);
 
 	if (out->sdr_rgb.score >= 0)

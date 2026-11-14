@@ -516,7 +516,7 @@ int dcp_get_connector_type(struct platform_device *pdev)
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	int ret = 0;
-	bool managed = of_property_present(dcp->dev->of_node, "apple,typec-connector");
+	bool managed = dcp_typec_managed(dcp);
 
 	if (port >= dcp->hw.num_dptx_ports)
 		return -EINVAL;
@@ -538,6 +538,16 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
+	if (dcp->typec_port) {
+		union phy_configure_opts limits = {};
+
+		ret = phy_validate(dcp->phy, PHY_MODE_DP, 0, &limits);
+		if (ret || !limits.dp.lanes) {
+			ret = ret ?: -ENOLINK;
+			goto out_unlock;
+		}
+		dcp->dptxport[port].lane_count = limits.dp.lanes;
+	}
 	dev_info(dcp->dev, "DPTX port %d: connecting remote port\n", port);
 	if (managed) {
 		ret = dptxport_validate_connection(dcp->dptxport[port].service, 0,
@@ -612,16 +622,19 @@ static void disconnected_hpd_event(struct apple_connector *con)
 
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 {
+	int ret = 0;
+
 	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
 
 	mutex_lock(&dcp->hpd_mutex);
 	if (dcp->dptxport[port].enabled && dcp->dptxport[port].connected) {
-		dptxport_release_display(dcp->dptxport[port].service);
-		dcp->dptxport[port].connected = false;
+		ret = dptxport_release_display(dcp->dptxport[port].service);
+		if (!ret)
+			dcp->dptxport[port].connected = false;
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 
-	return 0;
+	return ret;
 }
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
@@ -1268,7 +1281,8 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+	if ((dcp->phy || dcp_typec_managed(dcp)) &&
+	    dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
@@ -1348,7 +1362,7 @@ int dcp_start(struct platform_device *pdev)
 		}
 		/* A Type-C link starts only after PD has configured the PHY and HPD. */
 		if (v26_6 && !ret && dcp->dptxport[0].enabled &&
-		    !of_property_present(dcp->dev->of_node, "apple,typec-connector")) {
+		    !dcp_typec_managed(dcp)) {
 			ret = dcp_dptx_connect(dcp, 0);
 			if (ret)
 				dev_warn(dcp->dev,
@@ -1434,6 +1448,7 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
+	dcp_typec_set_ready(dcp, true);
 	if (dcp->typec_hpd_mux) {
 		spin_lock_irq(&dcp->typec_hpd_lock);
 		dcp->typec_hpd_ready = true;
@@ -2027,6 +2042,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (!dcp)
 		return;
 
+	dcp_typec_set_ready(dcp, false);
 	if (dcp->typec_hpd_mux) {
 		spin_lock_irq(&dcp->typec_hpd_lock);
 		dcp->typec_hpd_ready = false;
@@ -2174,6 +2190,14 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 
+	if (of_property_present(dev->of_node, "apple,dp-xbar-source")) {
+		u32 source;
+
+		if (of_property_read_u32(dev->of_node, "apple,dp-xbar-source", &source) ||
+		    source > 8)
+			return -EINVAL;
+		dcp->typec_xbar_source = source;
+	}
 	platform_set_drvdata(pdev, dcp);
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
@@ -2422,7 +2446,7 @@ void __init dcp_register(void)
 	platform_driver_register(&apple_platform_driver);
 }
 
-void __exit dcp_unregister(void)
+void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
 }

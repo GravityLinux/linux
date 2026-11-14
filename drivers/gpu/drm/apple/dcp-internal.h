@@ -40,6 +40,7 @@ static inline u64 dcp_read_firmware_time(void)
 }
 
 struct apple_dcp;
+struct apple_typec_port;
 struct apple_dcp_afkep;
 
 extern bool dcp_disable_rt_bandwidth;
@@ -324,6 +325,10 @@ struct apple_dcp {
 	/* these fields are output port specific */
 	struct phy *phy;
 	struct mux_control *xbar;
+	/* Direct-DP pool ownership is protected by typec.c. */
+	struct apple_typec_port *typec_port;
+	bool typec_routing_ready;
+	u32 typec_xbar_source;
 	struct typec_mux *typec_mux;
 	/* Type-C notifications can precede RTKit/IOMFB startup. */
 	struct typec_mux_dev *typec_hpd_mux;
@@ -366,5 +371,14 @@ static inline bool dcp_fw_is_26_6(const struct apple_dcp *dcp)
 	       dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ||
 	       dcp->fw_compat == DCP_FIRMWARE_V_27_2_T8142;
 }
+
+static inline bool dcp_typec_managed(const struct apple_dcp *dcp)
+{
+	return READ_ONCE(dcp->typec_port) ||
+	       of_property_present(dcp->dev->of_node, "apple,typec-connector") ||
+	       of_property_present(dcp->dev->of_node, "apple,dp-altmode");
+}
+
+void dcp_typec_set_ready(struct apple_dcp *dcp, bool ready);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

@@ -1014,7 +1014,7 @@ void __init dcp_audio_register(void)
         platform_driver_register(&dcpaud_driver);
 }
 
-void __exit dcp_audio_unregister(void)
+void dcp_audio_unregister(void)
 {
         platform_driver_unregister(&dcpaud_driver);
 }

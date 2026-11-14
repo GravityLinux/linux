@@ -1042,6 +1042,8 @@ static struct platform_driver apple_platform_driver = {
 
 static int __init appledrm_register(void)
 {
+	int ret;
+
 	if (drm_firmware_drivers_only())
 		return -ENODEV;
 
@@ -1049,18 +1051,30 @@ static int __init appledrm_register(void)
 	dcp_audio_register();
 #endif
 	dcp_register();
-	platform_driver_register(&apple_platform_driver);
+	ret = dcp_typec_register();
+	if (ret)
+		goto unregister_dcp;
+	ret = platform_driver_register(&apple_platform_driver);
+	if (!ret)
+		return 0;
 
-	return 0;
+	dcp_typec_unregister();
+unregister_dcp:
+	dcp_unregister();
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	dcp_audio_unregister();
+#endif
+	return ret;
 }
 
 static void __exit appledrm_unregister(void)
 {
+	platform_driver_unregister(&apple_platform_driver);
+	dcp_typec_unregister();
+	dcp_unregister();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
-	dcp_unregister();
-	platform_driver_unregister(&apple_platform_driver);
 }
 
 module_init(appledrm_register);
