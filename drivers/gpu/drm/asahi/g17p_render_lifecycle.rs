@@ -30,6 +30,8 @@ pub(crate) fn select_storage(next:u32,available:impl Fn(&u32)->bool)->Option<u32
 /// Original independent render policy: prefer a free exact caller snapshot,
 /// then another free pool in the same round-robin order. Test identity first:
 /// availability checks walk live GPU/CPU leases and retained queue fences.
+// Reference policy used by the host regression tests, not the live renderer.
+#[cfg(test)]
 pub(crate) fn select_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
     matches:impl Fn(&u32)->bool)->Option<u32> {
     if count==0 {return None;}
@@ -41,6 +43,8 @@ pub(crate) fn select_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
 /// Bounded serialized cache: exact immutable callers win, otherwise reuse
 /// the least recently published free context. Unused entries have age zero.
 /// The caller's availability predicate includes GPU, CPU and control leases.
+// Reference policy used by the host regression tests, not the live renderer.
+#[cfg(test)]
 pub(crate) fn select_cached_pool(next:u32,count:u32,available:impl Fn(&u32)->bool,
     matches:impl Fn(&u32)->bool,last_used:&[u64])->Option<u32> {
     if count==0 || count as usize>last_used.len() {return None;}
