@@ -1408,7 +1408,8 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 	return 0;
 }
 
-static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
+static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy,
+					    bool teardown)
 {
 	int ret;
 	u32 old_override, old_values;
@@ -1427,10 +1428,13 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 
 	ret = atcphy_pipehandler_lock(atcphy);
 	if (ret) {
-		writel(old_values, atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES);
-		writel(old_override, atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE);
+		if (!teardown) {
+			writel(old_values, atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES);
+			writel(old_override, atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE);
+		}
 		dev_warn(atcphy->dev, "Failed to lock pipehandler");
-		return ret;
+		if (!teardown)
+			return ret;
 	}
 
 	/* Switch to dummy PHY */
@@ -1440,7 +1444,8 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 	ret = atcphy_pipehandler_unlock(atcphy);
 	if (ret) {
 		dev_warn(atcphy->dev, "Failed to unlock pipehandler");
-		return ret;
+		if (!teardown)
+			return ret;
 	}
 
 	mask32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
@@ -1468,7 +1473,7 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 		atcphy->pipehandler_up = true;
 		break;
 	case ATCPHY_PIPEHANDLER_STATE_DUMMY:
-		ret = atcphy_configure_pipehandler_dummy(atcphy);
+		ret = atcphy_configure_pipehandler_dummy(atcphy, false);
 		if (!ret)
 			atcphy->pipehandler_up = false;
 		break;
@@ -2257,7 +2262,8 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	guard(mutex)(&atcphy->lock);
 	atcphy->usb3_host_ready = false;
 
-	ret = atcphy_configure_pipehandler_dummy(atcphy);
+	/* The controller is stopped: do not leave its clock on the dying PHY. */
+	ret = atcphy_configure_pipehandler_dummy(atcphy, true);
 	if (ret)
 		dev_warn(atcphy->dev, "Failed to switch pipe to dummy: %d", ret);
 
@@ -2457,7 +2463,7 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 
 	atcphy->usb3_host_ready = false;
 	if (atcphy->pipehandler_up) {
-		ret = atcphy_configure_pipehandler_dummy(atcphy);
+		ret = atcphy_configure_pipehandler_dummy(atcphy, false);
 		if (ret)
 			dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
 		else
@@ -2652,7 +2658,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		 * before changing lanes, then hand it back after PHY setup.
 		 */
 		if (atcphy->pipehandler_up) {
-			ret = atcphy_configure_pipehandler_dummy(atcphy);
+			ret = atcphy_configure_pipehandler_dummy(atcphy, false);
 			if (ret)
 				return ret;
 			atcphy->pipehandler_up = false;
