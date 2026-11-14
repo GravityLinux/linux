@@ -108,3 +108,6 @@
 	mtp {
 	};
 };
+
+/* External DP wiring is build-tested; physical ports remain unqualified. */
+#include "t8132-air-dp-altmode.dtsi"

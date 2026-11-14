@@ -624,3 +624,6 @@
 &ps_isp_cvm {
 	status = "disabled";
 };
+
+/* External DP wiring is build-tested; physical ports remain unqualified. */
+#include "t8132-air-dp-altmode.dtsi"
