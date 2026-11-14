@@ -8,6 +8,7 @@
  */
 
 #include "t8132-mtp.dtsi"
+#include "t8132-gpu.dtsi"
 #include <dt-bindings/leds/common.h>
 
 /*
@@ -238,3 +239,78 @@
 		mtp = &mtp;
 	};
 };
+
+/*
+ * ADT /arm-io/pmp reg/interrupts/power-gates and /arm-io/pmgr devices
+ * id1 report numbers agree for the active domains on J713/J715.
+ * Steady-vote policy is inherited from J713, not specified by the ADT;
+ * its behavior on J715 remains unverified. The GPU vote follows its genpd.
+ */
+&pmp_report_boot_f {
+	apple,always-on;
+};
+
+&pmp_report_boot_10 {
+	apple,always-on;
+};
+
+&pmp_report_atc0_common {
+	apple,always-on;
+};
+
+&pmp_report_atc1 {
+	apple,always-on;
+};
+
+&pmp_report_boot_18 {
+	apple,always-on;
+};
+
+&pmp_report_disp {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni0 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni1 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni3 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni4 {
+	apple,always-on;
+};
+
+&pmp_report_soc_ni5 {
+	apple,always-on;
+};
+
+&pmp_report_ans {
+	apple,always-on;
+};
+
+&pmp_report_pcie {
+	apple,always-on;
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+

@@ -16,7 +16,6 @@
 / {
 	compatible = "apple,j715", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (15-inch, M4, 2025)";
-
 };
 
 &dcp {
@@ -30,16 +29,6 @@
 		apple,max-brightness = <525>;
 	};
 };
-
-
-
-
-
-
-
-
-
-
 
 &mtp_hid {
 	multi-touch {
