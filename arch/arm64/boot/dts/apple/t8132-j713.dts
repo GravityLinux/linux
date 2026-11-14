@@ -178,6 +178,13 @@
 	};
 };
 
+&mtp_hid {
+	multi-touch {
+		/* Firmware packaging name is board-specific, not an ADT path. */
+		firmware-name = "apple/tpmtfw-j713.bin";
+	};
+};
+
 /* External DP wiring is build-tested; physical ports remain unqualified. */
 #include "t8132-air-dp-altmode.dtsi"
 

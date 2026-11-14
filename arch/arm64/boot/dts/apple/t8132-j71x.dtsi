@@ -13,7 +13,8 @@
 #include <dt-bindings/leds/common.h>
 
 /*
- * J713/J715 have two USB-C ports (ATC0, ATC1). ATC2/ATC3 don't exist: both ADTs list
+ * J713/J715 have two USB-C ports (ATC0, ATC1). ATC2/ATC3 don't exist:
+ * /arm-io/pmgr devices in both ADTs list
  * their power states without PS registers, so turning them on only fails.
  */
 &dwc3_2 {
@@ -137,6 +138,7 @@
 	status = "okay";
 };
 
+/* T8132 DISP_CPU is firmware-owned; use managed FE + DPTX_PHY as J713. */
 &framebuffer0 {
 	power-domains = <&ps_disp_fe>, <&ps_dptx_phy>;
 	panel = <&panel>;
@@ -489,11 +491,4 @@
 
 &ps_isp_cvm {
 	status = "disabled";
-};
-
-&mtp_hid {
-	multi-touch {
-		/* Firmware packaging name is board-specific, not an ADT path. */
-		firmware-name = "apple/tpmtfw-j713.bin";
-	};
 };
