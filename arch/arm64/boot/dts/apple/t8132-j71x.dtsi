@@ -107,3 +107,56 @@
 	status = "disabled";
 };
 
+/* Keep external DCPs off until their complete display path is supported. */
+/ {
+	aliases {
+		/*
+		 * No external display support yet. m1n1 enables every DCP behind a
+		 * dcpextN alias that the ADT lists, but not its DARTs or mailbox;
+		 * appledrm then never finishes init and boot blocks before userspace.
+		 */
+		/delete-property/ dcpext0;
+		/delete-property/ dcpext1;
+	};
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&framebuffer0 {
+	power-domains = <&ps_disp_fe>, <&ps_dptx_phy>;
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
+/*
+ * The internal eDP panel is driven through the DPTX PHY. DCP needs it
+ * powered: without it the panel stays dark (backlight only), DPTX reports
+ * FIFO errors, and DCP crashes on power-off touching the PHY registers.
+ */
+&dptxphy {
+	status = "okay";
+};
+
+&dcp {
+	phys = <&dptxphy>;
+	phy-names = "dp-phy";
+	apple,dptx-phy = <4>;
+};
+
+/*
+ * DCP/disp0 reg, interrupts and power-gates match in both ADTs.
+ * DPTX port 4 and PHY routing follow the working J713 (J715 inference).
+ */
+&dcp {
+	status = "okay";
+};

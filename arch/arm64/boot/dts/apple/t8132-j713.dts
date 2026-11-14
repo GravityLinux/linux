@@ -27,13 +27,7 @@
 		keyboard = &keyboard;
 		/* m1n1 maps the iBoot-provided MTP segments through this alias. */
 		mtp = &mtp;
-		/*
-		 * No external display support yet. m1n1 enables every DCP behind a
-		 * dcpextN alias that the ADT lists, but not its DARTs or mailbox;
-		 * appledrm then never finishes init and boot blocks before userspace.
-		 */
-		/delete-property/ dcpext0;
-		/delete-property/ dcpext1;
+
 	};
 
 	sound {
@@ -88,8 +82,6 @@
 };
 
 &dcp {
-	status = "okay";
-
 	panel: panel {
 		compatible = "apple,panel-j713", "apple,panel";
 		/*
@@ -104,28 +96,9 @@
 	};
 };
 
-&dcp_dart {
-	status = "okay";
-};
 
-&dcp_mbox {
-	status = "okay";
-};
 
-&disp0_dart {
-	status = "okay";
-};
 
-/*
- * The firmware-owned display CPU domain is locked on T8132; referencing it
- * holds simpledrm back until the deferred-probe timeout. Use the managed
- * display FE domain, as J773g does.
- */
-&framebuffer0 {
-	power-domains = <&ps_disp_fe>, <&ps_dptx_phy>;
-	panel = <&panel>;
-	post-init-providers = <&panel>;
-};
 
 &fpwm1 {
 	status = "okay";
@@ -185,21 +158,6 @@
 
 &bluetooth0 {
 	brcm,board-type = "apple,garden";
-};
-
-/*
- * The internal eDP panel is driven through the DPTX PHY. DCP needs it
- * powered: without it the panel stays dark (backlight only), DPTX reports
- * FIFO errors, and DCP crashes on power-off touching the PHY registers.
- */
-&dptxphy {
-	status = "okay";
-};
-
-&dcp {
-	phys = <&dptxphy>;
-	phy-names = "dp-phy";
-	apple,dptx-phy = <4>;
 };
 
 #include "hwmon-common.dtsi"
