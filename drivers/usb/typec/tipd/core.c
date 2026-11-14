@@ -630,30 +630,32 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		}
 
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
-		if (of_machine_is_compatible("apple,t8132")) {
-			/* T8132 sets its DP mux once per pin assignment. */
-			if (cd321x->state.alt == cd321x->port_altmode_dp &&
-			    cd321x->state.mode == mode)
-				return;
-		} else {
-			/* Pin assignment can stay unchanged across HPD edges and IRQs.
-			 * DP_SID's IRQ bit is sticky; DATA_STATUS clears after event
-			 * handling. */
-			dp_data.status &= ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
-			if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
-				dp_data.status |= DP_STATUS_HPD_STATE;
-			if ((st->data_status & CD321X_DATA_STATUS_HPD_IRQ) &&
-			    !cd321x->hpd_irq_asserted)
-				dp_data.status |= DP_STATUS_IRQ_HPD;
-			cd321x->hpd_irq_asserted =
-				!!(st->data_status & CD321X_DATA_STATUS_HPD_IRQ);
-		}
+		/* HPD can change without a new pin assignment. Deliver every snapshot
+		 * to the HPD consumer; the ATC mux ignores an unchanged lane mode. */
+		dp_data.status &= ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
+		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+			dp_data.status |= DP_STATUS_HPD_STATE;
+		if ((st->data_status & CD321X_DATA_STATUS_HPD_IRQ) &&
+		    !cd321x->hpd_irq_asserted)
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+		cd321x->hpd_irq_asserted =
+			!!(st->data_status & CD321X_DATA_STATUS_HPD_IRQ);
+		bool same_assignment = cd321x->state.alt == cd321x->port_altmode_dp &&
+				       cd321x->state.mode == mode;
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
 		cd321x->state.alt = cd321x->port_altmode_dp;
 		cd321x->state.data = &dp_data;
 		cd321x->state.mode = mode;
 		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
-		cd321x_mux_set(tps);
+		dev_dbg(tps->dev,
+			 "PD reports DP altmode: pin=%c status=%#x conf=%#x HPD=%u IRQ=%u\n",
+			 (int)('A' + mode - TYPEC_DP_STATE_A), st->data_status,
+			 dp_data.conf, !!(dp_data.status & DP_STATUS_HPD_STATE),
+			 !!(dp_data.status & DP_STATUS_IRQ_HPD));
+		if (of_machine_is_compatible("apple,t8132") && same_assignment)
+			typec_mux_set(cd321x->mux, &cd321x->state);
+		else
+			cd321x_mux_set(tps);
 	} else if (!cd321x->tbt_switch &&
 		   (st->data_status & (TPS_DATA_STATUS_TBT_CONNECTION |
 				       CD321X_DATA_STATUS_USB4_CONNECTION))) {
