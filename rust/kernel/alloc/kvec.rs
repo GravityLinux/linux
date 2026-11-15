@@ -860,7 +860,7 @@ where
     /// This does not preserve ordering of the remaining elements, but is *O*(1).
     /// If you need to preserve the element order, use [`remove`] instead.
     pub fn swap_remove(&mut self, index: usize) -> T {
-        if index > self.len() {
+        if index >= self.len() {
             panic!("Index out of range");
         }
         // SAFETY: index is in range
