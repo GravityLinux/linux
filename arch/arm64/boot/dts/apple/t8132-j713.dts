@@ -285,3 +285,18 @@
 &ps_isp_cvm {
 	status = "okay";
 };
+
+/* Scope firmware-ID reporting to the board qualified with this camera. */
+&pmp_report {
+	apple,pmp = <&pmp>;
+};
+
+&pmp_report_isp {
+	/* ISP's firmware record is notification-only, not acknowledged. */
+	/delete-property/ apple,always-on;
+	apple,boot-on;
+};
+
+&ps_isp_sys {
+	/delete-property/ apple,always-on;
+};

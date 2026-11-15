@@ -15,21 +15,17 @@
  */
 
 &pmp_report {
-	/* Device IDs and acknowledgement flags come from the firmware ADT. */
-	apple,pmp = <&pmp>;
-
 	/* PMP soc-device "ISP" is entry 7; report indices are entry - 1. */
 	pmp_report_isp: report@6 {
 		compatible = "apple,t6000-pmp-v2-report-entry";
 		reg = <0x6>;
 		label = "pmp-isp";
 		/*
-		 * ISP is a notification-only report: its actual bit does not mirror
-		 * the request. Keep the initial genpd state consistent while adding
-		 * the DARTs, then allow ordinary runtime power cycling. ISP_SYS also
-		 * holds dart-isp's DAPF and the ISP boot vector.
+		 * The PMP acknowledges turning this report off but not turning it
+		 * back on (power-on times out), so keep it and ISP_SYS on. ISP_SYS
+		 * also holds dart-isp's DAPF and the ISP boot vector.
 		 */
-		apple,boot-on;
+		apple,always-on;
 		#power-domain-cells = <0>;
 		power-domains = <&ps_isp_sys>;
 	};
@@ -43,6 +39,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sys";
+		apple,always-on;
 	};
 
 	/*
