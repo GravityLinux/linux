@@ -50,7 +50,8 @@ properties:
       transfers the version-1 table in apple,tunable-soc-device and its
       little-endian version in apple,tunable-ptd-driver-version. Records are
       124 bytes; the little-endian word at byte 0 is the one-based device ID.
-      Child reg values are device IDs minus one, regardless of record order.
+      On T8132, child reg values are device IDs minus one, regardless of
+      record order. Other layouts retain their table-position numbering.
       The little-endian flags word at byte 8 has bit 1 set for records that
       require an acknowledgement. When this reference is present, only
       records carrying that flag are polled. Without the reference, existing

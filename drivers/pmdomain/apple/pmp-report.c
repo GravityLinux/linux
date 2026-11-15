@@ -75,6 +75,7 @@ static int apple_pmp_report_read_device_flags(struct apple_pmp_report *rep)
 	struct device_node *pmp;
 	const u8 *table, *version;
 	unsigned int count, i;
+	bool id_mapped;
 	int len, ret = 0;
 
 	/* Preserve the established behaviour of trees without this metadata. */
@@ -104,15 +105,21 @@ static int apple_pmp_report_read_device_flags(struct apple_pmp_report *rep)
 		goto out;
 	}
 
+	/* Only T8132 has been validated with one-based firmware IDs.
+	 * Preserve the table-position contract used by other report layouts.
+	 */
+	id_mapped = of_device_is_compatible(dev->of_node,
+					  "apple,t8132-pmp-v2-report");
 	count = len / PMP_SOC_DEVICE_SIZE;
 	rep->valid_mask = 0;
 	rep->ack_mask = 0;
 	for (i = 0; i < count; i++) {
-		u32 id = get_unaligned_le32(table + i * PMP_SOC_DEVICE_SIZE);
+		u32 id = id_mapped ?
+			get_unaligned_le32(table + i * PMP_SOC_DEVICE_SIZE) : i + 1;
 		u32 flags = get_unaligned_le32(table + i * PMP_SOC_DEVICE_SIZE +
 					     PMP_SOC_DEVICE_FLAGS_OFFSET);
 
-		/* Records are not ordered by their one-based report IDs. */
+		/* T8132 records are not ordered by their one-based IDs. */
 		if (!id || id > 64 || (rep->valid_mask & BIT_ULL(id - 1))) {
 			ret = dev_err_probe(dev, -EINVAL,
 					    "invalid PMP device ID %u\n", id);
@@ -471,7 +478,6 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	u64 val, old;
 	int ret;
 	unsigned long flags;
-	int ret;
 
 	spin_lock_irqsave(&rep->lock, flags);
 	old = val = readq(rep->base + rep->offsets->tgt_read);
