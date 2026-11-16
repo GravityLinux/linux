@@ -342,7 +342,7 @@ static inline bool vma_desc_exceeds_object(const struct vm_area_desc *desc,
 		     ((u64)vma_desc_slice_off(desc) << PAGE_SHIFT_4KB);
 
 	return mm_is_p3s_4k(desc->mm) &&
-	       p3s_range_exceeds_object(offset, vma_desc_size(desc), size);
+	       p3s_range_exceeds_object(offset, desc->end - desc->start, size);
 }
 
 /*
