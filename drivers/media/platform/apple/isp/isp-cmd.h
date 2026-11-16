@@ -692,7 +692,42 @@ int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
 				     u32 enable);
 int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
 
+/*
+ * Factory lens-shading data of the camera module. LSC_INFO_GET describes the
+ * stored grid, LSC_GRID_GET returns it.
+ */
+struct cmd_ch_lsc_info {
+	u64 opcode;
+	u32 chan;
+	u32 layout; /* bits 0-7: columns, 8-15: rows, 16-31: format */
+	u32 info;
+} __packed;
+static_assert(sizeof(struct cmd_ch_lsc_info) == 0x14);
+
+#define CISP_LSC_GRID_AXIS_SLOTS 27
+#define CISP_LSC_GRID_COLS	 19
+#define CISP_LSC_GRID_ROWS	 17
+#define CISP_LSC_GRID_PLANES	 4
+
+/* Grid reply in format 0x050c, which has 19 columns and 17 rows. */
+struct cmd_ch_lsc_grid {
+	u64 opcode;
+	u32 chan;
+	u32 info;
+	/* Grid point positions across the image, IEEE 754 single precision */
+	u32 x[CISP_LSC_GRID_AXIS_SLOTS];
+	u32 y[CISP_LSC_GRID_AXIS_SLOTS];
+	u8 pad_e8[0x2c];
+	/* Measured relative response at each grid point, in four planes */
+	u8 response[CISP_LSC_GRID_PLANES][CISP_LSC_GRID_ROWS][CISP_LSC_GRID_COLS];
+} __packed;
+static_assert(sizeof(struct cmd_ch_lsc_grid) == 0x620);
+
 int isp_cmd_t6041_start(struct apple_isp *isp);
+int isp_cmd_ch_lsc_info_get(struct apple_isp *isp, u32 chan,
+			    struct cmd_ch_lsc_info *args);
+int isp_cmd_ch_lsc_grid_get(struct apple_isp *isp, u32 chan,
+			    struct cmd_ch_lsc_grid *args);
 int isp_cmd_ch_check_factory_lsc(struct apple_isp *isp, u32 chan);
 
 #endif /* __ISP_CMD_H__ */

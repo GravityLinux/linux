@@ -794,6 +794,24 @@ int isp_cmd_ch_property_read(struct apple_isp *isp, u32 chan, u32 prop, u32 *val
 	return ret;
 }
 
+int isp_cmd_ch_lsc_info_get(struct apple_isp *isp, u32 chan,
+			    struct cmd_ch_lsc_info *args)
+{
+	memset(args, 0, sizeof(*args));
+	args->opcode = CISP_OPCODE(CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET);
+	args->chan = chan;
+	return CISP_SEND_OUT(isp, args);
+}
+
+int isp_cmd_ch_lsc_grid_get(struct apple_isp *isp, u32 chan,
+			    struct cmd_ch_lsc_grid *args)
+{
+	memset(args, 0, sizeof(*args));
+	args->opcode = CISP_OPCODE(CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET);
+	args->chan = chan;
+	return CISP_SEND_OUT(isp, args);
+}
+
 int isp_cmd_ch_check_factory_lsc(struct apple_isp *isp, u32 chan)
 {
 	struct {
