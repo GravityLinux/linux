@@ -1711,6 +1711,15 @@ struct macaudio_platform_cfg macaudio_j413_cfg = {
 	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
 };
 
+static const struct macaudio_platform_cfg macaudio_j713_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W1T,
+	.stereo = true,
+	.amp_gain = 9,
+	.safe_vol = -20,
+};
+
 struct macaudio_platform_cfg macaudio_j415_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1804,8 +1813,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
-	/* j713    -       sn012776    15      2× 1W+1T (T8132 layout) */
-	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j413_cfg },
+	/* j713    AID37   sn012776    9       2× 1W+1T (T8132 layout) */
+	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
