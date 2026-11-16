@@ -3,10 +3,10 @@
  * Map the 64 KiB buffer of dma-mmap-probe.ko through the real
  * dma_mmap_pages() path, natively or from a 4K process (exec-4k).
  *
- * A 4K mapping is bounded in kernel pages and maps the 4K slices of the
- * buffer that its file offset selects: the whole buffer, single slices
- * inside a kernel page and ranges across a kernel page must all alias
- * the same bytes, ranges past the buffer fail with ENXIO, and no mapping
+ * On a 16K kernel, native-aligned file offsets alias the selected bytes,
+ * including a 4K VMA ending within a kernel page. The conservative PFN
+ * remap contract rejects non-native file offsets with EINVAL. Ranges
+ * past the allocation fail with ENXIO before that refusal, and no mapping
  * may install PTEs past its end (an anonymous neighbour follows each one).
  */
 #define _GNU_SOURCE
@@ -65,6 +65,8 @@ int main(void)
 	unsigned char *full, *a;
 	const struct { size_t off, len; } ok[] = {
 		{ 0, BUF },
+		{ 0, 4096 },		/* 4K VMA with a populated neighbour */
+		{ 16384, 4096 },
 		{ 0, 16384 },
 		{ 16384, 16384 },
 		{ 16384, 2 * 16384 },
@@ -96,6 +98,14 @@ int main(void)
 			continue;
 		a = alias(fd, off, len, page, &err);
 		errno = err;
+		if (page == 4096 && off % 16384) {
+			check(err == EINVAL, "reject non-native DMA file offset");
+			check(munmap(a, len) == 0, "unmap refused alias");
+			printf("EINVAL: off=%#zx len=%#zx (unsupported slice)\n",
+			       off, len);
+			cases++;
+			continue;
+		}
 		check(!err, "map buffer range");
 		for (size_t i = 0; i < len; i++)
 			if (a[i] != pattern(off + i)) {
@@ -131,7 +141,7 @@ int main(void)
 	for (size_t i = 0; i < BUF; i++)
 		check(full[i] == pattern(i), "buffer intact");
 	close(fd);
-	printf("PASS: pages=%zu, %d DMA mmap ranges; slices alias, out-of-range ENXIO, neighbours intact\n",
+	printf("PASS: pages=%zu, %d DMA mmap ranges; aligned ranges alias, sliced offsets EINVAL, out-of-range ENXIO, neighbours intact\n",
 	       page, cases);
 	return 0;
 }
