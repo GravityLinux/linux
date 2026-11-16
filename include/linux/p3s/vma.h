@@ -320,17 +320,29 @@ static inline loff_t vma_file_offset(const struct vm_area_struct *vma)
  * but not the padding after it in the last kernel page. Always false for
  * native VMAs, whose callers keep their kernel-page bounds.
  */
+static inline bool p3s_range_exceeds_object(u64 offset, u64 length, u64 size)
+{
+	u64 aligned_size = PAGE_ALIGN_4KB(size);
+
+	return aligned_size < size || offset >= aligned_size ||
+	       length > aligned_size - offset;
+}
+
 static inline bool vma_exceeds_object(const struct vm_area_struct *vma, u64 size)
 {
-	u64 aligned_size, offset;
+	return vma_is_p3s_4k(vma) &&
+	       p3s_range_exceeds_object(vma_file_offset(vma), vma_size(vma), size);
+}
 
-	if (!vma_is_p3s_4k(vma))
-		return false;
+/* Apply the same object contract before a 7.3 mmap action creates its VMA. */
+static inline bool vma_desc_exceeds_object(const struct vm_area_desc *desc,
+					 u64 size)
+{
+	u64 offset = ((u64)desc->pgoff << PAGE_SHIFT_KERNEL) +
+		     ((u64)vma_desc_slice_off(desc) << PAGE_SHIFT_4KB);
 
-	aligned_size = PAGE_ALIGN_4KB(size);
-	offset = vma_file_offset(vma);
-	return aligned_size < size || offset >= aligned_size ||
-	       vma_size(vma) > aligned_size - offset;
+	return mm_is_p3s_4k(desc->mm) &&
+	       p3s_range_exceeds_object(offset, vma_desc_size(desc), size);
 }
 
 /*

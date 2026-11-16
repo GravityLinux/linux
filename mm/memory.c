@@ -3435,6 +3435,13 @@ int simple_ioremap_prepare(struct vm_area_desc *desc)
 	unsigned long pfn;
 	int err;
 
+	if (mm_is_p3s_4k(desc->mm)) {
+		if ((start & ~PAGE_MASK_KERNEL) && p3s_4k_unsupported(desc->mm))
+			return -EOPNOTSUPP;
+		if (vma_desc_exceeds_object(desc, size))
+			return -EINVAL;
+	}
+
 	err = __simple_ioremap_prep(vma_desc_kernel_pages(desc), desc->pgoff,
 				    start, size, &pfn);
 	if (err)
