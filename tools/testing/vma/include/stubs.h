@@ -366,12 +366,21 @@ static inline void might_sleep(void)
 {
 }
 
-/* Native equivalents of the kernel's per-VMA page/slice helpers. */
-static inline pgoff_t vma_linear_page_index(const struct vm_area_struct *vma,
-					   unsigned long addr)
+struct vm_area_desc;
+extern unsigned long stack_guard_gap;
+
+static inline unsigned int mm_pte_shift(const struct mm_struct *mm)
 {
-	return vma->vm_pgoff + ((addr - vma->vm_start) >> PAGE_SHIFT);
+	return PAGE_SHIFT;
 }
+
+static inline void vma_desc_set_slice_off(struct vm_area_desc *desc,
+					  unsigned short slice_off)
+{
+}
+
+/* Native equivalents of the kernel's per-VMA page/slice helpers. */
+
 
 static inline unsigned short vma_slice_off(const struct vm_area_struct *vma)
 {
@@ -402,12 +411,7 @@ vma_mremap_slice_off(const struct vm_area_struct *vma, unsigned long old_addr,
 	return 0;
 }
 
-static inline void vma_set_split_offset(struct vm_area_struct *target,
-					const struct vm_area_struct *src,
-					unsigned long addr)
-{
-	target->vm_pgoff = vma_linear_page_index(src, addr);
-}
+
 
 static inline pgoff_t mm_mmap_pgoff(const struct mm_struct *mm,
 				    const struct file *file, pgoff_t pgoff)
