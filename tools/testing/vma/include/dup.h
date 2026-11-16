@@ -1603,7 +1603,9 @@ static inline pgprot_t vma_flags_to_page_prot(vma_flags_t vma_flags)
 static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return (address - vma->vm_start) >> PAGE_SHIFT;
+	if (address >= vma->vm_start)
+		return (address - vma->vm_start) >> PAGE_SHIFT;
+	return -((vma->vm_start - address) >> PAGE_SHIFT);
 }
 
 static inline pgoff_t linear_page_index(const struct vm_area_struct *vma,
