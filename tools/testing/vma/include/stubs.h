@@ -379,6 +379,9 @@ static inline void vma_desc_set_slice_off(struct vm_area_desc *desc,
 {
 }
 
+static inline pgoff_t vma_linear_page_index(const struct vm_area_struct *vma,
+					   unsigned long addr);
+
 /* Native equivalents of the kernel's per-VMA page/slice helpers. */
 
 

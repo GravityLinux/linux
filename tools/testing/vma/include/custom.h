@@ -100,7 +100,7 @@ static inline unsigned long vma_kernel_pagesize(struct vm_area_struct *vma)
 static inline pgoff_t vma_linear_page_index(const struct vm_area_struct *vma,
 					   unsigned long addr)
 {
-	return linear_page_index(vma, addr);
+	return vma->vm_pgoff + ((addr - vma->vm_start) >> PAGE_SHIFT);
 }
 
 static inline void vma_set_split_offset(struct vm_area_struct *target,
