@@ -10,6 +10,7 @@
 #include "isp-cmd.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
+#include "isp-setfile.h"
 
 #define ISP_MAX_PRESETS 32
 
@@ -18,6 +19,8 @@ struct isp_setfile {
 	u32 magic;
 	const char *path;
 	size_t size;
+	/* Lens-shading tables are to be built from the module's factory data */
+	bool factory_lsc;
 };
 
 // clang-format off
@@ -71,7 +74,8 @@ static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX913_7523_01] = {0x913, 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
 	[ISP_VD56G0_6221_01] = {0xd56, 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
 	[ISP_VD56G0_6222_01] = {0xd56, 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
-	[ISP_SENSOR_0958] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4},
+	[ISP_SENSOR_0958] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4,
+			     .factory_lsc = true},
 	/* This firmware exposes the module's factory calibration through CISP. */
 	[ISP_IMX958_FACTORY] = {.version = 0x958},
 };
@@ -353,6 +357,17 @@ release:
 	return err;
 }
 
+/*
+ * The preparation has only been established with the 26.6.2 firmware; other
+ * versions get the setfile as it is.
+ */
+static bool isp_setfile_needs_factory_lsc(struct apple_isp *isp,
+					  const struct isp_setfile *setfile)
+{
+	return setfile->factory_lsc && isp->hw->setfile_factory_lsc &&
+	       isp->fw_compat == ISP_FIRMWARE_V_26_6_2;
+}
+
 static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -393,6 +408,18 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 
 	memcpy(isp->data_surf->virt, (void *)fw->data, setfile->size);
 	release_firmware(fw);
+
+	if (isp_setfile_needs_factory_lsc(isp, setfile)) {
+		err = isp_setfile_prepare_lsc(isp, ch, isp->data_surf->virt,
+					      setfile->size);
+		if (err) {
+			/* The firmware would refuse the file as it is. */
+			dev_warn(isp->dev,
+				 "not loading setfile '%s': cannot build its lens shading from factory data (%d), camera runs uncalibrated\n",
+				 setfile->path, err);
+			return 0;
+		}
+	}
 
 	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
 				       setfile->size);

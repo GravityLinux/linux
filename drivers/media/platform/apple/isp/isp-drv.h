@@ -134,6 +134,12 @@ struct apple_isp_hw {
 	bool lpdp;
 	/* Halt the ISP cores before power-down so that they power up again. */
 	bool halt_cores;
+	/*
+	 * Build the lens shading of setfiles marked factory_lsc from the
+	 * module's factory data before upload; the firmware refuses them as
+	 * shipped.
+	 */
+	bool setfile_factory_lsc;
 };
 
 enum isp_sensor_id {

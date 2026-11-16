@@ -735,6 +735,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.scl1 = true,
 	.meta_size = ISP_META_SIZE_T6031,
 	.halt_cores = true,
+	.setfile_factory_lsc = true,
 };
 
 static const struct of_device_id apple_isp_of_match[] = {
