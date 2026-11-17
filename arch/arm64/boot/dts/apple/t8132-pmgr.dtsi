@@ -150,12 +150,14 @@
 	ps_dispext0_cpu: power-controller@1e8 {
 		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x1e8 4>;
+		apple,auto-pm-control = <&pmgr_dcp_controls 0x240 0x10>;
+		apple,power-gate = <&pmgr_power_gates 0x6cc>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dispext0_cpu";
 		power-domains = <&ps_dispext0_fe>;
-		/* This firmware-owned domain is locked on T8132. */
-		status = "disabled";
+		/* Software ownership is managed by the power-domain provider. */
+		status = "okay";
 	};
 
 	ps_scodec: power-controller@228 {
@@ -784,12 +786,14 @@
 	ps_dispext1_cpu: power-controller@4f0 {
 		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x4f0 4>;
+		apple,auto-pm-control = <&pmgr_dcp_controls 0x880 0x10>;
+		apple,power-gate = <&pmgr_power_gates 0xb4c>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dispext1_cpu";
 		power-domains = <&ps_dispext1_fe>;
-		/* This firmware-owned domain is locked on T8132. */
-		status = "disabled";
+		/* Software ownership is managed by the power-domain provider. */
+		status = "okay";
 	};
 
 	ps_ans: power-controller@538 {
@@ -963,11 +967,14 @@
 	ps_disp_cpu: power-controller@10000 {
 		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x10000 4>;
+		/* DART clock-protection slice42: 0x100 + 42 * 0x40. */
+		apple,auto-pm-control = <&pmgr_dcp_controls 0xb80 0x10>;
+		apple,power-gate = <&pmgr_power_gates 0x4c>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "disp_cpu";
 		power-domains = <&ps_disp_fe>;
-		/* This firmware-owned domain is locked on T8132. */
+		/* The mini opts into managed primary-engine ownership. */
 		status = "disabled";
 	};
 };

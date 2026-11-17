@@ -481,3 +481,21 @@
 &dp_altmode0 { apple,display-engines = <&dcpext0 &dcpext1 &dcp>; };
 &dp_altmode1 { apple,display-engines = <&dcpext0 &dcpext1 &dcp>; };
 &dp_altmode3 { apple,display-engines = <&dcpext0 &dcpext1 &dcp>; };
+
+/* Explicit consumers replace the boot-only always-on display votes. */
+&dcp {
+	power-domains = <&ps_disp_fe>, <&ps_disp_cpu>;
+	power-domain-names = "fe", "cpu";
+};
+
+&ps_disp_cpu {
+	status = "okay";
+};
+
+&ps_disp_fe {
+	/delete-property/ apple,always-on;
+};
+
+&ps_disp_sys {
+	/delete-property/ apple,always-on;
+};

@@ -741,6 +741,10 @@
 		};
 
 		dcp: dcp@30ae00000 {
+			apple,retirement-shared-control = <&pmgr_display_shared>;
+			apple,retirement-shared-bits = <0 0>;
+			/* Native main-engine reconnect asserts report bit15. */
+			apple,retirement-report = <&pmp_report_boot_f>;
 			compatible = "apple,t8132-dcp", "apple,dcp";
 			mboxes = <&dcp_mbox>;
 			mbox-names = "mbox";
@@ -787,6 +791,10 @@
 		};
 
 		dcpext0: dcp@286e00000 {
+			/* Observed report bit16 follows external0 on native hotplug. */
+			apple,retirement-report = <&pmp_report_boot_10>;
+			apple,retirement-shared-control = <&pmgr_display_shared>;
+			apple,retirement-shared-bits = <1 3>;
 			compatible = "apple,t8132-dcpext", "apple,dcpext";
 			mboxes = <&dcpext0_mbox>;
 			mbox-names = "mbox";
@@ -803,7 +811,8 @@
 			apple,iomfb-surface-order = <0 1 3>;
 			apple,iomfb-primary-surface = <0>;
 			apple,iomfb-max-layers = <3>;
-			power-domains = <&ps_dispext0_fe>;
+			power-domains = <&ps_dispext0_fe>, <&ps_dispext0_cpu>;
+			power-domain-names = "fe", "cpu";
 			clocks = <&clk_dispext0>;
 			apple,dcp-index = <1>;
 			phandle = <&dcpext0>;
@@ -829,6 +838,9 @@
 		};
 
 		dcpext1: dcp@48ae00000 {
+			apple,retirement-shared-control = <&pmgr_display_shared>;
+			apple,retirement-shared-bits = <2 4>;
+			apple,retirement-report = <&pmp_report_dispext1>;
 			compatible = "apple,t8132-dcpext", "apple,dcpext";
 			mboxes = <&dcpext1_mbox>;
 			mbox-names = "mbox";
@@ -845,7 +857,8 @@
 			apple,iomfb-surface-order = <0 1 3>;
 			apple,iomfb-primary-surface = <0>;
 			apple,iomfb-max-layers = <3>;
-			power-domains = <&ps_dispext1_fe>;
+			power-domains = <&ps_dispext1_fe>, <&ps_dispext1_cpu>;
+			power-domain-names = "fe", "cpu";
 			clocks = <&clk_dispext1>;
 			apple,dcp-index = <2>;
 			phandle = <&dcpext1>;
@@ -891,6 +904,22 @@
 			#size-cells = <1>;
 			reg = <0x3 0x80700000 0 0x14000>;
 			/* child nodes are added in t8132-pmgr.dtsi */
+		};
+
+
+		pmgr_power_gates: syscon@380725000 {
+			compatible = "syscon";
+			reg = <0x3 0x80725000 0 0x1000>;
+		};
+
+		pmgr_display_shared: syscon@3828a0000 {
+			compatible = "syscon";
+			reg = <0x3 0x828a0000 0 0xd000>;
+		};
+
+		pmgr_dcp_controls: syscon@38079c000 {
+			compatible = "syscon";
+			reg = <0x3 0x8079c000 0 0x1000>;
 		};
 
 		aic: interrupt-controller@381180000 {
