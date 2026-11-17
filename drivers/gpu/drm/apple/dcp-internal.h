@@ -41,6 +41,7 @@ static inline u64 dcp_read_firmware_time(void)
 
 struct apple_dcp;
 struct apple_typec_port;
+struct dcp_retirement;
 struct apple_dcp_afkep;
 
 extern bool dcp_disable_rt_bandwidth;
@@ -148,6 +149,9 @@ struct apple_dcp {
 	struct platform_device *piodma;
 	struct iommu_domain *iommu_dom;
 	struct apple_rtkit *rtk;
+	struct dcp_retirement *retirement;
+	struct device *fe_pm_dev, *cpu_pm_dev;
+	bool fe_pm_held, cpu_pm_held;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
 

@@ -48,6 +48,7 @@
 #include <drm/drm_fixed.h>
 
 #include "dcp.h"
+#include "retirement.h"
 #include "plane.h"
 
 #define DRIVER_NAME     "apple"
@@ -787,6 +788,9 @@ static int apple_drm_init_dcp(struct device *dev)
 		if (ret)
 			dev_warn(dev, "DCP[%d] not ready: %d\n", i, ret);
 	}
+	ret = dcp_retirement_mapping_context(dev);
+	if (ret)
+		return ret;
 	/* HACK: Wait for dcp* to settle before a modeset */
 	msleep(100);
 

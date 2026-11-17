@@ -19,6 +19,8 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
+#include <linux/pm_domain.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
@@ -40,6 +42,7 @@
 
 #include "afk.h"
 #include "av.h"
+#include "retirement.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
@@ -477,6 +480,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	/* A failed auxiliary DCP must not poison atomic transactions for the
 	 * other display pipelines.  Reject attempts to drive the crashed DCP,
 	 * but permit its already-disabled CRTC to remain disabled. */
+	if ((dcp_retirement_is_retired(dcp) || dcp_retirement_failed(dcp)) &&
+	    crtc_state->active)
+		return -EHOSTDOWN;
+
 	if (dcp->crashed && crtc_state->active)
 		return -EINVAL;
 
@@ -1369,13 +1376,17 @@ int dcp_start(struct platform_device *pdev)
 					 "Failed to connect DPTX port during startup: %d\n",
 					 ret);
 		}
-		if (v26_6 && enable_hdcp) {
+		if (v26_6 && (enable_hdcp ||
+			     dcp_retirement_transport_required(dcp))) {
 			ret = dcp_start_hdcp(dcp);
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
 						     "Failed to start HDCP endpoint\n");
 
-			ret = dcp_activate_hdcp(dcp, 0);
+			/* Retirement needs the complete retained transport set, not
+			 * content protection or an active HDCP controller.
+			 */
+			ret = enable_hdcp ? dcp_activate_hdcp(dcp, 0) : 0;
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
 						     "Failed to activate first HDCP controller\n");
@@ -1448,6 +1459,11 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
+	if (dcp_retirement_is_primary(dcp)) {
+		dcp_typec_pool_lock();
+		dcp_retirement_ready_locked(dcp);
+		dcp_typec_pool_unlock();
+	}
 	dcp_typec_set_ready(dcp, true);
 	if (dcp->typec_hpd_mux) {
 		spin_lock_irq(&dcp->typec_hpd_lock);
@@ -1528,6 +1544,8 @@ void dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	dcp_retirement_note_use(dcp);
+
 	if (dcp->hotplug_keepalive) {
 		dev_info(dcp->dev,
 			 "reusing live IOMFB state after external hotplug\n");
@@ -1575,6 +1593,9 @@ void dcp_poweron(struct platform_device *pdev)
 void dcp_poweroff(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp_retirement_defer_poweroff(dcp))
+		return;
 
 	/*
 	 * Keep the 26.6 external IOMFB instance alive while isolating the HPD
@@ -2028,7 +2049,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	init_completion(&dcp->start_done);
 	init_waitqueue_head(&dcp->swap_ack_wait);
 
-	return 0;
+	return dcp_retirement_init(dcp);
 }
 
 /*
@@ -2042,6 +2063,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (!dcp)
 		return;
 
+	dcp_retirement_stop(dcp);
 	dcp_typec_set_ready(dcp, false);
 	if (dcp->typec_hpd_mux) {
 		spin_lock_irq(&dcp->typec_hpd_lock);
@@ -2129,7 +2151,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		dcp->dcpavservep = NULL;
 	}
 
-	if (dcp->shmem)
+	if (dcp->shmem && !dcp_retirement_is_retired(dcp))
 		iomfb_shutdown(dcp);
 
 	if (dcp->piodma) {
@@ -2146,6 +2168,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
+	dcp_retirement_fini(dcp);
 }
 
 static const struct component_ops dcp_comp_ops = {
@@ -2159,6 +2182,61 @@ static void dcp_phy_power_off(void *data)
 
 	phy_power_off(phy);
 	phy_exit(phy);
+}
+
+static void dcp_detach_power_domains(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->cpu_pm_dev) {
+		if (dcp->cpu_pm_held)
+			pm_runtime_put_noidle(dcp->cpu_pm_dev);
+		dev_pm_domain_detach(dcp->cpu_pm_dev, false);
+	}
+	if (dcp->fe_pm_dev) {
+		if (dcp->fe_pm_held)
+			pm_runtime_put_noidle(dcp->fe_pm_dev);
+		dev_pm_domain_detach(dcp->fe_pm_dev, false);
+	}
+}
+
+static int dcp_attach_power_domains(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (of_property_match_string(dcp->dev->of_node, "power-domain-names", "cpu") < 0)
+		return 0;
+	dcp->fe_pm_dev = dev_pm_domain_attach_by_name(dcp->dev, "fe");
+	if (IS_ERR_OR_NULL(dcp->fe_pm_dev)) {
+		ret = dcp->fe_pm_dev ? PTR_ERR(dcp->fe_pm_dev) : -ENODEV;
+		dcp->fe_pm_dev = NULL;
+		return ret;
+	}
+	ret = pm_runtime_resume_and_get(dcp->fe_pm_dev);
+	if (ret < 0)
+		goto err;
+	dcp->fe_pm_held = true;
+	dcp->cpu_pm_dev = dev_pm_domain_attach_by_name(dcp->dev, "cpu");
+	if (IS_ERR_OR_NULL(dcp->cpu_pm_dev)) {
+		ret = dcp->cpu_pm_dev ? PTR_ERR(dcp->cpu_pm_dev) : -ENODEV;
+		dcp->cpu_pm_dev = NULL;
+		goto err;
+	}
+	ret = pm_runtime_resume_and_get(dcp->cpu_pm_dev);
+	if (ret < 0)
+		goto err;
+	dcp->cpu_pm_held = true;
+	/* System-PM ordering only: lifecycle controls the runtime votes explicitly. */
+	if (!device_link_add(dcp->dev, dcp->fe_pm_dev, DL_FLAG_AUTOREMOVE_CONSUMER) ||
+	    !device_link_add(dcp->dev, dcp->cpu_pm_dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	return devm_add_action_or_reset(dcp->dev, dcp_detach_power_domains, dcp);
+err:
+	dcp_detach_power_domains(dcp);
+	dcp->cpu_pm_dev = dcp->fe_pm_dev = NULL;
+	return ret;
 }
 
 static int dcp_platform_probe(struct platform_device *pdev)
@@ -2199,6 +2277,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		dcp->typec_xbar_source = source;
 	}
 	platform_set_drvdata(pdev, dcp);
+	{
+		int ret = dcp_attach_power_domains(dcp);
+
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to attach display power domains\n");
+	}
+
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
 	if (IS_ERR(dcp->phy)) {
@@ -2356,6 +2441,10 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	int ret = dcp_retirement_suspend(dcp);
+
+	if (ret)
+		return ret < 0 ? ret : 0;
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -2371,6 +2460,11 @@ static int dcp_platform_suspend(struct device *dev)
 	 * shutdown properly yet.
 	 */
 	device_set_wakeup_path(dev);
+	/* Multi-domain devices have separate virtual consumers with no parent. */
+	if (dcp->fe_pm_dev)
+		device_set_wakeup_path(dcp->fe_pm_dev);
+	if (dcp->cpu_pm_dev)
+		device_set_wakeup_path(dcp->cpu_pm_dev);
 
 	return 0;
 }
@@ -2378,6 +2472,10 @@ static int dcp_platform_suspend(struct device *dev)
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	int ret = dcp_retirement_resume(dcp);
+
+	if (ret)
+		return ret < 0 ? ret : 0;
 
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);
@@ -2388,8 +2486,10 @@ static int dcp_platform_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(dcp_platform_pm_ops,
-				dcp_platform_suspend, dcp_platform_resume);
+static const struct dev_pm_ops dcp_platform_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(dcp_platform_suspend, dcp_platform_resume)
+	RUNTIME_PM_OPS(dcp_retirement_runtime_suspend, dcp_retirement_runtime_resume, NULL)
+};
 
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {
@@ -2437,7 +2537,7 @@ static struct platform_driver apple_platform_driver = {
 	.driver	= {
 		.name = "apple-dcp",
 		.of_match_table	= of_match,
-		.pm = pm_sleep_ptr(&dcp_platform_pm_ops),
+		.pm = pm_ptr(&dcp_platform_pm_ops),
 	},
 };
 

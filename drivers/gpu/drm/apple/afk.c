@@ -15,6 +15,7 @@
 #include <linux/soc/apple/rtkit.h>
 
 #include "afk.h"
+#include "retirement.h"
 #include "trace.h"
 
 static bool compact_trace;
@@ -115,6 +116,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 
 	init_completion(&afkep->started);
 	init_completion(&afkep->stopped);
+	init_completion(&afkep->retained_control_done);
 	INIT_LIST_HEAD(&afkep->compact_cmds);
 	spin_lock_init(&afkep->lock);
 	mutex_init(&afkep->compact_tx_lock);
@@ -144,6 +146,8 @@ void afk_cancel_commands(struct apple_dcp_afkep *afkep)
 void afk_shutdown(struct apple_dcp_afkep *afkep)
 {
 	afk_cancel_commands(afkep);
+	if (dcp_retirement_is_retired(afkep->dcp))
+		goto free_host;
 	afk_send(afkep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
 	int ret;
 
@@ -152,6 +156,7 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 		dev_err(afkep->dcp->dev, "Timed out shutting down AFK endpoint %02x", afkep->endpoint);
 	}
 
+free_host:
 	destroy_workqueue(afkep->wq);
 	kvfree(afkep->compact_rx_data);
 	afkep->compact_rx_data = NULL;
@@ -287,6 +292,7 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 }
 #endif
 
+
 static const struct apple_epic_service_ops *
 afk_match_service(struct apple_dcp_afkep *ep, const char *name)
 {
@@ -418,6 +424,43 @@ out_unlock:
 	return ret;
 }
 
+/* Observed native unused-engine retirement control: interface zero, a
+ * four-byte body with value 2. Its reply has low byte 3; the upper bytes
+ * vary by endpoint and are not a success errno. Preserve them for diagnosis.
+ * Unlike an EPIC service call this has neither timestamp nor subheader.
+ */
+static int afk_retained_control(struct apple_dcp_afkep *ep, u32 value, u8 reply)
+{
+	__le32 request = cpu_to_le32(value);
+	int ret;
+
+	if (!dcp_is_t8132(ep->dcp) || !ep->txbfr.ready || !ep->rxbfr.ready)
+		return -EOPNOTSUPP;
+	mutex_lock(&ep->compact_tx_lock);
+	reinit_completion(&ep->retained_control_done);
+	WRITE_ONCE(ep->retained_control_expected, reply);
+	WRITE_ONCE(ep->retained_control_pending, true);
+	ret = afk_send_compact_fragment(ep, 0, &request, sizeof(request), sizeof(request));
+	if (!ret && !wait_for_completion_timeout(&ep->retained_control_done,
+						msecs_to_jiffies(1000)))
+		ret = -ETIMEDOUT;
+	WRITE_ONCE(ep->retained_control_pending, false);
+	mutex_unlock(&ep->compact_tx_lock);
+	dev_dbg(ep->dcp->dev, "retirement AFK ep=%02x control%u expected=%u reply=%#x status=%d\n",
+		 ep->endpoint, value, reply, ep->retained_control_reply, ret);
+	return ret;
+}
+
+int afk_retained_idle(struct apple_dcp_afkep *ep)
+{
+	return afk_retained_control(ep, 2, 3);
+}
+
+int afk_retained_resume(struct apple_dcp_afkep *ep)
+{
+	/* Resume the existing rings and service interfaces after management ON. */
+	return afk_retained_control(ep, 4, 5);
+}
 /* Serialize complete messages: fragments carry no transaction offset or tag
  * beyond the repeated interface/length and per-fragment sequence number.
  */
@@ -928,6 +971,21 @@ static bool afk_recv_handle_compact(struct apple_dcp_afkep *ep, u32 channel,
 		return false;
 	total = le32_to_cpu(hdr->length);
 	intf_id = le16_to_cpu(hdr->intf_id);
+	if (!offset && !intf_id && total == 4 && data_size == header_size + 4) {
+		__le32 value;
+
+		memcpy(&value, data + header_size, sizeof(value));
+		if (READ_ONCE(ep->retained_control_pending)) {
+			ep->retained_control_reply = le32_to_cpu(value);
+			if ((le32_to_cpu(value) & 0xff) ==
+			    READ_ONCE(ep->retained_control_expected))
+				complete(&ep->retained_control_done);
+		}
+		/* A transport control reply has no service sub-header. Never
+		 * parse an unexpected opcode as a larger service message.
+		 */
+		return true;
+	}
 	/* Eight-byte empty control messages also occur in native AV traces. */
 	if (!offset && total == 8 && data_size == header_size + 8)
 		return true;
@@ -1552,7 +1610,7 @@ out:
 	return ret;
 }
 
-static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
+static int __afk_send_compact_command(struct apple_epic_service *service, u8 type,
 				    const void *payload, size_t payload_len,
 				    void *output, size_t output_len,
 				    u32 request_status, u32 *retcode,
@@ -1631,7 +1689,24 @@ out:
 	return ret;
 }
 
-int afk_send_command(struct apple_epic_service *service, u8 type,
+static int afk_send_compact_command(struct apple_epic_service *service, u8 type,
+				    const void *payload, size_t payload_len,
+				    void *output, size_t output_len,
+				    u32 request_status, u32 *retcode,
+				    unsigned long timeout)
+{
+	int ret = dcp_retirement_rpc_get(service->ep->dcp);
+
+	if (ret)
+		return ret;
+	ret = __afk_send_compact_command(service, type, payload, payload_len,
+					output, output_len, request_status,
+					retcode, timeout);
+	dcp_retirement_rpc_put(service->ep->dcp);
+	return ret;
+}
+
+static int __afk_send_command(struct apple_epic_service *service, u8 type,
 		     const void *payload, size_t payload_len, void *output,
 		     size_t output_len, u32 *retcode)
 {
@@ -1734,6 +1809,20 @@ err_unlock:
 	dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
 	dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
+	return ret;
+}
+
+int afk_send_command(struct apple_epic_service *service, u8 type,
+		     const void *payload, size_t payload_len, void *output,
+		     size_t output_len, u32 *retcode)
+{
+	int ret = dcp_retirement_rpc_get(service->ep->dcp);
+
+	if (ret)
+		return ret;
+	ret = __afk_send_command(service, type, payload, payload_len,
+				 output, output_len, retcode);
+	dcp_retirement_rpc_put(service->ep->dcp);
 	return ret;
 }
 

@@ -14,6 +14,9 @@ int dcp_audiosrv_unprepare(struct device *dev);
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize);
 int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsize);
 
+int dcpaud_can_retire(struct platform_device *pdev);
+int dcpaud_retire(struct platform_device *pdev);
+void dcpaud_restart(struct platform_device *pdev);
 void dcpaud_connect(struct platform_device *pdev, bool connected);
 void dcpaud_disconnect(struct platform_device *pdev);
 

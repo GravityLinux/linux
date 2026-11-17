@@ -27,6 +27,7 @@
 
 #include "av.h"
 #include "dcp.h"
+#include "retirement.h"
 #include <linux/unaligned.h>
 #include "audio.h"
 #include "parser.h"
@@ -45,6 +46,9 @@ struct dcp_audio {
 	struct snd_jack *jack;
 	struct snd_pcm_substream *substream;
 	unsigned int open_cookie;
+	bool pcm_open;
+	bool retirement_paused;
+	struct mutex retirement_lock;
 	bool power_held;
 	bool link_started;
 	snd_pcm_format_t link_format;
@@ -273,7 +277,7 @@ static int dcpaud_init_dma(struct dcp_audio *dcpaud)
 	return 0;
 }
 
-static int dcp_pcm_open(struct snd_pcm_substream *substream)
+static int __dcp_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	struct snd_dmaengine_dai_dma_data dma_data = {
@@ -371,12 +375,43 @@ err_close:
 	return ret;
 }
 
+static int dcp_pcm_open(struct snd_pcm_substream *substream)
+{
+	struct dcp_audio *audio = substream->pcm->private_data;
+	struct apple_dcp *dcp = dev_get_drvdata(audio->dcp_dev);
+	int ret;
+
+	mutex_lock(&audio->retirement_lock);
+	if (audio->retirement_paused) {
+		ret = -EHOSTDOWN;
+		goto unlock;
+	}
+	ret = dcp_retirement_rpc_get(dcp);
+	if (ret)
+		goto unlock;
+	ret = __dcp_pcm_open(substream);
+	if (!ret) {
+		WRITE_ONCE(audio->pcm_open, true);
+		dcp_retirement_note_use(dcp);
+	}
+	dcp_retirement_rpc_put(dcp);
+unlock:
+	mutex_unlock(&audio->retirement_lock);
+	return ret;
+}
+
 static int dcp_pcm_close(struct snd_pcm_substream *substream)
 {
-	struct dcp_audio *dcpaud = substream->pcm->private_data;
-	dcpaud->selected_chmap.channels = 0;
+	struct dcp_audio *audio = substream->pcm->private_data;
+	int ret;
 
-	return snd_dmaengine_pcm_close(substream);
+	mutex_lock(&audio->retirement_lock);
+	/* close terminates/synchronizes SIO DMA before retirement can proceed. */
+	ret = snd_dmaengine_pcm_close(substream);
+	audio->selected_chmap.channels = 0;
+	WRITE_ONCE(audio->pcm_open, false);
+	mutex_unlock(&audio->retirement_lock);
+	return ret;
 }
 
 static int dcpaud_connection_up(struct dcp_audio *dcpaud)
@@ -794,6 +829,69 @@ err_free_card:
 	return ret;
 }
 
+int dcpaud_can_retire(struct platform_device *pdev)
+{
+	struct dcp_audio *audio = platform_get_drvdata(pdev);
+	int ret;
+
+	if (!audio || !audio->card)
+		return -EPROBE_DEFER;
+	mutex_lock(&audio->retirement_lock);
+	ret = audio->pcm_open ? -EBUSY : 0;
+	mutex_unlock(&audio->retirement_lock);
+	return ret;
+}
+
+int dcpaud_retire(struct platform_device *pdev)
+{
+	struct dcp_audio *audio = platform_get_drvdata(pdev);
+	int ret = 0;
+
+	if (!audio || !audio->card)
+		return -EPROBE_DEFER;
+	mutex_lock(&audio->retirement_lock);
+	if (audio->pcm_open) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	audio->retirement_paused = true;
+	/* These references outlive ordinary PCM closes on T8132. No PCM owns
+	 * them now, and close already synchronized its DMA termination.
+	 */
+	if (audio->link_started) {
+		ret = dcp_audiosrv_stoplink(audio->dcp_dev);
+		if (ret)
+			goto unlock;
+		audio->link_started = false;
+		ret = dcp_audiosrv_unprepare(audio->dcp_dev);
+		if (ret)
+			goto unlock;
+	}
+	if (audio->power_held) {
+		audio->power_held = false;
+		ret = pm_runtime_put_sync_suspend(audio->dev);
+	} else {
+		/* Normalize the unused boot state through its genpd provider. */
+		ret = pm_runtime_resume_and_get(audio->dev);
+		if (ret >= 0)
+			ret = pm_runtime_put_sync_suspend(audio->dev);
+	}
+unlock:
+	mutex_unlock(&audio->retirement_lock);
+	return ret < 0 ? ret : 0;
+}
+
+void dcpaud_restart(struct platform_device *pdev)
+{
+	struct dcp_audio *audio = platform_get_drvdata(pdev);
+
+	if (!audio)
+		return;
+	mutex_lock(&audio->retirement_lock);
+	audio->retirement_paused = false;
+	mutex_unlock(&audio->retirement_lock);
+}
+
 void dcpaud_connect(struct platform_device *pdev, bool connected)
 {
 	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
@@ -947,6 +1045,7 @@ static int dcpaud_probe(struct platform_device *pdev)
 
 	dcpaud->dev = &pdev->dev;
 	mutex_init(&dcpaud->data_lock);
+	mutex_init(&dcpaud->retirement_lock);
 	platform_set_drvdata(pdev, dcpaud);
 
 	/* DCP 26.6 constructs its AV audio interface against the live SIO

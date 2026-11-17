@@ -208,6 +208,10 @@ struct apple_dcp_afkep {
 
 	struct list_head compact_cmds;
 	bool compact_shutting_down;
+	struct completion retained_control_done;
+	bool retained_control_pending;
+	u32 retained_control_reply;
+	u8 retained_control_expected;
 	struct mutex compact_tx_lock;
 	struct afk_fragment_state compact_rx;
 	void *compact_rx_data;
@@ -224,6 +228,8 @@ struct apple_dcp_afkep {
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
 int afk_start(struct apple_dcp_afkep *ep);
+int afk_retained_idle(struct apple_dcp_afkep *ep);
+int afk_retained_resume(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);

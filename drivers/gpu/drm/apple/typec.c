@@ -4,10 +4,12 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/suspend.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/workqueue.h>
 
 #include "dcp.h"
+#include "retirement.h"
 #include "dcp-internal.h"
 
 #define APPLE_TYPEC_DCPS 3
@@ -36,6 +38,23 @@ struct apple_typec_port {
 /* Serialize pool ownership and keep firmware callbacks outside the PD lock. */
 static DEFINE_MUTEX(apple_typec_lock);
 static LIST_HEAD(apple_typec_ports);
+static bool apple_typec_sleeping;
+
+void dcp_typec_pool_lock(void)
+{
+	mutex_lock(&apple_typec_lock);
+}
+
+void dcp_typec_pool_unlock(void)
+{
+	mutex_unlock(&apple_typec_lock);
+}
+
+bool dcp_typec_pool_sleeping(void)
+{
+	lockdep_assert_held(&apple_typec_lock);
+	return apple_typec_sleeping;
+}
 
 static void apple_typec_retry_ports(void)
 {
@@ -79,6 +98,7 @@ static int apple_typec_release(struct apple_typec_port *port)
 		}
 	}
 	port->previous_phy = NULL;
+	dcp_retirement_unplug_locked(dcp);
 	apple_typec_retry_ports();
 	return 0;
 }
@@ -89,10 +109,13 @@ static int apple_typec_claim(struct apple_typec_port *port)
 	int ret, i;
 
 	lockdep_assert_held(&apple_typec_lock);
+	if (apple_typec_sleeping)
+		return -EBUSY;
 	for (i = 0; i < port->num_engines; i++) {
 		struct apple_dcp *candidate = platform_get_drvdata(port->engines[i]);
 
 		if (candidate && candidate->typec_routing_ready && !candidate->crashed &&
+		    !dcp_retirement_failed(candidate) &&
 		    !candidate->typec_port &&
 		    (!candidate->phy || !READ_ONCE(candidate->connector->connected))) {
 			dcp = candidate;
@@ -101,6 +124,10 @@ static int apple_typec_claim(struct apple_typec_port *port)
 	}
 	if (!dcp)
 		return -EBUSY;
+
+	ret = dcp_retirement_restart_locked(dcp);
+	if (ret)
+		return ret;
 
 	ret = phy_init(port->phy);
 	if (ret)
@@ -130,6 +157,7 @@ static int apple_typec_claim(struct apple_typec_port *port)
 	dcp->dptx_phy = port->target;
 	dcp->typec_port = port;
 	port->dcp = dcp;
+	dcp_retirement_note_use(dcp);
 	dev_info(port->dev, "Assigned %s source %u to ATC%u\n",
 		 dev_name(dcp->dev), dcp->typec_xbar_source, port->target);
 	return 0;
@@ -150,6 +178,11 @@ static void apple_typec_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&apple_typec_lock);
+	/* Keep latched HPD/mode events until all suppliers have resumed. */
+	if (apple_typec_sleeping) {
+		mutex_unlock(&apple_typec_lock);
+		return;
+	}
 	for (;;) {
 		spin_lock_irq(&port->lock);
 		hpd = port->hpd;
@@ -172,7 +205,9 @@ static void apple_typec_work(struct work_struct *work)
 				struct apple_dcp *free = platform_get_drvdata(port->engines[i]);
 
 				if (free && free->typec_routing_ready && !free->crashed &&
-				    !free->phy && !free->typec_port) {
+				    !dcp_retirement_failed(free) &&
+				    !free->phy && !free->typec_port &&
+				    !dcp_retirement_restart_locked(free)) {
 					ret = apple_typec_release(port);
 					break;
 				}
@@ -235,6 +270,8 @@ void dcp_typec_set_ready(struct apple_dcp *dcp, bool ready)
 
 	mutex_lock(&apple_typec_lock);
 	dcp->typec_routing_ready = ready;
+	if (ready)
+		dcp_retirement_ready_locked(dcp);
 	if (!ready && dcp->typec_port)
 		apple_typec_release(dcp->typec_port);
 	apple_typec_retry_ports();
@@ -356,12 +393,40 @@ static struct platform_driver apple_typec_driver = {
 	},
 };
 
+static int apple_typec_pm_notify(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	if (!dcp_retirement_policy_enabled())
+		return NOTIFY_DONE;
+	if (action != PM_SUSPEND_PREPARE && action != PM_POST_SUSPEND)
+		return NOTIFY_DONE;
+	mutex_lock(&apple_typec_lock);
+	apple_typec_sleeping = action == PM_SUSPEND_PREPARE;
+	if (!apple_typec_sleeping)
+		apple_typec_retry_ports();
+	mutex_unlock(&apple_typec_lock);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block apple_typec_pm_notifier = {
+	.notifier_call = apple_typec_pm_notify,
+};
+
 int dcp_typec_register(void)
 {
-	return platform_driver_register(&apple_typec_driver);
+	int ret;
+
+	ret = register_pm_notifier(&apple_typec_pm_notifier);
+	if (ret)
+		return ret;
+	ret = platform_driver_register(&apple_typec_driver);
+	if (ret)
+		unregister_pm_notifier(&apple_typec_pm_notifier);
+	return ret;
 }
 
 void dcp_typec_unregister(void)
 {
+	unregister_pm_notifier(&apple_typec_pm_notifier);
 	platform_driver_unregister(&apple_typec_driver);
 }

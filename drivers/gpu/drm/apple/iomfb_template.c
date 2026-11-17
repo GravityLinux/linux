@@ -26,6 +26,7 @@
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
+#include "retirement.h"
 #include "dcp-internal.h"
 #include "afk.h"
 #include "iomfb.h"
@@ -1128,7 +1129,7 @@ static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
 	 * to the display query and A473(1), without A457/A474. Reopening the
 	 * client here is reserved for the external pipeline's full wake path.
 	 */
-	if (dcp_has_panel(dcp)) {
+	if (dcp_has_panel(dcp) || dcp_retirement_retained_display(dcp)) {
 		dcp_is_main_display(dcp, false, dcp_poweron_after_main_display,
 				    cookie);
 		return;
@@ -1257,7 +1258,7 @@ static void aborted_swaps_dcp_poff(struct apple_dcp *dcp, void *out, void *cooki
 }
 #endif
 
-void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
+static int dcp_poweroff_sequence(struct apple_dcp *dcp)
 {
 	int ret, swap_id;
 #if DCP_FW_VER < DCP_FW_VERSION(26, 6, 0)
@@ -1271,7 +1272,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
-		return;
+		return -ENOMEM;
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1324,14 +1325,14 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	kref_put(&cookie->refcount, release_swap_cookie);
 	if (ret <= 0) {
 		dcp->crashed = true;
-		return;
+		return -ETIMEDOUT;
 	}
 
 	dev_dbg(dcp->dev, "%s: clear swap submitted: %u\n", __func__, swap_id);
 
 	poff_cookie = kzalloc(sizeof(*poff_cookie), GFP_KERNEL);
 	if (!poff_cookie)
-		return;
+		return -ENOMEM;
 	init_completion(&poff_cookie->done);
 	kref_init(&poff_cookie->refcount);
 	/* increase refcount to ensure the receiver has a reference */
@@ -1368,6 +1369,12 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	kref_put(&poff_cookie->refcount, release_wait_cookie);
 
 	dev_info(dcp->dev, "dcp_poweroff() done\n");
+	return ret > 0 ? 0 : ret ? ret : -ETIMEDOUT;
+}
+
+void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
+{
+	dcp_poweroff_sequence(dcp);
 }
 
 static void last_client_closed_sleep(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1421,7 +1428,7 @@ static void dcpep_cb_hotplug_state(struct apple_dcp *dcp, u64 connected)
 	 * is one example. dcp_is_main_display() returns true on devices with
 	 * integrated display. Ignore the hotplug_gated() callbacks there.
 	 */
-	if (dcp->main_display)
+	if (dcp->main_display || dcp_retirement_logically_off(dcp))
 		return;
 
 	if (dcp->during_modeset) {

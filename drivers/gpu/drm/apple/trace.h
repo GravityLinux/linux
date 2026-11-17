@@ -16,6 +16,14 @@
 #include <linux/types.h>
 #include <linux/tracepoint.h>
 
+TRACE_EVENT(dcp_retirement_stage,
+	TP_PROTO(struct apple_dcp *dcp, const char *stage),
+	TP_ARGS(dcp, stage),
+	TP_STRUCT__entry(__string(dev, dev_name(dcp->dev)) __string(stage, stage)),
+	TP_fast_assign(__assign_str(dev); __assign_str(stage);),
+	TP_printk("%s %s", __get_str(dev), __get_str(stage))
+);
+
 #define show_dcp_endpoint(ep)                                      \
 	__print_symbolic(ep, { SYSTEM_ENDPOINT, "system" },        \
 			 { TEST_ENDPOINT, "test" },                \

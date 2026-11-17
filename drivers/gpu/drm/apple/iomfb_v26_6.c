@@ -290,3 +290,49 @@ void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 
 #undef DCP_FW_VER
 #undef DCP_FW
+
+/* Display/engine quiesce from observed T8132 firmware transactions. */
+static int retained_transaction(struct apple_dcp *dcp,
+		const struct dcp_method_entry *method, void *input, size_t size,
+		size_t output_size)
+{
+	struct dcp_wait_cookie *cookie;
+	int ret;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	kref_get(&cookie->refcount);
+	dcp_push(dcp, false, method, size, output_size, input,
+		 complete_set_powerstate, cookie);
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+	return ret > 0 ? 0 : -ETIMEDOUT;
+}
+
+int iomfb_retained_display_off_v26_6_0(struct apple_dcp *dcp, bool prepare_display)
+{
+	const struct dcp_method_entry select = {
+		.name = "retained_select_off", .tag = { 'A', '4', '1', '1' },
+	};
+	const struct dcp_method_entry power = {
+		.name = "retained_dcp_power", .tag = { 'A', '5', '0', '0' },
+	};
+	u32 selector = 1;
+	u8 request[4] = { 0, 0, 0xaa, 0xaa };
+	int ret;
+
+	if (prepare_display) {
+		ret = retained_transaction(dcp, &select, &selector, sizeof(selector), sizeof(u32));
+		if (ret)
+			return ret;
+		ret = dcp_poweroff_sequence(dcp);
+		if (ret)
+			return ret;
+		/* Physical detach separates display-off from engine-off. */
+		msleep(10000);
+	}
+	return retained_transaction(dcp, &power, request, sizeof(request), 0);
+}

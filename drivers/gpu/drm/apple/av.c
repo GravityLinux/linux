@@ -67,6 +67,7 @@ struct audiosrv_data {
 	bool warned_get_elements;
 	bool warned_get_product_attrs;
 	bool is_open;
+	bool retirement_paused;
 };
 
 
@@ -124,7 +125,8 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 
 	asrv->plugged = true;
 	mutex_unlock(&asrv->plug_lock);
-	schedule_work(&asrv->start_av_service_wq);
+	if (!READ_ONCE(asrv->retirement_paused))
+		schedule_work(&asrv->start_av_service_wq);
 }
 
 static void av_audiosrv_teardown(struct apple_epic_service *service)
@@ -440,6 +442,54 @@ static const struct apple_epic_service_ops avep_ops[] = {
 	{}
 };
 
+int dcp_av_retire(struct apple_dcp *dcp, bool *was_open)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	*was_open = false;
+	if (!asrv)
+		return 0;
+	if (asrv->audio_dev) {
+		ret = dcpaud_can_retire(asrv->audio_dev);
+		if (ret)
+			return ret;
+	}
+	WRITE_ONCE(asrv->retirement_paused, true);
+	cancel_work_sync(&asrv->start_av_service_wq);
+	*was_open = asrv->is_open;
+	/* Stop the retained unowned audio link and gate DPA before closing its
+	 * stale AV binding, matching the existing T8132 power-transition path.
+	 */
+	if (asrv->audio_dev) {
+		ret = dcpaud_retire(asrv->audio_dev);
+		if (ret)
+			return ret;
+	}
+	if (*was_open)
+		return dcp_audiosrv_close_for_power_transition(dcp->dev);
+	return 0;
+}
+
+int dcp_av_restart(struct apple_dcp *dcp, bool was_open)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret = 0;
+
+	if (!asrv)
+		return 0;
+	/* An unowned DPA stays off. Ordinary display connect / PCM hw_params
+	 * will reopen AV and restore DPA/SIO in their normal order when needed.
+	 */
+	if (asrv->audio_dev)
+		dcpaud_restart(asrv->audio_dev);
+	else if (was_open)
+		ret = dcp_audiosrv_open_after_power_transition(dcp->dev);
+	if (!ret)
+		WRITE_ONCE(asrv->retirement_paused, false);
+	return ret;
+}
+
 void av_service_connect(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
@@ -522,7 +572,8 @@ static void av_work_service_start(struct work_struct *work)
 		dcp = audiosrv_data->srv->ep->dcp;
 	}
 
-	av_service_connect(dcp);
+	if (!READ_ONCE(audiosrv_data->retirement_paused))
+		av_service_connect(dcp);
 }
 
 int avep_init(struct apple_dcp *dcp)

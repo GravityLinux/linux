@@ -26,4 +26,6 @@ struct dcp_set_frame_sync_props_resp_v26_6_0 {
 	u8 props[0x50];
 } __packed;
 
+int iomfb_retained_display_off_v26_6_0(struct apple_dcp *dcp, bool prepare_display);
+
 #endif /* __APPLE_IOMFB_V26_6_H__ */
