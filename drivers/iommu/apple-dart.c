@@ -33,6 +33,7 @@
 #include <linux/slab.h>
 #include <linux/swab.h>
 #include <linux/types.h>
+#include <linux/soc/apple/dart.h>
 
 #include "dma-iommu.h"
 
@@ -1903,6 +1904,104 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.ttbr_shift = DART_T8110_TTBR_SHIFT,
 	.ttbr_count = 1,
 };
+
+/* Opt-in DCP retention: locked T8132 tables survive domain gating. */
+static int apple_dart_retained_cfg(struct device *dev,
+				 struct apple_dart_master_cfg **out)
+{
+	struct apple_dart_master_cfg *cfg;
+	struct apple_dart_stream_map *map;
+	int i;
+
+	if (!dev->iommu || !dev->iommu->iommu_dev ||
+	    dev->iommu->iommu_dev->ops != &apple_dart_iommu_ops)
+		return -ENODEV;
+	cfg = dev_iommu_priv_get(dev);
+	if (!cfg)
+		return -ENODEV;
+	for_each_stream_map(i, cfg, map) {
+		if (!of_device_is_compatible(map->dart->dev->of_node, "apple,t8132-dart") ||
+		    map->dart->hw->type != DART_T8110 || !map->dart->locked)
+			return -EOPNOTSUPP;
+	}
+	*out = cfg;
+	return 0;
+}
+
+int apple_dart_retained_streams(struct device *dev, bool enable)
+{
+	struct apple_dart_master_cfg *cfg;
+	struct apple_dart_stream_map *map;
+	unsigned int sid;
+	int i, ret = apple_dart_retained_cfg(dev, &cfg);
+
+	if (ret)
+		return ret;
+	for_each_stream_map(i, cfg, map) {
+		struct apple_dart *dart = map->dart;
+
+		for_each_set_bit(sid, map->sidmap, dart->num_streams) {
+			unsigned int idx;
+			u32 tcr = readl(dart->regs + DART_TCR(dart, sid));
+
+			if (enable && tcr != dart->save_tcr[sid])
+				return -ESTALE;
+			if (!enable)
+				dart->save_tcr[sid] = tcr;
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+				u32 ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
+
+				if (enable && ttbr != dart->save_ttbr[sid][idx])
+					return -ESTALE;
+				if (!enable)
+					dart->save_ttbr[sid][idx] = ttbr;
+			}
+		}
+		if (enable) {
+			/* Common interrupt state only. Never reset, write TCR/TTBR,
+			 * detach a domain, or replace a page-table allocation.
+			 */
+			writel(readl(dart->regs + dart->hw->error),
+			       dart->regs + dart->hw->error);
+			writel(0, dart->regs + DART_T8110_ERROR_MASK);
+			ret = dart->hw->invalidate_tlb(map);
+			if (ret)
+				return ret;
+		}
+		for_each_set_bit(sid, map->sidmap, dart->num_streams) {
+			u32 value, bit = BIT(sid % 32);
+			void __iomem *state = dart->regs + DART_T8110_ENABLE_STREAMS +
+					     4 * (sid / 32);
+
+			writel(bit, dart->regs + (enable ? DART_T8110_ENABLE_STREAMS :
+				 DART_T8110_DISABLE_STREAMS) + 4 * (sid / 32));
+			ret = readl_poll_timeout_atomic(state, value,
+						!!(value & bit) == enable, 1, 100);
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_retained_streams);
+
+int apple_dart_retained_state(struct device *dev, u32 *enabled)
+{
+	struct apple_dart_master_cfg *cfg;
+	struct apple_dart_stream_map *map;
+	unsigned int sid;
+	int i, ret = apple_dart_retained_cfg(dev, &cfg);
+
+	if (ret)
+		return ret;
+	*enabled = 0;
+	for_each_stream_map(i, cfg, map)
+		for_each_set_bit(sid, map->sidmap, map->dart->num_streams)
+			*enabled |= readl(map->dart->regs + DART_T8110_ENABLE_STREAMS +
+					4 * (sid / 32)) & BIT(sid % 32);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_retained_state);
 
 static __maybe_unused int apple_dart_suspend(struct device *dev)
 {
