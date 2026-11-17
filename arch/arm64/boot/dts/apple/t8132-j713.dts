@@ -300,3 +300,18 @@
 &ps_isp_sys {
 	/delete-property/ apple,always-on;
 };
+
+/* Experimental explicit ownership for primary-engine screen-off cycling. */
+&dcp {
+	power-domains = <&ps_disp_fe>, <&ps_disp_cpu>;
+	power-domain-names = "fe", "cpu";
+};
+&ps_disp_cpu {
+	status = "okay";
+};
+&ps_disp_fe {
+	/delete-property/ apple,always-on;
+};
+&ps_disp_sys {
+	/delete-property/ apple,always-on;
+};
