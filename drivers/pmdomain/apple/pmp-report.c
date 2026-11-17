@@ -14,6 +14,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
@@ -153,6 +154,20 @@ int apple_pmp_report_wait_ready(struct device *dev, unsigned long timeout_us)
 				 status & PMP_REPORT_READY, 1000, timeout_us);
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
+
+int apple_pmp_report_snapshot(struct device *dev, u64 *target, u64 *actual, u64 *status)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	if (!rep)
+		return -EPROBE_DEFER;
+	*target = readq(rep->base + rep->offsets->tgt_read);
+	*actual = readq(rep->base + rep->offsets->actual);
+	*status = readq(rep->base + rep->offsets->status);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_snapshot);
+
 
 static void apple_pmp_report_finalize_work(struct work_struct *work)
 {
@@ -523,6 +538,83 @@ static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 	return apple_pmp_report_set_state(genpd, false);
 }
 
+struct apple_pmp_idle_owner {
+	struct apple_pmp_report_entry *entry;
+	struct platform_device *pdev;
+};
+
+static void apple_pmp_idle_owner_release(void *data)
+{
+	struct apple_pmp_idle_owner *owner = data;
+	struct generic_pm_domain *genpd = &owner->entry->genpd;
+	unsigned long flags;
+
+	pm_runtime_resume_and_get(&owner->pdev->dev);
+	spin_lock_irqsave(&genpd->slock, flags);
+	genpd->flags |= GENPD_FLAG_ALWAYS_ON;
+	spin_unlock_irqrestore(&genpd->slock, flags);
+	pm_runtime_disable(&owner->pdev->dev);
+	pm_genpd_remove_device(&owner->pdev->dev);
+	platform_device_unregister(owner->pdev);
+}
+
+struct device *devm_apple_pmp_report_idle_owner(struct device *dev,
+					     struct device_node *node)
+{
+	struct apple_pmp_idle_owner *owner;
+	struct platform_device *provider;
+	struct apple_pmp_report_entry *ent;
+	unsigned long flags;
+	int ret;
+
+	/* Air's unasserted report needs no new vote; preserve its policy. */
+	if (!node || !of_property_read_bool(node, "apple,always-on"))
+		return NULL;
+	if (!of_device_is_compatible(node, "apple,t6000-pmp-v2-report-entry"))
+		return ERR_PTR(-EINVAL);
+	provider = of_find_device_by_node(node);
+	if (!provider)
+		return ERR_PTR(-EPROBE_DEFER);
+	ent = platform_get_drvdata(provider);
+	put_device(&provider->dev);
+	if (!ent)
+		return ERR_PTR(-EPROBE_DEFER);
+	owner = devm_kzalloc(dev, sizeof(*owner), GFP_KERNEL);
+	if (!owner)
+		return ERR_PTR(-ENOMEM);
+	owner->entry = ent;
+	owner->pdev = platform_device_alloc("apple-dcpext-idle-vote", PLATFORM_DEVID_AUTO);
+	if (!owner->pdev)
+		return ERR_PTR(-ENOMEM);
+	owner->pdev->dev.parent = ent->dev;
+	ret = platform_device_add(owner->pdev);
+	if (ret)
+		goto put;
+	ret = pm_genpd_add_device(&ent->genpd, &owner->pdev->dev);
+	if (ret)
+		goto del;
+	pm_runtime_get_noresume(&owner->pdev->dev);
+	ret = pm_runtime_set_active(&owner->pdev->dev);
+	if (ret)
+		goto detach;
+	pm_runtime_enable(&owner->pdev->dev);
+	/* An active registered consumer replaces ALWAYS_ON, under the genpd lock. */
+	spin_lock_irqsave(&ent->genpd.slock, flags);
+	ent->genpd.flags &= ~GENPD_FLAG_ALWAYS_ON;
+	spin_unlock_irqrestore(&ent->genpd.slock, flags);
+	ret = devm_add_action_or_reset(dev, apple_pmp_idle_owner_release, owner);
+	return ret ? ERR_PTR(ret) : &owner->pdev->dev;
+detach:
+	pm_runtime_put_noidle(&owner->pdev->dev);
+	pm_genpd_remove_device(&owner->pdev->dev);
+del:
+	platform_device_del(owner->pdev);
+put:
+	platform_device_put(owner->pdev);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(devm_apple_pmp_report_idle_owner);
+
 static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -601,6 +693,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 
 	pm_genpd_remove_device(dev);
+	platform_set_drvdata(pdev, ent);
 
 	return 0;
 err_remove:
