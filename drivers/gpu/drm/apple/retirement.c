@@ -548,12 +548,16 @@ static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 		return idle_failure(idle, ret);
 	idle_unblock_rpc(idle);
 	idle_stage(idle, "retained-DPTX-service");
-	if (!dcp->active || !dcp->dptxport[0].service)
+	if (!dcp->active)
 		return idle_failure(idle, -ENODEV);
-	ret = dptxport_validate_connection(dcp->dptxport[0].service, 0,
-					 dcp->dptx_phy, dcp->dptx_die);
-	if (ret)
-		return idle_failure(idle, ret);
+	if (!dcp_has_panel(dcp)) {
+		if (!dcp->dptxport[0].service)
+			return idle_failure(idle, -ENODEV);
+		ret = dptxport_validate_connection(dcp->dptxport[0].service, 0,
+						 dcp->dptx_phy, dcp->dptx_die);
+		if (ret)
+			return idle_failure(idle, ret);
+	}
 	ret = dcp_av_restart(dcp, idle->av_was_open);
 	if (ret)
 		return idle_failure(idle, ret);
