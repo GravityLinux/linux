@@ -5,6 +5,7 @@
  */
 
 #include "rtkit-internal.h"
+#include <linux/pm_runtime.h>
 
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
@@ -153,11 +154,13 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver);
 	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, want_ver);
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
+	complete_all(&rtk->hello_completion);
 
 	return;
 
 abort_boot:
 	rtk->boot_result = -EINVAL;
+	complete_all(&rtk->hello_completion);
 	complete_all(&rtk->epmap_completion);
 }
 
@@ -187,10 +190,19 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	else
 		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 
+	/* Retained reconnect echoes the advertised map, including its bitmap. */
+	if (rtk->retained_boot)
+		reply = msg & ~APPLE_RTKIT_MGMT_TYPE;
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
 
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
+
+	/* Retained reconnect enumerates endpoints without starting them again.
+	 * Reissuing START_EP would renegotiate buffers the firmware still owns.
+	 */
+	if (rtk->retained_boot)
+		goto epmap_done;
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		if (apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_EARLY_CRASHLOG) &&
@@ -220,7 +232,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		}
 	}
 
-	rtk->boot_result = 0;
+epmap_done:
+	if (!rtk->retained_boot)
+		rtk->boot_result = 0;
 	complete_all(&rtk->epmap_completion);
 }
 
@@ -279,6 +293,17 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 {
 	u64 reply;
 	int err;
+
+	/* The retained macOS restart does not renegotiate shared memory. Stop
+	 * rather than overwrite an allocation still owned by the firmware.
+	 */
+	if (rtk->retained_boot && buffer->size) {
+		dev_err(rtk->dev, "retained restart: unexpected buffer request ep %#x\n", ep);
+		rtk->boot_result = -EPROTO;
+		complete_all(&rtk->epmap_completion);
+		complete_all(&rtk->iop_pwr_ack_completion);
+		return -EPROTO;
+	}
 
 	/* The different size vs. IOVA shifts look odd but are indeed correct this way */
 	if (ep == APPLE_RTKIT_EP_OSLOG) {
@@ -579,7 +604,6 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	struct apple_rtkit_rx_work *rtk_work =
 		container_of(work, struct apple_rtkit_rx_work, work);
 	struct apple_rtkit *rtk = rtk_work->rtk;
-
 	switch (rtk_work->ep) {
 	case APPLE_RTKIT_EP_MGMT:
 		apple_rtkit_management_rx(rtk, rtk_work->msg);
@@ -749,6 +773,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	init_completion(&rtk->crashlog_completion);
 
 	init_completion(&rtk->epmap_completion);
+	init_completion(&rtk->hello_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1017,6 +1042,8 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 			rtk->iop_power_state, ret);
 		return ret;
 	}
+	if (rtk->retained_boot && rtk->iop_power_state != APPLE_RTKIT_PWR_STATE_ON)
+		return -EPROTO;
 	if (apple_rtkit_has_quirk(rtk, APPLE_RTKIT_QUIRK_EARLY_CRASHLOG)) {
 		ret = apple_rtkit_wait_for_completion(&rtk->crashlog_completion);
 		if (ret) {
@@ -1025,7 +1052,7 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 		}
 	}
 
-	if (rtk->skip_boot_ap_power) {
+	if (rtk->skip_boot_ap_power && !rtk->retained_boot) {
 		rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
 		return 0;
 	}
@@ -1073,25 +1100,92 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poweroff);
 
+int apple_rtkit_idle_ap(struct apple_rtkit *rtk)
+{
+	int ret;
+	ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_ap);
+
+int apple_rtkit_idle_iop(struct apple_rtkit *rtk)
+{
+	int ret;
+	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_iop);
+
+void apple_rtkit_power_state(struct apple_rtkit *rtk, u32 *ap, u32 *iop)
+{
+	*ap = READ_ONCE(rtk->ap_power_state);
+	*iop = READ_ONCE(rtk->iop_power_state);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_power_state);
+
 int apple_rtkit_idle(struct apple_rtkit *rtk)
+{
+	int ret = apple_rtkit_idle_ap(rtk);
+
+	return ret ? ret : apple_rtkit_idle_iop(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle);
+
+static int apple_rtkit_park_state(struct apple_rtkit *rtk, u32 iop)
+{
+	if (rtk->crashed || rtk->iop_power_state != iop ||
+	    rtk->ap_power_state != APPLE_RTKIT_PWR_STATE_IDLE)
+		return -EBUSY;
+	apple_mbox_stop_retained(rtk->mbox);
+	flush_workqueue(rtk->wq);
+	pm_runtime_barrier(rtk->mbox->dev);
+	/* The client's active supplier link may still hold the mailbox domain.
+	 * Park reception now; the client drops that vote after clearing RUN.
+	 */
+	return 0;
+}
+int apple_rtkit_park(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_park_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_park);
+
+int apple_rtkit_rearm_retained(struct apple_rtkit *rtk)
+{
+	if (rtk->mbox->active || rtk->crashed ||
+	    rtk->iop_power_state != APPLE_RTKIT_PWR_STATE_IDLE ||
+	    rtk->ap_power_state != APPLE_RTKIT_PWR_STATE_IDLE)
+		return -EBUSY;
+	/* RUN is still clear. Rearm management only, never free shared buffers. */
+	reinit_completion(&rtk->hello_completion);
+	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+	bitmap_clear(rtk->endpoints, 0, APPLE_RTKIT_APP_ENDPOINT_START);
+	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+	rtk->boot_result = 0;
+	rtk->retained_boot = true;
+	return apple_mbox_start_retained(rtk->mbox);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_rearm_retained);
+
+int apple_rtkit_boot_retained(struct apple_rtkit *rtk)
 {
 	int ret;
 
-	/* if OFF is used here the co-processor will not wake up again */
-	ret = apple_rtkit_set_ap_power_state(rtk,
-					     APPLE_RTKIT_PWR_STATE_IDLE);
+	if (!rtk->retained_boot)
+		return -EINVAL;
+	ret = apple_rtkit_wait_for_completion(&rtk->hello_completion);
 	if (ret)
 		return ret;
-
-	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
-	if (ret)
-		return ret;
-
-	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
-	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
-	return 0;
+	ret = apple_rtkit_boot(rtk);
+	if (!ret && !apple_rtkit_is_running(rtk))
+		ret = -EPROTO;
+	if (!ret)
+		rtk->retained_boot = false;
+	return ret;
 }
-EXPORT_SYMBOL_GPL(apple_rtkit_idle);
+EXPORT_SYMBOL_GPL(apple_rtkit_boot_retained);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {

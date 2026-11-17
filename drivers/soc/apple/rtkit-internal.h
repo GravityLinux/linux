@@ -33,6 +33,8 @@ struct apple_rtkit {
 	struct apple_mbox *mbox;
 
 	struct completion epmap_completion;
+	struct completion hello_completion;
+	bool retained_boot;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
 

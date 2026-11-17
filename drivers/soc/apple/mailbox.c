@@ -32,6 +32,7 @@
 #include <linux/types.h>
 #include "mailbox.h"
 
+
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_ASC_MBOX_CONTROL_EMPTY BIT(17)
 #define APPLE_ASC_MBOX_CONTROL_ENABLE BIT(0)
@@ -157,7 +158,6 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 	writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
 	writeq_relaxed(FIELD_PREP(APPLE_MBOX_MSG1_MSG, msg.msg1),
 		       mbox->regs + mbox->hw->a2i_send1);
-
 	spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 	return 0;
@@ -195,7 +195,6 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 		msg.msg1 = FIELD_GET(
 			APPLE_MBOX_MSG1_MSG,
 			readq_relaxed(mbox->regs + mbox->hw->i2a_recv1));
-
 		mbox->rx(mbox, msg, mbox->cookie);
 		ret++;
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
@@ -241,7 +240,7 @@ int apple_mbox_poll(struct apple_mbox *mbox)
 }
 EXPORT_SYMBOL(apple_mbox_poll);
 
-int apple_mbox_start(struct apple_mbox *mbox)
+static int __apple_mbox_start(struct apple_mbox *mbox, bool retained)
 {
 	int ret;
 
@@ -259,7 +258,7 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	 * FIFO.  Native clients reset only OUTBOX (I2A) here; resetting A2I would
 	 * race the IOP-owned read pointer and could discard an AP message.
 	 */
-	if (of_property_read_bool(mbox->dev->of_node,
+	if (retained || of_property_read_bool(mbox->dev->of_node,
 				  "apple,reset-recv-fifo-on-start")) {
 		writel_relaxed(APPLE_ASC_MBOX_CONTROL_EMPTY |
 			       APPLE_ASC_MBOX_CONTROL_ENABLE,
@@ -285,7 +284,19 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	mbox->active = true;
 	return 0;
 }
+int apple_mbox_start(struct apple_mbox *mbox)
+{
+	return __apple_mbox_start(mbox, false);
+}
 EXPORT_SYMBOL(apple_mbox_start);
+
+int apple_mbox_start_retained(struct apple_mbox *mbox)
+{
+	if (mbox->hw->i2a_control != APPLE_ASC_MBOX_I2A_CONTROL)
+		return -EOPNOTSUPP;
+	return __apple_mbox_start(mbox, true);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_start_retained);
 
 void apple_mbox_stop(struct apple_mbox *mbox)
 {
@@ -298,6 +309,25 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 	pm_runtime_put_autosuspend(mbox->dev);
 }
 EXPORT_SYMBOL(apple_mbox_stop);
+
+
+void apple_mbox_stop_retained(struct apple_mbox *mbox)
+{
+	u32 ctrl;
+
+	if (!mbox->active)
+		return;
+	/* Preserve the drained FIFO pointers; only clear ENABLE before RUN. */
+	ctrl = readl(mbox->regs + mbox->hw->i2a_control);
+	writel(ctrl & ~APPLE_ASC_MBOX_CONTROL_ENABLE,
+	       mbox->regs + mbox->hw->i2a_control);
+	readl(mbox->regs + mbox->hw->i2a_control);
+	mbox->active = false;
+	disable_irq(mbox->irq_recv_not_empty);
+	pm_runtime_mark_last_busy(mbox->dev);
+	pm_runtime_put_autosuspend(mbox->dev);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_stop_retained);
 
 struct apple_mbox *apple_mbox_get(struct device *dev, int index)
 {

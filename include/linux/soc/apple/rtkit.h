@@ -171,6 +171,15 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
  * Put the co-processor into idle mode
  */
 int apple_rtkit_idle(struct apple_rtkit *rtk);
+int apple_rtkit_idle_ap(struct apple_rtkit *rtk);
+int apple_rtkit_idle_iop(struct apple_rtkit *rtk);
+void apple_rtkit_power_state(struct apple_rtkit *rtk, u32 *ap, u32 *iop);
+
+/* Park an acknowledged IDLE transport without freeing endpoint/buffer state. */
+int apple_rtkit_park(struct apple_rtkit *rtk);
+/* Rearm with CPU stopped, then wait for firmware Hello after RUN. */
+int apple_rtkit_rearm_retained(struct apple_rtkit *rtk);
+int apple_rtkit_boot_retained(struct apple_rtkit *rtk);
 
 /*
  * Checks if RTKit is running and ready to handle messages.
