@@ -811,14 +811,16 @@ int dcp_retirement_init(struct apple_dcp *dcp)
 	if (!dcp_retirement_policy_enabled() || !dcp->cpu_pm_dev ||
 	    dcp->fw_compat != DCP_FIRMWARE_V_26_6 ||
 	    (!of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext") &&
-	     !(of_machine_is_compatible("apple,j773g") &&
+	     !((of_machine_is_compatible("apple,j773g") ||
+	       of_machine_is_compatible("apple,j713")) &&
 	       of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcp"))))
 		return 0;
 	idle = devm_kzalloc(dcp->dev, sizeof(*idle), GFP_KERNEL);
 	if (!idle)
 		return -ENOMEM;
 	idle->dcp = dcp;
-	idle->primary = of_machine_is_compatible("apple,j773g") &&
+	idle->primary = (of_machine_is_compatible("apple,j773g") ||
+	       of_machine_is_compatible("apple,j713")) &&
 		of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcp");
 	idle_stage(idle, "booting");
 	spin_lock_init(&idle->rpc_lock);
