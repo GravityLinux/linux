@@ -73,6 +73,7 @@ enum {
 
 #define APPLE_RTKIT_OSLOG_TYPE GENMASK_ULL(63, 56)
 #define APPLE_RTKIT_OSLOG_BUFFER_REQUEST 1
+#define APPLE_RTKIT_OSLOG_NOTIFY 2
 #define APPLE_RTKIT_OSLOG_SIZE GENMASK_ULL(55, 36)
 #define APPLE_RTKIT_OSLOG_IOVA GENMASK_ULL(35, 0)
 
@@ -592,6 +593,10 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
 						 APPLE_RTKIT_EP_OSLOG, msg);
+		break;
+	case APPLE_RTKIT_OSLOG_NOTIFY:
+		/* DCP expects the notification word back even without a log reader. */
+		apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG, msg, NULL, false);
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
