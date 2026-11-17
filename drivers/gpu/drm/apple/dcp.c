@@ -995,7 +995,10 @@ static void dcp_hdcp_service_init(struct apple_epic_service *service,
 	 */
 	if (service->channel == 1 || service->channel == 3) {
 		dcp->hdcp_service[service->channel >> 1] = service;
-		if (dcp->hdcp_service[0] && dcp->hdcp_service[1])
+		if (dcp->hdcp_service[0] &&
+		    (dcp->hdcp_service[1] ||
+		     (dcp_has_panel(dcp) && !enable_hdcp &&
+		      dcp_retirement_transport_required(dcp))))
 			complete_all(&dcp->hdcp_ready);
 	}
 
