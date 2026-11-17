@@ -781,9 +781,7 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
 
-	apple_isp_video_resume(isp);
-
-	return 0;
+	return apple_isp_video_resume(isp);
 }
 
 static const struct dev_pm_ops apple_isp_pm_ops = {

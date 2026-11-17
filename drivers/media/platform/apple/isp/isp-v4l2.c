@@ -408,9 +408,17 @@ int apple_isp_video_suspend(struct apple_isp *isp)
 	 * STATE_STREAMING.
 	 */
 	if (test_bit(ISP_STATE_STREAMING, &isp->state)) {
-		/* Signal buffers to be recycled for clean shutdown */
-		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+		unsigned long flags;
+
 		apple_isp_stop_streaming(isp);
+		/* Keep ownership across sleep. Returning QUEUED buffers to vb2
+		 * empties our lists without re-running its buf_queue callback.
+		 * Firmware and IRQs are stopped now, so recycle the outstanding
+		 * buffers for the fresh firmware instance on resume.
+		 */
+		spin_lock_irqsave(&isp->buf_lock, flags);
+		list_splice_tail_init(&isp->bufs_submitted, &isp->bufs_pending);
+		spin_unlock_irqrestore(&isp->buf_lock, flags);
 		set_bit(ISP_STATE_SLEEPING, &isp->state);
 	}
 
@@ -420,8 +428,13 @@ int apple_isp_video_suspend(struct apple_isp *isp)
 int apple_isp_video_resume(struct apple_isp *isp)
 {
 	if (test_bit(ISP_STATE_SLEEPING, &isp->state)) {
+		int err;
+
 		clear_bit(ISP_STATE_SLEEPING, &isp->state);
-		apple_isp_start_streaming(isp);
+		err = apple_isp_start_streaming(isp);
+		if (err)
+			vb2_queue_error(&isp->vbq);
+		return err;
 	}
 
 	return 0;
