@@ -93,6 +93,14 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 					enum vb2_buffer_state state =
 						VB2_BUF_STATE_ERROR;
 
+					/* Shutdown returns unfilled buffers. Keep them
+					 * active across sleep for the next firmware boot.
+					 */
+					if (test_bit(ISP_STATE_SLEEPING, &isp->state)) {
+						list_move_tail(&buf->link, &isp->bufs_pending);
+						continue;
+					}
+
 					buf->vb.vb2_buf.timestamp =
 						ktime_get_ns();
 					buf->vb.sequence = isp->sequence++;
@@ -410,6 +418,7 @@ int apple_isp_video_suspend(struct apple_isp *isp)
 	if (test_bit(ISP_STATE_STREAMING, &isp->state)) {
 		unsigned long flags;
 
+		set_bit(ISP_STATE_SLEEPING, &isp->state);
 		apple_isp_stop_streaming(isp);
 		/* Keep ownership across sleep. Returning QUEUED buffers to vb2
 		 * empties our lists without re-running its buf_queue callback.
@@ -419,7 +428,6 @@ int apple_isp_video_suspend(struct apple_isp *isp)
 		spin_lock_irqsave(&isp->buf_lock, flags);
 		list_splice_tail_init(&isp->bufs_submitted, &isp->bufs_pending);
 		spin_unlock_irqrestore(&isp->buf_lock, flags);
-		set_bit(ISP_STATE_SLEEPING, &isp->state);
 	}
 
 	return 0;
