@@ -744,7 +744,12 @@ static int idle_show(struct seq_file *m, void *data)
 		}
 	}
 #endif
-	if ((fe & 0xf0) == 0xf0) {
+	/* A failed transition can leave FE on after the CPU is already off.
+	 * FE alone does not make the ASC registers accessible. Only inspect
+	 * the island while the ready engine owns its normal power votes.
+	 */
+	if (idle->state == DCP_IDLE_READY &&
+	    (cpu & 0xf0) == 0xf0 && (fe & 0xf0) == 0xf0) {
 		u32 fw, scanout;
 
 		seq_printf(m, "CPU_CONTROL=%#x\n", readl(dcp->coproc_reg + DCP_CPU_CONTROL));
