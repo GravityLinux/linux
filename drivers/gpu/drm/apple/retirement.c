@@ -293,20 +293,19 @@ static int idle_resume_endpoints(struct apple_dcp *dcp)
 	return 0;
 }
 
-static int idle_check_domains(struct dcp_retirement *idle)
+static int idle_check_cpu_off(struct dcp_retirement *idle)
 {
-	u32 cpu, fe, sys;
+	u32 cpu;
 	int ret;
 
 	ret = apple_pmgr_read_state(idle->cpu_node, &cpu);
-	if (!ret)
-		ret = apple_pmgr_read_state(idle->fe_node, &fe);
-	if (!ret)
-		ret = apple_pmgr_read_state(idle->sys_node, &sys);
 	if (ret)
 		return ret;
-	/* These registers remain accessible with the display island off. */
-	return ((cpu | fe | sys) & 0xff) ? -EBUSY : 0;
+	/* FE/SYS are shared with mapping contexts and other domain consumers.
+	 * Our votes have been released; genpd can switch them off once the
+	 * remaining consumers idle. Only the engine CPU must be off here.
+	 */
+	return (cpu & 0xff) ? -EBUSY : 0;
 }
 
 /* Shared display requests are serialized by the display-engine pool lock.
@@ -471,7 +470,7 @@ static int idle_retire_locked(struct apple_dcp *dcp)
 	ret = pm_runtime_put_sync_suspend(dcp->dev);
 	if (ret < 0)
 		return idle_failure(idle, ret);
-	ret = read_poll_timeout(idle_check_domains, ret, !ret, 1000, 1000000, false, idle);
+	ret = read_poll_timeout(idle_check_cpu_off, ret, !ret, 1000, 1000000, false, idle);
 	if (ret)
 		return idle_failure(idle, ret);
 	idle->state = DCP_IDLE_RETIRED;
