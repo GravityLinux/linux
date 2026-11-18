@@ -1394,7 +1394,7 @@ int dcp_start(struct platform_device *pdev)
 				return dev_err_probe(dcp->dev, ret,
 						     "Failed to activate first HDCP controller\n");
 		}
-		if (v26_6 && (enable_dpavctrl ||
+		if (v26_6 && (enable_dpavctrl || dcp_typec_managed(dcp) ||
 			     dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140)) {
 			/*
 			 * DPAV owns link-control services used during ordinary plug and
