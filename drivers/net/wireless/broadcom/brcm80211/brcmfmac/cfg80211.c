@@ -2272,7 +2272,8 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 			akm == WLAN_AKM_SUITE_FT_OVER_SAE;
 
 		if (params->crypto.psk && !is_sae_akm &&
-		    profile->use_fwsup != BRCMF_PROFILE_FWSUP_SAE) {
+		    profile->use_fwsup != BRCMF_PROFILE_FWSUP_SAE &&
+		    profile->use_fwsup != BRCMF_PROFILE_FWSUP_PSK) {
 			if (WARN_ON(profile->use_fwsup !=
 				    BRCMF_PROFILE_FWSUP_NONE)) {
 				err = -EINVAL;
@@ -2291,7 +2292,8 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		} else {
 			err = brcmf_fil_iovar_int_set(ifp, "sup_wpa", 0);
 		}
-		if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK)
+		if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK &&
+		    params->crypto.psk)
 			err = brcmf_set_pmk(ifp, params->crypto.psk,
 					    BRCMF_WSEC_MAX_PSK_LEN);
 		else if (profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE &&
