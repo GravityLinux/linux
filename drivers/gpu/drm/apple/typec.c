@@ -135,11 +135,13 @@ static int fixed_dp_show(struct seq_file *m, void *data)
 {
 	struct apple_fixed_dp *port = m->private;
 	dcp_lifecycle_lock();
-	seq_printf(m, "engine=%s atc=%u source=%u static=1 ready=%u hpd=%u irq=%u mode=%#lx connected=%u error=%d\n",
+	seq_printf(m, "engine=%s atc=%u source=%u static=1 ready=%u hpd=%u irq=%u mode=%#lx connected=%u last_lanes=%u last_rate_Mbps=%u error=%d\n",
 		dev_name(port->dcp->dev), port->target, port->source,
 		port->dcp->typec_routing_ready, READ_ONCE(port->hpd),
 		READ_ONCE(port->irq), READ_ONCE(port->mode),
-		port->dcp->dptxport[0].connected, port->error);
+		port->dcp->dptxport[0].connected,
+		port->dcp->dptxport[0].lane_count,
+		port->dcp->dptxport[0].phy_ops.dp.link_rate, port->error);
 	dcp_lifecycle_unlock();
 	return 0;
 }

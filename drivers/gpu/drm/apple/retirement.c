@@ -313,7 +313,7 @@ static int idle_check_cpu_off(struct dcp_retirement *idle)
 	return (cpu & 0xff) ? -EBUSY : 0;
 }
 
-/* Shared display requests are serialized by the display-engine pool lock.
+/* Shared display requests are serialized by the lifecycle mutex.
  * Preserve other engines' votes; the notification is the request population.
  */
 static int idle_shared_lifecycle(struct dcp_retirement *idle, bool on)
