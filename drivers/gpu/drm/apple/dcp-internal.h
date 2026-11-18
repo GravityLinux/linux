@@ -40,7 +40,7 @@ static inline u64 dcp_read_firmware_time(void)
 }
 
 struct apple_dcp;
-struct apple_typec_port;
+struct apple_fixed_dp;
 struct dcp_retirement;
 struct apple_dcp_afkep;
 
@@ -329,10 +329,9 @@ struct apple_dcp {
 	/* these fields are output port specific */
 	struct phy *phy;
 	struct mux_control *xbar;
-	/* Direct-DP pool ownership is protected by typec.c. */
-	struct apple_typec_port *typec_port;
+	/* Permanent Type-C wiring, protected by the lifecycle mutex. */
+	struct apple_fixed_dp *fixed_dp;
 	bool typec_routing_ready;
-	u32 typec_xbar_source;
 	struct typec_mux *typec_mux;
 	/* Type-C notifications can precede RTKit/IOMFB startup. */
 	struct typec_mux_dev *typec_hpd_mux;
@@ -378,11 +377,12 @@ static inline bool dcp_fw_is_26_6(const struct apple_dcp *dcp)
 
 static inline bool dcp_typec_managed(const struct apple_dcp *dcp)
 {
-	return READ_ONCE(dcp->typec_port) ||
+	return READ_ONCE(dcp->fixed_dp) ||
 	       of_property_present(dcp->dev->of_node, "apple,typec-connector") ||
 	       of_property_present(dcp->dev->of_node, "apple,dp-altmode");
 }
 
 void dcp_typec_set_ready(struct apple_dcp *dcp, bool ready);
+bool dcp_fixed_dp_hpd(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

@@ -545,7 +545,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
-	if (dcp->typec_port) {
+	if (dcp->fixed_dp) {
 		union phy_configure_opts limits = {};
 
 		ret = phy_validate(dcp->phy, PHY_MODE_DP, 0, &limits);
@@ -1463,9 +1463,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	if (dcp_retirement_is_primary(dcp)) {
-		dcp_typec_pool_lock();
+		dcp_lifecycle_lock();
 		dcp_retirement_ready_locked(dcp);
-		dcp_typec_pool_unlock();
+		dcp_lifecycle_unlock();
 	}
 	dcp_typec_set_ready(dcp, true);
 	if (dcp->typec_hpd_mux) {
@@ -2271,14 +2271,6 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 
-	if (of_property_present(dev->of_node, "apple,dp-xbar-source")) {
-		u32 source;
-
-		if (of_property_read_u32(dev->of_node, "apple,dp-xbar-source", &source) ||
-		    source > 8)
-			return -EINVAL;
-		dcp->typec_xbar_source = source;
-	}
 	platform_set_drvdata(pdev, dcp);
 	{
 		int ret = dcp_attach_power_domains(dcp);

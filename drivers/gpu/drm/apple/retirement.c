@@ -55,6 +55,7 @@ struct dcp_retirement {
 	unsigned int rpc_count;
 	bool rpc_blocked, ever_used, stopping, pm_held, piodma_held, av_was_open;
 	bool primary, logical_off, manual_disable, resume_retired, hpd_parked;
+	bool retained_client;
 	enum dcp_idle_state state;
 	const char *stage;
 	int error;
@@ -98,7 +99,8 @@ bool dcp_retirement_logically_off(struct apple_dcp *dcp)
 
 bool dcp_retirement_retained_display(struct apple_dcp *dcp)
 {
-	return dcp_retirement_is_primary(dcp) && dcp->retirement->retire_count;
+	return dcp->retirement && dcp->retirement->retire_count &&
+		(dcp->retirement->primary || dcp->retirement->retained_client);
 }
 
 bool dcp_retirement_display_was_used(struct apple_dcp *dcp)
@@ -194,10 +196,13 @@ static bool idle_eligible(struct apple_dcp *dcp)
 {
 	struct dcp_retirement *idle = dcp->retirement;
 
-	return idle && !idle->stopping && !dcp->typec_port &&
+	return idle && !idle->stopping &&
 		(idle->primary ? (READ_ONCE(idle->logical_off) && dcp->crtc &&
 		 !dcp->crtc->base.state->active) :
-		 (!READ_ONCE(idle->ever_used) && !dcp->phy)) &&
+		 (dcp->fixed_dp ? (!dcp_fixed_dp_hpd(dcp) &&
+		 !dcp->dptxport[0].connected && dcp->crtc &&
+		 !dcp->crtc->base.state->active) :
+		 (!READ_ONCE(idle->ever_used) && !dcp->phy))) &&
 		!dcp->crashed && dcp->active &&
 		!dcp->valid_mode && !dcp->during_modeset &&
 		(idle->primary || !READ_ONCE(dcp->connector->connected)) &&
@@ -400,7 +405,8 @@ static int idle_retire_locked(struct apple_dcp *dcp)
 	if (ret)
 		goto abort_quiesce;
 	idle_stage(idle, idle->primary ? "display-state-off/A500" : "engine-power/A500");
-	ret = iomfb_retained_display_off_v26_6_0(dcp, idle->primary && idle->ever_used);
+	ret = iomfb_retained_display_off_v26_6_0(dcp,
+		(idle->primary || dcp->fixed_dp) && idle->ever_used);
 	if (ret)
 		return idle_failure(idle, ret);
 	idle_stage(idle, "block-RPC");
@@ -473,6 +479,7 @@ static int idle_retire_locked(struct apple_dcp *dcp)
 	ret = read_poll_timeout(idle_check_cpu_off, ret, !ret, 1000, 1000000, false, idle);
 	if (ret)
 		return idle_failure(idle, ret);
+	idle->retained_client = dcp->fixed_dp && idle->ever_used;
 	idle->state = DCP_IDLE_RETIRED;
 	idle_stage(idle, "off");
 	idle->retire_count++;
@@ -496,7 +503,7 @@ static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 		return 0;
 	if (idle->state != DCP_IDLE_RETIRED)
 		return -EHOSTDOWN;
-	if (!system_resume && dcp_typec_pool_sleeping())
+	if (!system_resume && dcp_lifecycle_sleeping())
 		return -EBUSY;
 	idle->state = DCP_IDLE_WAKING;
 	idle_stage(idle, "SYS/FE-on");
@@ -565,10 +572,10 @@ static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 	idle->restart_count++;
 	if (!idle->primary)
 		mod_delayed_work(system_unbound_wq, &idle->work, DCP_IDLE_GRACE);
-	if (idle->primary) {
+	if (idle->primary)
 		idle->logical_off = false;
+	if (idle->primary || dcp->fixed_dp)
 		dcp->hotplug_keepalive = false;
-	}
 	if (idle->hpd_parked) {
 		enable_irq(dcp->hdmi_hpd_irq);
 		idle->hpd_parked = false;
@@ -589,12 +596,12 @@ static void idle_work(struct work_struct *work)
 						 struct dcp_retirement, work);
 	int ret;
 
-	dcp_typec_pool_lock();
+	dcp_lifecycle_lock();
 	ret = idle_retire_locked(idle->dcp);
 	if (ret == -EBUSY && !idle->stopping && !idle->ever_used &&
 	    idle->state == DCP_IDLE_READY)
 		mod_delayed_work(system_unbound_wq, &idle->work, DCP_IDLE_GRACE);
-	dcp_typec_pool_unlock();
+	dcp_lifecycle_unlock();
 }
 
 void dcp_retirement_ready_locked(struct apple_dcp *dcp)
@@ -609,7 +616,7 @@ void dcp_retirement_ready_locked(struct apple_dcp *dcp)
 
 void dcp_retirement_unplug_locked(struct apple_dcp *dcp)
 {
-	/* A previously claimed engine is intentionally ineligible for now. */
+	/* Fixed outputs become eligible after HPD and the CRTC are both off. */
 	if (dcp->retirement && !dcp->retirement->primary &&
 	    !dcp->retirement->stopping)
 		mod_delayed_work(system_unbound_wq, &dcp->retirement->work, DCP_IDLE_GRACE);
@@ -621,16 +628,17 @@ int dcp_retirement_suspend(struct apple_dcp *dcp)
 	int ret;
 
 	/* Keep the existing after-real-use workaround until it is qualified. */
-	if (!idle || READ_ONCE(idle->ever_used) || dcp->typec_port)
+	if (!idle || (READ_ONCE(idle->ever_used) && !dcp->fixed_dp) ||
+	    dcp_fixed_dp_hpd(dcp))
 		return 0;
 	if (idle->primary && dcp->crtc && !dcp->crtc->base.state->active &&
 	    !READ_ONCE(dcp->connector->connected))
 		WRITE_ONCE(idle->logical_off, true);
-	dcp_typec_pool_lock();
+	dcp_lifecycle_lock();
 	ret = idle_retire_locked(dcp);
 	if (!ret)
 		idle->resume_retired = true;
-	dcp_typec_pool_unlock();
+	dcp_lifecycle_unlock();
 	return ret ? ret : 1;
 }
 
@@ -641,12 +649,12 @@ int dcp_retirement_resume(struct apple_dcp *dcp)
 
 	if (!idle || !idle->resume_retired)
 		return 0;
-	dcp_typec_pool_lock();
+	dcp_lifecycle_lock();
 	/* Pool claims stay blocked until PM_POST_SUSPEND, after device resume. */
 	ret = idle_restart_locked(dcp, true);
 	if (!ret)
 		idle->resume_retired = false;
-	dcp_typec_pool_unlock();
+	dcp_lifecycle_unlock();
 	return ret ? ret : 1;
 }
 
@@ -700,7 +708,7 @@ static int idle_show(struct seq_file *m, void *data)
 	struct dcp_retirement *idle = dcp->retirement;
 	u32 cpu = 0, fe = 0, sys = 0, ap, iop;
 
-	dcp_typec_pool_lock();
+	dcp_lifecycle_lock();
 	apple_rtkit_power_state(dcp->rtk, &ap, &iop);
 	seq_printf(m, "RTKit_AP=%#x IOP=%#x\n", ap, iop);
 	apple_pmgr_read_state(idle->cpu_node, &cpu);
@@ -756,7 +764,7 @@ static int idle_show(struct seq_file *m, void *data)
 		    !apple_dart_retained_state(&dcp->piodma->dev, &scanout))
 			seq_printf(m, "DART_enabled_fw=%#x scanout=%#x\n", fw, scanout);
 	}
-	dcp_typec_pool_unlock();
+	dcp_lifecycle_unlock();
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(idle);
@@ -775,7 +783,7 @@ static ssize_t idle_control_write(struct file *file, const char __user *buf,
 	command[len] = 0;
 	if (dcp_retirement_is_primary(dcp))
 		drm_modeset_lock_all(dcp->crtc->base.dev);
-	dcp_typec_pool_lock();
+	dcp_lifecycle_lock();
 	if (sysfs_streq(command, "prepare")) {
 		/* Explicit primary-output test only: arm the next DRM disable.
 		 * Ordinary DPMS and hot-unplug retain the existing keepalive path.
@@ -801,7 +809,7 @@ static ssize_t idle_control_write(struct file *file, const char __user *buf,
 		ret = dcp_retirement_restart_locked(dcp);
 	else
 		ret = -EINVAL;
-	dcp_typec_pool_unlock();
+	dcp_lifecycle_unlock();
 	if (dcp_retirement_is_primary(dcp))
 		drm_modeset_unlock_all(dcp->crtc->base.dev);
 	return ret ? ret : len;

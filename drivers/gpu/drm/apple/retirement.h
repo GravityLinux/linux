@@ -29,8 +29,8 @@ int dcp_retirement_mapping_context(struct device *dev);
 int dcp_retirement_rpc_get(struct apple_dcp *dcp);
 void dcp_retirement_rpc_put(struct apple_dcp *dcp);
 
-/* Existing pool lock also serializes lifecycle transitions; never used in IRQ. */
-void dcp_typec_pool_lock(void);
-void dcp_typec_pool_unlock(void);
-bool dcp_typec_pool_sleeping(void);
+/* Serialize the fixed outputs and their lifecycle; never used in IRQ. */
+void dcp_lifecycle_lock(void);
+void dcp_lifecycle_unlock(void);
+bool dcp_lifecycle_sleeping(void);
 #endif

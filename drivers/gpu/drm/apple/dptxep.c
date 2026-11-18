@@ -342,7 +342,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);
 
 	/* A two-lane DP assignment cannot accept a cached four-lane request. */
-	if (dcp->typec_port && lane_count > dptx->lane_count) {
+	if (dcp->fixed_dp && lane_count > dptx->lane_count) {
 		retcode = 1;
 		lane_count = 0;
 		goto reply;
