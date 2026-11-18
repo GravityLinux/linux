@@ -315,3 +315,23 @@
 &ps_disp_sys {
 	/delete-property/ apple,always-on;
 };
+
+/*
+ * Fixed direct-DP routes for the J713 test. ADT HPM0 is left-front and
+ * HPM1 left-back; each ATC dpphy is direct DFP port 0. The external DCPs
+ * are UFP endpoints 1 and 2, stream 0 (crossbar sources 2 and 4).
+ * The Air macOS plug capture uses ATC0/source2 with external0.
+ */
+&dp_altmode0 {
+	compatible = "apple,t8132-fixed-dp";
+	/delete-property/ apple,display-engines;
+	apple,display-engine = <&dcpext0>;
+	mux-index = <2>;
+};
+
+&dp_altmode1 {
+	compatible = "apple,t8132-fixed-dp";
+	/delete-property/ apple,display-engines;
+	apple,display-engine = <&dcpext1>;
+	mux-index = <4>;
+};
