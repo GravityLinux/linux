@@ -24,18 +24,7 @@ config DRM_ASAHI
 	select RUST_DRM_GPUVM
 	select RUST_APPLE_RTKIT
 	help
-	  Rust DRM driver for Apple AGX GPUs in the M1 and M2 SoC families,
-	  M4, M4 Max, and A18 Pro (MacBook Neo). Device-tree matching selects
+	  Rust DRM driver for Apple AGX GPUs in M4, M4 Max and
+	  A18 Pro (MacBook Neo). Device-tree matching selects
 	  the appropriate firmware backend.
 
-config DRM_ASAHI_DEBUG_ALLOCATOR
-	bool "Use debug allocator"
-	depends on DRM_ASAHI
-	help
-	  Use an alternate, simpler allocator which significantly reduces
-	  performance, but can help find firmware- or GPU-side memory safety
-	  issues. However, it can also trigger firmware bugs more easily,
-	  so expect GPU crashes.
-
-	  Say N unless you are debugging firmware structures or porting to a
-	  new firmware version.
