@@ -194,7 +194,11 @@ static int fixed_dp_probe(struct platform_device *pdev)
 	if (!port->engine)
 		return -EPROBE_DEFER;
 	port->dcp = platform_get_drvdata(port->engine);
-	if (!port->dcp) { ret = -EPROBE_DEFER; goto put_engine; }
+	/* drvdata is published early; wait until probe stops assigning PHY state. */
+	if (!port->dcp || !device_is_bound(&port->engine->dev)) {
+		ret = -EPROBE_DEFER;
+		goto put_engine;
+	}
 	if (!device_link_add(dev, &port->engine->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
 		ret = -ENOMEM;
 		goto put_engine;
