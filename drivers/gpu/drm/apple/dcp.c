@@ -2191,6 +2191,10 @@ static void dcp_detach_power_domains(void *data)
 {
 	struct apple_dcp *dcp = data;
 
+	if (dcp->cpu_pm_link)
+		device_link_del(dcp->cpu_pm_link);
+	if (dcp->fe_pm_link)
+		device_link_del(dcp->fe_pm_link);
 	if (dcp->cpu_pm_dev) {
 		if (dcp->cpu_pm_held)
 			pm_runtime_put_noidle(dcp->cpu_pm_dev);
@@ -2229,15 +2233,22 @@ static int dcp_attach_power_domains(struct apple_dcp *dcp)
 	if (ret < 0)
 		goto err;
 	dcp->cpu_pm_held = true;
-	/* System-PM ordering only: lifecycle controls the runtime votes explicitly. */
-	if (!device_link_add(dcp->dev, dcp->fe_pm_dev, DL_FLAG_AUTOREMOVE_CONSUMER) ||
-	    !device_link_add(dcp->dev, dcp->cpu_pm_dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+	/*
+	 * System-PM ordering only: lifecycle controls the runtime votes
+	 * explicitly. The virtual domain devices never bind a driver, so a
+	 * managed link would stay dormant through probe; keep the links
+	 * stateless and drop them before the domains are detached.
+	 */
+	dcp->fe_pm_link = device_link_add(dcp->dev, dcp->fe_pm_dev, DL_FLAG_STATELESS);
+	dcp->cpu_pm_link = device_link_add(dcp->dev, dcp->cpu_pm_dev, DL_FLAG_STATELESS);
+	if (!dcp->fe_pm_link || !dcp->cpu_pm_link) {
 		ret = -ENOMEM;
 		goto err;
 	}
 	return devm_add_action_or_reset(dcp->dev, dcp_detach_power_domains, dcp);
 err:
 	dcp_detach_power_domains(dcp);
+	dcp->cpu_pm_link = dcp->fe_pm_link = NULL;
 	dcp->cpu_pm_dev = dcp->fe_pm_dev = NULL;
 	return ret;
 }

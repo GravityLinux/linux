@@ -151,6 +151,7 @@ struct apple_dcp {
 	struct apple_rtkit *rtk;
 	struct dcp_retirement *retirement;
 	struct device *fe_pm_dev, *cpu_pm_dev;
+	struct device_link *fe_pm_link, *cpu_pm_link;
 	bool fe_pm_held, cpu_pm_held;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
