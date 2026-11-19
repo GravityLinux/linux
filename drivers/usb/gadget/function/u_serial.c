@@ -753,6 +753,7 @@ static ssize_t gs_write(struct tty_struct *tty, const u8 *buf, size_t count)
 {
 	struct gs_port	*port = tty->driver_data;
 	unsigned long	flags;
+	unsigned int	queued;
 	int ret = 0;
 	struct gserial  *gser = port->port_usb;
 
@@ -760,8 +761,16 @@ static ssize_t gs_write(struct tty_struct *tty, const u8 *buf, size_t count)
 			port->port_num, tty, count);
 
 	spin_lock_irqsave(&port->port_lock, flags);
-	if (count)
-		count = kfifo_in(&port->port_write_buf, buf, count);
+	/*
+	 * Without a host, keep what fits for the next one and drop the rest,
+	 * as a UART with nothing attached would: the writer must not sleep
+	 * until a host connects.
+	 */
+	if (count) {
+		queued = kfifo_in(&port->port_write_buf, buf, count);
+		if (port->port_usb)
+			count = queued;
+	}
 
 	if (port->suspended) {
 		spin_unlock_irqrestore(&port->port_lock, flags);
@@ -828,9 +837,15 @@ static unsigned int gs_write_room(struct tty_struct *tty)
 	unsigned long	flags;
 	unsigned int room = 0;
 
+	/*
+	 * Also take data while disconnected (gs_write() keeps what fits for
+	 * the next host), so a writer does not sleep until a host connects.
+	 */
 	spin_lock_irqsave(&port->port_lock, flags);
 	if (port->port_usb)
 		room = kfifo_avail(&port->port_write_buf);
+	else if (kfifo_initialized(&port->port_write_buf))
+		room = WRITE_BUF_SIZE;
 	spin_unlock_irqrestore(&port->port_lock, flags);
 
 	pr_vdebug("gs_write_room: (%d,%p) room=%u\n",
@@ -845,8 +860,13 @@ static unsigned int gs_chars_in_buffer(struct tty_struct *tty)
 	unsigned long	flags;
 	unsigned int	chars;
 
+	/*
+	 * Without a host nothing is in flight, and nothing would ever drain
+	 * the buffer: report it empty, or tcdrain() and TCSETSW on the tty
+	 * wait forever.
+	 */
 	spin_lock_irqsave(&port->port_lock, flags);
-	chars = kfifo_len(&port->port_write_buf);
+	chars = port->port_usb ? kfifo_len(&port->port_write_buf) : 0;
 	spin_unlock_irqrestore(&port->port_lock, flags);
 
 	pr_vdebug("gs_chars_in_buffer: (%d,%p) chars=%u\n",
@@ -1456,6 +1476,8 @@ void gserial_disconnect(struct gserial *gser)
 	port->port_usb = NULL;
 	gser->ioport = NULL;
 	if (port->port.count > 0) {
+		/* Like a dropped carrier: what was not sent is not for the next host */
+		kfifo_reset(&port->port_write_buf);
 		wake_up_interruptible(&port->drain_wait);
 		if (port->port.tty)
 			tty_hangup(port->port.tty);
