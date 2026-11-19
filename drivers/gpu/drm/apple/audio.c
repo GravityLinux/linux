@@ -63,6 +63,7 @@ struct dcp_audio {
 	struct dcp_sound_cookie selected_cookie;
 	void *elements;
 	size_t elements_size;
+	unsigned int info_cookie;
 	void *productattrs;
 
 	struct snd_pcm_chmap *chmap_info;
@@ -85,9 +86,15 @@ static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.periods_max		= UINT_MAX,
 };
 
-static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
+static int dcpaud_read_remote_info(struct dcp_audio *dcpaud, unsigned int cookie)
 {
+	size_t size;
 	int ret;
+
+	/* The sink's capabilities only change with a new connection. */
+	if (dcpaud->elements_size && dcpaud->info_cookie == cookie)
+		return 0;
+	dcpaud->elements_size = 0;
 
 	ret = dcp_audiosrv_get_elements(dcpaud->dcp_dev, dcpaud->elements,
 					DCPAUD_ELEMENTS_MAXSIZE);
@@ -95,13 +102,15 @@ static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
 		return ret;
 	if (ret < sizeof(u32) || get_unaligned_le32(dcpaud->elements) != 0xd3)
 		return -EINVAL;
-	dcpaud->elements_size = ret;
+	size = ret;
 
 	ret = dcp_audiosrv_get_product_attrs(dcpaud->dcp_dev, dcpaud->productattrs,
 					     DCPAUD_PRODUCTATTRS_MAXSIZE);
 	if (ret < 0)
 		return ret;
 
+	dcpaud->elements_size = size;
+	dcpaud->info_cookie = cookie;
 	return 0;
 }
 
@@ -300,7 +309,7 @@ static int __dcp_pcm_open(struct snd_pcm_substream *substream)
 	dcpaud->open_cookie = dcpaud->connection_cookie;
 	mutex_unlock(&dcpaud->data_lock);
 
-	ret = dcpaud_read_remote_info(dcpaud);
+	ret = dcpaud_read_remote_info(dcpaud, dcpaud->open_cookie);
 	if (ret < 0)
 		return ret;
 
