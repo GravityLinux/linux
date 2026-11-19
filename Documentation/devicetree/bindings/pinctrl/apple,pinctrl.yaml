@@ -88,6 +88,21 @@ patternProperties:
 
     additionalProperties: false
 
+  '-hog$':
+    type: object
+    description: GPIO hog node
+    properties:
+      gpio-hog: true
+      gpios: true
+      input: true
+      output-high: true
+      output-low: true
+      line-name: true
+    required:
+      - gpio-hog
+      - gpios
+    additionalProperties: false
+
 allOf:
   - $ref: pinctrl.yaml#
 
