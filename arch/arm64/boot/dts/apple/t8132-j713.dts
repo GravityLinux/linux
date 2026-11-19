@@ -165,15 +165,18 @@
 
 	sensor-presets {
 		/*
-		 * Assumes the M4 Max's 12 MP Center Stage sensor (0x958): config 0
-		 * reads 3072 x 3024 and a centred 16:9 crop gives 1280x720, as in
-		 * t6041-isp.dtsi. Check against the CONFIG_GET dump at probe.
+		 * Config 0 reads 3072 x 3024. The lens's image circle does not
+		 * cover that window: in J713 frames it has a radius of about
+		 * 1570 pixels, centred about 58 pixels above the window's
+		 * centre. A full-width 16:9 crop puts all four corners outside
+		 * it; this 2560 x 1440 crop is centred on the circle and stays
+		 * about 100 pixels inside it, and scales by exactly 2.
 		 */
 		preset0 {
 			apple,config-index = <0>;
 			apple,input-size = <3072 3024>;
 			apple,output-size = <1280 720>;
-			apple,crop = <0 648 3072 1728>;
+			apple,crop = <256 736 2560 1440>;
 		};
 	};
 };
