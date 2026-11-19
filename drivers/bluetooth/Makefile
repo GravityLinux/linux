@@ -52,3 +52,4 @@ hci_uart-$(CONFIG_BT_HCIUART_AML)	+= hci_aml.o
 hci_uart-objs				:= $(hci_uart-y)
 
 CONTEXT_ANALYSIS := y
+obj-$(CONFIG_BT_HCIMT793B) += hci_mt793b.o
