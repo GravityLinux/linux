@@ -335,21 +335,6 @@ static int idle_resume_endpoints(struct apple_dcp *dcp)
 	return 0;
 }
 
-static int idle_check_cpu_off(struct dcp_retirement *idle)
-{
-	u32 cpu;
-	int ret;
-
-	ret = apple_pmgr_read_state(idle->cpu_node, &cpu);
-	if (ret)
-		return ret;
-	/* FE/SYS are shared with mapping contexts and other domain consumers.
-	 * Our votes have been released; genpd can switch them off once the
-	 * remaining consumers idle. Only the engine CPU must be off here.
-	 */
-	return (cpu & 0xff) ? -EBUSY : 0;
-}
-
 /* Shared display requests are serialized by the lifecycle mutex.
  * Preserve other engines' votes; the notification is the request population.
  */
@@ -513,9 +498,11 @@ static int idle_retire_locked(struct apple_dcp *dcp)
 	ret = pm_runtime_put_sync_suspend(dcp->dev);
 	if (ret < 0)
 		return idle_failure(idle, ret);
-	ret = read_poll_timeout(idle_check_cpu_off, ret, !ret, 1000, 1000000, false, idle);
-	if (ret)
-		return idle_failure(idle, ret);
+	/*
+	 * The core is stopped and our votes are released, so the engine is
+	 * retired whether or not genpd has switched its CPU domain off yet
+	 * (during system sleep that happens at noirq).
+	 */
 	idle->retained_client = dcp->fixed_dp && idle->ever_used;
 	idle->state = DCP_IDLE_RETIRED;
 	idle_stage(idle, "off");
