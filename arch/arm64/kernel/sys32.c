@@ -11,6 +11,7 @@
 
 #include <asm/syscall.h>
 #include <asm/unistd_compat_32.h>
+#include <linux/p3s_user_pages.h>
 
 asmlinkage long compat_sys_sigreturn(void);
 asmlinkage long compat_sys_rt_sigreturn(void);

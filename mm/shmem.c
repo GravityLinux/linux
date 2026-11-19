@@ -42,6 +42,7 @@
 #include <linux/iversion.h>
 #include <linux/unicode.h>
 #include <linux/swap_ops.h>
+#include <linux/p3s/shmem.h>
 #include "swap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
@@ -86,6 +87,7 @@ static struct vfsmount *shm_mnt __ro_after_init;
 #include <linux/uaccess.h>
 
 #include "internal.h"
+#include "p3s/truncate.h"
 
 #define VM_ACCT(size)    (PAGE_ALIGN(size) >> PAGE_SHIFT)
 
@@ -176,7 +178,8 @@ static inline struct shmem_sb_info *SHMEM_SB(struct super_block *sb)
 static inline int shmem_acct_size(unsigned long flags, loff_t size)
 {
 	return (flags & SHMEM_F_NORESERVE) ?
-		0 : security_vm_enough_memory_mm(current->mm, VM_ACCT(size));
+		0 : security_vm_enough_memory_mm(current->mm,
+			mm_pages_from_kernel(current->mm, VM_ACCT(size)));
 }
 
 static inline void shmem_unacct_size(unsigned long flags, loff_t size)
@@ -191,7 +194,9 @@ static inline int shmem_reacct_size(unsigned long flags,
 	if (!(flags & SHMEM_F_NORESERVE)) {
 		if (VM_ACCT(newsize) > VM_ACCT(oldsize))
 			return security_vm_enough_memory_mm(current->mm,
-					VM_ACCT(newsize) - VM_ACCT(oldsize));
+				mm_pages_from_kernel(current->mm,
+						     VM_ACCT(newsize) -
+						     VM_ACCT(oldsize)));
 		else if (VM_ACCT(newsize) < VM_ACCT(oldsize))
 			vm_unacct_memory(VM_ACCT(oldsize) - VM_ACCT(newsize));
 	}
@@ -210,7 +215,8 @@ static inline int shmem_acct_blocks(unsigned long flags, long pages)
 		return 0;
 
 	return security_vm_enough_memory_mm(current->mm,
-			pages * VM_ACCT(PAGE_SIZE));
+			mm_pages_from_kernel(current->mm,
+					     pages * VM_ACCT(PAGE_SIZE)));
 }
 
 static inline void shmem_unacct_blocks(unsigned long flags, long pages)
@@ -1058,6 +1064,9 @@ unsigned long shmem_swap_usage(struct vm_area_struct *vma)
 	if (!swapped)
 		return 0;
 
+	if (vma_is_p3s_4k(vma))
+		return vma_shmem_swap_usage(vma, vma->vm_start, vma->vm_end);
+
 	if (!pgoff && vma->vm_end - vma->vm_start >= inode->i_size)
 		return swapped << PAGE_SHIFT;
 
@@ -1371,6 +1380,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			if (oldsize > holebegin)
 				unmap_mapping_range(inode->i_mapping,
 							holebegin, 0, 1);
+			p3s_unmap_truncated_tail(inode->i_mapping, newsize);
 			if (info->alloced)
 				shmem_truncate_range(inode,
 							newsize, (loff_t)-1);
@@ -1378,6 +1388,7 @@ static int shmem_setattr(struct mnt_idmap *idmap,
 			if (oldsize > holebegin)
 				unmap_mapping_range(inode->i_mapping,
 							holebegin, 0, 1);
+			p3s_unmap_truncated_tail(inode->i_mapping, newsize);
 		}
 	}
 
@@ -2718,6 +2729,9 @@ static vm_fault_t shmem_fault(struct vm_fault *vmf)
 	vm_fault_t ret = 0;
 	int err;
 
+	if (unlikely(vma_slice_past_eof(vmf->vma, vmf->address, inode)))
+		return VM_FAULT_SIGBUS;
+
 	/*
 	 * Trinity finds that probing a hole which tmpfs is punching can
 	 * prevent the hole-punch from ever completing: noted in i_private.
@@ -2816,6 +2830,9 @@ unsigned long shmem_get_unmapped_area(struct file *file,
 		if (SHMEM_SB(sb)->huge == SHMEM_HUGE_NEVER && !order)
 			return addr;
 	}
+
+	if (mm_is_p3s_4k(current->mm))
+		return addr;
 
 	if (len < hpage_size)
 		return addr;

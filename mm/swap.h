@@ -3,7 +3,7 @@
 #define _MM_SWAP_H
 
 #include <linux/atomic.h> /* for atomic_long_t */
-#include <linux/mm.h> /* for PAGE_SHIFT */
+#include <linux/mm.h> /* for PAGE_SHIFT_KERNEL */
 #include <linux/memcontrol.h> /* for mem_cgroup_swappiness() */
 #include <linux/swap.h> /* for MAX_SWAPFILES_SHIFT, struct swap_info_struct */
 
@@ -13,11 +13,11 @@ struct swap_memcg_table;
 struct swap_io_ctx;
 
 #if defined(MAX_POSSIBLE_PHYSMEM_BITS)
-#define SWAP_CACHE_PFN_BITS (MAX_POSSIBLE_PHYSMEM_BITS - PAGE_SHIFT)
+#define SWAP_CACHE_PFN_BITS (MAX_POSSIBLE_PHYSMEM_BITS - PAGE_SHIFT_KERNEL)
 #elif defined(MAX_PHYSMEM_BITS)
-#define SWAP_CACHE_PFN_BITS (MAX_PHYSMEM_BITS - PAGE_SHIFT)
+#define SWAP_CACHE_PFN_BITS (MAX_PHYSMEM_BITS - PAGE_SHIFT_KERNEL)
 #else
-#define SWAP_CACHE_PFN_BITS (BITS_PER_LONG - PAGE_SHIFT)
+#define SWAP_CACHE_PFN_BITS (BITS_PER_LONG - PAGE_SHIFT_KERNEL)
 #endif
 
 /* Swap table marker, 0x1 means shadow, 0x2 means PFN (SWP_TB_PFN_MARK) */

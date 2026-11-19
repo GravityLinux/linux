@@ -37,6 +37,9 @@ struct perf_buffer {
 
 	refcount_t			mmap_count;
 	unsigned long			mmap_locked;
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+	unsigned long			mmap_page_size;
+#endif
 	struct user_struct		*mmap_user;
 
 	/* AUX area */

@@ -1268,6 +1268,11 @@ static inline void vm_unacct_memory(long pages)
 	vm_acct_memory(-pages);
 }
 
+static inline void vm_unacct_memory_mm(struct mm_struct *mm, long pages)
+{
+	vm_unacct_memory(pages);
+}
+
 static inline void mapping_allow_writable(struct address_space *mapping)
 {
 	atomic_inc(&mapping->i_mmap_writable);
@@ -1598,17 +1603,15 @@ static inline pgprot_t vma_flags_to_page_prot(vma_flags_t vma_flags)
 static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return (address - vma->vm_start) >> PAGE_SHIFT;
+	if (address >= vma->vm_start)
+		return (address - vma->vm_start) >> PAGE_SHIFT;
+	return -((vma->vm_start - address) >> PAGE_SHIFT);
 }
 
 static inline pgoff_t linear_page_index(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	pgoff_t pgoff;
-
-	pgoff = linear_page_delta(vma, address);
-	pgoff += vma_start_pgoff(vma);
-	return pgoff;
+	return vma_linear_page_index(vma, address);
 }
 
 static inline void vma_assert_can_modify(struct vm_area_struct *vma)

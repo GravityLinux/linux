@@ -1866,6 +1866,9 @@ static const struct vm_operations_struct tcp_vm_ops = {
 int tcp_mmap(struct file *file, struct socket *sock,
 	     struct vm_area_struct *vma)
 {
+	if (p3s_4k_unsupported(vma->vm_mm))
+		return -EOPNOTSUPP;
+
 	if (vma->vm_flags & (VM_WRITE | VM_EXEC))
 		return -EPERM;
 	vm_flags_clear(vma, VM_MAYWRITE | VM_MAYEXEC);

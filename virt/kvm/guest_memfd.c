@@ -435,6 +435,9 @@ static const struct vm_operations_struct kvm_gmem_vm_ops = {
 
 static int kvm_gmem_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	if (p3s_4k_unsupported(vma->vm_mm))
+		return -EOPNOTSUPP;
+
 	if (!kvm_gmem_supports_mmap(file_inode(file)))
 		return -ENODEV;
 

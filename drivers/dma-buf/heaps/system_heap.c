@@ -250,7 +250,8 @@ static int system_heap_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	for (; sg && addr < vma->vm_end; sg = sg_next(sg)) {
 		unsigned long n = (sg->length >> PAGE_SHIFT) - pgoff;
 		struct page *page = sg_page(sg) + pgoff;
-		unsigned long size = n << PAGE_SHIFT;
+		/* A 4KB VMA can start inside the first backing page. */
+		unsigned long size = (n << PAGE_SHIFT) - vma_folio_offset(vma, addr);
 
 		if (addr + size > vma->vm_end)
 			size = vma->vm_end - addr;

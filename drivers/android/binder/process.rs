@@ -1160,13 +1160,9 @@ impl Process {
     }
 
     fn create_mapping(&self, vma: &mm::virt::VmaNew) -> Result {
-        use kernel::page::PAGE_SIZE;
         let size = usize::min(vma.end() - vma.start(), bindings::SZ_4M as usize);
         let mapping = Mapping::new(vma.start(), size);
-        let page_count = self.pages.register_with_vma(vma)?;
-        if page_count * PAGE_SIZE != size {
-            return Err(EINVAL);
-        }
+        self.pages.register_with_vma(vma)?;
 
         // Save range allocator for later.
         self.inner.lock().mapping = Some(mapping);
@@ -1777,6 +1773,9 @@ impl Process {
     ) -> Result {
         // We don't allow mmap to be used in a different process.
         if this.task != kernel::current!().group_leader() {
+            return Err(EINVAL);
+        }
+        if !vma.starts_at_kernel_page() {
             return Err(EINVAL);
         }
         if vma.start() == 0 {

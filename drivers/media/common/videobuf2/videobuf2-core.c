@@ -874,6 +874,10 @@ int vb2_core_reqbufs(struct vb2_queue *q, enum vb2_memory memory,
 	unsigned int i, first_index;
 	int ret = 0;
 
+	if (*count && memory == VB2_MEMORY_USERPTR &&
+	    p3s_4k_unsupported(current->mm))
+		return -EOPNOTSUPP;
+
 	if (q->streaming) {
 		dprintk(q, 1, "streaming active\n");
 		return -EBUSY;
@@ -1041,6 +1045,10 @@ int vb2_core_create_bufs(struct vb2_queue *q, enum vb2_memory memory,
 	unsigned int q_num_bufs = vb2_get_num_buffers(q);
 	bool no_previous_buffers = !q_num_bufs;
 	int ret = 0;
+
+	if (*count && memory == VB2_MEMORY_USERPTR &&
+	    p3s_4k_unsupported(current->mm))
+		return -EOPNOTSUPP;
 
 	if (q_num_bufs == q->max_num_buffers) {
 		dprintk(q, 1, "maximum number of buffers already allocated\n");
@@ -1264,6 +1272,9 @@ static int __prepare_userptr(struct vb2_buffer *vb)
 	unsigned int plane;
 	int ret = 0;
 	bool reacquired = vb->planes[0].mem_priv == NULL;
+
+	if (p3s_4k_unsupported(current->mm))
+		return -EOPNOTSUPP;
 
 	memset(planes, 0, sizeof(planes[0]) * vb->num_planes);
 	/* Copy relevant information provided by the userspace */
@@ -2491,6 +2502,10 @@ int vb2_mmap(struct vb2_queue *q, struct vm_area_struct *vma)
 	unsigned int plane = 0;
 	int ret;
 	unsigned long length;
+
+	/* Buffer offsets are page-aligned cookies, not byte offsets. */
+	if (vma_slice_off(vma))
+		return -EINVAL;
 
 	/*
 	 * Check memory area access mode.

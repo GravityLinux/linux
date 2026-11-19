@@ -22,6 +22,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
 #include "internal.h"
+#include "p3s/truncate.h"
 
 static void clear_shadow_entries(struct address_space *mapping,
 				 unsigned long start, unsigned long max)
@@ -795,8 +796,10 @@ void truncate_pagecache(struct inode *inode, loff_t newsize)
 	 * unmap_mapping_range call must be made for correctness.
 	 */
 	unmap_mapping_range(mapping, holebegin, 0, 1);
+	p3s_unmap_truncated_tail(mapping, newsize);
 	truncate_inode_pages(mapping, newsize);
 	unmap_mapping_range(mapping, holebegin, 0, 1);
+	p3s_unmap_truncated_tail(mapping, newsize);
 }
 EXPORT_SYMBOL(truncate_pagecache);
 

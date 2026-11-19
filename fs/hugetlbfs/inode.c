@@ -115,6 +115,9 @@ static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	vma_set_flags(vma, VMA_HUGETLB_BIT, VMA_DONTEXPAND_BIT);
 	vma->vm_ops = &hugetlb_vm_ops;
 
+	if (p3s_4k_unsupported(vma->vm_mm))
+		return -EINVAL;
+
 	/*
 	 * page based offset in vm_pgoff could be sufficiently large to
 	 * overflow a loff_t when converted to byte offset.  This can
@@ -1502,6 +1505,9 @@ struct file *hugetlb_file_setup(const char *name, size_t size,
 	struct vfsmount *mnt;
 	int hstate_idx;
 	struct file *file;
+
+	if (p3s_4k_unsupported(current->mm))
+		return ERR_PTR(-EINVAL);
 
 	hstate_idx = get_hstate_idx(page_size_log);
 	if (hstate_idx < 0)

@@ -24,6 +24,9 @@ static int btf_sysfs_vmlinux_mmap(struct file *filp, struct kobject *kobj,
 	phys_addr_t addr = __pa_symbol(__start_BTF);
 	unsigned long pfn = addr >> PAGE_SHIFT;
 
+	if (p3s_4k_unsupported(vma->vm_mm))
+		return -EOPNOTSUPP;
+
 	if (attr->private != __start_BTF || !PAGE_ALIGNED(addr))
 		return -EINVAL;
 

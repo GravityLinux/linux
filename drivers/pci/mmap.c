@@ -29,7 +29,7 @@ int pci_mmap_resource_range(struct pci_dev *pdev, int bar,
 	int ret;
 
 	size = ((pci_resource_len(pdev, bar) - 1) >> PAGE_SHIFT) + 1;
-	if (vma->vm_pgoff + vma_pages(vma) > size)
+	if (vma->vm_pgoff + vma_kernel_pages(vma) > size)
 		return -EINVAL;
 
 	if (write_combine)
@@ -64,7 +64,7 @@ int pci_mmap_fits(struct pci_dev *pdev, int resno, struct vm_area_struct *vma,
 
 	if (pci_resource_len(pdev, resno) == 0)
 		return 0;
-	nr = vma_pages(vma);
+	nr = vma_kernel_pages(vma);
 	start = vma->vm_pgoff;
 	size = ((pci_resource_len(pdev, resno) - 1) >> PAGE_SHIFT) + 1;
 	if (mmap_api == PCI_MMAP_PROCFS) {

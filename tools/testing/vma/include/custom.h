@@ -95,3 +95,17 @@ static inline unsigned long vma_kernel_pagesize(struct vm_area_struct *vma)
 {
 	return PAGE_SIZE;
 }
+
+/* Native equivalents need the VMA definition from include/dup.h. */
+static inline pgoff_t vma_linear_page_index(const struct vm_area_struct *vma,
+					   unsigned long addr)
+{
+	return vma->vm_pgoff + ((addr - vma->vm_start) >> PAGE_SHIFT);
+}
+
+static inline void vma_set_split_offset(struct vm_area_struct *target,
+					const struct vm_area_struct *src,
+					unsigned long addr)
+{
+	target->vm_pgoff = vma_linear_page_index(src, addr);
+}

@@ -1037,6 +1037,9 @@ SYSCALL_DEFINE4(io_uring_register, unsigned int, fd, unsigned int, opcode,
 	if (opcode >= IORING_REGISTER_LAST)
 		return -EINVAL;
 
+	if (p3s_4k_unsupported(current->mm))
+		return -EPERM;
+
 	if (fd == -1)
 		return io_uring_register_blind(opcode, arg, nr_args);
 

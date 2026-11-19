@@ -979,6 +979,9 @@ struct task_struct {
 
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+	struct mm_struct		*p3s_remote_mm;
+#endif
 
 	struct task_exec_state __rcu	*exec_state;
 
