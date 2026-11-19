@@ -464,13 +464,39 @@ int afk_retained_resume(struct apple_dcp_afkep *ep)
 /* Serialize complete messages: fragments carry no transaction offset or tag
  * beyond the repeated interface/length and per-fragment sequence number.
  */
+static bool afk_tx_ring_drained(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	bool drained;
+
+	spin_lock_irqsave(&ep->lock, flags);
+	dma_rmb();
+	drained = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)) ==
+		  le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
+	spin_unlock_irqrestore(&ep->lock, flags);
+	return drained;
+}
+
+/* Without progress for this long a compact message is abandoned. */
+#define AFK_COMPACT_PROGRESS_TIMEOUT msecs_to_jiffies(5000)
+#define AFK_COMPACT_MESSAGE_TIMEOUT msecs_to_jiffies(30000)
+
+static int afk_compact_tx_dead(struct apple_dcp_afkep *ep)
+{
+	if (READ_ONCE(ep->compact_shutting_down))
+		return -ESHUTDOWN;
+	if (READ_ONCE(ep->dcp->crashed))
+		return -EIO;
+	return 0;
+}
+
 static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 			    u8 category, const void *payload, size_t payload_size,
 			    size_t wire_size)
 {
 	struct epic_compact_sub_hdr *sub;
 	size_t total, offset = 0, chunk;
-	unsigned long deadline;
+	unsigned long start, deadline;
 	bool waiting_for_space = false;
 	void *body;
 	int ret = 0;
@@ -489,8 +515,12 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 		memcpy(sub + 1, payload, payload_size);
 
 	mutex_lock(&ep->compact_tx_lock);
-	deadline = jiffies + msecs_to_jiffies(5000);
+	start = jiffies;
+	deadline = start + AFK_COMPACT_PROGRESS_TIMEOUT;
 	while (offset < total) {
+		ret = afk_compact_tx_dead(ep);
+		if (ret)
+			break;
 		chunk = min_t(size_t, total - offset, AFK_COMPACT_FRAGMENT_SIZE);
 		ret = afk_send_compact_fragment(ep, intf_id, body + offset,
 					       chunk, total);
@@ -500,7 +530,8 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 					 (chunk + offsetof(struct epic_compact_hdr, timestamp)));
 				waiting_for_space = true;
 			}
-			if (time_after_eq(jiffies, deadline)) {
+			if (time_after_eq(jiffies, deadline) ||
+			    time_after_eq(jiffies, start + AFK_COMPACT_MESSAGE_TIMEOUT)) {
 				ret = -ETIMEDOUT;
 				break;
 			}
@@ -512,9 +543,36 @@ static int afk_send_compact(struct apple_dcp_afkep *ep, u16 intf_id, u8 type,
 			break;
 		waiting_for_space = false;
 		offset += chunk;
+		/* The deadline covers each step of progress, not the message. */
+		deadline = jiffies + AFK_COMPACT_PROGRESS_TIMEOUT;
+		/*
+		 * Every fragment is announced with its own mailbox message,
+		 * and the firmware queues those per endpoint. A large message
+		 * sent back to back overflowed that queue on a busy endpoint
+		 * ("MBI queue overflow"). Let the firmware take each fragment
+		 * before announcing the next. Pacing is only qualified on
+		 * T8132 firmware.
+		 */
+		while (dcp_is_t8132(ep->dcp) && offset < total &&
+		       !afk_tx_ring_drained(ep)) {
+			ret = afk_compact_tx_dead(ep);
+			if (ret)
+				break;
+			if (time_after_eq(jiffies, deadline) ||
+			    time_after_eq(jiffies, start + AFK_COMPACT_MESSAGE_TIMEOUT)) {
+				ret = -ETIMEDOUT;
+				break;
+			}
+			usleep_range(100, 200);
+		}
+		if (ret)
+			break;
 	}
-	/* Do not send a new header into an unfinished remote assembly. */
-	if (ret && offset)
+	/*
+	 * Do not send a new header into an unfinished remote assembly. A
+	 * crash or shutdown is handled by its own path.
+	 */
+	if (ret && offset && ret != -ESHUTDOWN && ret != -EIO)
 		afk_cancel_commands(ep);
 	mutex_unlock(&ep->compact_tx_lock);
 	kvfree(body);
