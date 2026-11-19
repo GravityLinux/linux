@@ -30,11 +30,15 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
+#include <linux/suspend.h>
 #include <linux/time64.h>
 
 #include "nvme.h"
 
 #define APPLE_ANS_BOOT_TIMEOUT	  USEC_PER_SEC
+
+/* Optional DT-described T8132 idle-control register. */
+#define APPLE_ANS_IDLE_ENABLE BIT(0)
 
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
@@ -42,7 +46,11 @@
 #define APPLE_ANS_ACQ_DB  0x1004
 #define APPLE_ANS_IOCQ_DB 0x100c
 
-#define APPLE_ANS_MAX_PEND_CMDS_CTRL 0x1210
+#define APPLE_ANS_T8132_IOQ_CMDS 0x1200
+#define APPLE_ANS_T8132_IOQ_CQES 0x1208
+#define APPLE_ANS_T8132_IOQ_SIZE 0x1210
+
+#define APPLE_ANS_T8103_MAX_PEND_CMDS_CTRL 0x1210
 
 #define APPLE_ANS_BOOT_STATUS	 0x1300
 #define APPLE_ANS_BOOT_STATUS_OK 0xde71ce55
@@ -184,6 +192,7 @@ struct apple_nvme_iod {
 
 struct apple_nvme_hw {
 	bool has_lsq_nvmmu;
+	bool needs_ioq_register;
 	u32 max_queue_depth;
 };
 
@@ -192,6 +201,7 @@ struct apple_nvme {
 
 	void __iomem *mmio_coproc;
 	void __iomem *mmio_nvme;
+	void __iomem *mmio_idle;
 	const struct apple_nvme_hw *hw;
 
 	struct device **pd_dev;
@@ -217,7 +227,25 @@ struct apple_nvme {
 
 	int irq;
 	spinlock_t lock;
+
+	/*
+	 * Delayed cache flush handling state
+	 */
+	struct nvme_ns *flush_ns;
+	unsigned long flush_interval;
+	unsigned long last_flush;
+	struct delayed_work flush_dwork;
+	bool s2idle_retained;
 };
+
+unsigned int flush_interval = 1000;
+module_param(flush_interval, uint, 0644);
+MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
+
+static bool panic_on_crash;
+module_param(panic_on_crash, bool, 0644);
+MODULE_PARM_DESC(panic_on_crash,
+		 "Panic when the ANS co-processor crashes instead of failing all I/O");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -249,7 +277,9 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 {
 	struct apple_nvme *anv = cookie;
 
-	dev_warn(anv->dev, "RTKit crashed; unable to recover without a reboot");
+	dev_crit(anv->dev, "RTKit crashed; unable to recover without a reboot");
+	if (panic_on_crash)
+		panic("%s: ANS co-processor crashed", dev_name(anv->dev));
 	nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -778,6 +808,26 @@ static int apple_nvme_remove_sq(struct apple_nvme *anv)
 	return nvme_submit_sync_cmd(anv->ctrl.admin_q, &c, NULL, 0);
 }
 
+static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
+				     struct request *req)
+{
+	if (!anv->flush_interval || req_op(req) != REQ_OP_FLUSH)
+		return false;
+	if (delayed_work_pending(&anv->flush_dwork))
+		return true;
+	if (time_before(jiffies, anv->last_flush + anv->flush_interval)) {
+		kblockd_mod_delayed_work_on(WORK_CPU_UNBOUND, &anv->flush_dwork,
+						anv->flush_interval);
+		if (WARN_ON_ONCE(anv->flush_ns && anv->flush_ns != ns))
+			goto out;
+		anv->flush_ns = ns;
+		return true;
+	}
+out:
+	anv->last_flush = jiffies;
+	return false;
+}
+
 static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 					const struct blk_mq_queue_data *bd)
 {
@@ -813,6 +863,11 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 
 	nvme_start_request(req);
+
+	if (apple_nvme_delayed_flush(anv, ns, req)) {
+                blk_mq_complete_request(req);
+                return BLK_STS_OK;
+        }
 
 	if (anv->hw->has_lsq_nvmmu)
 		apple_nvme_submit_cmd_t8103(q, cmnd);
@@ -852,16 +907,18 @@ static int apple_nvme_init_request(struct blk_mq_tag_set *set,
 static void apple_nvme_disable(struct apple_nvme *anv, bool shutdown)
 {
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
-	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 	bool dead = false, freeze = false;
 	unsigned long flags;
+	u32 csts;
 
-	if (apple_rtkit_is_crashed(anv->rtk))
+	/* Don't touch the controller's registers once its firmware is dead. */
+	if (apple_rtkit_is_crashed(anv->rtk)) {
 		dead = true;
-	if (!(csts & NVME_CSTS_RDY))
-		dead = true;
-	if (csts & NVME_CSTS_CFS)
-		dead = true;
+	} else {
+		csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+		if (!(csts & NVME_CSTS_RDY) || (csts & NVME_CSTS_CFS))
+			dead = true;
+	}
 
 	if (state == NVME_CTRL_LIVE ||
 	    state == NVME_CTRL_RESETTING) {
@@ -934,7 +991,6 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	struct apple_nvme_queue *q = iod->q;
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 	unsigned long flags;
-	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 
 	if (nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE) {
 		/*
@@ -964,7 +1020,8 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	}
 
 	/* check if we just missed an interrupt if we're still alive */
-	if (!apple_rtkit_is_crashed(anv->rtk) && !(csts & NVME_CSTS_CFS)) {
+	if (!apple_rtkit_is_crashed(anv->rtk) &&
+	    !(readl(anv->mmio_nvme + NVME_REG_CSTS) & NVME_CSTS_CFS)) {
 		spin_lock_irqsave(&anv->lock, flags);
 		apple_nvme_handle_cq(q, false);
 		spin_unlock_irqrestore(&anv->lock, flags);
@@ -1035,6 +1092,32 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 	apple_nvme_enable_queue(q);
 }
 
+/*
+ * Permit or forbid automatic ANS power gating (T8132). With the permission
+ * set, an ANS whose firmware was shut down (by U-Boot before it starts the
+ * kernel, or by this driver's own reset and shutdown paths) does not survive
+ * the cold boot in apple_nvme_reset_work(): the CPU that touches ANS stalls
+ * and takes the system down with it. So grant the permission only once the
+ * ANS CPU runs, and withdraw it before every path that stops the CPU.
+ */
+static void apple_nvme_set_auto_idle(struct apple_nvme *anv, bool enable)
+{
+	u32 val;
+
+	if (!anv->mmio_idle)
+		return;
+
+	val = readl(anv->mmio_idle);
+	if (enable)
+		val |= APPLE_ANS_IDLE_ENABLE;
+	else
+		val &= ~APPLE_ANS_IDLE_ENABLE;
+	writel(val, anv->mmio_idle);
+
+	if (enable && !(readl(anv->mmio_idle) & APPLE_ANS_IDLE_ENABLE))
+		dev_warn_once(anv->dev, "Failed to enable automatic ANS idle\n");
+}
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1064,6 +1147,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		if (anv->ctrl.ctrl_config & NVME_CC_ENABLE)
 			apple_nvme_disable(anv, false);
 		dev_dbg(anv->dev, "Trying to shut down RTKit before reset.");
+		apple_nvme_set_auto_idle(anv, false);
 		ret = apple_rtkit_shutdown(anv->rtk);
 		if (ret)
 			goto out;
@@ -1093,8 +1177,11 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
+		/* Before RTKit INIT, now that the CPU runs. */
+		apple_nvme_set_auto_idle(anv, true);
 		ret = apple_rtkit_boot(anv->rtk);
 	} else {
+		apple_nvme_set_auto_idle(anv, true);
 		ret = apple_rtkit_wake(anv->rtk);
 	}
 
@@ -1133,9 +1220,16 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 
 		/* Allow as many pending command as possible for both queues */
-		writel(anv->hw->max_queue_depth
-			| (anv->hw->max_queue_depth << 16), anv->mmio_nvme
-			+ APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		if (!anv->hw->needs_ioq_register) {
+			/*
+			 * Since T8132, this is replaced by IOQ_SIZE which is
+			 * located at the same offset and is handled with the
+			 * IO queue setup further below.
+			 */
+			writel(anv->hw->max_queue_depth
+				| (anv->hw->max_queue_depth << 16), anv->mmio_nvme
+				+ APPLE_ANS_T8103_MAX_PEND_CMDS_CTRL);
+		}
 
 		/* Setup the NVMMU for the maximum admin and IO queue depth */
 		writel(anv->hw->max_queue_depth - 1,
@@ -1189,6 +1283,16 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	ret = apple_nvme_create_sq(anv);
 	if (ret)
 		goto out_remove_cq;
+
+	if (anv->hw->needs_ioq_register) {
+		writeq(anv->ioq.cq_dma_addr,
+			anv->mmio_nvme + APPLE_ANS_T8132_IOQ_CQES);
+		writeq(anv->ioq.sq_dma_addr,
+			anv->mmio_nvme + APPLE_ANS_T8132_IOQ_CMDS);
+		writel((anv->hw->max_queue_depth - 1)
+			| ((anv->hw->max_queue_depth - 1) << 16), anv->mmio_nvme
+			+ APPLE_ANS_T8132_IOQ_SIZE);
+	}
 
 	apple_nvme_init_queue(&anv->ioq);
 	nr_io_queues = 1;
@@ -1450,6 +1554,28 @@ static void devm_apple_nvme_mempool_destroy(void *data)
 	mempool_destroy(data);
 }
 
+static void apple_nvme_flush_work(struct work_struct *work)
+{
+	struct nvme_command c = { };
+	struct apple_nvme *anv;
+	struct nvme_ns *ns;
+	int err;
+
+	anv = container_of(work, struct apple_nvme, flush_dwork.work);
+	ns = anv->flush_ns;
+	if (WARN_ON_ONCE(!ns))
+		return;
+
+	c.common.opcode = nvme_cmd_flush;
+	c.common.nsid = cpu_to_le32(anv->flush_ns->head->ns_id);
+	err = nvme_submit_sync_cmd(ns->queue, &c, NULL, 0);
+	if (err) {
+		dev_err(anv->dev, "Deferred flush failed: %d\n", err);
+	} else {
+		anv->last_flush = jiffies;
+	}
+}
+
 static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1574,6 +1700,28 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	if (ret)
 		goto put_dev;
 
+	/*
+	 * T8132 retains firmware configuration in this separate control word.
+	 * Bit 0 permits automatic ANS power gating while the firmware is idle;
+	 * it does not stop the coprocessor. Keep all other firmware-programmed
+	 * bits. Older DTs omit this resource.
+	 *
+	 * The previous stage may have shut ANS down (U-Boot does, and so does
+	 * this driver's shutdown), so keep the bit clear until reset_work has
+	 * the CPU running again; see apple_nvme_set_auto_idle().
+	 */
+	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "idle")) {
+		anv->mmio_idle = devm_platform_ioremap_resource_byname(pdev,
+								       "idle");
+		if (IS_ERR(anv->mmio_idle)) {
+			ret = PTR_ERR(anv->mmio_idle);
+			anv->mmio_idle = NULL;
+			goto put_dev;
+		}
+		apple_nvme_set_auto_idle(anv, false);
+		dev_info(dev, "Automatic ANS idle supported\n");
+	}
+
 	anv->rtk =
 		devm_apple_rtkit_init(dev, anv, NULL, 0, &apple_nvme_rtkit_ops);
 	if (IS_ERR(anv->rtk)) {
@@ -1617,6 +1765,14 @@ static int apple_nvme_probe(struct platform_device *pdev)
 		goto out_uninit_ctrl;
 	}
 
+	if (flush_interval) {
+		anv->flush_interval = msecs_to_jiffies(flush_interval);
+		anv->flush_ns = NULL;
+		anv->last_flush = jiffies - anv->flush_interval;
+	}
+
+	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
+
 	nvme_reset_ctrl(&anv->ctrl);
 	async_schedule(apple_nvme_async_probe, anv);
 
@@ -1651,6 +1807,7 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	nvme_uninit_ctrl(&anv->ctrl);
 
 	if (apple_rtkit_is_running(anv->rtk)) {
+		apple_nvme_set_auto_idle(anv, false);
 		apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -1663,8 +1820,10 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 {
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
+	flush_delayed_work(&anv->flush_dwork);
 	apple_nvme_disable(anv, true);
 	if (apple_rtkit_is_running(anv->rtk)) {
+		apple_nvme_set_auto_idle(anv, false);
 		apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -1675,6 +1834,13 @@ static int apple_nvme_resume(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 
+	if (anv->s2idle_retained) {
+		nvme_unquiesce_io_queues(&anv->ctrl);
+		nvme_unfreeze(&anv->ctrl);
+		anv->s2idle_retained = false;
+		return 0;
+	}
+
 	return nvme_reset_ctrl(&anv->ctrl);
 }
 
@@ -1683,9 +1849,32 @@ static int apple_nvme_suspend(struct device *dev)
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret = 0;
 
+	if (of_machine_is_compatible("apple,j713") &&
+	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		if (nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE)
+			return -EBUSY;
+
+		/*
+		 * ANS already hardware-gates while idle on J713. Retain its
+		 * initialized state: the cold restart does not service I/O
+		 * reliably before tasks thaw. Drain deferred flushes first.
+		 */
+		flush_delayed_work(&anv->flush_dwork);
+		nvme_start_freeze(&anv->ctrl);
+		if (!nvme_wait_freeze_timeout(&anv->ctrl)) {
+			nvme_unfreeze(&anv->ctrl);
+			return -EBUSY;
+		}
+		nvme_quiesce_io_queues(&anv->ctrl);
+		device_set_wakeup_path(dev);
+		anv->s2idle_retained = true;
+		return 0;
+	}
+
 	apple_nvme_disable(anv, true);
 
 	if (apple_rtkit_is_running(anv->rtk)) {
+		apple_nvme_set_auto_idle(anv, false);
 		ret = apple_rtkit_shutdown(anv->rtk);
 
 		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -1699,17 +1888,26 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_nvme_pm_ops, apple_nvme_suspend,
 
 static const struct apple_nvme_hw apple_nvme_t8015_hw = {
 	.has_lsq_nvmmu = false,
+	.needs_ioq_register = false,
 	.max_queue_depth = 16,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
+	.needs_ioq_register = false,
+	.max_queue_depth = 64,
+};
+
+static const struct apple_nvme_hw apple_nvme_t8132_hw = {
+	.has_lsq_nvmmu = true,
+	.needs_ioq_register = true,
 	.max_queue_depth = 64,
 };
 
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
