@@ -32,7 +32,8 @@ static void
 mt7921_regd_channel_update(struct wiphy *wiphy, struct mt792x_dev *dev)
 {
 #define IS_UNII_INVALID(idx, sfreq, efreq) \
-	(!(dev->phy.clc_chan_conf & BIT(idx)) && (cfreq) >= (sfreq) && (cfreq) <= (efreq))
+	(!is_mt7932(&dev->mt76) && !(dev->phy.clc_chan_conf & BIT(idx)) && \
+	 (cfreq) >= (sfreq) && (cfreq) <= (efreq))
 	struct ieee80211_supported_band *sband;
 	struct mt76_dev *mdev = &dev->mt76;
 	struct device_node *np, *band_np;

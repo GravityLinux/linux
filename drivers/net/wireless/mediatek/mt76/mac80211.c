@@ -745,7 +745,7 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
 }
 EXPORT_SYMBOL_GPL(mt76_alloc_device);
 
-int mt76_register_device(struct mt76_dev *dev, bool vht,
+int mt76_prepare_device(struct mt76_dev *dev, bool vht,
 			 struct ieee80211_rate *rates, int n_rates)
 {
 	struct ieee80211_hw *hw = dev->hw;
@@ -786,6 +786,20 @@ int mt76_register_device(struct mt76_dev *dev, bool vht,
 		if (ret)
 			return ret;
 	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mt76_prepare_device);
+
+int mt76_register_device(struct mt76_dev *dev, bool vht,
+			 struct ieee80211_rate *rates, int n_rates)
+{
+	struct ieee80211_hw *hw = dev->hw;
+	struct mt76_phy *phy = &dev->phy;
+	int ret;
+
+	ret = mt76_prepare_device(dev, vht, rates, n_rates);
+	if (ret)
+		return ret;
 
 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
 		ret = mt76_led_init(phy);

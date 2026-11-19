@@ -90,16 +90,22 @@ static int __mt7921_init_hardware(struct mt792x_dev *dev)
 	 */
 	mt76_wr(dev, MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
 	ret = mt792x_mcu_init(dev);
-	if (ret)
+	if (ret) {
+		dev_err(dev->mt76.dev, "MCU initialization failed: %d\n", ret);
 		goto out;
+	}
 
 	ret = mt76_eeprom_override(&dev->mphy);
-	if (ret)
+	if (ret) {
+		dev_err(dev->mt76.dev, "EEPROM override failed: %d\n", ret);
 		goto out;
+	}
 
 	ret = mt7921_mcu_set_eeprom(dev);
-	if (ret)
+	if (ret) {
+		dev_err(dev->mt76.dev, "EEPROM initialization failed: %d\n", ret);
 		goto out;
+	}
 
 	ret = mt7921_mac_init(dev);
 out:
@@ -142,6 +148,18 @@ static void mt7921_init_work(struct work_struct *work)
 	mt7921_set_stream_he_caps(&dev->phy);
 	mt792x_config_mac_addr_list(dev);
 
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt76_prepare_device(&dev->mt76, true, mt76_rates,
+					 ARRAY_SIZE(mt76_rates));
+		if (!ret)
+			ret = mt7932_fullmac_init(dev);
+		if (ret)
+			dev_err(dev->mt76.dev, "MT7932 cfg80211 init failed: %d\n", ret);
+		else
+			dev->hw_init_done = true;
+		return;
+	}
+
 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
 				   ARRAY_SIZE(mt76_rates));
 	if (ret) {
@@ -163,6 +181,11 @@ static void mt7921_init_work(struct work_struct *work)
 
 	/* we support chip reset now */
 	dev->hw_init_done = true;
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt7932_fullmac_init(dev);
+		if (ret)
+			dev_err(dev->mt76.dev, "MT7932 native datapath init: %d\n", ret);
+	}
 
 	mt76_connac_mcu_set_deep_sleep(&dev->mt76, dev->pm.ds_enable);
 }
@@ -208,7 +231,7 @@ int mt7921_register_device(struct mt792x_dev *dev)
 	dev->pm.stats.last_doze_event = jiffies;
 
 	if (!mt76_is_usb(&dev->mt76) &&
-	    !is_mt7902(&dev->mt76)) {
+	    !is_mt7902(&dev->mt76) && !is_mt7932(&dev->mt76)) {
 		dev->pm.enable_user = true;
 		dev->pm.enable = true;
 		dev->pm.ds_enable_user = true;

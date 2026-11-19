@@ -9,12 +9,15 @@
 #include <linux/of.h>
 
 #include "mt7921.h"
+#include "mt7932_regs.h"
 #include "../mt76_connac2_mac.h"
 #include "../dma.h"
 #include "mcu.h"
 #include "regd.h"
 
 static const struct pci_device_id mt7921_pci_device_table[] = {
+	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, MT7932_CHIP_ID),
+		.driver_data = (kernel_ulong_t)MT7932_FIRMWARE_WM },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7961),
 		.driver_data = (kernel_ulong_t)MT7921_FIRMWARE_WM },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7922),
@@ -51,12 +54,22 @@ static void mt7921e_unregister_device(struct mt792x_dev *dev)
 		wiphy_rfkill_stop_polling(hw->wiphy);
 
 	cancel_work_sync(&dev->init_work);
+	if (is_mt7932(&dev->mt76)) {
+		/* Stop accepting recovery requests before quiescing NAPI/DMA. */
+		dev->hw_init_done = false;
+		mt7932_fullmac_quiesce(dev);
+		cancel_work_sync(&dev->reset_work);
+	}
 	mt76_unregister_device(&dev->mt76);
 	mt76_for_each_q_rx(&dev->mt76, i)
 		napi_disable(&dev->mt76.napi[i]);
 	cancel_delayed_work_sync(&pm->ps_work);
 	cancel_work_sync(&pm->wake_work);
 	cancel_work_sync(&dev->reset_work);
+	if (is_mt7932(&dev->mt76)) {
+		mt792x_dma_disable(dev, true);
+		mt7932_fullmac_remove(dev);
+	}
 
 	mt76_connac2_tx_token_put(&dev->mt76);
 	__mt792x_mcu_drv_pmctrl(dev);
@@ -117,8 +130,19 @@ static u32 __mt7921_reg_addr(struct mt792x_dev *dev, u32 addr)
 	};
 	int i;
 
-	if (addr < 0x100000)
+	if (addr < SZ_1M)
 		return addr;
+	if (is_mt7932(&dev->mt76)) {
+		if (addr >= MT7932_WF_REMAP_PHYS &&
+		    addr - MT7932_WF_REMAP_PHYS < MT7932_REMAP_WINDOW_SIZE)
+			return MT7932_WF_REMAP_BAR + addr - MT7932_WF_REMAP_PHYS;
+		if (addr >= MT7932_CONN_REMAP_PHYS &&
+		    addr - MT7932_CONN_REMAP_PHYS < MT7932_REMAP_WINDOW_SIZE)
+			return MT7932_CONN_REMAP_BAR + addr - MT7932_CONN_REMAP_PHYS;
+		if (addr >= MT7932_CONN_REMAP_ALIAS &&
+		    addr - MT7932_CONN_REMAP_ALIAS < MT7932_REMAP_WINDOW_SIZE)
+			return MT7932_CONN_REMAP_BAR + addr - MT7932_CONN_REMAP_ALIAS;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(fixed_map); i++) {
 		u32 ofs;
@@ -176,10 +200,10 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 		.mcu_rxdone_ring_size  = MT7921_RX_MCU_RING_SIZE,
 		.has_mcu_wa            = true,
 	};
-	bool is_mt7902;
+	bool mt7902_variant;
 	int ret;
 
-	is_mt7902 = mt7921_l1_rr(dev, MT_HW_CHIPID) == 0x7902;
+	mt7902_variant = is_mt7902(&dev->mt76);
 
 	/*
 	 * MT7902 special case:
@@ -187,7 +211,7 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 	 *   - RX Ring0 is larger and shared for event/TX-done
 	 *   - MT7902 does not use the MCU_WA ring
 	 */
-	if (is_mt7902) {
+	if (mt7902_variant) {
 		layout.mcu_wm_txq           = MT7902_TXQ_MCU_WM;
 		layout.mcu_rxdone_ring_size = MT7902_RX_MCU_RING_SIZE;
 		layout.has_mcu_wa           = false;
@@ -223,8 +247,9 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 	/* event from WM before firmware download */
 	ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MCU],
 			       MT7921_RXQ_MCU_WM,
-			       layout.mcu_rxdone_ring_size,
-			       MT_RX_BUF_SIZE, MT_RX_EVENT_RING_BASE);
+			       is_mt7932(&dev->mt76) ? 32 : layout.mcu_rxdone_ring_size,
+			       is_mt7932(&dev->mt76) ? 2352 : MT_RX_BUF_SIZE,
+			       MT_RX_EVENT_RING_BASE);
 	if (ret)
 		return ret;
 
@@ -232,16 +257,41 @@ static int mt7921_dma_init(struct mt792x_dev *dev)
 		/* Change mcu queue after firmware download */
 		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MCU_WA],
 				       MT7921_RXQ_MCU_WM,
-				       MT7921_RX_MCU_WA_RING_SIZE,
-				       MT_RX_BUF_SIZE, MT_WFDMA0(0x540));
+				       is_mt7932(&dev->mt76) ? 32 : MT7921_RX_MCU_WA_RING_SIZE,
+				       is_mt7932(&dev->mt76) ? 2352 : MT_RX_BUF_SIZE,
+				       MT_WFDMA0(0x540));
 		if (ret)
 			return ret;
 	}
 
 	/* rx data */
+	if (is_mt7932(&dev->mt76)) {
+		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MAIN_WA],
+				       3, 32, 2352, MT_RX_EVENT_RING_BASE);
+		if (ret)
+			return ret;
+		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_BAND1_WA],
+				       8, 64, 2352, MT_RX_EVENT_RING_BASE);
+		if (ret)
+			return ret;
+		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_BAND1],
+				       7, 512, 2352, MT_RX_EVENT_RING_BASE);
+		if (ret)
+			return ret;
+		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_BAND2],
+				       5, 224, 2352, MT_RX_EVENT_RING_BASE);
+		if (ret)
+			return ret;
+		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_BAND2_WA],
+				       6, 128, 2352, MT_RX_EVENT_RING_BASE);
+		if (ret)
+			return ret;
+	}
 	ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MAIN],
-			       MT7921_RXQ_BAND0, MT7921_RX_RING_SIZE,
-			       MT_RX_BUF_SIZE, MT_RX_DATA_RING_BASE);
+			       MT7921_RXQ_BAND0,
+			       is_mt7932(&dev->mt76) ? 512 : MT7921_RX_RING_SIZE,
+			       is_mt7932(&dev->mt76) ? 2352 : MT_RX_BUF_SIZE,
+			       MT_RX_DATA_RING_BASE);
 	if (ret)
 		return ret;
 
@@ -399,19 +449,50 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	if (!mt7921_disable_aspm && mt76_pci_aspm_supported(pdev))
 		dev->aspm_supported = true;
 
-	ret = mt792xe_mcu_fw_pmctrl(dev);
-	if (ret)
-		goto err_free_dev;
-
-	ret = __mt792xe_mcu_drv_pmctrl(dev);
-	if (ret)
-		goto err_free_dev;
+	/* MT7932's ROM must not be handed to firmware ownership before a
+	 * warm probe. Teardown/recovery leaves it in ROM; only WFSYS reset
+	 * followed by driver-own is valid there. The reset below performs
+	 * that handoff, matching the qualified native warm-reset sequence.
+	 * Keep the existing firmware-own/driver-own pair for other chips.
+	 */
+	if (id->device != MT7932_CHIP_ID) {
+		ret = mt792xe_mcu_fw_pmctrl(dev);
+		if (ret)
+			goto err_free_dev;
+		ret = __mt792xe_mcu_drv_pmctrl(dev);
+		if (ret)
+			goto err_free_dev;
+	}
+	if (id->device == MT7932_CHIP_ID) {
+		mdev->rev = (MT7932_CHIP_ID << 16) |
+			     FIELD_GET(MT7932_HW_REV_MASK, mt76_rr(dev, MT7932_HW_REV));
+		mt76_wr(dev, MT7932_PCIE_REMAP(1),
+			FIELD_PREP(MT7932_PCIE_REMAP_TARGET,
+				   MT7932_WF_REMAP_PHYS >> 16) |
+			MT7932_PCIE_REMAP_WF_CONTROL);
+		udelay(MT7932_PCIE_REMAP_SETTLE_US);
+		mt76_wr(dev, MT7932_PCIE_REMAP(2),
+			FIELD_PREP(MT7932_PCIE_REMAP_TARGET,
+				   MT7932_CONN_REMAP_PHYS >> 16) |
+			MT7932_PCIE_REMAP_CONN_CONTROL);
+		udelay(MT7932_PCIE_REMAP_SETTLE_US);
+		if (FIELD_GET(MT7932_PCIE_REMAP_TARGET,
+			      mt76_rr(dev, MT7932_PCIE_REMAP(1))) !=
+		    MT7932_WF_REMAP_PHYS >> 16 ||
+		    FIELD_GET(MT7932_PCIE_REMAP_TARGET,
+			      mt76_rr(dev, MT7932_PCIE_REMAP(2))) !=
+		    MT7932_CONN_REMAP_PHYS >> 16) {
+			ret = -EIO;
+			goto err_free_dev;
+		}
+	} else {
 
 	chipid = mt7921_l1_rr(dev, MT_HW_CHIPID);
 	if (chipid == 0x7961 && (mt7921_l1_rr(dev, MT_HW_BOUND) & BIT(7)))
 		chipid = 0x7920;
 	mdev->rev = (chipid << 16) |
 		    (mt7921_l1_rr(dev, MT_HW_REV) & 0xff);
+	}
 	dev_info(mdev->dev, "ASIC revision: %04x\n", mdev->rev);
 
 	ret = mt792x_wfsys_reset(dev);
@@ -420,7 +501,7 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 
 	mt76_wr(dev, irq_map.host_irq_enable, 0);
 
-	mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0xff);
+	mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, is_mt7932(mdev) ? 0x1ff : 0xff);
 
 	ret = devm_request_irq(mdev->dev, pdev->irq, mt792x_irq_handler,
 			       IRQF_SHARED, KBUILD_MODNAME, dev);
@@ -434,6 +515,10 @@ static int mt7921_pci_probe(struct pci_dev *pdev,
 	ret = mt7921_register_device(dev);
 	if (ret)
 		goto err_free_irq;
+
+	/* Finish shared-radio bootstrap before the Bluetooth function probes. */
+	if (is_mt7932(mdev))
+		flush_work(&dev->init_work);
 
 	if (of_property_read_bool(dev->mt76.dev->of_node, "wakeup-source"))
 		device_init_wakeup(dev->mt76.dev, true);
