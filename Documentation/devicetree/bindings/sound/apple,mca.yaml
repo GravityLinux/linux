@@ -7,19 +7,76 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Apple MCA I2S transceiver
 
 description: |
-  MCA is an I2S transceiver peripheral found on M1 and other Apple chips. It is
-  composed of a number of identical clusters which can operate independently
-  or in an interlinked fashion. Up to 6 clusters have been seen on an MCA.
+  MCA is an I2S transceiver peripheral found on M1 and other Apple chips.
+  T8132 uses a single banked aperture with one TX serializer per cluster.
+  Earlier hardware is composed of a number of identical clusters which can
+  operate independently or in an interlinked fashion. Up to 6 clusters have
+  been seen on an MCA.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-mca
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        dmas:
+          maxItems: 6
+        dma-names:
+          minItems: 1
+          maxItems: 6
+          uniqueItems: true
+          items:
+            enum: [tx0a, tx1a, tx2a, tx3a, tx4a, tx5a]
+    else:
+      properties:
+        reg:
+          minItems: 2
+        dmas:
+          minItems: 16
+        dma-names:
+          minItems: 16
+          items:
+            - const: tx0a
+            - const: rx0a
+            - const: tx0b
+            - const: rx0b
+            - const: tx1a
+            - const: rx1a
+            - const: tx1b
+            - const: rx1b
+            - const: tx2a
+            - const: rx2a
+            - const: tx2b
+            - const: rx2b
+            - const: tx3a
+            - const: rx3a
+            - const: tx3b
+            - const: rx3b
+            - const: tx4a
+            - const: rx4a
+            - const: tx4b
+            - const: rx4b
+            - const: tx5a
+            - const: rx5a
+            - const: tx5b
+            - const: rx5b
+        clocks:
+          minItems: 4
+        power-domains:
+          minItems: 5
 
 properties:
   compatible:
     oneOf:
+      - const: apple,t8132-mca
       - items:
           - const: apple,t6020-mca
           - const: apple,t8103-mca
@@ -32,6 +89,7 @@ properties:
           - const: apple,mca
 
   reg:
+    minItems: 1
     items:
       - description: Register region of the MCA clusters proper
       - description: Register region of the DMA glue and its FIFOs
@@ -49,7 +107,7 @@ properties:
     const: 0
 
   dmas:
-    minItems: 16
+    minItems: 1
     maxItems: 24
     description:
       DMA channels corresponding to the SERDES units in the peripheral. They are
@@ -57,38 +115,14 @@ properties:
       as associated to the TXA, RXA, TXB, RXB units.
 
   dma-names:
-    minItems: 16
-    items:
-      - const: tx0a
-      - const: rx0a
-      - const: tx0b
-      - const: rx0b
-      - const: tx1a
-      - const: rx1a
-      - const: tx1b
-      - const: rx1b
-      - const: tx2a
-      - const: rx2a
-      - const: tx2b
-      - const: rx2b
-      - const: tx3a
-      - const: rx3a
-      - const: tx3b
-      - const: rx3b
-      - const: tx4a
-      - const: rx4a
-      - const: tx4b
-      - const: rx4b
-      - const: tx5a
-      - const: rx5a
-      - const: tx5b
-      - const: rx5b
+    minItems: 1
+    maxItems: 24
     description: |
       Names for the DMA channels: 'tx'/'rx', then cluster number, then 'a'/'b'
       based on the associated SERDES unit.
 
   clocks:
-    minItems: 4
+    minItems: 1
     maxItems: 6
     description:
       Clusters' input reference clock.
@@ -97,7 +131,7 @@ properties:
     maxItems: 1
 
   power-domains:
-    minItems: 5
+    minItems: 2
     maxItems: 7
     description:
       First a general power domain for register access, then the power

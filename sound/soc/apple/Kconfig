@@ -9,4 +9,56 @@ config SND_SOC_APPLE_MCA
 	  This option enables an ASoC platform driver for MCA peripherals found
 	  on Apple Silicon SoCs.
 
+config SND_SOC_APPLE_MACAUDIO
+	tristate "Sound support for Apple Silicon Macs"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select SND_SOC_APPLE_MCA
+	select SND_SIMPLE_CARD_UTILS
+	select APPLE_ADMAC if DMADEVICES
+	select COMMON_CLK_APPLE_NCO if COMMON_CLK
+	select SND_SOC_TAS2764 if I2C
+	select SND_SOC_TAS2770 if I2C
+	select SND_SOC_CS42L83 if I2C
+	select SND_SOC_CS42L84 if I2C
+	select REGULATOR_FIXED_VOLTAGE if REGULATOR
+	help
+	  This option enables an ASoC machine-level driver for Apple Silicon Macs
+	  and it also enables the required SoC and codec drivers for overall
+	  sound support on these machines.
+
+config SND_SOC_APPLE_T8132_SPEAKER
+	tristate "Experimental T8132 Mac mini speaker and headphones"
+	depends on ARCH_APPLE && ARM64_16K_PAGES && I2C && GPIOLIB && OF
+	depends on DMADEVICES
+	select SND_PCM
+	select SND_SOC_APPLE_MCA
+	select SND_SOC_TAS2764
+	select SND_SOC_CS42L84
+	select APPLE_ADMAC
+	help
+	  Fixed-format J773g internal-speaker playback with an in-kernel
+	  voice-coil thermal model. Samples are attenuated and their energy
+	  is charged before they reach the DMA ring, so no userspace daemon
+	  or V/I feedback is needed. The amplifier is held at a hardware
+	  ceiling set by the ceiling_dvc module parameter.
+	  Also supports stereo playback and jack detection with the CS42L84
+	  headphone codec. Headset microphone capture is not yet supported.
+
+	  Uses the shared MCA, ADMAC, DART and TAS2764 drivers with J773g
+	  routing and protected PCM copies. This driver can be built into
+	  the kernel or as the snd-t8132-speaker module.
+
+config SND_SOC_APPLE_J713_HEADPHONES
+	tristate "Apple J713 headphones"
+	depends on ARCH_APPLE && ARM64_16K_PAGES && I2C && GPIOLIB && OF
+	depends on DMADEVICES
+	select SND_PCM
+	select SND_SOC_APPLE_MCA
+	select SND_SOC_CS42L84
+	select APPLE_ADMAC
+	help
+	  Headphone-only playback and jack detection on the M4 MacBook Air J713.
+	  Uses MCA frontend/port 2, ADMAC TX2 and the CS42L84 codec. No speaker
+	  amplifier, speaker PCM or speaker protection model is instantiated.
+
 endmenu
