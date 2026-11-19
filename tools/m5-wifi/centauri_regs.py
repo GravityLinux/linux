@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: GPL-2.0-only
+"""Named register roles supported by runtime captures and Gravity/Asahi PCIe.
+
+Offsets are relative to their ADT register bank, not global physical addresses.
+PHY-IP register 0x90 bit 16 remains unresolved; see REGISTERS.rst.
+"""
+
+PHY_CONTROL = 0x00
+PHY_CLK0_REQUEST = 1 << 0
+PHY_CLK1_REQUEST = 1 << 1
+PHY_CLK0_ACK = 1 << 2
+PHY_CLK1_ACK = 1 << 3
+PHY_RESET = 1 << 4
+PHY_REFERENCE_CLOCK_ENABLE = (1 << 9) | (1 << 10)
+PHY_STARTUP_CONTROL = 0x04
+PHY_CLOCK_STATUS = 0x08
+PHY_CLOCK_READY = 1 << 0
+PHY_COMMON_CLOCK_CONTROL = 0x00
+PHY_COMMON_CLOCK_MODE_MASK = 0x3
+PHY_COMMON_CLOCK_MODE_RUN = 1
+PHY_IP_REG_90 = 0x90
+PHY_IP_REG_90_BIT16 = 1 << 16  # Meaning unresolved; not required for root/link startup.
+
+ROOT_CONTROL = 0x50
+ROOT_CONTROL_RUN = 1 << 0
+ROOT_STATUS = 0x58
+ROOT_STATUS_READY = 1 << 0
+
+PORT_LTSSM_CONTROL = 0x80
+PORT_LTSSM_ENABLE = 1 << 0
+# Functional names for the measured request/completion handshake. Bit0 sets
+# completion bit4 while the link stays up; bit4 is W1C. Exact traffic gating
+# semantics are not yet established. This is not a persistent setup preset.
+PORT_QUIESCE_CONTROL = 0x88
+PORT_QUIESCE_REQUEST = 1 << 0
+PORT_QUIESCE_COMPLETE = 1 << 4
+PORT_LINK_STATUS = 0x208
+PORT_LINK_UP = 1 << 0
+PORT_LINK_BUSY = 1 << 2
+PORT_APP_CLOCK_CONTROL = 0x800
+PORT_APP_CLOCK_ENABLE = 1 << 0
+PORT_APP_CLOCK_GATING_DISABLE = 1 << 8
+PORT_STATUS = 0x804
+PORT_RUNNING = 1 << 0
+PORT_RESET_CONTROL = 0x82c
+PORT_RESET_RELEASE = 1 << 0
+PORT_MSI_CONFIG = 0x124
+PORT_MSI_ENABLE = 1 << 0
+PORT_MSI_ADDRESS_LOW = 0x16c  # T602x and later layout.
+PORT_MSI_ADDRESS_HIGH = 0x170
+PORT_MSI_MAP_TABLE = 0x3800
+PORT_MSI_MAP_ENABLE = 1 << 31
+PORT_MSI_VECTOR_COUNT = 32
+INTERRUPT_TO_AXI_CONTROL = 0x80  # Relative to ADT bank 11.
+INTERRUPT_TO_AXI_ENABLE = 1 << 0
+PORT_RID_TO_SID_TABLE = 0x3000
+PORT_RID_TO_SID_VALID = 1 << 31
+PORT_RID_TO_SID_STREAM_SHIFT = 16
+
+PCI_PRIMARY_SECONDARY_SUBORDINATE_BUS = 0x18
+PCI_COMMAND = 0x04
+PCI_COMMAND_MEMORY = 1 << 1
+PCI_COMMAND_BUS_MASTER = 1 << 2
+PCI_COMMAND_INTX_DISABLE = 1 << 10
+PCI_MEMORY_BASE_LIMIT = 0x20
+PCI_PREFETCH_BASE_LIMIT = 0x24
+PCI_PREFETCH_BASE_UPPER = 0x28
+PCI_PREFETCH_LIMIT_UPPER = 0x2c
+PCI_CAPABILITY_LIST = 0x34
+PCI_CAP_ID_EXPRESS = 0x10
+PCI_EXP_LINK_STATUS = 0x12  # Relative to the PCI Express capability.
+PCI_EXP_DEVICE_CONTROL = 0x08
+PCI_EXP_DEVICE_MAX_PAYLOAD_MASK = 0xe0
+PCI_EXP_DEVICE_MAX_PAYLOAD_256 = 0x20
+PCI_EXP_DEVICE_MAX_READ_REQUEST_MASK = 0x7000
+PCI_EXP_DEVICE_MAX_READ_REQUEST_512 = 0x2000
+PCI_EXP_DEVICE_ERROR_REPORT_ENABLE = 0xf
+PCI_CAP_ID_MSI = 0x05
+PCI_CAP_ID_PM = 0x01
+PCI_PM_CONTROL = 0x04
+PCI_PM_STATE_MASK = 0x0003
+PCI_PM_STATE_D3HOT = 0x0003
+PCI_PM_PME_ENABLE = 0x0100
+PCI_PM_PME_STATUS = 0x8000
+PCI_EXT_CAP_ID_PTM = 0x001f
+PCI_PTM_CAP = 0x04
+PCI_PTM_CONTROL = 0x08
+PCI_PTM_ENABLE = 1
+PCI_PTM_ROOT_SELECT = 2
+PCI_PTM_GRANULARITY_MASK = 0xff00
+PCI_MSI_CONTROL = 0x02
+PCI_MSI_ENABLE = 1 << 0
+PCI_MSI_MULTIPLE_ENABLE_MASK = 0x70
+PCI_MSI_MULTIPLE_ENABLE_FOUR = 2 << 4
+PCI_MSI_ADDRESS_64BIT = 1 << 7
+PCI_MSI_ADDRESS_LOW = 0x04
+PCI_MSI_ADDRESS_HIGH = 0x08
+PCI_MSI_DATA_32BIT = 0x08
+PCI_MSI_DATA_64BIT = 0x0c
+
+PCI_VENDOR_APPLE = 0x106b
+CENTAURI_BOOTSTRAP_DEVICE = 0x1900
+CENTAURI_CONTROL_DEVICE = 0x1901
+CENTAURI_WIFI_DEVICE = 0x1902
+CENTAURI_BETA_DEVICE = 0x1903
+# Runtime configuration metadata. Observed paired words decode as
+# Unix microseconds near guest startup; the update trigger remains unknown.
+CENTAURI_PCI_UNIX_TIME_US_LOW = 0xff8
+CENTAURI_PCI_UNIX_TIME_US_HIGH = 0xffc
+# Per-function boot buffer: control PF0 publishes 0xae3c00 bytes before
+# +0x1070; Wi-Fi PF1 publishes a separate 0x200000-byte allocation.
+# Its role remains unresolved; this names the published DMA address and size.
+CENTAURI_PCI_BOOT_BUFFER_LOW = 0xf88
+CENTAURI_PCI_BOOT_BUFFER_HIGH = 0xf8c
+CENTAURI_PCI_BOOT_BUFFER_LENGTH = 0xf90
+
+GPIO_PIN_DATA = 1 << 0
+GPIO_PIN_MODE_SHIFT = 1
+GPIO_PIN_MODE_MASK = 0x7 << GPIO_PIN_MODE_SHIFT
+GPIO_MODE_INPUT = 0
+GPIO_MODE_OUTPUT = 1
+
+# BAR0 startup interface. Only this bank is accessible at cold startup;
+# the lower control bank becomes accessible at a later, unresolved stage.
+BOOTSTRAP_BANK = 0x8000
+BOOTSTRAP_STATUS = 0x00
+BOOTSTRAP_IMAGE_READY = 4
+BOOTSTRAP_IDENTITY_WORD0 = 0x04
+BOOTSTRAP_CHIP_BOARD_ID = 0x08
+BOOTSTRAP_CHIP_ID_SHIFT = 16
+BOOTSTRAP_BOARD_ID_MASK = 0xffff
+BOOTSTRAP_IDENTITY_WORD2 = 0x0c
+BOOTSTRAP_IDENTITY_WORD3 = 0x10
+BOOTSTRAP_SUBMISSION_STATUS = 0x40
+BOOTSTRAP_SUBMISSION_ADDRESS_LOW = 0x44
+BOOTSTRAP_SUBMISSION_ADDRESS_HIGH = 0x48
+BOOTSTRAP_SUBMISSION_LENGTH = 0x4c
+BOOTSTRAP_SUBMIT = 0x1000
+BOOTSTRAP_HOST_PLATFORM_ID = 0x7c
+BOOTSTRAP_HOST_BOARD_ID_SHIFT = 16
+BOOTSTRAP_IMAGE_RECORD_SIZE = 32
+BOOTSTRAP_IMAGE_SOURCE_OFFSET = 0x00
+BOOTSTRAP_IMAGE_LENGTH_OFFSET = 0x08
+
+# Runtime control PF0, relative to BAR0 + 0x8000. Unlike cold bootstrap,
+# this bank initially reports 1 and uses a different image doorbell.
+CONTROL_BANK = 0x8000
+CONTROL_IMAGE_READY = 2
+CONTROL_IMAGE_SUBMIT = 0x1070
+CONTROL_IPC_STATE = 0x50
+CONTROL_IPC_ADDRESS_LOW = 0x54
+CONTROL_IPC_ADDRESS_HIGH = 0x58
+CONTROL_IPC_HANDSHAKE = 0x107c
+# Boot-37: eighteen owned transfers, including 15 -> 0 index wrap.
+CONTROL_SUBMISSION_DOORBELL = 0x1000
+
+# Runtime Wi-Fi PF1 BAR0: reference startup polls +8 until it reports 2.
+# ControlApp readiness and a completed greeting do not establish this state.
+WIFI_STARTUP_STATUS = 0x08
+WIFI_STARTUP_READY = 2
+
+# Sibling PF2 BAR0, reference-53 and bare first-publication target-55.
+BETA_IPC_STATE = 0x00
+BETA_IPC_CONTEXT_LOW = 0x04
+BETA_IPC_CONTEXT_HIGH = 0x08
+BETA_DMA_WINDOW_BASE_LOW = 0x0c
+BETA_DMA_WINDOW_BASE_HIGH = 0x10
+BETA_DMA_WINDOW_LENGTH = 0x14
+BETA_FIRMWARE_STATE = 0x18
+BETA_IPC_HANDSHAKE = 0x107c
+# Reference bases + lengths end here across three boots; target-55 also
+# publishes a relocated window successfully. No access outside mapped
+# owned buffers is implied by the larger advertised aperture.
+RUNTIME_DMA_WINDOW_END = 0x3ff00000
+
+# Wi-Fi PF1's analogous window in reference-17. Its context is distinct
+# from the window base; own Wi-Fi IPC publication remains unimplemented.
+WIFI_IPC_CONTEXT_LOW = 0x10
+WIFI_IPC_CONTEXT_HIGH = 0x14
+WIFI_DMA_WINDOW_BASE_LOW = 0x18
+WIFI_DMA_WINDOW_BASE_HIGH = 0x1c
+WIFI_DMA_WINDOW_LENGTH = 0x20
+
+# Sibling inline HCI pair, reference-56 and owned command/event target-57.
+BETA_HCI_COMMAND_QUEUE = 1
+BETA_HCI_EVENT_QUEUE = 7
+BETA_HCI_INLINE_CAPACITY = 0x104
+BETA_HCI_INLINE_STRIDE = 0x114  # 16-byte descriptor plus 260-byte payload area
+BETA_HCI_COMMAND_ENTRIES = 5
+BETA_HCI_EVENT_ENTRIES = 17
+
+WIFI_IPC_STATE = 0x0c
+
+# Offsets in the published Wi-Fi host context, holding u16 ring cursors.
+WIFI_DEVICE_COMPLETION_INDICES = 0x78
+WIFI_DEVICE_SUBMISSION_INDICES = 0x24c
+WIFI_HOST_COMPLETION_INDICES = 0x3cc
+WIFI_HOST_SUBMISSION_INDICES = 0x5a0
+WIFI_IPC_HANDSHAKE = 0x1028
