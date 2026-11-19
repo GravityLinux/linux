@@ -89,14 +89,10 @@
 &dcpext0 {
 	apple,connector-type = "DP";
 	apple,dp-altmode;
-	/* ADT UFP endpoint 1, stream 0. */
-	apple,dp-xbar-source = <2>;
 };
 
 &dcpext1 {
 	apple,connector-type = "DP";
 	apple,dp-altmode;
-	/* ADT UFP endpoint 2, stream 0. */
-	apple,dp-xbar-source = <4>;
 };
 
