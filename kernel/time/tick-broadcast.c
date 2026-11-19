@@ -780,13 +780,48 @@ static void tick_handle_oneshot_broadcast(struct clock_event_device *dev)
 	}
 }
 
-static int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
+static __always_inline int broadcast_needs_cpu(struct clock_event_device *bc, int cpu)
 {
 	if (!(bc->features & CLOCK_EVT_FEAT_HRTIMER))
 		return 0;
 	if (bc->next_event == KTIME_MAX)
 		return 0;
+	/* Retry a handoff which could not move a running hrtimer callback. */
+	if (tick_broadcast_hrtimer_preferred_enabled() && bc->bound_on == cpu)
+		tick_broadcast_hrtimer_queue(bc);
 	return bc->bound_on == cpu ? -EBUSY : 0;
+}
+
+/*
+ * Run on the preferred CPU, after the programming CPU released the lock.
+ * Until this actually moves the hrtimer, bound_on still protects the old
+ * owner from entering a state which stops its local timer.
+ */
+void tick_broadcast_hrtimer_reprogram(void *arg)
+{
+	struct clock_event_device *bc;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&tick_broadcast_lock, flags);
+	bc = tick_broadcast_device.evtdev;
+	if (bc != arg || !(bc->features & CLOCK_EVT_FEAT_HRTIMER) ||
+	    !clockevent_state_oneshot(bc) || bc->next_event == KTIME_MAX)
+		goto out;
+
+	/*
+	 * An IPI can run before broadcast EXIT, or after EXIT deferred the
+	 * local event to a broadcast IPI. In either case the local clockevent
+	 * might be unprogrammed. Starting an hrtimer with an equal or later
+	 * expiry does not necessarily reprogram it. Keep the current owner
+	 * until this CPU no longer depends on broadcast delivery.
+	 */
+	if (cpumask_test_cpu(smp_processor_id(), tick_broadcast_oneshot_mask) ||
+	    tick_check_broadcast_expired())
+		goto out;
+
+	bc->set_next_ktime(bc->next_event, bc);
+out:
+	raw_spin_unlock_irqrestore(&tick_broadcast_lock, flags);
 }
 
 static void broadcast_shutdown_local(struct clock_event_device *bc,

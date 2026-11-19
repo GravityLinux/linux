@@ -7602,6 +7602,22 @@ Kernel parameters
 			See Documentation/admin-guide/mm/transhuge.rst for more
 			details.
 
+	tick_broadcast_hrtimer.cpu= [KNL,SMP]
+			Preferred CPU for the hrtimer broadcast clockevent.
+			Format: <cpu-number>
+			Default: -1 (follow the CPU programming the event).
+			With the parameter unset or -1, a disabled static key
+			bypasses preference work in the programming/owner paths.
+			This preserves timer decisions, not instruction identity.
+			A valid opt-in enables the key at early initcall time.
+			Reprogramming requests an asynchronous handoff to this
+			CPU. Until the handoff completes, the existing owner is
+			kept out of timer-stopping idle states. An offline target
+			falls back to the normal caller-based placement.
+			This does not reserve a CPU or affect hardware broadcast
+			clockevents. Select a housekeeping CPU with a working
+			local timer; timer latency and power need validation.
+
 	tlbi=		[X86-64]
 			Format: {ipi}
 			ipi: switch to IPI-based TLB flushing
