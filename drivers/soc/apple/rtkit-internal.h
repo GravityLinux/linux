@@ -25,11 +25,16 @@
 struct apple_rtkit {
 	void *cookie;
 	const struct apple_rtkit_ops *ops;
+	/* Compatibility for clients configuring boot policy per instance. */
+	unsigned int compat_quirks;
+	bool skip_boot_ap_power;
 	struct device *dev;
 
 	struct apple_mbox *mbox;
 
 	struct completion epmap_completion;
+	struct completion hello_completion;
+	bool retained_boot;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
 
@@ -38,11 +43,13 @@ struct apple_rtkit {
 
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
+	struct completion crashlog_completion;
 	bool crashed;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
+	struct apple_rtkit_shmem system7_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;
 	struct apple_rtkit_shmem oslog_buffer;
 

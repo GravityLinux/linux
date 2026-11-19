@@ -329,6 +329,23 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 	kfree(priv);
 }
 
+static int apple_soc_cpufreq_set_boost(struct cpufreq_policy *policy, int state)
+{
+	unsigned int max_freq = policy->cpuinfo.max_freq;
+	int ret;
+
+	/*
+	 * Our maximum comes entirely from the OPP table. Clear the cached
+	 * maximum so the generic helper can lower it when disabling boost.
+	 */
+	policy->cpuinfo.max_freq = 0;
+	ret = cpufreq_boost_set_sw(policy, state);
+	if (ret)
+		policy->cpuinfo.max_freq = max_freq;
+
+	return ret;
+}
+
 static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.name		= "apple-cpufreq",
 	.flags		= CPUFREQ_HAVE_GOVERNOR_PER_POLICY |
@@ -340,7 +357,7 @@ static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.target_index	= apple_soc_cpufreq_set_target,
 	.fast_switch	= apple_soc_cpufreq_fast_switch,
 	.register_em	= cpufreq_register_em_with_opp,
-	.set_boost	= cpufreq_boost_set_sw,
+	.set_boost	= apple_soc_cpufreq_set_boost,
 	.suspend	= cpufreq_generic_suspend,
 };
 
@@ -348,6 +365,13 @@ static int __init apple_soc_cpufreq_module_init(void)
 {
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return -ENODEV;
+
+	/*
+	 * Allow T8132 governors to request turbo OPPs within hardware limits.
+	 * System suspend quiesces CPUs; runtime standby is not a reason to
+	 * exclude a board from the default boost policy.
+	 */
+	apple_soc_cpufreq_driver.boost_enabled = of_machine_is_compatible("apple,t8132");
 
 	return cpufreq_register_driver(&apple_soc_cpufreq_driver);
 }

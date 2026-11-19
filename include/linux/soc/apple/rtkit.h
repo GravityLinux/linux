@@ -34,9 +34,25 @@ struct apple_rtkit_shmem {
 	void *private;
 };
 
+/**
+ * enum apple_rtkit_quirks - opt-in system endpoint protocol variants
+ * @APPLE_RTKIT_QUIRK_EARLY_CRASHLOG: Start the crashlog endpoint before
+ *     acknowledging its endpoint map, acknowledge firmware-owned crash buffers,
+ *     and wait for the buffer exchange before requesting AP power on.
+ * @APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE: Omit the size field from replies allocating
+ *     an oslog buffer; the reply contains only the type and page address.
+ *
+ * Clients select these at initialization. Zero preserves the default protocol.
+ */
+enum apple_rtkit_quirks {
+	APPLE_RTKIT_QUIRK_EARLY_CRASHLOG = 1U << 0,
+	APPLE_RTKIT_QUIRK_OSLOG_NO_SIZE = 1U << 1,
+};
+
 /*
  * Struct to represent implementation-specific RTKit operations.
  *
+ * @quirks:        System endpoint protocol variants, fixed for this instance.
  * @crashed:       Called when the co-processor has crashed. Runs in process
  *                 context.
  * @recv_message:  Function called when a message from RTKit is received
@@ -56,6 +72,7 @@ struct apple_rtkit_shmem {
  *                 context.
  */
 struct apple_rtkit_ops {
+	u32 quirks;
 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
@@ -78,6 +95,13 @@ struct apple_rtkit;
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
+/*
+ * Frees internal RTKit state allocated by devm_apple_rtkit_init().
+ *
+ * @dev:	Pointer to the device node this coprocessor is assocated with
+ * @rtk:	Internal RTKit state initialized by devm_apple_rtkit_init()
+ */
+void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk);
 
 /*
  * Non-devm version of devm_apple_rtkit_init. Must be freed with
@@ -103,6 +127,17 @@ void apple_rtkit_free(struct apple_rtkit *rtk);
  * is held in reset.
  */
 int apple_rtkit_reinit(struct apple_rtkit *rtk);
+
+/* Per-instance compatibility APIs retained for the original M4 PMP clients. */
+void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable);
+void apple_rtkit_set_early_crashlog(struct apple_rtkit *rtk);
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
+			      size_t n_endpoints);
+int apple_rtkit_reuse_syslog_buffer(struct apple_rtkit *rtk, dma_addr_t iova,
+				    size_t size, size_t n_entries,
+				    size_t msg_size);
+int apple_rtkit_reuse_crashlog_buffer(struct apple_rtkit *rtk,
+				      dma_addr_t iova, size_t size);
 
 /*
  * Handle RTKit's boot process. Should be called after the CPU of the
@@ -136,6 +171,15 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
  * Put the co-processor into idle mode
  */
 int apple_rtkit_idle(struct apple_rtkit *rtk);
+int apple_rtkit_idle_ap(struct apple_rtkit *rtk);
+int apple_rtkit_idle_iop(struct apple_rtkit *rtk);
+void apple_rtkit_power_state(struct apple_rtkit *rtk, u32 *ap, u32 *iop);
+
+/* Park an acknowledged IDLE transport without freeing endpoint/buffer state. */
+int apple_rtkit_park(struct apple_rtkit *rtk);
+/* Rearm with CPU stopped, then wait for firmware Hello after RUN. */
+int apple_rtkit_rearm_retained(struct apple_rtkit *rtk);
+int apple_rtkit_boot_retained(struct apple_rtkit *rtk);
 
 /*
  * Checks if RTKit is running and ready to handle messages.
@@ -152,6 +196,9 @@ bool apple_rtkit_is_crashed(struct apple_rtkit *rtk);
  * sent or received from that endpoint.
  */
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint);
+
+/* Start a client-known application endpoint omitted by the firmware epmap. */
+int apple_rtkit_start_ep_implicit(struct apple_rtkit *rtk, u8 endpoint);
 
 /*
  * Send a message to the given endpoint.
