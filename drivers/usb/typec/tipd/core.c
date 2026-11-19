@@ -9,11 +9,9 @@
 #include <linux/i2c.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
-#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
-#include <linux/interrupt.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -92,30 +90,6 @@ struct tps6598x_rx_identity_reg {
 	struct usb_pd_identity identity;
 } __packed;
 
-/* TPS_REG_USB4_STATUS */
-struct tps6598x_usb4_status_reg {
-	u8 mode_status;
-	__le32 eudo;
-	__le32 unknown;
-} __packed;
-
-/* TPS_REG_DP_SID_STATUS */
-struct tps6598x_dp_sid_status_reg {
-	u8 mode_status;
-	__le32 status_tx;
-	__le32 status_rx;
-	__le32 configure;
-	__le32 mode_data;
-} __packed;
-
-/* TPS_REG_INTEL_VID_STATUS */
-struct tps6598x_intel_vid_status_reg {
-	u8 mode_status;
-	__le32 attention_vdo;
-	__le16 enter_vdo;
-	__le16 device_mode;
-} __packed;
-
 /* Standard Task return codes */
 #define TPS_TASK_TIMEOUT		1
 #define TPS_TASK_REJECTED		3
@@ -143,82 +117,6 @@ static const char *const modes[] = {
 
 /* Unrecognized commands will be replaced with "!CMD" */
 #define INVALID_CMD(_cmd_)		(_cmd_ == 0x444d4321)
-
-struct tps6598x;
-
-struct tipd_data {
-	irq_handler_t irq_handler;
-	u64 irq_mask1;
-	size_t tps_struct_size;
-	void (*remove)(struct tps6598x *tps);
-	int (*register_port)(struct tps6598x *tps, struct fwnode_handle *node);
-	void (*unregister_port)(struct tps6598x *tps);
-	void (*trace_data_status)(u32 status);
-	void (*trace_power_status)(u16 status);
-	void (*trace_status)(u32 status);
-	int (*apply_patch)(struct tps6598x *tps);
-	int (*init)(struct tps6598x *tps);
-	int (*switch_power_state)(struct tps6598x *tps, u8 target_state);
-	bool (*read_data_status)(struct tps6598x *tps);
-	bool (*read_power_status)(struct tps6598x *tps);
-	int (*reset)(struct tps6598x *tps);
-	int (*connect)(struct tps6598x *tps, u32 status);
-};
-
-struct tps6598x {
-	struct device *dev;
-	struct regmap *regmap;
-	struct mutex lock; /* device lock */
-	u8 i2c_protocol:1;
-
-	struct gpio_desc *reset;
-	struct typec_port *port;
-	struct typec_partner *partner;
-	struct usb_pd_identity partner_identity;
-	struct usb_role_switch *role_sw;
-	struct typec_capability typec_cap;
-
-	struct power_supply *psy;
-	struct power_supply_desc psy_desc;
-	enum power_supply_usb_type usb_type;
-
-	int wakeup;
-	u32 status; /* status reg */
-	u32 data_status;
-	u16 pwr_status;
-	struct delayed_work	wq_poll;
-
-	const struct tipd_data *data;
-};
-
-struct cd321x_status {
-	u32 status;
-	u32 pwr_status;
-	u32 data_status;
-	u32 status_changed;
-	struct usb_pd_identity partner_identity;
-	struct tps6598x_dp_sid_status_reg dp_sid_status;
-	struct tps6598x_intel_vid_status_reg intel_vid_status;
-	struct tps6598x_usb4_status_reg usb4_status;
-};
-
-struct cd321x {
-	struct tps6598x tps;
-
-	struct tps6598x_dp_sid_status_reg dp_sid_status;
-	struct tps6598x_intel_vid_status_reg intel_vid_status;
-	struct tps6598x_usb4_status_reg usb4_status;
-
-	struct typec_altmode *port_altmode_dp;
-	struct typec_altmode *port_altmode_tbt;
-
-	struct typec_mux *mux;
-	struct typec_mux_state state;
-
-	struct cd321x_status update_status;
-	struct delayed_work update_work;
-	struct usb_pd_identity cur_partner_identity;
-};
 
 static enum power_supply_property tps6598x_psy_props[] = {
 	POWER_SUPPLY_PROP_USB_TYPE,
@@ -672,17 +570,37 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 	}
 }
 
-static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
+static bool cd321x_data_connected(const struct cd321x_status *st)
+{
+	return st->data_status & TPS_DATA_STATUS_DATA_CONNECTION;
+}
+
+static void cd321x_mux_set(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
-	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
+	/* Neo keeps its shared HS controller live; its PHY detaches PIPE itself. */
+	if (!of_machine_is_compatible("apple,j700") &&
+	    usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)
+		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+	typec_mux_set(cd321x->mux, &cd321x->state);
+}
+
+static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	struct typec_thunderbolt_switch_data tbt_switch_data = {
+		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
+	};
+
+	if (!cd321x_data_connected(st)) {
 		if (cd321x->state.mode == TYPEC_STATE_SAFE)
 			return;
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+		cd321x_mux_set(tps);
 	} else if (st->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		struct typec_displayport_data dp_data;
 		unsigned long mode;
@@ -711,17 +629,49 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			return;
 		}
 
-		if (cd321x->state.alt == cd321x->port_altmode_dp &&
-		   cd321x->state.mode == mode) {
-			return;
-		}
-
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
+		/* HPD can change without a new pin assignment. Deliver every snapshot
+		 * to the HPD consumer; the ATC mux ignores an unchanged lane mode. */
+		dp_data.status &= ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
+		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+			dp_data.status |= DP_STATUS_HPD_STATE;
+		if ((st->data_status & CD321X_DATA_STATUS_HPD_IRQ) &&
+		    !cd321x->hpd_irq_asserted)
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+		cd321x->hpd_irq_asserted =
+			!!(st->data_status & CD321X_DATA_STATUS_HPD_IRQ);
+		bool same_assignment = cd321x->state.alt == cd321x->port_altmode_dp &&
+				       cd321x->state.mode == mode;
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
 		cd321x->state.alt = cd321x->port_altmode_dp;
 		cd321x->state.data = &dp_data;
 		cd321x->state.mode = mode;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+		dev_dbg(tps->dev,
+			 "PD reports DP altmode: pin=%c status=%#x conf=%#x HPD=%u IRQ=%u\n",
+			 (int)('A' + mode - TYPEC_DP_STATE_A), st->data_status,
+			 dp_data.conf, !!(dp_data.status & DP_STATUS_HPD_STATE),
+			 !!(dp_data.status & DP_STATUS_IRQ_HPD));
+		if (of_machine_is_compatible("apple,t8132") && same_assignment)
+			typec_mux_set(cd321x->mux, &cd321x->state);
+		else
+			cd321x_mux_set(tps);
+	} else if (!cd321x->tbt_switch &&
+		   (st->data_status & (TPS_DATA_STATUS_TBT_CONNECTION |
+				       CD321X_DATA_STATUS_USB4_CONNECTION))) {
+		/*
+		 * The controller entered USB4 or Thunderbolt mode, but no USB4 host
+		 * is wired to this port, so nothing can use the lanes or a tunnel.
+		 * Keep the PHY out of USB4 mode, whose PIPE clock comes from that
+		 * missing controller, and leave USB2, which such devices still
+		 * provide on D+/D-.
+		 */
+		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB2)
+			return;
+		cd321x->state.alt = NULL;
+		cd321x->state.mode = TYPEC_MODE_USB2;
+		cd321x->state.data = NULL;
+		cd321x_mux_set(tps);
 	} else if (st->data_status & TPS_DATA_STATUS_TBT_CONNECTION) {
 		struct typec_thunderbolt_data tbt_data;
 
@@ -745,7 +695,14 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
+
+		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_TBT;
+		tbt_switch_data.tbt = tbt_data;
+		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
+						      TYPEC_ORIENTATION_REVERSE :
+						      TYPEC_ORIENTATION_NORMAL;
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
 		struct enter_usb_data eusb_data;
 
@@ -759,14 +716,22 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		cd321x_mux_set(tps);
+
+		tbt_switch_data.state = TYPEC_THUNDERBOLT_SWITCH_USB4;
+		tbt_switch_data.usb4 = eusb_data;
+		tbt_switch_data.orientation = TPS_STATUS_TO_UPSIDE_DOWN(st->status) ?
+						      TYPEC_ORIENTATION_REVERSE :
+						      TYPEC_ORIENTATION_NORMAL;
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 	} else {
 		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_STATE_USB)
 			return;
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_USB;
 		cd321x->state.data = NULL;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
+		cd321x_mux_set(tps);
 	}
 
 	/* Clear data since it's no longer used after typec_mux_set and points to the stack */
@@ -779,6 +744,9 @@ static void cd321x_update_work(struct work_struct *work)
 					    struct cd321x, update_work);
 	struct tps6598x *tps = &cd321x->tps;
 	struct cd321x_status st;
+	struct typec_thunderbolt_switch_data tbt_switch_data = {
+		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
+	};
 
 	guard(mutex)(&tps->lock);
 
@@ -798,7 +766,11 @@ static void cd321x_update_work(struct work_struct *work)
 	enum typec_orientation orientation = TYPEC_ORIENTATION_NONE;
 
 	if (usb_connection) {
-		if (tps->data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
+		/* T8132 takes the data role from the queued status. */
+		u32 data_status = of_machine_is_compatible("apple,t8132") ?
+				  st.data_status : tps->data_status;
+
+		if (data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
 			new_role = USB_ROLE_DEVICE;
 		else
 			new_role = USB_ROLE_HOST;
@@ -829,10 +801,15 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If there was a disconnection, set PHY to off */
 	if (!new_connected || was_disconnected) {
+		typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+		cd321x->hpd_irq_asserted = false;
+		/* T8132 leaves the mux to the next mode update. */
+		if (!of_machine_is_compatible("apple,t8132"))
+			typec_mux_set(cd321x->mux, &cd321x->state);
 	}
 
 	/* Update Type-C properties */
@@ -854,8 +831,11 @@ static void cd321x_update_work(struct work_struct *work)
 		desc.usb_pd = is_pd;
 		desc.accessory = TYPEC_ACCESSORY_NONE; /* XXX: handle accessories */
 
-		if (desc.usb_pd)
-			desc.identity = &st.partner_identity;
+		if (desc.usb_pd) {
+			/* The Type-C core retains this pointer after work returns. */
+			cd321x->cur_partner_identity = st.partner_identity;
+			desc.identity = &cd321x->cur_partner_identity;
+		}
 
 		tps->partner = typec_register_partner(tps->port, &desc);
 		if (IS_ERR(tps->partner)) {
@@ -895,17 +875,35 @@ static void cd321x_queue_status(struct cd321x *cd321x)
 static int cd321x_connect(struct tps6598x *tps, u32 status)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	unsigned int delay_ms = CD321X_DEBOUNCE_DELAY_MS;
+	u32 data = tps->data_status;
 
 	tps->status = status;
 	cd321x_queue_status(cd321x);
 
+	/* Private shared-controller timing experiment. On this board the HS
+	 * hub is already live for the other connector, so deferring a settled
+	 * plain USB3 host indication can let HS enumeration win before the SS
+	 * PHY is configured. Keep the original debounce for other boards,
+	 * disconnects, device mode and all negotiated alternate modes.
+	 */
+	if (of_machine_is_compatible("apple,j700") &&
+	    (status & TPS_STATUS_PLUG_PRESENT) &&
+	    (data & TPS_DATA_STATUS_DATA_CONNECTION) &&
+	    (data & TPS_DATA_STATUS_USB3_CONNECTION) &&
+	    !(data & (TPS_DATA_STATUS_USB_DATA_ROLE | TPS_DATA_STATUS_DP_CONNECTION |
+		      TPS_DATA_STATUS_TBT_CONNECTION | CD321X_DATA_STATUS_USB4_CONNECTION))) {
+		delay_ms = 0;
+		dev_info(tps->dev, "Neo shared USB3: immediate host update, data=%08x\n", data);
+	}
+
 	/*
-	 * Cancel pending work if not already running, then requeue after CD321X_DEBOUNCE_DELAY_MS
+	 * Cancel pending work if not already running, then requeue after the selected delay
 	 * regardless since the work function will check for any plug or altmodes changes since
 	 * its last run anyway.
 	 */
 	cancel_delayed_work(&cd321x->update_work);
-	schedule_delayed_work(&cd321x->update_work, msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+	schedule_delayed_work(&cd321x->update_work, msecs_to_jiffies(delay_ms));
 
 	return 0;
 }
@@ -1134,11 +1132,12 @@ static int tps6598x_check_mode(struct tps6598x *tps)
 	return -ENODEV;
 }
 
-static const struct regmap_config tps6598x_regmap_config = {
+const struct regmap_config tps6598x_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
 	.max_register = 0x7F,
 };
+EXPORT_SYMBOL_GPL(tps6598x_regmap_config);
 
 static int tps6598x_psy_get_online(struct tps6598x *tps,
 				   union power_supply_propval *val)
@@ -1335,6 +1334,12 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_unregister_altmodes;
 	}
 
+	cd321x->tbt_switch = fwnode_typec_thunderbolt_switch_get(fwnode);
+	if (IS_ERR(cd321x->tbt_switch)) {
+		ret = PTR_ERR(cd321x->tbt_switch);
+		goto err_unregister_mux;
+	}
+
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
 	cd321x->state.data = NULL;
@@ -1342,6 +1347,9 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 
 	return 0;
 
+err_unregister_mux:
+	typec_mux_put(cd321x->mux);
+	cd321x->mux = NULL;
 err_unregister_altmodes:
 	typec_unregister_altmode(cd321x->port_altmode_dp);
 	typec_unregister_altmode(cd321x->port_altmode_tbt);
@@ -1363,6 +1371,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
+	typec_thunderbolt_switch_put(cd321x->tbt_switch);
+	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 	typec_unregister_altmode(cd321x->port_altmode_dp);
@@ -1785,27 +1795,98 @@ static void cd321x_remove(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
 
-static int tps6598x_probe(struct i2c_client *client)
+/* Private bring-up snapshot: selected status registers, never IRQ clear/FIFO. */
+static ssize_t neo_link_status_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
 {
-	const struct tipd_data *data;
-	struct tps6598x *tps;
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct tps6598x_dp_sid_status_reg dp;
+	struct tps6598x_rx_identity_reg id;
+	u32 status, data;
+	u64 events;
+	u16 power;
+	u8 system_power;
+	int ret;
+
+	guard(mutex)(&tps->lock);
+	ret = tps6598x_read32(tps, TPS_REG_STATUS, &status);
+	if (ret)
+		return ret;
+	ret = tps6598x_read32(tps, TPS_REG_DATA_STATUS, &data);
+	if (ret)
+		return ret;
+	ret = tps6598x_read16(tps, TPS_REG_POWER_STATUS, &power);
+	if (ret)
+		return ret;
+	ret = tps6598x_block_read(tps, TPS_REG_RX_IDENTITY_SOP, &id, sizeof(id));
+	if (ret)
+		return ret;
+	ret = tps6598x_block_read(tps, TPS_REG_DP_SID_STATUS, &dp, sizeof(dp));
+	if (ret)
+		return ret;
+	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &events);
+	if (ret)
+		return ret;
+	ret = tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &system_power);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf,
+		"status=%08x data=%08x power=%04x system_power=%u events=%016llx cached=%08x/%08x identity=%*phN dp=%*phN\n",
+		status, data, power, system_power, events, tps->status, tps->data_status,
+		(int)sizeof(id), &id, (int)sizeof(dp), &dp);
+}
+static DEVICE_ATTR_RO(neo_link_status);
+
+/* Private diagnostic, not a power policy: only native-observed SSPS 0/2.
+ * Serialize with the IRQ worker; never issue raw SPMI commands from the host.
+ */
+static ssize_t neo_system_power_store(struct device *dev,
+                                     struct device_attribute *attr,
+                                     const char *buf, size_t count)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	u8 target, state;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &target);
+	if (ret)
+		return ret;
+	if (target != 0 && target != 2)
+		return -EINVAL;
+
+	guard(mutex)(&tps->lock);
+	/* Force the command even when the state already matches: test whether
+	 * the native per-attach command has side effects beyond register 0x20.
+	 */
+	ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target), &target, 0, NULL);
+	if (ret)
+		return ret;
+	ret = tps6598x_read8(tps, TPS_REG_SYSTEM_POWER_STATE, &state);
+	if (ret)
+		return ret;
+	dev_info(dev, "private SSPS target=%u readback=%u\n", target, state);
+	if (state != target)
+		return -EIO;
+	return count;
+}
+static DEVICE_ATTR_WO(neo_system_power);
+
+static struct attribute *neo_link_attrs[] = {
+	&dev_attr_neo_link_status.attr,
+	&dev_attr_neo_system_power.attr,
+	NULL,
+};
+static const struct attribute_group neo_link_group = {
+	.attrs = neo_link_attrs,
+};
+
+int tipd_init(struct tps6598x *tps)
+{
 	struct fwnode_handle *fwnode;
 	bool patch_loaded = false;
 	u32 status;
 	u32 vid = 0;
 	int ret;
-
-	data = i2c_get_match_data(client);
-	if (!data)
-		return -EINVAL;
-
-	tps = devm_kzalloc(&client->dev, data->tps_struct_size, GFP_KERNEL);
-	if (!tps)
-		return -ENOMEM;
-
-	mutex_init(&tps->lock);
-	tps->dev = &client->dev;
-	tps->data = data;
 
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
@@ -1813,10 +1894,6 @@ static int tps6598x_probe(struct i2c_client *client)
 				     "failed to get reset GPIO\n");
 	if (tps->reset)
 		msleep(TPS_SETUP_MS);
-
-	tps->regmap = devm_regmap_init_i2c(client, &tps6598x_regmap_config);
-	if (IS_ERR(tps->regmap))
-		return PTR_ERR(tps->regmap);
 
 	if (!device_is_compatible(tps->dev, "ti,tps25750")) {
 		ret = tps6598x_read32(tps, TPS_REG_VID, &vid);
@@ -1826,13 +1903,6 @@ static int tps6598x_probe(struct i2c_client *client)
 			return -ENODEV;
 		}
 	}
-
-	/*
-	 * Checking can the adapter handle SMBus protocol. If it can not, the
-	 * driver needs to take care of block reads separately.
-	 */
-	if (i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
-		tps->i2c_protocol = true;
 
 	if (tps->data->switch_power_state) {
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
@@ -1870,7 +1940,7 @@ static int tps6598x_probe(struct i2c_client *client)
 	 * with existing DT files, we work around this by deleting any
 	 * fwnode_links to/from this fwnode.
 	 */
-	fwnode = device_get_named_child_node(&client->dev, "connector");
+	fwnode = device_get_named_child_node(tps->dev, "connector");
 	if (fwnode)
 		fw_devlink_purge_absent_suppliers(fwnode);
 
@@ -1894,16 +1964,21 @@ static int tps6598x_probe(struct i2c_client *client)
 			goto err_unregister_port;
 		if (!tps->data->read_data_status(tps))
 			goto err_unregister_port;
+		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
+			ret = tps6598x_read_partner_identity(tps);
+			if (ret)
+				goto err_unregister_port;
+		}
 		ret = tps->data->connect(tps, status);
 		if (ret)
-			dev_err(&client->dev, "failed to register partner\n");
+			dev_err(tps->dev, "failed to register partner\n");
 	}
 
-	if (client->irq) {
-		ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
+	if (tps->irq) {
+		ret = devm_request_threaded_irq(tps->dev, tps->irq, NULL,
 						tps->data->irq_handler,
 						IRQF_SHARED | IRQF_ONESHOT,
-						dev_name(&client->dev), tps);
+						dev_name(tps->dev), tps);
 	} else {
 		dev_dbg(tps->dev, "no IRQ specified, using polling mode\n");
 		INIT_DELAYED_WORK(&tps->wq_poll, tps6598x_poll_work);
@@ -1914,13 +1989,23 @@ static int tps6598x_probe(struct i2c_client *client)
 	if (ret)
 		goto err_disconnect;
 
-	i2c_set_clientdata(client, tps);
+	/* SN201202x may latch an edge while S0/masks are set, before the
+	 * threaded handler exists. Drain pending events after registering it. */
+	if (tps->irq && device_is_compatible(tps->dev, "apple,sn201202x"))
+		tps->data->irq_handler(tps->irq, tps);
+
 	fwnode_handle_put(fwnode);
 
+	if (device_is_compatible(tps->dev, "apple,sn201202x")) {
+		ret = devm_device_add_group(tps->dev, &neo_link_group);
+		if (ret)
+			goto err_disconnect;
+	}
+
 	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
-	if (tps->wakeup && client->irq) {
-		devm_device_init_wakeup(&client->dev);
-		enable_irq_wake(client->irq);
+	if (tps->wakeup && tps->irq) {
+		devm_device_init_wakeup(tps->dev);
+		enable_irq_wake(tps->irq);
 	}
 
 	return 0;
@@ -1942,15 +2027,14 @@ err_reset_controller:
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(tipd_init);
 
-static void tps6598x_remove(struct i2c_client *client)
+void tipd_remove(struct tps6598x *tps)
 {
-	struct tps6598x *tps = i2c_get_clientdata(client);
-
-	if (!client->irq)
+	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
 	else
-		devm_free_irq(tps->dev, client->irq, tps);
+		devm_free_irq(tps->dev, tps->irq, tps);
 
 	if (tps->data->remove)
 		tps->data->remove(tps);
@@ -1965,29 +2049,26 @@ static void tps6598x_remove(struct i2c_client *client)
 	if (tps->reset)
 		gpiod_set_value_cansleep(tps->reset, 1);
 }
+EXPORT_SYMBOL_GPL(tipd_remove);
 
-static int __maybe_unused tps6598x_suspend(struct device *dev)
+int tipd_suspend(struct tps6598x *tps)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct tps6598x *tps = i2c_get_clientdata(client);
-
 	if (tps->wakeup) {
-		disable_irq(client->irq);
-		enable_irq_wake(client->irq);
+		disable_irq(tps->irq);
+		enable_irq_wake(tps->irq);
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 1);
 	}
 
-	if (!client->irq)
+	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tipd_suspend);
 
-static int __maybe_unused tps6598x_resume(struct device *dev)
+int tipd_resume(struct tps6598x *tps)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct tps6598x *tps = i2c_get_clientdata(client);
 	int ret;
 
 	ret = tps6598x_check_mode(tps);
@@ -2001,25 +2082,22 @@ static int __maybe_unused tps6598x_resume(struct device *dev)
 	}
 
 	if (tps->wakeup) {
-		disable_irq_wake(client->irq);
-		enable_irq(client->irq);
+		disable_irq_wake(tps->irq);
+		enable_irq(tps->irq);
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 0);
 		msleep(TPS_SETUP_MS);
 	}
 
-	if (!client->irq)
+	if (!tps->irq)
 		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
 				   msecs_to_jiffies(POLL_INTERVAL));
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tipd_resume);
 
-static const struct dev_pm_ops tps6598x_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(tps6598x_suspend, tps6598x_resume)
-};
-
-static const struct tipd_data cd321x_data = {
+static const struct tipd_data tipd_cd321x_data = {
 	.irq_handler = cd321x_interrupt,
 	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
 		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
@@ -2039,7 +2117,7 @@ static const struct tipd_data cd321x_data = {
 	.connect = cd321x_connect,
 };
 
-static const struct tipd_data tps6598x_data = {
+static const struct tipd_data tipd_tps6598x_data = {
 	.irq_handler = tps6598x_interrupt,
 	.irq_mask1 = TPS_REG_INT_POWER_STATUS_UPDATE |
 		     TPS_REG_INT_DATA_STATUS_UPDATE |
@@ -2076,7 +2154,7 @@ static const struct tipd_data tps66993_data = {
 	.connect = tps6598x_connect,
 };
 
-static const struct tipd_data tps25750_data = {
+static const struct tipd_data tipd_tps25750_data = {
 	.irq_handler = tps25750_interrupt,
 	.irq_mask1 = TPS_REG_INT_POWER_STATUS_UPDATE |
 		     TPS_REG_INT_DATA_STATUS_UPDATE |
@@ -2095,33 +2173,35 @@ static const struct tipd_data tps25750_data = {
 	.connect = tps6598x_connect,
 };
 
-static const struct of_device_id tps6598x_of_match[] = {
-	{ .compatible = "ti,tps6598x", &tps6598x_data},
-	{ .compatible = "ti,tps66993", &tps66993_data},
-	{ .compatible = "apple,cd321x", &cd321x_data},
-	{ .compatible = "ti,tps25750", &tps25750_data},
-	{}
+static const struct tipd_data tipd_sn201202x_data = {
+	.irq_handler = cd321x_interrupt,
+	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
+		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
+		     APPLE_CD_REG_INT_PLUG_EVENT,
+	.tps_struct_size = sizeof(struct sn201202x),
+	.remove = cd321x_remove,
+	.register_port = cd321x_register_port,
+	.unregister_port = cd321x_unregister_port,
+	.trace_data_status = trace_cd321x_data_status,
+	.trace_power_status = trace_tps6598x_power_status,
+	.trace_status = trace_tps6598x_status,
+	.init = cd321x_init,
+	.read_data_status = cd321x_read_data_status,
+	.read_power_status = tps6598x_read_power_status,
+	.reset = cd321x_reset,
+	.switch_power_state = cd321x_switch_power_state,
+	.connect = cd321x_connect,
 };
-MODULE_DEVICE_TABLE(of, tps6598x_of_match);
 
-static const struct i2c_device_id tps6598x_id[] = {
-	{ .name = "tps6598x", .driver_data = (kernel_ulong_t)&tps6598x_data },
-	{ }
+const struct tipd_data *tipd_hw_variants[] = {
+	[TIPD_VARIANT_CD321X] = &tipd_cd321x_data,
+	[TIPD_VARIANT_TPS6598X] = &tipd_tps6598x_data,
+	[TIPD_VARIANT_TPS66993] = &tps66993_data,
+	[TIPD_VARIANT_TPS25750] = &tipd_tps25750_data,
+	[TIPD_VARIANT_SN201202X] = &tipd_sn201202x_data,
 };
-MODULE_DEVICE_TABLE(i2c, tps6598x_id);
-
-static struct i2c_driver tps6598x_i2c_driver = {
-	.driver = {
-		.name = "tps6598x",
-		.pm = &tps6598x_pm_ops,
-		.of_match_table = tps6598x_of_match,
-	},
-	.probe = tps6598x_probe,
-	.remove = tps6598x_remove,
-	.id_table = tps6598x_id,
-};
-module_i2c_driver(tps6598x_i2c_driver);
+EXPORT_SYMBOL_GPL(tipd_hw_variants);
 
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("TI TPS6598x USB Power Delivery Controller Driver");
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("TI TPS6598x USB Power Delivery Controller Core Functions");
