@@ -61,6 +61,9 @@ struct audiosrv_data {
 	struct rw_semaphore srv_rwsem;
 	/* Workqueue for starting the audio service */
 	struct work_struct start_av_service_wq;
+	/* Closes the audio service when the firmware asks for it */
+	struct work_struct close_av_service_wq;
+	u32 close_channel;
 
 	struct dcp_av_audio_cmds cmds;
 
@@ -395,13 +398,34 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 	return ret;
 }
 
+/*
+ * When the display goes away, the firmware sends the audio interface a
+ * group 2 command 1 report and then waits up to 10 s for the AP to close
+ * the interface before it reports the unplug ("timeout while waiting for
+ * DCPAVAudioInterface close"). A plug or other state change only carries
+ * command 0 reports. Close the service from process context.
+ */
+#define AV_AUDIO_REPORT_GROUP_STATE	2
+#define AV_AUDIO_REPORT_CLOSE_REQUEST	1
+
 static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 						  const void *data, size_t data_size)
 {
+	struct audiosrv_data *asrv = service->ep->dcp->audiosrv;
+	const struct epic_service_call *call = data;
+
 	dev_dbg(service->ep->dcp->dev, "got audio report %d size %zx\n", idx, data_size);
 #ifdef DEBUG
 	print_hex_dump(KERN_DEBUG, "audio report: ", DUMP_PREFIX_NONE, 16, 1, data, data_size, true);
 #endif
+
+	if (idx == EPIC_SUBTYPE_STD_SERVICE && data_size >= 16 &&
+	    le32_to_cpu(call->magic) == EPIC_SERVICE_CALL_MAGIC &&
+	    le16_to_cpu(call->group) == AV_AUDIO_REPORT_GROUP_STATE &&
+	    le32_to_cpu(call->command) == AV_AUDIO_REPORT_CLOSE_REQUEST) {
+		WRITE_ONCE(asrv->close_channel, service->channel);
+		schedule_work(&asrv->close_av_service_wq);
+	}
 
 	return 0;
 }
@@ -457,6 +481,7 @@ int dcp_av_retire(struct apple_dcp *dcp, bool *was_open)
 	}
 	WRITE_ONCE(asrv->retirement_paused, true);
 	cancel_work_sync(&asrv->start_av_service_wq);
+	cancel_work_sync(&asrv->close_av_service_wq);
 	*was_open = asrv->is_open;
 	/* Stop the retained unowned audio link and gate DPA before closing its
 	 * stale AV binding, matching the existing T8132 power-transition path.
@@ -535,14 +560,20 @@ void av_service_disconnect(struct apple_dcp *dcp)
 
 	/* close AV audio service */
 	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
-	if (!asrv->is_open)
-		return;
 
+	/*
+	 * Mark the service closed before the call: on an unplug the firmware
+	 * acts on the close but may not answer it, and by the time the call
+	 * times out a replug can already have opened the next interface.
+	 */
 	mutex_lock(&asrv->plug_lock);
-
+	if (!asrv->is_open) {
+		mutex_unlock(&asrv->plug_lock);
+		return;
+	}
+	asrv->is_open = false;
 	if (asrv->audio_dev)
 		dcpaud_disconnect(asrv->audio_dev);
-
 	mutex_unlock(&asrv->plug_lock);
 
 	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
@@ -552,7 +583,6 @@ void av_service_disconnect(struct apple_dcp *dcp)
 	}
 	if (service->torndown)
 		service->enabled = false;
-	asrv->is_open = false;
 }
 
 static void av_work_service_start(struct work_struct *work)
@@ -574,6 +604,47 @@ static void av_work_service_start(struct work_struct *work)
 
 	if (!READ_ONCE(audiosrv_data->retirement_paused))
 		av_service_connect(dcp);
+}
+
+static void av_work_service_close(struct work_struct *work)
+{
+	struct audiosrv_data *asrv =
+		container_of(work, struct audiosrv_data, close_av_service_wq);
+	struct apple_epic_service *service;
+	bool was_open;
+	int ret;
+
+	/*
+	 * Detach the interface first: it is going away, and a replug
+	 * announces a new one. Nothing (a suspend, a resume, an ALSA open)
+	 * may use or reopen it in the meantime.
+	 */
+	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+		service = asrv->srv;
+		if (!service ||
+		    service->channel != READ_ONCE(asrv->close_channel))
+			return;
+		asrv->srv = NULL;
+	}
+
+	mutex_lock(&asrv->plug_lock);
+	was_open = asrv->is_open;
+	asrv->is_open = false;
+	if (asrv->audio_dev)
+		dcpaud_disconnect(asrv->audio_dev);
+	mutex_unlock(&asrv->plug_lock);
+
+	if (!was_open)
+		return;
+	/*
+	 * The firmware acts on the close (it reports the unplug at once) but
+	 * does not answer it, so do not wait the usual 5 s for a reply.
+	 */
+	ret = afk_service_call_status(service, 0, asrv->cmds.close, NULL, 0, 16,
+				      NULL, 0, 16, NULL, msecs_to_jiffies(500));
+	if (ret)
+		dev_dbg(service->ep->dcp->dev,
+			"requested audio service close: %d\n", ret);
 }
 
 int avep_init(struct apple_dcp *dcp)
@@ -606,6 +677,7 @@ int avep_init(struct apple_dcp *dcp)
 
 	dcp->audiosrv = audiosrv_data;
 	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
+	INIT_WORK(&audiosrv_data->close_av_service_wq, av_work_service_close);
 
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
 	if (endpoint) {
