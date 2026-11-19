@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* T8132 ADT: each ATC has one direct DP output and two USB4 DP-INs.
- * Only the direct output (mux control 0) is described here.
+/*
+ * T8132 ADT: each ATC has one direct DP output and two USB4 DP-INs. Only the
+ * direct output (mux control 0) is described here. Each is permanently wired
+ * to one external display engine: ADT HPM0 (ATC0) is left-front and HPM1
+ * (ATC1) left-back; each ATC dpphy is direct DFP port 0, and the external
+ * DCPs are UFP endpoints 1 and 2, stream 0 (crossbar sources 2 and 4).
  */
 
 &{/soc} {
@@ -13,15 +17,16 @@
 	};
 
 	dp_altmode0: display-port-0 {
-		compatible = "apple,t8132-dp-altmode";
+		compatible = "apple,t8132-fixed-dp";
 		apple,atc-index = <0>;
-		apple,display-engines = <&dcpext0 &dcpext1>;
 		mode-switch;
 		phys = <&atcphy0 PHY_TYPE_DP>;
 		phy-names = "dp-phy";
 		mux-controls = <&atcphy0_dpxbar 0>;
 		mux-control-names = "dp-xbar";
 		status = "disabled";
+		apple,display-engine = <&dcpext0>;
+		mux-index = <2>;
 
 		port {
 			dp_altmode0_hpd: endpoint {
@@ -39,15 +44,16 @@
 	};
 
 	dp_altmode1: display-port-1 {
-		compatible = "apple,t8132-dp-altmode";
+		compatible = "apple,t8132-fixed-dp";
 		apple,atc-index = <1>;
-		apple,display-engines = <&dcpext0 &dcpext1>;
 		mode-switch;
 		phys = <&atcphy1 PHY_TYPE_DP>;
 		phy-names = "dp-phy";
 		mux-controls = <&atcphy1_dpxbar 0>;
 		mux-control-names = "dp-xbar";
 		status = "disabled";
+		apple,display-engine = <&dcpext1>;
+		mux-index = <4>;
 
 		port {
 			dp_altmode1_hpd: endpoint {
