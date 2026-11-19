@@ -1,0 +1,728 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/* Copyright 2023 Martin Povišer <povik+lin@cutebit.org> */
+
+// #define DEBUG
+
+#include <linux/debugfs.h>
+#include <linux/kconfig.h>
+#include <linux/of_graph.h>
+#include <linux/of_platform.h>
+#include <linux/rwsem.h>
+#include <linux/types.h>
+#include <linux/workqueue.h>
+
+#include "audio.h"
+#include "afk.h"
+#include "av.h"
+#include "dcp.h"
+#include "dcp-internal.h"
+
+struct dcp_av_audio_cmds {
+	/* commands in group 0*/
+	u32 open;
+	u32 close;
+	u32 prepare;
+	u32 start_link;
+	u32 stop_link;
+	u32 unprepare;
+	/* commands in group 1*/
+	u32 get_elements;
+	u32 get_product_attrs;
+};
+
+static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v12_3 = {
+	.open = 6,
+	.close = 7,
+	.prepare = 8,
+	.start_link = 9,
+	.stop_link = 12,
+	.unprepare = 13,
+	.get_elements = 18,
+	.get_product_attrs = 20,
+};
+
+static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
+	.open = 4,
+	.close = 5,
+	.prepare = 6,
+	.start_link = 7,
+	.stop_link = 10,
+	.unprepare = 11,
+	.get_elements = 16,
+	.get_product_attrs = 18,
+};
+
+struct audiosrv_data {
+	struct platform_device *audio_dev;
+	bool plugged;
+	struct mutex plug_lock;
+
+	struct apple_epic_service *srv;
+	struct rw_semaphore srv_rwsem;
+	/* Workqueue for starting the audio service */
+	struct work_struct start_av_service_wq;
+	/* Closes the audio service when the firmware asks for it */
+	struct work_struct close_av_service_wq;
+	u32 close_channel;
+
+	struct dcp_av_audio_cmds cmds;
+
+	bool warned_get_elements;
+	bool warned_get_product_attrs;
+	bool is_open;
+	bool retirement_paused;
+};
+
+
+static void av_interface_init(struct apple_epic_service *service, const char *name,
+			      const char *class, s64 unit)
+{
+}
+
+static void av_interface_teardown(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	service->enabled = false;
+
+	mutex_lock(&asrv->plug_lock);
+
+	asrv->plugged = false;
+	if (asrv->audio_dev)
+		dcpaud_disconnect(asrv->audio_dev);
+
+	mutex_unlock(&asrv->plug_lock);
+}
+
+static void av_aux_interface_teardown(struct apple_epic_service *service)
+{
+	service->enabled = false;
+}
+
+static int av_interface_call(struct apple_epic_service *service, u16 group,
+			     u32 idx,
+			     const void *data, size_t data_size,
+			     void *reply, size_t reply_size)
+{
+	if (group)
+		return -ENOSYS;
+
+	if (reply && reply_size)
+		memset(reply, 0, reply_size);
+
+	return 0;
+}
+
+static void av_audiosrv_init(struct apple_epic_service *service, const char *name,
+			     const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	mutex_lock(&asrv->plug_lock);
+
+	down_write(&asrv->srv_rwsem);
+	asrv->srv = service;
+	up_write(&asrv->srv_rwsem);
+
+	asrv->plugged = true;
+	mutex_unlock(&asrv->plug_lock);
+	if (!READ_ONCE(asrv->retirement_paused))
+		schedule_work(&asrv->start_av_service_wq);
+}
+
+static void av_audiosrv_teardown(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	mutex_lock(&asrv->plug_lock);
+
+	down_write(&asrv->srv_rwsem);
+	asrv->srv = NULL;
+	asrv->is_open = false;
+	up_write(&asrv->srv_rwsem);
+
+	asrv->plugged = false;
+	if (asrv->audio_dev)
+		dcpaud_disconnect(asrv->audio_dev);
+
+	mutex_unlock(&asrv->plug_lock);
+}
+
+int dcp_audiosrv_close_for_power_transition(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *service;
+	int ret = 0;
+
+	if (!asrv || dcp->fw_compat != DCP_FIRMWARE_V_26_6)
+		return 0;
+
+	down_write(&asrv->srv_rwsem);
+	service = asrv->srv;
+	if (!service) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!asrv->is_open)
+		goto out;
+
+	/* Native 26.6 closes the AV binding after DPA has gone inactive and
+	 * before powering it back up.  Closing a live binding instead tears
+	 * down the complete IOAV display interface. */
+	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
+			       NULL, 0, 16);
+	if (!ret)
+		asrv->is_open = false;
+
+out:
+	up_write(&asrv->srv_rwsem);
+	return ret;
+}
+
+int dcp_audiosrv_open_after_power_transition(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *service;
+	int ret = 0;
+
+	if (!asrv || dcp->fw_compat != DCP_FIRMWARE_V_26_6)
+		return 0;
+
+	down_write(&asrv->srv_rwsem);
+	service = asrv->srv;
+	if (!service) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	/* This is the matching half of close_for_power_transition(): DPA is up
+	 * and SIO has been configured before native issues open. */
+	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
+			       NULL, 0, 32);
+	if (!ret)
+		asrv->is_open = true;
+
+out:
+	up_write(&asrv->srv_rwsem);
+	return ret;
+}
+
+int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	down_read(&asrv->srv_rwsem);
+	if (asrv->srv)
+		ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, cookie,
+				       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
+				       64);
+	else
+		ret = -ENODEV;
+	up_read(&asrv->srv_rwsem);
+
+	return ret;
+}
+
+int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	down_read(&asrv->srv_rwsem);
+	if (asrv->srv)
+		ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, cookie,
+				       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
+				       64);
+	else
+		ret = -ENODEV;
+	up_read(&asrv->srv_rwsem);
+
+	return ret;
+}
+
+int dcp_audiosrv_stoplink(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	down_read(&asrv->srv_rwsem);
+	if (asrv->srv)
+		ret = afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0,
+				       64, NULL, 0, 64);
+	else
+		ret = -ENODEV;
+	up_read(&asrv->srv_rwsem);
+
+	return ret;
+}
+
+int dcp_audiosrv_unprepare(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	down_read(&asrv->srv_rwsem);
+	if (asrv->srv)
+		ret = afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0,
+				       64, NULL, 0, 64);
+	else
+		ret = -ENODEV;
+	up_read(&asrv->srv_rwsem);
+
+	return ret;
+}
+
+static int
+dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
+			   u32 command, void *output, size_t output_maxsize,
+			   size_t *output_size)
+{
+	struct {
+		__le64 max_size;
+		u8 _pad1[24];
+		__le64 used_size;
+		u8 _pad2[8];
+	} __attribute__((packed)) *hdr;
+	static_assert(sizeof(*hdr) == 48);
+	size_t bfr_len = output_maxsize + sizeof(*hdr);
+	void *bfr;
+	int ret;
+
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
+	if (!bfr)
+		return -ENOMEM;
+
+	hdr = bfr;
+	hdr->max_size = cpu_to_le64(output_maxsize);
+	ret = afk_service_call(service, group, command, hdr, sizeof(*hdr), output_maxsize,
+			       bfr, sizeof(*hdr) + output_maxsize, 0);
+	if (ret)
+		goto out;
+
+	/* A successful service call can still contain a truncated OSObject. */
+	if (le64_to_cpu(hdr->used_size) < sizeof(u32) ||
+	    le64_to_cpu(hdr->used_size) > output_maxsize) {
+		ret = -EMSGSIZE;
+		goto out;
+	}
+	if (output)
+		memcpy(output, bfr + sizeof(*hdr), le64_to_cpu(hdr->used_size));
+	if (output_size)
+		*output_size = le64_to_cpu(hdr->used_size);
+
+out:
+	kvfree(bfr);
+	return ret;
+}
+
+int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	size_t size = 0;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	memset(elements, 0, maxsize);
+	down_read(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		ret = -ENODEV;
+	} else {
+		ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
+						 asrv->cmds.get_elements, elements,
+						 maxsize, &size);
+	}
+	up_read(&asrv->srv_rwsem);
+
+	if (ret && !asrv->warned_get_elements) {
+		dev_err(dev, "audiosrv: error getting elements: %d\n", ret);
+		asrv->warned_get_elements = true;
+	} else if (!ret) {
+		dev_dbg(dev, "audiosrv: got %zd bytes worth of elements\n", size);
+	}
+
+	return ret ? ret : size;
+}
+
+int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsize)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	size_t size = 0;
+	int ret;
+
+	if (!asrv)
+		return -ENODEV;
+
+	memset(attrs, 0, maxsize);
+	down_read(&asrv->srv_rwsem);
+	if (asrv->srv)
+		ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
+						 asrv->cmds.get_product_attrs, attrs,
+						 maxsize, &size);
+	else
+		ret = -ENODEV;
+	up_read(&asrv->srv_rwsem);
+
+	if (ret && !asrv->warned_get_product_attrs) {
+		dev_err(dev, "audiosrv: error getting product attributes: %d\n", ret);
+		asrv->warned_get_product_attrs = true;
+	} else if (!ret) {
+		dev_dbg(dev, "audiosrv: got %zd bytes worth of product attributes\n", size);
+	}
+
+	return ret;
+}
+
+/*
+ * When the display goes away, the firmware sends the audio interface a
+ * group 2 command 1 report and then waits up to 10 s for the AP to close
+ * the interface before it reports the unplug ("timeout while waiting for
+ * DCPAVAudioInterface close"). A plug or other state change only carries
+ * command 0 reports. Close the service from process context.
+ */
+#define AV_AUDIO_REPORT_GROUP_STATE	2
+#define AV_AUDIO_REPORT_CLOSE_REQUEST	1
+
+static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
+						  const void *data, size_t data_size)
+{
+	struct audiosrv_data *asrv = service->ep->dcp->audiosrv;
+	const struct epic_service_call *call = data;
+
+	dev_dbg(service->ep->dcp->dev, "got audio report %d size %zx\n", idx, data_size);
+#ifdef DEBUG
+	print_hex_dump(KERN_DEBUG, "audio report: ", DUMP_PREFIX_NONE, 16, 1, data, data_size, true);
+#endif
+
+	if (idx == EPIC_SUBTYPE_STD_SERVICE && data_size >= 16 &&
+	    le32_to_cpu(call->magic) == EPIC_SERVICE_CALL_MAGIC &&
+	    le16_to_cpu(call->group) == AV_AUDIO_REPORT_GROUP_STATE &&
+	    le32_to_cpu(call->command) == AV_AUDIO_REPORT_CLOSE_REQUEST) {
+		WRITE_ONCE(asrv->close_channel, service->channel);
+		schedule_work(&asrv->close_av_service_wq);
+	}
+
+	return 0;
+}
+
+static const struct apple_epic_service_ops avep_ops[] = {
+	{
+		.name = "DCPAVSimpleVideoInterface",
+		.init = av_interface_init,
+		.call = av_interface_call,
+		.teardown = av_interface_teardown,
+	},
+	{
+		.name = "DCPAVAudioInterface",
+		.init = av_audiosrv_init,
+		.call = av_interface_call,
+		.report = av_audiosrv_report,
+		.teardown = av_audiosrv_teardown,
+	},
+	{
+		.name = "dcpav-video-interface-",
+		.init = av_interface_init,
+		.call = av_interface_call,
+		.teardown = av_aux_interface_teardown,
+	},
+	{
+		.name = "dcpav-audio-interface-",
+		.init = av_audiosrv_init,
+		.call = av_interface_call,
+		.report = av_audiosrv_report,
+		.teardown = av_audiosrv_teardown,
+	},
+	{
+		.name = "dcpav-cec-interface-ep",
+		.init = av_interface_init,
+		.call = av_interface_call,
+		.teardown = av_aux_interface_teardown,
+	},
+	{}
+};
+
+int dcp_av_retire(struct apple_dcp *dcp, bool *was_open)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	*was_open = false;
+	if (!asrv)
+		return 0;
+	if (asrv->audio_dev) {
+		ret = dcpaud_can_retire(asrv->audio_dev);
+		if (ret)
+			return ret;
+	}
+	WRITE_ONCE(asrv->retirement_paused, true);
+	cancel_work_sync(&asrv->start_av_service_wq);
+	cancel_work_sync(&asrv->close_av_service_wq);
+	*was_open = asrv->is_open;
+	/* Stop the retained unowned audio link and gate DPA before closing its
+	 * stale AV binding, matching the existing T8132 power-transition path.
+	 */
+	if (asrv->audio_dev) {
+		ret = dcpaud_retire(asrv->audio_dev);
+		if (ret)
+			return ret;
+	}
+	if (*was_open)
+		return dcp_audiosrv_close_for_power_transition(dcp->dev);
+	return 0;
+}
+
+int dcp_av_restart(struct apple_dcp *dcp, bool was_open)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret = 0;
+
+	if (!asrv)
+		return 0;
+	/* An unowned DPA stays off. Ordinary display connect / PCM hw_params
+	 * will reopen AV and restore DPA/SIO in their normal order when needed.
+	 */
+	if (asrv->audio_dev)
+		dcpaud_restart(asrv->audio_dev);
+	else if (was_open)
+		ret = dcp_audiosrv_open_after_power_transition(dcp->dev);
+	if (!ret)
+		WRITE_ONCE(asrv->retirement_paused, false);
+	return ret;
+}
+
+void av_service_connect(struct apple_dcp *dcp)
+{
+	struct apple_epic_service *service;
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+		if (!asrv->srv)
+			return;
+		service = asrv->srv;
+	}
+
+	/* open AV audio service */
+	dev_info(dcp->dev, "%s: starting audio service, plugged:%d\n", __func__,  asrv->plugged);
+	if (asrv->is_open)
+		return;
+
+	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
+			       NULL, 0, 32);
+	if (ret) {
+		dev_err(dcp->dev, "error opening audio service: %d\n", ret);
+		return;
+	}
+	mutex_lock(&asrv->plug_lock);
+	asrv->is_open = true;
+
+	if (asrv->audio_dev)
+		dcpaud_connect(asrv->audio_dev, asrv->plugged);
+	mutex_unlock(&asrv->plug_lock);
+}
+
+void av_service_disconnect(struct apple_dcp *dcp)
+{
+	struct apple_epic_service *service;
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	int ret;
+
+	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+		if (!asrv->srv)
+			return;
+		service = asrv->srv;
+	}
+
+	/* close AV audio service */
+	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
+
+	/*
+	 * Mark the service closed before the call: on an unplug the firmware
+	 * acts on the close but may not answer it, and by the time the call
+	 * times out a replug can already have opened the next interface.
+	 */
+	mutex_lock(&asrv->plug_lock);
+	if (!asrv->is_open) {
+		mutex_unlock(&asrv->plug_lock);
+		return;
+	}
+	asrv->is_open = false;
+	if (asrv->audio_dev)
+		dcpaud_disconnect(asrv->audio_dev);
+	mutex_unlock(&asrv->plug_lock);
+
+	ret = afk_service_call(service, 0, asrv->cmds.close, NULL, 0, 16,
+			       NULL, 0, 16);
+	if (ret) {
+		dev_err(dcp->dev, "error closing audio service: %d\n", ret);
+	}
+	if (service->torndown)
+		service->enabled = false;
+}
+
+/*
+ * The display went away: close the audio service and drop the interface.
+ * The firmware announces a new audio interface on the next plug; until
+ * then nothing may open the old one. An open sent to it during the next
+ * plug (dcp_dptx_connect() runs before the new interface is announced) is
+ * rejected and waits for the full timeout, and the plug does not complete.
+ */
+void av_service_unplug(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	av_service_disconnect(dcp);
+	if (!asrv)
+		return;
+	scoped_guard(rwsem_write, &asrv->srv_rwsem)
+		asrv->srv = NULL;
+}
+
+static void av_work_service_start(struct work_struct *work)
+{
+	struct audiosrv_data *audiosrv_data;
+	struct apple_dcp *dcp;
+
+	audiosrv_data = container_of(work, struct audiosrv_data, start_av_service_wq);
+
+	scoped_guard(rwsem_read, &audiosrv_data->srv_rwsem) {
+		if (!audiosrv_data->srv ||
+		!audiosrv_data->srv->ep ||
+		!audiosrv_data->srv->ep->dcp) {
+			pr_err("%s: dcp: av: NULL ptr during startup\n", __func__);
+			return;
+		}
+		dcp = audiosrv_data->srv->ep->dcp;
+	}
+
+	if (!READ_ONCE(audiosrv_data->retirement_paused))
+		av_service_connect(dcp);
+}
+
+static void av_work_service_close(struct work_struct *work)
+{
+	struct audiosrv_data *asrv =
+		container_of(work, struct audiosrv_data, close_av_service_wq);
+	struct apple_epic_service *service;
+	bool was_open;
+	int ret;
+
+	/*
+	 * Detach the interface first: it is going away, and a replug
+	 * announces a new one. Nothing (a suspend, a resume, an ALSA open)
+	 * may use or reopen it in the meantime.
+	 */
+	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+		service = asrv->srv;
+		if (!service ||
+		    service->channel != READ_ONCE(asrv->close_channel))
+			return;
+		asrv->srv = NULL;
+	}
+
+	mutex_lock(&asrv->plug_lock);
+	was_open = asrv->is_open;
+	asrv->is_open = false;
+	if (asrv->audio_dev)
+		dcpaud_disconnect(asrv->audio_dev);
+	mutex_unlock(&asrv->plug_lock);
+
+	if (!was_open)
+		return;
+	/*
+	 * The firmware acts on the close (it reports the unplug at once) but
+	 * does not answer it, so do not wait the usual 5 s for a reply.
+	 */
+	ret = afk_service_call_status(service, 0, asrv->cmds.close, NULL, 0, 16,
+				      NULL, 0, 16, NULL, msecs_to_jiffies(500));
+	if (ret)
+		dev_dbg(service->ep->dcp->dev,
+			"requested audio service close: %d\n", ret);
+}
+
+int avep_init(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *audiosrv_data;
+	struct platform_device *audio_pdev;
+	struct device *dev = dcp->dev;
+	struct device_node *endpoint, *audio_node = NULL;
+
+	audiosrv_data = devm_kzalloc(dcp->dev, sizeof(*audiosrv_data), GFP_KERNEL);
+	if (!audiosrv_data)
+		return -ENOMEM;
+	init_rwsem(&audiosrv_data->srv_rwsem);
+	mutex_init(&audiosrv_data->plug_lock);
+
+	switch (dcp->fw_compat) {
+	case DCP_FIRMWARE_V_12_3:
+		audiosrv_data->cmds = dcp_av_audio_cmds_v12_3;
+		break;
+	case DCP_FIRMWARE_V_14_7:
+		return -ENODEV;
+	case DCP_FIRMWARE_V_13_5:
+	case DCP_FIRMWARE_V_26_6:
+		audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
+		break;
+	default:
+		dev_err(dcp->dev, "Audio not supported for firmware\n");
+		return -ENODEV;
+	}
+
+	dcp->audiosrv = audiosrv_data;
+	INIT_WORK(&audiosrv_data->start_av_service_wq, av_work_service_start);
+	INIT_WORK(&audiosrv_data->close_av_service_wq, av_work_service_close);
+
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+	if (endpoint) {
+		audio_node = of_graph_get_remote_port_parent(endpoint);
+		of_node_put(endpoint);
+	}
+	if (!audio_node || !of_device_is_available(audio_node)) {
+		of_node_put(audio_node);
+		dev_info(dev, "No audio support\n");
+		goto start_ep;
+	}
+
+	audio_pdev = of_find_device_by_node(audio_node);
+	of_node_put(audio_node);
+	if (!audio_pdev) {
+		dev_info(dev, "No DP/HDMI audio device not ready\n");
+		goto start_ep;
+	}
+	dcp->audiosrv->audio_dev = audio_pdev;
+
+	device_link_add(&audio_pdev->dev, dev,
+			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
+
+start_ep:
+	dcp->avep = afk_init(dcp, AV_ENDPOINT, avep_ops);
+	if (IS_ERR(dcp->avep))
+		return PTR_ERR(dcp->avep);
+	dcp->avep->debugfs_entry = dcp->ep_debugfs[AV_ENDPOINT - 0x20];
+	return afk_start(dcp->avep);
+}

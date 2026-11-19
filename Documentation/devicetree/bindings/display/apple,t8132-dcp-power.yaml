@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,t8132-dcp-power.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8132 display coprocessor power resources
+
+maintainers:
+  - Niklas Sheth <hi@niklassheth.com>
+
+description: |
+  These properties describe the power resources of T8132 display engines.
+  Named front-end and CPU consumers allow a driver to release the CPU before
+  the front-end and its system parent. The CPU domain provider describes its
+  own gate sequencer and automatic ownership; neither belongs to the display
+  consumer. The panel engine may retain its existing single-domain binding.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t8132-dcp
+          - apple,t8132-dcpext
+  required:
+    - compatible
+
+properties:
+  power-domains:
+    minItems: 1
+    maxItems: 2
+
+  power-domain-names:
+    items:
+      - const: fe
+      - const: cpu
+
+  apple,retirement-shared-control:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Shared display-request syscon. Its request, enable, notification and
+      power words are at offsets 0x4000, 0xc028, 0x9c14 and 0xc020; offset
+      0xc024 contains the common request configuration. Other engines' votes
+      must be preserved when changing one engine's state.
+
+  apple,retirement-shared-bits:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - description: This engine's enable and request bit
+        minimum: 0
+        maximum: 2
+      - description: This engine's power-request bit
+        minimum: 0
+        maximum: 31
+
+  apple,retirement-report:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP report client whose firmware-inherited active vote belongs to this
+      engine. Release that vote after quiescing the engine and restore it
+      after the CPU domain is active on restart.
+
+dependentRequired:
+  apple,retirement-shared-control:
+    - apple,retirement-shared-bits
+  apple,retirement-shared-bits:
+    - apple,retirement-shared-control
+
+# The display engine's transport, framebuffer and routing properties are
+# outside this power-resource description.
+additionalProperties: true
+...
