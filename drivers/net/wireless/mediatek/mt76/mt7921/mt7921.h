@@ -7,6 +7,40 @@
 #include "../mt792x.h"
 #include "regs.h"
 
+int mt7932_load_firmware(struct mt792x_dev *dev);
+int mt7932_load_calibration(struct mt792x_dev *dev);
+int mt7932_start(struct mt792x_phy *phy);
+u8 mt7932_host_bss(void);
+void mt7932_diag_init(struct mt792x_dev *dev, struct dentry *dir);
+void mt7932_diag_rx(enum mt76_rxq_id q, struct sk_buff *skb);
+int mt7932_fullmac_init(struct mt792x_dev *dev);
+void mt7932_fullmac_remove(struct mt792x_dev *dev);
+void mt7932_fullmac_quiesce(struct mt792x_dev *dev);
+void mt7932_fullmac_tx_purge(struct mt792x_dev *dev);
+void mt7932_fullmac_reset_prepare(struct mt792x_dev *dev);
+void mt7932_fullmac_reset_done(struct mt792x_dev *dev, int error);
+int mt7932_fullmac_reinit(struct mt792x_dev *dev);
+void mt7932_fullmac_event(struct mt792x_dev *dev, struct sk_buff *skb);
+bool mt7932_fullmac_rx(struct mt792x_dev *dev, struct sk_buff *skb);
+bool mt7932_fullmac_is_tx(struct mt792x_dev *dev, struct sk_buff *skb);
+void mt7932_fullmac_txwi(struct mt792x_dev *dev, __le32 *txwi,
+			struct sk_buff *skb);
+bool mt7932_fullmac_tx_free(struct mt792x_dev *dev, struct mt76_txwi_cache *t);
+int mt7932_add_interface(struct mt792x_dev *dev, struct ieee80211_vif *vif,
+			struct mt792x_vif *mvif, bool enable);
+int mt7932_set_channel(struct mt792x_phy *phy, u8 bss_idx);
+int mt7932_bss_update(struct mt792x_dev *dev, struct ieee80211_vif *vif);
+int mt7932_set_key(struct mt792x_dev *dev, struct ieee80211_vif *vif,
+		   struct ieee80211_sta *sta, struct ieee80211_key_conf *key,
+		   enum set_key_cmd cmd);
+int mt7932_sta_update(struct mt792x_dev *dev, struct ieee80211_sta *sta,
+		     struct ieee80211_vif *vif, bool enable,
+		     enum mt76_sta_info_state state);
+int mt7932_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
+			  int cmd, int *seq);
+int mt7932_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+			    struct sk_buff *skb, int seq);
+
 #define MT7921_MAX_AID                  20
 
 #define MT7921_TX_RING_SIZE		2048

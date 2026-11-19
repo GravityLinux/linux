@@ -1,0 +1,140 @@
+SPDX-License-Identifier: GPL-2.0-only
+MT7932 register and firmware ABI audit, 2026-10-21
+
+Purpose
+Replace arithmetic on decoded offsets with named registers, typed wire layouts
+and checked lengths. Preserve the current wire bytes and conservative power
+settings. This document distinguishes a field's location from knowledge of its
+semantics: an unknown_* field or observed policy is deliberately unresolved.
+Names alone do not establish its meaning.
+
+New mt7932_regs.h uses BAR0 offsets except the explicitly separated PCI config
+section. mt7932_mcu.h groups firmware namespaces, packed layouts, and static
+assertions. A flat legacy command ID is NOT interchangeable with a CONNAC UNI
+command that happens to have the same number.
+
+Evidence
+- Existing private native captures, captured firmware messages and successful
+  hardware tests underpin MT7932-specific layouts. No Apple executable
+  disassembly was used for this audit.
+- Shared DMA bootstrap matches previously qualified m1n1 wifi_mt7932.c startup.
+- linux/neo-wifi/native-disconnect-2026-10-21 freezes the action-correlated EA42
+  request. standard-reconnect-2026-10-21 freezes actual Linux completions.
+- Existing mt76_connac_mcu.h supplies command descriptor/event fields, generic
+  scan prefix, NIC power/download IDs and firmware download response flag.
+- Public MediaTek gen4m headers corroborate legacy RLM, BSS activation, basic
+  configuration prefix and command naming. They are comparisons, not proof
+  that every ABI version or numerical enum is the same. Pinned source:
+  https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-wlan-core-gen4m/tree/9ce201484a7426eeddfcf240b7b12ae385cd79e2/include
+  Files: wsys_cmd_handler_fw.h, nic_cmd_event.h.
+- IE and channel-width names come from Linux ieee80211.h. Standard IE 255 is
+  the extension container; extension IDs 35 and 58 mean HE capabilities and
+  short SSID list respectively, not ordinary IE 35/58.
+
+Register map
+Decoded remap/boot/publication registers are named in mt7932_regs.h.
+MT7932 DMA/prefetch setup in mt792x_dma.c still contains raw offsets and
+observed policies needing a separate audit.
+  BAR0 offset        Function established / remaining uncertainty
+  0xfe24c+4*n        PCIe remap register n. Target high 16 bits used for the
+                     WF/CONN windows. Low control fields remain undecoded.
+  remap1             Target 0x70000000, BAR window 0x70000, size 64 KiB.
+  remap2             Target 0x18050000, BAR window 0x90000, size 64 KiB;
+                     0x7c050000 is the corresponding software alias.
+  remap0             Native boot value 0x18451807; restored to 0x1845184f
+                     after secure command. Individual control bits unknown.
+  0x40060 bit0       Secure boot-command readiness, polled before submission.
+  0x40260 bit0       Secure command completion write after submission.
+  0x93c28 bit0       Shared host DMA publication control0 native init value.
+  0x93a38 bit1       Shared host DMA publication control1 native init value.
+  0x93a3c            First allocated coherent host DMA buffer address.
+  0x93a30            Second allocated coherent host DMA buffer address.
+  0x93a54            Third allocated coherent host DMA buffer address.
+                     Detailed buffer ownership, descriptor format, and meaning
+                     of control bits are not fully decoded. Preserve ordering.
+  0xb1000 bits7:0    Hardware revision byte, combined with chip ID0x7932.
+  PCI cfg0x48c       Bits19:16 firmware boot state; observed ready value2.
+                     This is NOT a BAR0 register.
+Existing general mt76 fixed-map tuples remain descriptive mapping data; naming
+all literal addresses individually would add indirection without explanation.
+
+Firmware boot
+Generic mt76 download command IDs are reused where exactly equal. The MT7932
+patch semaphore ABI differs: request byte2; response1=busy,2=already loaded,
+3=acquired. Generic mt76 PATCH_* response enum is zero-based and MUST NOT be
+used here. This audit retains the working MT7932 values explicitly.
+
+Firmware message layouts
+- Basic config24: legacy native-802.11 byte, assert/debug controls, checksum
+  words and segmentation prefix; MT7932 unknown byte3=3 and extension at12.
+  One initializer now supplies both startup and Ethernet-offload mode. The
+  twelve extension bytes and byte3 are not assigned speculative meanings.
+- Probe privacy60: subcommand at0, inclusive last-bitmap-byte at4, policy
+  bytes5/6, bitmap begins7 and covers32 ordinary IE bytes +8 extension bytes.
+  Last bitmap index39 is derived from its size. Policy command uses observed
+  subcommand1 and bytes5/6=20; meanings/units of those20s are unproven.
+- BSS activation12: BSS0, active1, network type2, OMAC3, MAC4..9, BMC WCID10.
+  Native last byte11=1 remains unknown (older gen4m labels it reserved).
+- AIS MAC8: BSS0, pad1, address2..7; filled from the current interface.
+- RLM22: BSS0, band1, primary channel2, secondary-channel offset3; protection
+  and HT-operation fields4..12; short-preamble13, short-slot14, VHT width15,
+  center channels16/17, VHT basic MCS18..19, TX/RX stream counts20/21.
+  Secondary offset and VHT width use the corresponding IEEE80211 constants.
+- Native scan1236: generic mt76 scan prefix through ext_channels, TWO inserted
+  bytes before ext_ssids at0x380, BSSID0x458, random MAC0x45e, unresolved tail.
+  Initial conversion using an eight-byte gap failed static assertions and was
+  corrected before any device test. Size/offset assertions pin the real ABI.
+  Shared fields now use generic named members, not body[0x9f] etc. Current
+  passive-only behavior is preserved; active probing is not claimed tested.
+- Transmit power: shared44-byte header plus122-byte per-channel record;
+  channel byte followed by121 rate limits. Wire version3/format0x0a remain
+  explicit. Detailed121-entry modulation mapping is unresolved. Existing
+  behavior conservatively applies the minimum requested rate limit throughout
+  the record and caps it at20 half-dBm (10dBm). No cap increase in this audit.
+- MCU event header uses mt76_connac2_mcu_rxd fields/sizeof, replacing literal
+  header36/eid28. MLME envelope12 has unknown zero word, type, payload length.
+  Types40/41/44/4d are associated/authorized/disconnected/connecting respectively.
+  Typed minimum lengths24/22/20 preserve bounded parsing; unknown portions of
+  those events remain explicitly unknown. Peer WCID defensive limit48 is
+  named as a limit, NOT claimed to be the decoded hardware table capacity.
+- Connect856 retains its existing typed layout and asserted offsets. SAE and
+  CCMP masks, password format10, required PMF2 and native profile0x00020407 are
+  named in the MT7932 namespace. The profile bits, auth policy bits, operation8,
+  deadline120 (units unproven), compatibility20 and candidate policy arrays
+  remain observed native policies, not fully decoded security semantics.
+- Disconnect24: policy word8, zero word, tag1+peer length, BSS+current peer MAC+
+  pad, trailer word30. Peer length derives from the packed peer group. Policy8
+  and trailer30 are NOT called reason codes or timeouts without evidence.
+- Precal file20 header: magic8, MAC6, countLE16, total-sizeLE32. Calibration
+  records20-byte header includes class/operation/id/length and three-word key.
+  D7 request has a leading unknown word plus the same12-byte key; compare all
+  key bytes exactly. Class1 group blocks1080, class2 channel blocks604, class3
+  channel-info blocks16. RF payloads remain opaque and board-specific.
+  Selector low16 group, upper16 preload qualification and frequency low24
+  masks are named. Group28/6GHz is still an explicit tested coverage bound,
+  not a general band/frequency mapping. No other channel's DPD is substituted.
+
+Outstanding audit
+- Host-SME legacy BSS116/STA200/key64 helper bodies still contain raw offsets.
+  Standard frontend does not use this association path, but it needs separate
+  layout verification or removal when consolidating the driver.
+- Regulatory domain and boot response translation now use typed headers and
+  named packet types. The native domain policy word at4, policy byte6 and FCC
+  policy byte11 remain unresolved; generic input bandwidth names are not
+  imposed on the differing native variant. Channel flags explicitly translate
+  NO_IR/RADAR to firmware passive/DFS bits. Initial calibration replay stream
+  is now typed as a20-byte file header plus8-byte command-policy record
+  headers and4-byte fragment headers. Profile query/reply offsets are explicit
+  and size checked. RF fragment bytes remain opaque and board-specific.
+- Three queue-management startup records and DBDC startup record have largely
+  unresolved payload fields. Preserve and identify each using bounded native
+  comparisons before changing them; turning them into macros is not decoding.
+- Diagnostic runtime command0x93 is no longer called per-channel configuration:
+  that claim was unproven, and another public ABI uses the ID differently.
+- Scan batching/cancel, station statistics, actual disconnect/reconnect, firmware
+  recovery and PCI reprobe are implemented and qualified, including on7.3.
+  Broader calibration/security and AP coverage, active probing, association IE
+  handling, runtime/system PM and precise early auth failure reasons remain
+  incomplete. Broader AP testing is deferred by user; unsupported capabilities
+  remain unadvertised. The companion bootloader worktree records integration
+  evidence in linux/neo-linux73/STATUS.txt.

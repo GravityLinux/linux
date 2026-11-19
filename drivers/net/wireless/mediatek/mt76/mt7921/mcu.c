@@ -18,6 +18,8 @@ int mt7921_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 	int mcu_cmd = FIELD_GET(__MCU_CMD_FIELD_ID, cmd);
 	struct mt76_connac2_mcu_rxd *rxd;
 	int ret = 0;
+	if (is_mt7932(mdev))
+		return mt7932_mcu_parse_response(mdev, cmd, skb, seq);
 
 	if (!skb) {
 		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
@@ -86,7 +88,14 @@ static int mt7921_mcu_read_eeprom(struct mt792x_dev *dev, u32 offset, u8 *val)
 	if (ret)
 		return ret;
 
+	if (skb->len < sizeof(*res)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 	res = (struct mt7921_mcu_eeprom_info *)skb->data;
+	if (is_mt7932(&dev->mt76))
+		dev_info(dev->mt76.dev, "MT7932 efuse block %#x: %*ph\n",
+			 offset & ~15U, (int)sizeof(*res), res);
 	*val = res->data[offset % MT7921_EEPROM_BLOCK_SIZE];
 	dev_kfree_skb(skb);
 
@@ -216,6 +225,10 @@ mt7921_mcu_debug_msg_event(struct mt792x_dev *dev, struct sk_buff *skb)
 		u8 content[512];
 	} __packed * msg;
 
+	/* Neo emits compressed index records, already retained in private debugfs. */
+	if (is_mt7932(&dev->mt76))
+		return;
+
 	skb_pull(skb, sizeof(struct mt76_connac2_mcu_rxd));
 	msg = (struct mt7921_debug_msg *)skb->data;
 
@@ -299,17 +312,40 @@ mt7921_mcu_rx_unsolicited_event(struct mt792x_dev *dev, struct sk_buff *skb)
 
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
 	switch (rxd->eid) {
+	case 0x10:
+		if (is_mt7932(&dev->mt76) && skb->len >= 60) {
+			u8 *grant = skb->data + 36;
+
+			dev_info(dev->mt76.dev, "MT7932 ROC bss=%u token=%u status=%u channel=%u band=%u duration=%u\n",
+				 grant[0], grant[1], grant[2], grant[3], grant[5],
+				 get_unaligned_le32(grant + 12));
+
+			if (grant[0] < 4 && grant[1] == dev->phy.roc_token_id &&
+			    !grant[2]) {
+				dev->phy.roc_grant = true;
+				wake_up(&dev->phy.roc_wait);
+				if (grant[9] == MT7921_ROC_REQ_ROC)
+					ieee80211_ready_on_channel(dev->mphy.hw);
+				mod_timer(&dev->phy.roc_timer, jiffies +
+					msecs_to_jiffies(get_unaligned_le32(grant + 12)));
+			}
+		}
+		break;
 	case MCU_EVENT_BSS_BEACON_LOSS:
 		mt7921_mcu_connection_loss_event(dev, skb);
 		break;
 	case MCU_EVENT_SCHED_SCAN_DONE:
 	case MCU_EVENT_SCAN_DONE:
+		if (is_mt7932(&dev->mt76))
+			break; /* Fullmac event worker owns scan completion. */
 		mt7921_mcu_scan_event(dev, skb);
 		return;
 	case MCU_EVENT_DBG_MSG:
 		mt7921_mcu_debug_msg_event(dev, skb);
 		break;
 	case MCU_EVENT_COREDUMP:
+		if (is_mt7932(&dev->mt76) && !dev->fw_assert)
+			mt76_wr(dev, 0x11484, 0x800);
 		dev->fw_assert = true;
 		mt76_connac_mcu_coredump_event(&dev->mt76, skb,
 					       &dev->coredump);
@@ -357,8 +393,25 @@ void mt7921_mcu_rx_event(struct mt792x_dev *dev, struct sk_buff *skb)
 	}
 
 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+	if (is_mt7932(&dev->mt76))
+		mt7932_fullmac_event(dev, skb);
+	if (is_mt7932(&dev->mt76) && skb->len >= 36 &&
+	    (rxd->eid == 0xea || rxd->eid == 0xee))
+		dev_info_ratelimited(dev->mt76.dev, "MT7932 MLME event eid=%#x ext=%#x seq=%u len=%u\n",
+			 rxd->eid, rxd->ext_eid, rxd->seq, skb->len);
+	if (is_mt7932(&dev->mt76) && skb->len >= 36 &&
+	    (rxd->eid == 0x0d || rxd->eid == 0x10 || rxd->eid == 0x5d || rxd->eid == 0x5e ||
+	     rxd->eid == 0xd7))
+		dev_info(dev->mt76.dev, "MT7932 event %#x seq=%u len=%u: %*ph\n",
+			 rxd->eid, rxd->seq, skb->len,
+			 min_t(unsigned int, skb->len - 36, 64), skb->data + 36);
+	if (is_mt7932(&dev->mt76) && skb->len >= 32 &&
+	    get_unaligned_le16(skb->data + 26) == 0xe000) {
+		mt76_mcu_rx_event(&dev->mt76, skb);
+		return;
+	}
 
-	if (rxd->option & MCU_UNI_CMD_UNSOLICITED_EVENT) {
+	if (!is_mt7932(&dev->mt76) && rxd->option & MCU_UNI_CMD_UNSOLICITED_EVENT) {
 		mt7921_mcu_uni_rx_unsolicited_event(dev, skb);
 		return;
 	}
@@ -368,7 +421,8 @@ void mt7921_mcu_rx_event(struct mt792x_dev *dev, struct sk_buff *skb)
 		return;
 	}
 
-	if (rxd->ext_eid == MCU_EXT_EVENT_RATE_REPORT ||
+	if ((is_mt7932(&dev->mt76) && rxd->eid == 0x10) ||
+	    rxd->ext_eid == MCU_EXT_EVENT_RATE_REPORT ||
 	    rxd->eid == MCU_EVENT_BSS_BEACON_LOSS ||
 	    rxd->eid == MCU_EVENT_SCHED_SCAN_DONE ||
 	    rxd->eid == MCU_EVENT_RSSI_NOTIFY ||
@@ -616,13 +670,17 @@ static int mt7921_mcu_get_nic_capability(struct mt792x_phy *mphy)
 		len = le32_to_cpu(tlv->len);
 		if (skb->len < len)
 			break;
+		if (is_mt7932(phy->dev))
+			dev_info(phy->dev->dev, "MT7932 capability tag=%u len=%u: %*ph\n",
+				 le32_to_cpu(tlv->type), len, min(len, 12), skb->data);
 
 		switch (le32_to_cpu(tlv->type)) {
 		case MT_NIC_CAP_6G:
 			phy->cap.has_6ghz = skb->data[0];
 			break;
 		case MT_NIC_CAP_MAC_ADDR:
-			memcpy(phy->macaddr, (void *)skb->data, ETH_ALEN);
+			if (!is_mt7932(phy->dev) || is_valid_ether_addr(skb->data))
+				memcpy(phy->macaddr, (void *)skb->data, ETH_ALEN);
 			break;
 		case MT_NIC_CAP_PHY:
 			mt7921_mcu_parse_phy_cap(phy->dev, skb);
@@ -633,7 +691,9 @@ static int mt7921_mcu_get_nic_capability(struct mt792x_phy *mphy)
 							     skb);
 			break;
 		case MT_NIC_CAP_CHIP_CAP:
-			memcpy(&mphy->chip_cap, (void *)skb->data, sizeof(u64));
+			/* MT7932 tag 0x20 describes roaming, not mt7921 chip flags. */
+			if (!is_mt7932(phy->dev) && len >= sizeof(u64))
+				memcpy(&mphy->chip_cap, skb->data, sizeof(u64));
 			break;
 		default:
 			break;
@@ -663,7 +723,7 @@ int mt7921_run_firmware(struct mt792x_dev *dev)
 {
 	int err;
 
-	err = mt792x_load_firmware(dev);
+	err = is_mt7932(&dev->mt76) ? mt7932_load_firmware(dev) : mt792x_load_firmware(dev);
 	if (err)
 		return err;
 
@@ -671,7 +731,7 @@ int mt7921_run_firmware(struct mt792x_dev *dev)
 	if (err)
 		return err;
 
-	err = mt7921_load_clc(dev, mt792x_ram_name(dev));
+	err = is_mt7932(&dev->mt76) ? 0 : mt7921_load_clc(dev, mt792x_ram_name(dev));
 	if (err)
 		return err;
 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
@@ -794,6 +854,19 @@ int mt7921_mcu_set_roc(struct mt792x_phy *phy, struct mt792x_vif *vif,
 {
 	int center_ch = ieee80211_frequency_to_channel(chan->center_freq);
 	struct mt792x_dev *dev = phy->dev;
+	if (is_mt7932(&dev->mt76)) {
+		u8 legacy[24] = {
+			vif->bss_conf.mt76.idx, token_id, 0, chan->hw_value, 0,
+			chan->band == NL80211_BAND_2GHZ ? 1 :
+			chan->band == NL80211_BAND_5GHZ ? 2 : 3,
+			0, center_ch, 0, type, 0,
+		};
+
+		put_unaligned_le32(duration, legacy + 12);
+		dev_info(dev->mt76.dev, "MT7932 channel request bss=%u token=%u channel=%u band=%u type=%u duration=%u\n",
+			 legacy[0], token_id, legacy[3], legacy[5], type, duration);
+		return mt76_mcu_send_msg(&dev->mt76, 0x1c, legacy, sizeof(legacy), false);
+	}
 	struct {
 		struct {
 			u8 rsv[4];
@@ -859,6 +932,11 @@ int mt7921_mcu_abort_roc(struct mt792x_phy *phy, struct mt792x_vif *vif,
 			 u8 token_id)
 {
 	struct mt792x_dev *dev = phy->dev;
+	if (is_mt7932(&dev->mt76)) {
+		u8 legacy[24] = { vif->bss_conf.mt76.idx, token_id, 1 };
+
+		return mt76_mcu_send_msg(&dev->mt76, 0x1c, legacy, sizeof(legacy), false);
+	}
 	struct {
 		struct {
 			u8 rsv[4];
@@ -954,7 +1032,52 @@ int mt7921_mcu_set_eeprom(struct mt792x_dev *dev)
 		.buffer_mode = EE_MODE_EFUSE,
 		.format = EE_FORMAT_WHOLE,
 	};
+	if (is_mt7932(&dev->mt76)) {
+		const struct firmware *fw;
+		u8 version, power;
+		const char *name;
+		int ret, offset;
+		u8 upload[1028];
 
+		ret = mt7921_mcu_read_eeprom(dev, 0x7a, &version);
+		if (ret)
+			return ret;
+		ret = mt7921_mcu_read_eeprom(dev, 0x164, &power);
+		if (ret)
+			return ret;
+		dev_info(dev->mt76.dev, "MT7932 module %#x target power %#x\n", version, power);
+		if ((version & 15) && power)
+			goto efuse;
+		name = version & 15 ? "mediatek/PPR_MT7932.bin" :
+					 "mediatek/EEPROM_MT7932_1.bin";
+		ret = request_firmware(&fw, name, dev->mt76.dev);
+		if (ret)
+			return ret;
+		if ((version & 15) ? fw->size != 412 :
+		    fw->size != 2560 || get_unaligned_le16(fw->data) != 0x7932) {
+			ret = -EINVAL;
+			goto release;
+		}
+		for (offset = 0; offset < fw->size; offset += 1024) {
+			int size = min_t(size_t, 1024, fw->size - offset);
+
+			upload[0] = version & 15 ? 2 : 1;
+			upload[1] = version & 15 ? 0 : 0x41 | ((offset / 1024) << 2);
+			put_unaligned_le16(size, upload + 2);
+			memcpy(upload + 4, fw->data + offset, size);
+			ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_QUERY(EFUSE_BUFFER_MODE),
+					       upload, size + 4, true);
+			if (ret)
+				break;
+		}
+release:
+		release_firmware(fw);
+		if (!ret && (version & 15))
+			ret = mt7932_load_calibration(dev);
+		return ret;
+	}
+
+efuse:
 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(EFUSE_BUFFER_MODE),
 				 &req, sizeof(req), true);
 }
@@ -1088,6 +1211,8 @@ int mt7921_mcu_sta_update(struct mt792x_dev *dev, struct ieee80211_sta *sta,
 	};
 	struct mt792x_sta *msta;
 
+	if (is_mt7932(&dev->mt76))
+		return mt7932_sta_update(dev, sta, vif, enable, state);
 	msta = sta ? (struct mt792x_sta *)sta->drv_priv : NULL;
 	info.wcid = msta ? &msta->deflink.wcid : &mvif->sta.deflink.wcid;
 	info.newly = msta ? state != MT76_STA_INFO_STATE_ASSOC : true;
@@ -1482,6 +1607,15 @@ int mt7921_mcu_wf_rf_pin_ctrl(struct mt792x_phy *phy, u8 action)
 int mt7921_mcu_set_rxfilter(struct mt792x_dev *dev, u32 fif,
 			    u8 bit_op, u32 bit_map)
 {
+	if (is_mt7932(&dev->mt76)) {
+		u8 filter[68] = {};
+
+		/* The legacy firmware takes a filter word at offset zero. */
+		put_unaligned_le32(0x6000000f, filter);
+		return mt76_mcu_send_msg(&dev->mt76, 0x0a, filter,
+					 sizeof(filter), false);
+	}
+
 	struct {
 		u8 rsv[4];
 		u8 mode;
