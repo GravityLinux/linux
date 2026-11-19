@@ -518,6 +518,26 @@ abort_quiesce:
 	return ret;
 }
 
+/*
+ * An unused, disconnected primary output counts as logically off for its
+ * retirement. If the engine does not end up retired, undo that: while
+ * logical_off is set, the engine ignores the firmware's hot-plug calls.
+ */
+static int idle_retire_primary_locked(struct apple_dcp *dcp)
+{
+	struct dcp_retirement *idle = dcp->retirement;
+	bool was_off = READ_ONCE(idle->logical_off);
+	int ret;
+
+	if (idle->primary && idle_crtc_inactive(dcp) && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected))
+		WRITE_ONCE(idle->logical_off, true);
+	ret = idle_retire_locked(dcp);
+	if (ret)
+		WRITE_ONCE(idle->logical_off, was_off);
+	return ret;
+}
+
 static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 {
 	struct dcp_retirement *idle = dcp->retirement;
@@ -638,9 +658,15 @@ static void idle_work(struct work_struct *work)
 	int ret;
 
 	dcp_lifecycle_lock();
-	ret = idle_retire_locked(idle->dcp);
-	if (idle_should_retry(idle->dcp, ret))
-		idle_retry(idle);
+	if (dcp_lifecycle_sleeping()) {
+		/* The suspend callback retires during a transition; check later. */
+		if (!idle->stopping && idle->state == DCP_IDLE_READY)
+			mod_delayed_work(system_unbound_wq, &idle->work, DCP_IDLE_RETRY_MIN);
+	} else {
+		ret = idle_retire_locked(idle->dcp);
+		if (idle_should_retry(idle->dcp, ret))
+			idle_retry(idle);
+	}
 	dcp_lifecycle_unlock();
 }
 
@@ -662,36 +688,54 @@ void dcp_retirement_unplug_locked(struct apple_dcp *dcp)
 		idle_kick(dcp->retirement);
 }
 
+/*
+ * Retire an unused ready engine from system suspend, as an idle engine
+ * would be at runtime. An engine with a display in use takes the existing
+ * suspend path. An engine that is not eligible right now (for example its
+ * firmware queues are still busy) also takes that path instead of failing
+ * the transition. Retired external engines are not restarted on resume:
+ * hot-plug restarts them when a display needs them. The primary engine is
+ * restarted on resume.
+ */
 int dcp_retirement_suspend(struct apple_dcp *dcp)
 {
 	struct dcp_retirement *idle = dcp->retirement;
 	int ret;
 
-	/* Keep the existing after-real-use workaround until it is qualified. */
 	if (!idle || (READ_ONCE(idle->ever_used) && !dcp->fixed_dp) ||
 	    dcp_fixed_dp_hpd(dcp))
 		return 0;
-	if (idle->primary && idle_crtc_inactive(dcp) && dcp->connector &&
-	    !READ_ONCE(dcp->connector->connected))
-		WRITE_ONCE(idle->logical_off, true);
 	dcp_lifecycle_lock();
-	ret = idle_retire_locked(dcp);
-	if (!ret)
+	if (idle->state == DCP_IDLE_RETIRED || idle->state == DCP_IDLE_FAILED) {
+		ret = 1;
+	} else {
+		ret = idle_retire_primary_locked(dcp);
+		if (ret == -EBUSY || ret == -EPROBE_DEFER)
+			ret = 0;
+		else if (!ret)
+			ret = 1;
+	}
+	if (ret == 1)
 		idle->resume_retired = true;
 	dcp_lifecycle_unlock();
-	return ret ? ret : 1;
+	return ret;
 }
 
 int dcp_retirement_resume(struct apple_dcp *dcp)
 {
 	struct dcp_retirement *idle = dcp->retirement;
-	int ret;
+	int ret = 0;
 
 	if (!idle || !idle->resume_retired)
 		return 0;
 	dcp_lifecycle_lock();
-	/* Pool claims stay blocked until PM_POST_SUSPEND, after device resume. */
-	ret = idle_restart_locked(dcp, true);
+	/*
+	 * Only fixed DP ports restart their engine on hot-plug. The primary
+	 * engine (the mini's HDMI) has no such path, so bring it back here as
+	 * before; otherwise a display connected after the sleep never shows.
+	 */
+	if (idle->primary)
+		ret = idle_restart_locked(dcp, true);
 	if (!ret)
 		idle->resume_retired = false;
 	dcp_lifecycle_unlock();
@@ -704,7 +748,9 @@ int dcp_retirement_runtime_suspend(struct device *dev)
 
 	int ret;
 
-	if (!dcp->retirement || dcp->retirement->state != DCP_IDLE_RETIRING)
+	/* A retiring or retired engine has no use for its FE domain. */
+	if (!dcp->retirement || (dcp->retirement->state != DCP_IDLE_RETIRING &&
+	    dcp->retirement->state != DCP_IDLE_RETIRED))
 		return -EBUSY;
 	if (!dcp->fe_pm_dev || !dcp->fe_pm_held)
 		return 0;
@@ -840,11 +886,10 @@ static ssize_t idle_control_write(struct file *file, const char __user *buf,
 		 * Do not require a modeset solely to exercise its firmware cycle.
 		 */
 		if (dcp_retirement_is_primary(dcp) &&
-		    !dcp_retirement_display_was_used(dcp) &&
-		    idle_crtc_inactive(dcp) && dcp->connector &&
-		    !READ_ONCE(dcp->connector->connected))
-			WRITE_ONCE(dcp->retirement->logical_off, true);
-		ret = idle_retire_locked(dcp);
+		    !dcp_retirement_display_was_used(dcp))
+			ret = idle_retire_primary_locked(dcp);
+		else
+			ret = idle_retire_locked(dcp);
 	} else if (sysfs_streq(command, "restart"))
 		ret = dcp_retirement_restart_locked(dcp);
 	else

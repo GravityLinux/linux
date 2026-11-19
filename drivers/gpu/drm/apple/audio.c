@@ -870,8 +870,12 @@ int dcpaud_retire(struct platform_device *pdev)
 	if (audio->power_held) {
 		audio->power_held = false;
 		ret = pm_runtime_put_sync_suspend(audio->dev);
-	} else {
-		/* Normalize the unused boot state through its genpd provider. */
+	} else if (!pm_runtime_status_suspended(audio->dev) &&
+		   pm_runtime_enabled(audio->dev)) {
+		/* Normalize the unused boot state through its genpd provider.
+		 * An audio device that is already suspended, including one the
+		 * system transition has force-suspended, needs nothing here.
+		 */
 		ret = pm_runtime_resume_and_get(audio->dev);
 		if (ret >= 0)
 			ret = pm_runtime_put_sync_suspend(audio->dev);
