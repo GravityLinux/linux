@@ -62,7 +62,7 @@ struct dcp_retirement {
 	unsigned int rpc_count;
 	bool rpc_blocked, ever_used, stopping, pm_held, piodma_held, av_was_open;
 	bool primary, logical_off, manual_disable, resume_retired, hpd_parked;
-	bool retained_client, expects_port;
+	bool retained_client, expects_port, core_stopped;
 	enum dcp_idle_state state;
 	const char *stage;
 	int error;
@@ -479,6 +479,7 @@ static int idle_retire_locked(struct apple_dcp *dcp)
 	/* Complete the stopped-core store before withdrawing its DMA paths. */
 	if (readl(dcp->coproc_reg + DCP_CPU_CONTROL) & DCP_CPU_RUN)
 		return idle_failure(idle, -EIO);
+	idle->core_stopped = true;
 	idle_stage(idle, "DART-streams-off");
 	ret = apple_dart_retained_streams(dcp->dev, false);
 	if (!ret)
@@ -584,6 +585,7 @@ static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 	if (ret)
 		return idle_failure(idle, ret);
 	idle_stage(idle, "RUN");
+	idle->core_stopped = false;
 	writel(idle->saved_run | DCP_CPU_RUN, dcp->coproc_reg + DCP_CPU_CONTROL);
 	if (!(readl(dcp->coproc_reg + DCP_CPU_CONTROL) & DCP_CPU_RUN))
 		return idle_failure(idle, -EIO);
@@ -706,8 +708,15 @@ int dcp_retirement_suspend(struct apple_dcp *dcp)
 	    dcp_fixed_dp_hpd(dcp))
 		return 0;
 	dcp_lifecycle_lock();
-	if (idle->state == DCP_IDLE_RETIRED || idle->state == DCP_IDLE_FAILED) {
+	if (idle->state == DCP_IDLE_RETIRED ||
+	    (idle->state == DCP_IDLE_FAILED && idle->core_stopped)) {
 		ret = 1;
+	} else if (idle->state == DCP_IDLE_FAILED) {
+		/*
+		 * Failed before its core was stopped: the core may still run
+		 * and DMA, so keep its domains on through the normal path.
+		 */
+		ret = 0;
 	} else {
 		ret = idle_retire_primary_locked(dcp);
 		if (ret == -EBUSY || ret == -EPROBE_DEFER)
