@@ -801,10 +801,13 @@ static int dwc3_apple_suspend(struct device *dev)
 	/*
 	 * No system-PM context save/restore exists in this glue yet. Letting
 	 * genpd cut power loses a configured gadget while its UDC still says
-	 * configured. Keep the controller and its PHY dependency powered for
-	 * J713 s2idle; hardware automatic gating remains available.
+	 * configured, and on J773g the host controller behind the internal
+	 * hub stops answering commands after resume. Keep the controller and
+	 * its PHY dependency powered for J713 and J773g s2idle; hardware
+	 * automatic gating remains available.
 	 */
-	if (of_machine_is_compatible("apple,j713") &&
+	if ((of_machine_is_compatible("apple,j713") ||
+	     of_machine_is_compatible("apple,j773g")) &&
 	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
 	    (appledwc->state == DWC3_APPLE_HOST ||
 	     appledwc->state == DWC3_APPLE_DEVICE))
