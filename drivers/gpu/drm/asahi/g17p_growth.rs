@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+//! Source-only Neo TVB request/reply and limit-report identities.
+//! These decoders never dereference addresses supplied by firmware.
+
+pub(crate) const PAGE: u64 = 0x4000;
+pub(crate) const BLOCK: u64 = 0x20000;
+pub(crate) const UNIT: u64 = 0x8000;
+pub(crate) const CONTEXT_BASE: u64 = 0x1000000000;
+pub(crate) const GROWTH_BASE: u64 = 0x1002000000;
+pub(crate) const INCREMENT: usize = 10;
+pub(crate) const REQUEST_LIMIT: u32 = 32;
+pub(crate) const GROWTH_END: u64 = GROWTH_BASE + REQUEST_LIMIT as u64 * INCREMENT as u64 * 0x28000;
+
+/// A retained pool cannot move its tiler block IDs when another caller is
+/// admitted. Keep its whole growth reservation free, including later requests.
+pub(crate) fn caller_fits_growth(base: u64, requests: u32, bindings: &[(u64, u64, u64, u32)]) -> bool {
+    let Some(end) = u64::from(requests)
+        .checked_mul(INCREMENT as u64)
+        .and_then(|n| n.checked_mul(0x28000))
+        .and_then(|length| base.checked_add(length))
+    else {
+        return false;
+    };
+    if base < CONTEXT_BASE || end > 1 << 42 {
+        return false;
+    }
+    bindings.iter().all(|&(address, size, _, _)| {
+        let address = if address < CONTEXT_BASE { address + CONTEXT_BASE } else { address };
+        size != 0 && address.checked_add(size).is_some_and(|last|
+            last <= 1 << 42 && (requests == 0 || last <= base || address >= end))
+    })
+}
+
+/// Source G17PFirstRender's global and independently overridable pool bounds.
+pub(crate) fn source_pool_limits(global: u32, overrides: [u32; 2]) -> Option<[u32; 2]> {
+    fn valid(value: u32) -> bool { value == 0 || (8..=2048).contains(&value) }
+    if !valid(global) { return None; }
+    let values = overrides.map(|value| if value == u32::MAX { global } else { value });
+    if !values.into_iter().all(valid) { return None; }
+    Some(values.map(|value| if value == 0 { 2048 } else { value }))
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+fn u64_at(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pub(crate) vm: u32,
+    pub(crate) pool: u32,
+}
+impl Owner {
+    pub(crate) fn valid(self) -> bool {
+        (1..64).contains(&self.vm) && self.pool < super::g17p_render_lifecycle::POOL_SLOTS
+    }
+    pub(crate) fn request(self, body: &[u8], counter: u32) -> bool {
+        if !self.valid() || body.len() != 0x48 {
+            return false;
+        }
+        let scheduling = (u32_at(body, 16), u64_at(body, 64));
+        u32_at(body, 0) == 6
+            && u32_at(body, 4) == self.vm
+            && u32_at(body, 8) == self.pool
+            && u32_at(body, 12) == counter
+            // This is a scheduler index and its one-hot mask, not the pool's
+            // fixed event grid. Pool9 under load reports (5,32), while older
+            // observed cases use (0,1) and (2,4). Neither field is echoed.
+            // Ownership remains the exact VM/pool/counter and installed root.
+            && scheduling.0 < 64 && scheduling.1 == 1u64 << scheduling.0
+            && body[20..56].iter().all(|b| *b == 0)
+            && u64_at(body, 56) == 1
+    }
+    pub(crate) fn reply(self, body: &[u8], counter: u32, success: bool) -> Option<[u8; 64]> {
+        if !self.request(body, counter) {
+            return None;
+        }
+        let mut out = [0; 64];
+        for (i, value) in [8, u32::from(success), self.pool, self.vm, counter]
+            .into_iter()
+            .enumerate()
+        {
+            out[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        Some(out)
+    }
+    pub(crate) fn limit(self, body: &[u8], work: &[u64], fragment: u64, event: u32) -> Option<u64> {
+        if !self.valid()
+            || body.len() != 0x48
+            || !(1..=2).contains(&work.len())
+            || work.contains(&0)
+            || fragment == 0
+        {
+            return None;
+        }
+        (u32_at(body, 0) == 7
+            && u32_at(body, 4) == 0
+            && u32_at(body, 8) == 1
+            && u32_at(body, 12) == event
+            // The directly authored identity is the event's 32-bit counter.
+            // Native type9 echoes that counter, not a report-supplied pointer.
+            // Treat the adjacent upper word as retained report data: the
+            // synthetic slab+counter qword is not an allocated work address.
+            // Exact descriptor/event/VM/pool/refusal/root/generation checks
+            // still establish the owner before any acknowledgement.
+            && work.iter().any(|node| *node as u32 == u32_at(body, 16))
+            && u64_at(body, 24) != 0
+            && u64_at(body, 32) == 0
+            && u64_at(body, 40) == fragment
+            && u64_at(body, 48) == event as u64
+            && u64_at(body, 56) == self.vm as u64
+            && u64_at(body, 64) == self.pool as u64)
+            .then(|| u64_at(body, 24))
+    }
+}
+
+pub(crate) fn fatal(body: &[u8]) -> bool {
+    body.len() == 0x48 && u32_at(body, 0) == 4 && body[4..].iter().all(|v| *v == 0)
+}
+
+/// Native RID1 type9, observed for separate- and combined-command-buffer
+/// memoryless failures. Four queued native failures reply with the event
+/// counter's upper24 bits (0x100/0x200/0x300/0x400), not descriptor hardware
+/// tags (0x100/0x102/0x103/0x104). Queue/counter come from retained Source DATA;
+/// the report callback cookie is never dereferenced or echoed. This replies
+/// to a render error and does not promise cancellation of dependent work.
+pub(crate) fn limit_reply(queue: u64, stamp: u32) -> Option<[u8; 64]> {
+    if queue == 0 || queue & 0xf != 0 || stamp == 0 || stamp & 0xff != 0 { return None; }
+    let mut out = [0; 64];
+    out[..4].copy_from_slice(&9u32.to_le_bytes());
+    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[8..16].copy_from_slice(&queue.to_le_bytes());
+    out[16..24].copy_from_slice(&u64::from(stamp).to_le_bytes());
+    Some(out)
+}
+
+pub(crate) fn block_id(va: u64) -> Option<u64> {
+    if va < CONTEXT_BASE || va % UNIT != 0 || va.checked_add(BLOCK)? > 1 << 42 {
+        return None;
+    }
+    let id = (va - CONTEXT_BASE) / UNIT;
+    (id <= u32::MAX as u64).then_some(id)
+}
+
+/// Validate the complete retained+new list before allocating or publishing.
+pub(crate) fn block_list(old: &[u64], new: &[u64]) -> bool {
+    if new.is_empty()
+        || old
+            .len()
+            .checked_add(new.len())
+            .is_none_or(|n| n > u32::MAX as usize)
+    {
+        return false;
+    }
+    let blocks = old.iter().chain(new.iter());
+    for (i, &a) in blocks.clone().enumerate() {
+        if block_id(a).is_none() {
+            return false;
+        }
+        for &b in blocks.clone().take(i) {
+            if a < b + BLOCK && b < a + BLOCK {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn block_addresses(counter: u32) -> Option<[u64; INCREMENT]> {
+    if counter >= REQUEST_LIMIT {
+        return None;
+    }
+    Some(core::array::from_fn(|i| {
+        GROWTH_BASE + (counter as u64 * INCREMENT as u64 + i as u64) * 0x28000
+    }))
+}

@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+//! Field-built compute protocol objects for the scheduled firmware family.
+//! The caller supplies CDM and resource addresses; no shader or workload data
+//! is embedded. Large output buffers belong to the caller, not the CPU stack.
+
+use kernel::macros::versions;
+
+#[path = "scheduled_compute.rs"]
+#[allow(dead_code)]
+pub(crate) mod wire;
+#[path = "scheduled_work.rs"]
+#[allow(dead_code)]
+pub(crate) mod work;
+
+pub(crate) const PAGE: usize = 0x4000;
+pub(crate) const USC_EXEC_BASE: u64 = 0x10000000000;
+pub(crate) type Register = (u32, u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Error {
+    Invalid,
+    Overflow,
+    MissingRegister,
+    UnsupportedExecBase,
+}
+pub(super) type Result<T = ()> = core::result::Result<T, Error>;
+pub(super) fn add(a: u64, b: u64) -> Result<u64> {
+    a.checked_add(b).ok_or(Error::Overflow)
+}
+pub(super) fn clear(out: &mut [u8], size: usize) -> Result {
+    if out.len() != size {
+        return Err(Error::Invalid);
+    }
+    out.fill(0);
+    Ok(())
+}
+pub(super) fn u16_at(out: &mut [u8], at: usize, value: u16) {
+    out[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+pub(super) fn u32_at(out: &mut [u8], at: usize, value: u32) {
+    out[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+pub(super) fn u64_at(out: &mut [u8], at: usize, value: u64) {
+    out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+fn qword(out: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(out[at..at + 8].try_into().unwrap())
+}
+
+pub(crate) fn register_value(
+    registers: &[Register],
+    number: u32,
+    occurrence: usize,
+) -> Result<u64> {
+    if registers.len() > 128 {
+        return Err(Error::Invalid);
+    }
+    registers
+        .iter()
+        .filter(|(n, _)| *n == number)
+        .nth(occurrence)
+        .map(|(_, v)| *v)
+        .ok_or(Error::MissingRegister)
+}
+
+fn wire_error(e: wire::Error) -> Error {
+    match e {
+        wire::Error::Invalid => Error::Invalid,
+        wire::Error::Overflow => Error::Overflow,
+        wire::Error::MissingRegister => Error::MissingRegister,
+        wire::Error::UnsupportedExecBase => Error::UnsupportedExecBase,
+    }
+}
+
+#[versions(AGX_SCHEDULED)]
+pub(crate) struct Program {
+    pub(crate) preempt: u64,
+    pub(crate) cdm: u64,
+    pub(crate) identity: u64,
+    pub(crate) context: u32,
+    pub(crate) ordinal: u32,
+    pub(crate) robustness: u64,
+    pub(crate) operand_state: u64,
+    #[ver(G == G17P)]
+    pub(crate) usc_exec_base: u64,
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) usc_exec_base: Option<u64>,
+    pub(crate) helper_binary: u64,
+    pub(crate) helper_data: u64,
+    pub(crate) helper_cfg: u64,
+    pub(crate) execution_gate: u64,
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) register_a599: u64,
+}
+pub(crate) type ProgramOutputG17P = [Register; 40];
+pub(crate) type ProgramOutputG16C = wire::ComputeProgramG16C;
+pub(crate) type ProgramOutputG16S = wire::ComputeProgramG16S;
+#[versions(AGX_SCHEDULED)]
+impl Program::ver {
+    pub(crate) fn build(&self) -> Result<ProgramOutput::ver> {
+        let raw=wire::ComputeProgram::ver::new(&self.parameters()).map_err(wire_error)?;
+        #[ver(G == G17P)]
+        return Ok(raw.into_array());
+        #[ver(G == G16S || G == G16C)]
+        return Ok(raw);
+    }
+    fn parameters(&self)->wire::ProgramParameters {
+        wire::ProgramParameters {
+            save_area: self.preempt, cdm: self.cdm, identity: self.identity,
+            context: self.context, ordinal: self.ordinal, robustness: self.robustness,
+            operand_state: self.operand_state,
+            #[ver(G == G17P)]
+            usc_exec_base: Some(self.usc_exec_base),
+            #[ver(G == G16S || G == G16C)]
+            usc_exec_base: self.usc_exec_base,
+            helper_binary: self.helper_binary, helper_data: self.helper_data,
+            helper_config: self.helper_cfg, execution_gate: self.execution_gate,
+            #[ver(G == G17P)]
+            register_a599: 0x13200400020,
+            #[ver(G == G16S || G == G16C)]
+            register_a599: self.register_a599,
+        }
+    }
+}
+
+#[versions(AGX_SCHEDULED)]
+pub(crate) struct Descriptor {
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) save_area: u64,
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) cdm: u64,
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) identity: u64,
+    pub(crate) scheduler: u64,
+    pub(crate) low_alias: u64,
+    pub(crate) cdm_terminator: u64,
+    pub(crate) sequence: u64,
+    pub(crate) context: u32,
+    pub(crate) grid: u32,
+    pub(crate) dispatch: [u64; 2],
+    pub(crate) status: [u64; 2],
+    pub(crate) timestamps: [u64; 2],
+    pub(crate) shared_control: u64,
+    pub(crate) zero_page: u64,
+    pub(crate) support_control: u32,
+    pub(crate) support_flags: u32,
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) support_kind: u16,
+    #[ver(G == G16S || G == G16C)]
+    pub(crate) support_phase: u8,
+    pub(crate) ordinal: u32,
+    pub(crate) queue_submission: u32,
+    pub(crate) queue_ordinal: u32,
+    pub(crate) submission_index: u32,
+    pub(crate) sampler_array: u64,
+    pub(crate) sampler_count: u32,
+}
+#[versions(AGX_SCHEDULED)]
+impl Descriptor::ver {
+    pub(crate) fn build(&self, out: &mut [u8], registers: &[Register]) -> Result {
+        #[ver(G == G17P)]
+        if out.len() != PAGE { return Err(Error::Invalid); }
+        #[ver(G == G16S || G == G16C)]
+        if out.len() != 0x1000 && out.len() != PAGE { return Err(Error::Invalid); }
+        wire::ComputeDescriptor::ver::write(out, &wire::Parameters {
+            #[ver(G == G17P)]
+            save_area: 0, // Neo scalars come from the register program.
+            #[ver(G == G17P)]
+            cdm: 0,
+            #[ver(G == G17P)]
+            identity: 0,
+            #[ver(G == G16S || G == G16C)]
+            save_area: self.save_area,
+            #[ver(G == G16S || G == G16C)]
+            cdm: self.cdm,
+            #[ver(G == G16S || G == G16C)]
+            identity: self.identity,
+            sequence: self.sequence,
+            context: self.context,
+            scheduler: self.scheduler,
+            alias: self.low_alias,
+            terminator: self.cdm_terminator,
+            sampler_array: self.sampler_array,
+            sampler_count: self.sampler_count,
+            dispatch: self.dispatch,
+            grid: self.grid,
+            queue_submission: self.queue_submission,
+            queue_ordinal: self.queue_ordinal,
+            submission_index: self.submission_index,
+            ordinal: self.ordinal,
+            status: self.status,
+            timestamps: self.timestamps,
+            support: self.shared_control,
+            support_control: self.support_control,
+            support_flags: self.support_flags,
+            #[ver(G == G17P)]
+            support_kind: 0x9f,
+            #[ver(G == G16S || G == G16C)]
+            support_kind: self.support_kind,
+            #[ver(G == G17P)]
+            support_phase: 1,
+            #[ver(G == G16S || G == G16C)]
+            support_phase: self.support_phase,
+            zero_page: self.zero_page,
+        }, registers).map_err(wire_error)
+    }
+}
+
+// Keep existing Neo call sites and their constructor inputs unchanged while
+// the queue-generation path gains a concrete Max instantiation.
+pub(crate) type Descriptor = DescriptorG17P;
+pub(crate) type Program = ProgramG17P;
+
+pub(crate) struct Optional {
+    pub(crate) context_low: u64,
+    pub(crate) context_high: u64,
+    pub(crate) grid: u32,
+    pub(crate) ordinal: u32,
+    pub(crate) shared_control: u64,
+    pub(crate) channel_control: u64,
+    pub(crate) uuid: u32,
+    pub(crate) field_46: u32,
+    pub(crate) field_1e: u32,
+    pub(crate) field_32: u32,
+    pub(crate) field_56: u32,
+    pub(crate) field_5e: u32,
+    pub(crate) first: bool,
+    pub(crate) item_index: u32,
+}
+impl Optional {
+    pub(crate) fn build(&self) -> [u8; 0xc0] {
+        let raw = work::ComputeWrapperG17P::new(&work::WrapperParameters {
+            scratch_low: self.context_low, scratch_high: self.context_high,
+            support: self.shared_control, queue_control: self.channel_control,
+            grid: self.grid as u16, item: self.item_index as u16,
+            ordinal: self.ordinal as u16, context: self.field_32 as u16,
+            support_id: self.field_56 as u16, uuid: self.uuid as u16,
+            scheduler: self.field_1e as u16, scheduler_hint: self.field_46 as u16,
+            first: self.first, field_52: self.first as u16,
+            field_5e: self.field_5e as u16, field_62: self.first as u16,
+        });
+        let mut out = [0; 0xc0];
+        out.copy_from_slice(raw.as_bytes());
+        out
+    }
+}
+
+pub(crate) fn event(out: &mut [u8], group: u32, grid: u32, counter_low: u32) -> Result {
+    if group > 0xffffff {
+        return Err(Error::Overflow);
+    }
+    clear(out, 0x400)?;
+    for (at, value) in [
+        (0, 0xe),
+        (4, 0x10000 | (grid & 0xffff)),
+        (8, (group << 8) | (counter_low & 0xff)),
+        (0x10, 0x200),
+    ] {
+        u32_at(out, at, value);
+    }
+    Ok(())
+}
+
+pub(crate) fn points(out: &mut [u8], engine: u8, event_slot: u8, points: &[(u8, u32)]) -> Result {
+    if points.is_empty() || points.len() > 32 || points.iter().any(|(queue, _)| *queue >= 128) {
+        return Err(Error::Invalid);
+    }
+    clear(out, 0x110)?;
+    u64_at(
+        out,
+        0,
+        0xffff000000000000
+            | ((engine as u64) << 40)
+            | ((event_slot as u64) << 32)
+            | ((1u64 << points.len()) - 1),
+    );
+    for (index, (queue, value)) in points.iter().enumerate() {
+        u64_at(out, 8 + index * 8, ((*queue as u64) << 40) | *value as u64);
+    }
+    Ok(())
+}
+/// Extend the existing Source same-queue point without changing its
+/// completion, receiver event slot, or firmware-owned context tail.
+#[versions(AGX_SCHEDULED)]
+impl work::ComputeRecord::ver {
+    /// Write a complete ordered dependency vector without altering the
+    /// captured timeout/engine prefix or any register/retirement fields.
+    pub(crate) fn set_dependencies(&mut self,points:&[(u8,u32)])->Result {
+        if points.is_empty() || points.len()>4
+            || points.iter().any(|&(grid,value)|grid>=128 || value>=1<<30) {
+            return Err(Error::Invalid);
+        }
+        self.write_dependencies(points);Ok(())
+    }
+    fn write_dependencies(&mut self,points:&[(u8,u32)]) {
+        let header=u64::from_le_bytes(self.dependency_header);
+        self.dependency_header=((header&!0xffffffff)|((1u64<<points.len())-1)).to_le_bytes();
+        let mut words=[[0u8;8];4];
+        for (out,&(grid,value))in words.iter_mut().zip(points) {
+            *out=((u64::from(grid)<<40)|u64::from(value)).to_le_bytes();
+        }
+        [self.previous,self.field_30,self.field_38,self.field_40]=words;
+        self.dependency_tail.fill(0);
+    }
+    /// Preserve the ordinary queue rule: foreign waits precede our own point.
+    pub(crate) fn append_dependencies(&mut self, dependencies: &[(u8, u32)]) -> Result {
+        if dependencies.is_empty() { return Ok(()); }
+        #[ver(G == G17P)]
+        if dependencies.len()>3 {return Err(Error::Invalid);}
+        #[ver(G == G16S || G == G16C)]
+        if dependencies.len()>4 {return Err(Error::Invalid);}
+        let header=u64::from_le_bytes(self.dependency_header);
+        let previous=u64::from_le_bytes(self.previous);
+        let mut merged=[(0u8,0u32);4];
+        let mut own=((previous>>40)as u8,previous as u32);
+        if own.0>=128 {return Err(Error::Invalid);}
+        let mut count=0;
+        for &(grid,value) in dependencies {
+            if grid>=128 || value>=1<<30 {return Err(Error::Invalid);}
+            #[ver(G == G17P)]
+            if value==0 {return Err(Error::Invalid);}
+            if grid==own.0 {own.1=own.1.max(value);continue;}
+            if let Some(existing)=merged[..count].iter_mut().find(|p|p.0==grid) {
+                existing.1=existing.1.max(value);
+            } else {
+                #[ver(G == G16S || G == G16C)]
+                if count==3 {return Err(Error::Invalid);}
+                merged[count]=(grid,value);count+=1;
+            }
+        }
+        merged[count]=own;count+=1;
+        #[ver(G == G17P)]
+        let prefix=0xffff080000000000u64 | (((header>>32)&255)<<32);
+        #[ver(G == G16S || G == G16C)]
+        let prefix=header & !0xffffffff;
+        self.dependency_header=prefix.to_le_bytes();
+        self.write_dependencies(&merged[..count]);Ok(())
+    }
+}
+
+pub(crate) fn context_dependencies(out:&mut[u8],dependencies:&[(u8,u32)])->Result {
+    if dependencies.is_empty() {return Ok(());}
+    if out.len()!=work::ComputeRecordG17P::SIZE {return Err(Error::Invalid);}
+    // SAFETY: This is owned staging, the exact record size was checked, and
+    // the asserted repr(C) layout contains only alignment-one byte arrays.
+    let record=unsafe {&mut *out.as_mut_ptr().cast::<work::ComputeRecordG17P>()};
+    record.append_dependencies(dependencies)
+}
+
+pub(crate) fn completion_header(header: u64, value: u32) -> Result<u64> {
+    if value == 0 || value >= 1 << 30 {
+        return Err(Error::Invalid);
+    }
+    Ok(header & !0xfffffffc | ((value as u64) << 2))
+}
+pub(crate) fn context_offset(item_index: u32, records: u32) -> Result<usize> {
+    if !(2..=256).contains(&records) {
+        return Err(Error::Invalid);
+    }
+    Ok(((item_index as u64 + 1) % records as u64 * 0x200) as usize)
+}
+
+pub(crate) struct Context<'a> {
+    pub(crate) descriptor: u64,
+    pub(crate) queue: u64,
+    pub(crate) grid: u32,
+    pub(crate) flags: u64,
+    pub(crate) word_220: u64,
+    pub(crate) word_330: u64,
+    pub(crate) word_338: u64,
+    pub(crate) word_350: u64,
+    pub(crate) word_358: u64,
+    pub(crate) word_378: u64,
+    pub(crate) item_index: u32,
+    pub(crate) points: Option<&'a [(u8, u32)]>,
+    pub(crate) event_slot: Option<u8>,
+    pub(crate) completion: Option<u32>,
+}
+impl Context<'_> {
+    pub(crate) fn build(&self, out: &mut [u8]) -> Result {
+        // grid*4 is shifted by 40 in a u64 field in the Python serializer.
+        if self.grid >= 1 << 22 {
+            return Err(Error::Overflow);
+        }
+        let mut header =
+            self.flags | ((self.grid as u64 * 4) << 40) | ((self.item_index as u64 + 1) * 4);
+        if let Some(value) = self.completion {
+            header = completion_header(header, value)?;
+        }
+        clear(out, 0x200)?;
+        let raw = work::ComputeRecordG17P::from_fields(work::RecordFields {
+            header, descriptor: self.descriptor, queue: self.queue,
+            dependency_header: self.word_220,
+            previous: ((self.grid as u64) << 40) | self.item_index as u64,
+            field_30: 0, control_130: self.word_330,
+            retire_control: self.word_338, ready: 0,
+            arrays: [self.word_350, self.word_358], mask: self.word_378,
+        });
+        out.copy_from_slice(raw.as_bytes());
+        if let Some(values) = self.points {
+            points(
+                &mut out[0x20..0x130],
+                8,
+                self.event_slot.unwrap_or((self.word_220 >> 32) as u8),
+                values,
+            )?;
+        }
+        Ok(())
+    }
+}
+/// Reuse preserves firmware-owned bytes and replaces the authored point prefix.
+pub(crate) fn update_context(previous: &mut [u8], current: &[u8]) -> Result {
+    if previous.len() != 0x200 || current.len() != 0x200 {
+        return Err(Error::Invalid);
+    }
+    let mask = qword(current, 0x20) as u32;
+    if mask == 0 || (mask != u32::MAX && mask & (mask + 1) != 0) {
+        return Err(Error::Invalid);
+    }
+    let end = 0x28 + (32 - mask.leading_zeros()) as usize * 8;
+    for at in [0, 0x10, 0x18, 0x20, 0x28, 0x130, 0x138, 0x150, 0x158, 0x178] {
+        previous[at..at + 8].copy_from_slice(&current[at..at + 8]);
+    }
+    previous[0x20..end].copy_from_slice(&current[0x20..end]);
+    Ok(())
+}
+
+pub(crate) struct Scheduler {
+    pub(crate) slot: u64,
+    pub(crate) work_id: u32,
+    pub(crate) phase: u32,
+    pub(crate) job_list: u64,
+    pub(crate) node_id: u64,
+    pub(crate) completion_kind: u64,
+}
+impl Scheduler {
+    pub(crate) fn build(&self) -> [u8; 0x100] {
+        let raw = work::ComputeSchedulerG17P::new(work::SchedulerParameters {
+            slot: self.slot, work_id: self.work_id, phase: self.phase,
+            job_list: self.job_list, node_id: self.node_id,
+            completion_kind: self.completion_kind,
+        });
+        let mut out = [0; 0x100];
+        out.copy_from_slice(raw.as_bytes());
+        out
+    }
+}
+pub(crate) fn scheduler_slot(first: u64, occupied: usize) -> Result<[u8; 0x40]> {
+    if occupied > 8 {
+        return Err(Error::Invalid);
+    }
+    let mut out = [0; 0x40];
+    for index in 0..occupied {
+        u64_at(
+            &mut out,
+            index * 8,
+            (2 << 32) | if index == 0 { first } else { 0 },
+        );
+    }
+    Ok(out)
+}
+
+impl ProgramG16C {
+    pub(crate) fn build_for(&self,profile:super::scheduled_profile::Profile)->Result<ProgramOutputG16C> {
+        wire::ComputeProgramG16C::for_profile(&self.parameters(),profile).map_err(wire_error)
+    }
+}

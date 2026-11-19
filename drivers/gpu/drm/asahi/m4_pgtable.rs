@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright The Gravity Linux Contributors
+// Adapted from the Asahi UAT implementation and Niklas Sheth's G16 port.
+
+//! UAT Page Table management
+//!
+//! AGX GPUs use an MMU called the UAT, which is largely compatible with the ARM64 page table
+//! format. This module manages the actual page tables by allocating raw memory pages from
+//! the kernel page allocator.
+
+use core::cell::{Cell, RefCell};
+use core::fmt::Debug;
+use core::mem::size_of;
+use core::ops::Range;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use kernel::rbtree::RBTree;
+use kernel::{addr::PhysicalAddr, error::Result, page::Page, prelude::*};
+
+use crate::util::align;
+
+/// Number of bits in a page offset.
+pub(crate) const UAT_PGBIT: usize = 14;
+/// UAT page size.
+pub(crate) const UAT_PGSZ: usize = 1 << UAT_PGBIT;
+/// UAT page offset mask.
+pub(crate) const UAT_PGMSK: usize = UAT_PGSZ - 1;
+
+type Pte = AtomicU64;
+
+const PTE_BIT: usize = 3; // log2(sizeof(Pte))
+const PTE_SIZE: usize = 1 << PTE_BIT;
+
+/// Number of PTEs per page.
+const UAT_NPTE: usize = UAT_PGSZ / size_of::<Pte>();
+
+/// Number of address bits to address a level
+const UAT_LVBIT: usize = UAT_PGBIT - PTE_BIT;
+/// Number of entries per level
+const UAT_LVSZ: usize = UAT_NPTE;
+/// Mask of level bits
+const UAT_LVMSK: u64 = (UAT_LVSZ - 1) as u64;
+
+const UAT_LEVELS: usize = 3;
+
+const PTE_TYPE_BITS: u64 = 3;
+const PTE_TYPE_LEAF_TABLE: u64 = 3;
+
+const UAT_NON_GLOBAL: u64 = 1 << 11;
+const UAT_AP_SHIFT: u32 = 6;
+const UAT_HIGH_BITS_SHIFT: u32 = 52;
+const UAT_MEMATTR_SHIFT: u32 = 2;
+
+const UAT_AF: u64 = 1 << 10;
+
+const MEMATTR_CACHED: u8 = 0;
+const MEMATTR_DEV: u8 = 1;
+const MEMATTR_UNCACHED: u8 = 2;
+
+const AP_FW_GPU: u8 = 0;
+const AP_FW: u8 = 1;
+const AP_GPU: u8 = 2;
+
+const HIGH_BITS_PXN: u16 = 1 << 1;
+const HIGH_BITS_UXN: u16 = 1 << 2;
+const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
+
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct Prot {
+    memattr: u8,
+    ap: u8,
+    high_bits: u16,
+}
+
+// Firmware + GPU access
+const PROT_FW_GPU_NA: Prot = Prot::from_bits(AP_FW_GPU, 0, 0);
+
+// Firmware only access
+const PROT_FW_RO: Prot = Prot::from_bits(AP_FW, 0, 0);
+const PROT_FW_RW: Prot = Prot::from_bits(AP_FW, 1, 0);
+
+// GPU only access
+const PROT_GPU_RO: Prot = Prot::from_bits(AP_GPU, 0, 0);
+const PROT_GPU_WO: Prot = Prot::from_bits(AP_GPU, 0, 1);
+const PROT_GPU_RW: Prot = Prot::from_bits(AP_GPU, 1, 0);
+
+
+
+pub(crate) mod prot {
+    pub(crate) use super::Prot;
+    use super::*;
+
+    /// Firmware MMIO R/W
+    pub(crate) const PROT_FW_MMIO_RW: Prot = PROT_FW_RW.memattr(MEMATTR_DEV);
+    /// Firmware MMIO R/O
+    pub(crate) const PROT_FW_MMIO_RO: Prot = PROT_FW_RO.memattr(MEMATTR_DEV);
+    /// Firmware shared (uncached) RW
+    pub(crate) const PROT_FW_SHARED_RW: Prot = PROT_FW_RW.memattr(MEMATTR_UNCACHED);
+    /// Firmware shared (uncached) RO
+    pub(crate) const PROT_FW_SHARED_RO: Prot = PROT_FW_RO.memattr(MEMATTR_UNCACHED);
+    /// Firmware private (cached) RW
+    pub(crate) const PROT_FW_PRIV_RW: Prot = PROT_FW_RW.memattr(MEMATTR_CACHED);
+    /// GPU shared/coherent RW
+    pub(crate) const PROT_GPU_SHARED_RW: Prot = PROT_GPU_RW.memattr(MEMATTR_UNCACHED);
+    /// GPU shared/coherent RO
+    pub(crate) const PROT_GPU_SHARED_RO: Prot = PROT_GPU_RO.memattr(MEMATTR_UNCACHED);
+    /// GPU shared/coherent WO
+    pub(crate) const PROT_GPU_SHARED_WO: Prot = PROT_GPU_WO.memattr(MEMATTR_UNCACHED);
+}
+
+impl Prot {
+    const fn from_bits(ap: u8, uxn: u16, pxn: u16) -> Self {
+        assert!(uxn <= 1);
+        assert!(pxn <= 1);
+        assert!(ap <= 3);
+
+        Prot {
+            high_bits: HIGH_BITS_GPU_ACCESS | (pxn * HIGH_BITS_PXN) | (uxn * HIGH_BITS_UXN),
+            memattr: 0,
+            ap,
+        }
+    }
+
+
+
+    const fn memattr(&self, memattr: u8) -> Self {
+        Self { memattr, ..*self }
+    }
+
+    const fn as_pte(&self) -> u64 {
+        (self.ap as u64) << UAT_AP_SHIFT
+            | (self.high_bits as u64) << UAT_HIGH_BITS_SHIFT
+            | (self.memattr as u64) << UAT_MEMATTR_SHIFT
+            | UAT_AF
+    }
+}
+
+impl Default for Prot {
+    fn default() -> Self {
+        PROT_FW_GPU_NA
+    }
+}
+
+
+enum Walk {
+    Read,
+    Write,
+    Allocate,
+}
+
+struct OwnedTable {
+    phys: PhysicalAddr,
+    parent: PhysicalAddr,
+    index: usize,
+}
+
+pub(crate) struct UatPageTable {
+    ttb: PhysicalAddr,
+    ttb_owned: bool,
+    va_range: Range<u64>,
+    oas_mask: u64,
+    ias_mask: u64,
+    owned_tables: KVec<OwnedTable>,
+    // Membership survives publication; the queue contains only pending cleans.
+    dirty_tables: RBTree<PhysicalAddr, Cell<bool>>,
+    pending_tables: RefCell<KVec<PhysicalAddr>>,
+    invalidations: RefCell<KVec<Range<u64>>>,
+}
+
+impl UatPageTable {
+    /// Allocate a root with the address width of this GPU generation.
+    /// G16 has 64 top-level entries (42 address bits per TTBR), while
+    /// G13/G14 use 8 entries (39 bits per TTBR).
+    pub(crate) fn new_with_ias(oas: u32, ias: usize) -> Result<Self> {
+        if !(UAT_PGBIT..=UAT_PGBIT + UAT_LEVELS * UAT_LVBIT).contains(&ias)
+            || !(UAT_PGBIT as u32..=52).contains(&oas)
+        {
+            return Err(EINVAL);
+        }
+        pr_debug!("UATPageTable::new: oas={} ias={}\n", oas, ias);
+        let ttb_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+        let mut dirty_tables = RBTree::new();
+        dirty_tables.try_create_and_insert(ttb_page.phys(), Cell::new(true), GFP_KERNEL)?;
+        let mut pending_tables = KVec::new();
+        pending_tables.push(ttb_page.phys(), GFP_KERNEL)?;
+        let ttb = Page::into_phys(ttb_page);
+        Ok(UatPageTable {
+            ttb,
+            ttb_owned: true,
+            va_range: 0..(1u64 << ias),
+            oas_mask: (1u64 << oas) - 1,
+            ias_mask: (1u64 << ias) - 1,
+            owned_tables: KVec::new(),
+            dirty_tables,
+            pending_tables: RefCell::new(pending_tables),
+            invalidations: RefCell::new(KVec::new()),
+        })
+    }
+
+    /// Borrow a firmware root without owning its existing child tables.
+    pub(crate) fn new_with_ttb_and_ias(
+        ttb: PhysicalAddr,
+        va_range: Range<u64>,
+        oas: u32,
+        ias: usize,
+    ) -> Result<Self> {
+        if !(UAT_PGBIT..=UAT_PGBIT + UAT_LEVELS * UAT_LVBIT).contains(&ias)
+            || !(UAT_PGBIT as u32..=52).contains(&oas)
+            || va_range.is_empty()
+            || va_range.end - va_range.start > 1u64 << ias
+        {
+            return Err(EINVAL);
+        }
+        pr_debug!(
+            "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} oas={}\n",
+            ttb,
+            va_range,
+            oas
+        );
+        if ttb & (UAT_PGMSK as PhysicalAddr) != 0 {
+            return Err(EINVAL);
+        }
+        if (va_range.start | va_range.end) & (UAT_PGMSK as u64) != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: The TTB is should remain valid (if properly mapped), as it is bootloader-managed.
+        if unsafe { Page::borrow_phys(&ttb) }.is_none() {
+            pr_err!(
+                "UATPageTable::new_with_ttb: ttb at {:#x} is not mapped (DT using no-map?)\n",
+                ttb
+            );
+            return Err(EIO);
+        }
+
+        Ok(UatPageTable {
+            ttb,
+            ttb_owned: false,
+            va_range,
+            oas_mask: (1u64 << oas) - 1,
+            ias_mask: (1u64 << ias) - 1,
+            owned_tables: KVec::new(),
+            dirty_tables: RBTree::new(),
+            pending_tables: RefCell::new(KVec::new()),
+            invalidations: RefCell::new(KVec::new()),
+        })
+    }
+
+    /// Queue cache cleaning for edited tables, including borrowed ancestors.
+    /// The enclosing publication batch supplies the completion barrier.
+    pub(crate) fn clean(&self) {
+        for phys in self.pending_tables.borrow_mut().drain_all() {
+            self.dirty_tables.get(&phys).unwrap().set(false);
+            // SAFETY: Every recorded table is live until this owner is dropped.
+            let page = unsafe { Page::borrow_phys_unchecked(&phys) };
+            page.with_page_mapped(|p| {
+                for off in (0..UAT_PGSZ).step_by(64) {
+                    // SAFETY: This cache line lies within the mapped table page.
+                    unsafe {
+                        core::arch::asm!("dc cvac, {addr}", addr = in(reg) p.add(off));
+                    }
+                }
+            });
+        }
+    }
+
+    pub(crate) fn sync(&self) {
+        self.clean();
+        crate::mem::sync();
+    }
+
+    /// Publish changed global mappings, then forget the completed ranges.
+    pub(crate) fn publish(&self) {
+        self.sync();
+        self.invalidate(None);
+        crate::mem::sync();
+        self.clear_invalidations();
+    }
+
+    /// Record before editing so an allocation failure cannot hide a changed
+    /// mapping. Adjacent edits share one invalidation interval.
+    fn changed(&mut self, range: Range<u64>) -> Result {
+        if range.is_empty()
+            || range.start < self.va_range.start
+            || range.end > self.va_range.end
+            || (range.start | range.end) & UAT_PGMSK as u64 != 0
+        {
+            return Err(EINVAL);
+        }
+        let ranges = self.invalidations.get_mut();
+        if let Some(last) = ranges.last_mut() {
+            if last.start <= range.end && range.start <= last.end {
+                last.start = last.start.min(range.start);
+                last.end = last.end.max(range.end);
+                return Ok(());
+            }
+        }
+        ranges.push(range, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// PTE cleaning must have completed before invalidation. None targets
+    /// global firmware mappings by VA across all ASIDs, never the whole TLB.
+    pub(crate) fn invalidate(&self, asid: Option<u8>) {
+        for range in self.invalidations.borrow().iter() {
+            crate::mem::tlbi_range(asid, range.start, range.end);
+        }
+    }
+
+    pub(crate) fn reserve_invalidation(&mut self) -> Result {
+        self.invalidations.get_mut().reserve(1, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_invalidations(&self) {
+        self.invalidations.borrow_mut().clear();
+    }
+
+    // Record dirtiness before writing a PTE so allocation failure cannot leave
+    // an untracked edit. Read-only walks neither allocate nor dirty metadata.
+    fn mark_dirty(&mut self, phys: PhysicalAddr) -> Result {
+        match self.dirty_tables.get(&phys) {
+            Some(dirty) if dirty.get() => return Ok(()),
+            Some(_) => {}
+            None => {
+                self.dirty_tables
+                    .try_create_and_insert(phys, Cell::new(false), GFP_KERNEL)?;
+            }
+        }
+        // Queue before setting membership or editing a PTE. A failed reserve
+        // leaves the table clean and permits a later attempt to enqueue it.
+        self.pending_tables.get_mut().push(phys, GFP_KERNEL)?;
+        self.dirty_tables.get(&phys).unwrap().set(true);
+        Ok(())
+    }
+
+    pub(crate) fn ttb(&self) -> PhysicalAddr {
+        self.ttb
+    }
+
+    fn with_pages<F>(&mut self, iova_range: Range<u64>, walk: Walk, mut cb: F) -> Result
+    where
+        F: FnMut(u64, &[Pte]) -> Result,
+    {
+        let alloc = matches!(walk, Walk::Allocate);
+        let write = !matches!(walk, Walk::Read);
+        pr_debug!(
+            "UATPageTable::with_pages: {:#x?} alloc={}\n",
+            iova_range,
+            alloc
+        );
+        if (iova_range.start | iova_range.end) & (UAT_PGMSK as u64) != 0 {
+            pr_err!(
+                "UATPageTable::with_pages: iova range not aligned: {:#x?}\n",
+                iova_range
+            );
+            return Err(EINVAL);
+        }
+
+        if iova_range.is_empty() {
+            return Ok(());
+        }
+
+        let mut iova = iova_range.start & self.ias_mask;
+        let mut last_iova = iova;
+        // Handle the case where iova_range.end is just at the top boundary of the IAS
+        let end = ((iova_range.end - 1) & self.ias_mask) + 1;
+
+        let mut pt_addr: [Option<PhysicalAddr>; UAT_LEVELS] = Default::default();
+        pt_addr[UAT_LEVELS - 1] = Some(self.ttb);
+
+        'outer: while iova < end {
+            pr_debug!("UATPageTable::with_pages: iova={:#x}\n", iova);
+            let addr_diff = last_iova ^ iova;
+            for level in (0..UAT_LEVELS - 1).rev() {
+                // If the iova has changed at this level or above, invalidate the physaddr
+                if addr_diff & !((1 << (UAT_PGBIT + (level + 1) * UAT_LVBIT)) - 1) != 0 {
+                    if pt_addr[level].take().is_some() {
+                        pr_debug!("UATPageTable::with_pages: invalidate level {}\n", level);
+                    }
+                }
+            }
+            last_iova = iova;
+            for level in (0..UAT_LEVELS - 1).rev() {
+                // Fetch the page table base address for this level
+                if pt_addr[level].is_none() {
+                    let phys = pt_addr[level + 1].unwrap();
+                    pr_debug!(
+                        "UATPageTable::with_pages: need level {}, parent phys {:#x}\n",
+                        level,
+                        phys
+                    );
+                    let upidx = ((iova >> (UAT_PGBIT + (level + 1) * UAT_LVBIT) as u64) & UAT_LVMSK)
+                        as usize;
+                    // SAFETY: Page table addresses are either allocated by us, or
+                    // firmware-managed and safe to borrow a struct page from.
+                    let upt = unsafe { Page::borrow_phys_unchecked(&phys) };
+                    pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
+                    pt_addr[level] =
+                        upt.with_pointer_into_page(upidx * PTE_SIZE, PTE_SIZE, |p| {
+                            let uptep = p as *const _ as *const Pte;
+                            // SAFETY: with_pointer_into_page() ensures the pointer is valid,
+                            // and our index is aligned so it is safe to deref as an AtomicU64.
+                            let upte = unsafe { &*uptep };
+                            let mut upte_val = upte.load(Ordering::Relaxed);
+                            // Allocate if requested
+                            if upte_val == 0 && alloc {
+                                self.mark_dirty(phys)?;
+                                let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+                                pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
+                                let pt_paddr = pt_page.phys();
+                                self.owned_tables.push(OwnedTable {
+                                    phys: pt_paddr,
+                                    parent: phys,
+                                    index: upidx,
+                                }, GFP_KERNEL)?;
+                                let _ = Page::into_phys(pt_page);
+                                // The new table's zero entries also need publication.
+                                // Ownership has transferred before this fallible step.
+                                self.mark_dirty(pt_paddr)?;
+                                upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
+                                upte.store(upte_val, Ordering::Relaxed);
+                            }
+                            if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
+                                Ok(Some(upte_val & self.oas_mask & (!UAT_PGMSK as u64)))
+                            } else if upte_val == 0 || !alloc {
+                                pr_debug!("UATPageTable::with_pages: no level {}\n", level);
+                                Ok(None)
+                            } else {
+                                pr_err!("UATPageTable::with_pages: Unexpected Table PTE value {:#x} at iova {:#x} index {} phys {:#x}\n", upte_val,
+                                        iova, level + 1, phys + ((upidx * PTE_SIZE) as PhysicalAddr));
+                                Ok(None)
+                            }
+                        })?;
+                    pr_debug!(
+                        "UATPageTable::with_pages: level {} PT {:#x?}\n",
+                        level,
+                        pt_addr[level]
+                    );
+                }
+                // If we don't have a page table, skip this entire level
+                if pt_addr[level].is_none() {
+                    let block = 1 << (UAT_PGBIT + UAT_LVBIT * (level + 1));
+                    let old = iova;
+                    iova = align(iova + 1, block);
+                    pr_debug!(
+                        "UATPageTable::with_pages: skip {:#x} {:#x} -> {:#x}\n",
+                        block,
+                        old,
+                        iova
+                    );
+                    continue 'outer;
+                }
+            }
+
+            let idx = ((iova >> UAT_PGBIT as u64) & UAT_LVMSK) as usize;
+            let max_count = UAT_NPTE - idx;
+            let count = (((end - iova) >> UAT_PGBIT) as usize).min(max_count);
+            let phys = pt_addr[0].unwrap();
+            pr_debug!(
+                "UATPageTable::with_pages: leaf PT at {:#x} idx {:#x} count {:#x} iova {:#x}\n",
+                phys,
+                idx,
+                count,
+                iova
+            );
+            if write {
+                self.mark_dirty(phys)?;
+            }
+            // SAFETY: Page table addresses are either allocated by us, or
+            // firmware-managed and safe to borrow a struct page from.
+            let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
+            pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
+                let ptep = p as *const _ as *const Pte;
+                // SAFETY: We know this is a valid pointer to PTEs and the range is valid and
+                // checked by with_pointer_into_page().
+                let ptes = unsafe { core::slice::from_raw_parts(ptep, count) };
+                cb(iova, ptes)?;
+                Ok(())
+            })?;
+
+            let block = 1 << (UAT_PGBIT + UAT_LVBIT);
+            iova = align(iova + 1, block);
+        }
+
+        Ok(())
+    }
+
+    fn pte_bits(&self) -> u64 {
+        if self.ttb_owned {
+            // Owned page tables are userspace, so non-global
+            PTE_TYPE_LEAF_TABLE | UAT_NON_GLOBAL
+        } else {
+            // The sole non-owned page table is kernelspace, so global
+            PTE_TYPE_LEAF_TABLE
+        }
+    }
+
+    pub(crate) fn map_pages(
+        &mut self,
+        iova_range: Range<u64>,
+        mut phys: PhysicalAddr,
+        prot: Prot,
+        one_page: bool,
+    ) -> Result {
+        pr_debug!(
+            "UATPageTable::map_pages: {:#x?} {:#x?} {:?}\n",
+            iova_range,
+            phys,
+            prot
+        );
+        if phys & (UAT_PGMSK as PhysicalAddr) != 0 {
+            pr_err!("UATPageTable::map_pages: phys not aligned: {:#x?}\n", phys);
+            return Err(EINVAL);
+        }
+
+        self.changed(iova_range.clone())?;
+        let pte_bits = self.pte_bits();
+
+        self.with_pages(iova_range, Walk::Allocate, |iova, ptes| {
+            for (idx, pte) in ptes.iter().enumerate() {
+                let ptev = pte.load(Ordering::Relaxed);
+                if ptev != 0 {
+                    pr_err!(
+                        "UATPageTable::map_pages: Page at IOVA {:#x} is mapped (PTE: {:#x})\n",
+                        iova + (idx * UAT_PGSZ) as u64,
+                        ptev
+                    );
+                }
+                pte.store(phys | prot.as_pte() | pte_bits, Ordering::Relaxed);
+                if !one_page {
+                    phys += UAT_PGSZ as PhysicalAddr;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Resolve a mapped byte address without allocating page tables.
+    pub(crate) fn translate(&mut self, iova: u64) -> Result<Option<PhysicalAddr>> {
+        let page = iova & !(UAT_PGMSK as u64);
+        let end = page.checked_add(UAT_PGSZ as u64).ok_or(EINVAL)?;
+        if page < self.va_range.start || end > self.va_range.end {
+            return Err(EINVAL);
+        }
+        let mut result = None;
+        let mask = self.oas_mask & !(UAT_PGMSK as u64);
+        self.with_pages(page..end, Walk::Read, |_, ptes| {
+            let pte = ptes[0].load(Ordering::Relaxed);
+            if pte & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
+                result = Some((pte & mask) | (iova & UAT_PGMSK as u64));
+            }
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    pub(crate) fn unmap_pages(&mut self, iova_range: Range<u64>) -> Result {
+        self.changed(iova_range.clone())?;
+        pr_debug!("UATPageTable::unmap_pages: {:#x?}\n", iova_range);
+        self.with_pages(iova_range, Walk::Write, |iova, ptes| {
+            for (idx, pte) in ptes.iter().enumerate() {
+                if pte.load(Ordering::Relaxed) & PTE_TYPE_LEAF_TABLE == 0 {
+                    pr_err!(
+                        "UATPageTable::unmap_pages: Page at IOVA {:#x} already unmapped\n",
+                        iova + (idx * UAT_PGSZ) as u64
+                    );
+                }
+                pte.store(0, Ordering::Relaxed);
+            }
+            Ok(())
+        })
+    }
+
+}
+
+impl Drop for UatPageTable {
+    fn drop(&mut self) {
+        pr_debug!("UATPageTable::drop range: {:#x?}\n", &self.va_range);
+        // Free only the child tables allocated by this owner. G16 extends
+        // firmware-owned child tables inside its host VA range; walking and
+        // freeing the whole range would release reserved firmware memory.
+        while let Some(table) = self.owned_tables.pop() {
+            // SAFETY: Parents precede children in the allocation list. A
+            // parent is either still owned here or is bootloader-reserved.
+            let parent = unsafe { Page::borrow_phys_unchecked(&table.parent) };
+            let _ = parent.with_pointer_into_page(table.index * PTE_SIZE, PTE_SIZE, |p| {
+                // SAFETY: This checked slot is an aligned atomic page-table entry.
+                let pte = unsafe { &*p.cast::<Pte>() };
+                pte.store(0, Ordering::Relaxed);
+                Ok(())
+            });
+            // SAFETY: Each tracked table was transferred once with into_phys.
+            unsafe { Page::from_phys(table.phys) };
+        }
+        if self.ttb_owned {
+            pr_debug!("UATPageTable::drop: Free TTB {:#x}\n", self.ttb);
+            // SAFETY: If we own the ttb, it was allocated with Page::into_phys().
+            unsafe {
+                Page::from_phys(self.ttb);
+            }
+        }
+    }
+}

@@ -51,3 +51,22 @@ __rust_helper int rust_helper_spin_trylock_irq_disable(spinlock_t *lock)
 {
 	return spin_trylock_irq_disable(lock);
 }
+
+__rust_helper unsigned long rust_helper_spin_lock_irqsave(spinlock_t *lock)
+{
+	unsigned long flags;
+	spin_lock_irqsave(lock, flags);
+	return flags;
+}
+
+__rust_helper void rust_helper_spin_unlock_irqrestore(spinlock_t *lock,
+						    unsigned long flags)
+{
+	spin_unlock_irqrestore(lock, flags);
+}
+
+__rust_helper bool rust_helper_spin_trylock_irqsave(spinlock_t *lock,
+						  unsigned long *flags)
+{
+	return spin_trylock_irqsave(lock, *flags);
+}
