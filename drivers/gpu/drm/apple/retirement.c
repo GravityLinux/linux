@@ -26,7 +26,14 @@
 
 #define DCP_CPU_CONTROL 0x44
 #define DCP_CPU_RUN BIT(4)
-#define DCP_IDLE_GRACE msecs_to_jiffies(70000)
+/*
+ * No grace period: an unused engine retires as soon as idle_eligible()
+ * allows. A not-yet-eligible engine (CRTC still being disabled, audio
+ * card not registered yet, firmware queues still draining) is retried
+ * with a doubling interval.
+ */
+#define DCP_IDLE_RETRY_MIN msecs_to_jiffies(1000)
+#define DCP_IDLE_RETRY_MAX msecs_to_jiffies(16000)
 
 static bool retire_unused = true;
 module_param(retire_unused, bool, 0444);
@@ -60,8 +67,22 @@ struct dcp_retirement {
 	const char *stage;
 	int error;
 	u32 saved_run;
+	unsigned long retry_delay;
 	unsigned int retire_count, restart_count;
 };
+
+/* Callers hold the lifecycle lock. */
+static void idle_kick(struct dcp_retirement *idle)
+{
+	idle->retry_delay = DCP_IDLE_RETRY_MIN;
+	mod_delayed_work(system_unbound_wq, &idle->work, 0);
+}
+
+static void idle_retry(struct dcp_retirement *idle)
+{
+	mod_delayed_work(system_unbound_wq, &idle->work, idle->retry_delay);
+	idle->retry_delay = min(idle->retry_delay * 2, DCP_IDLE_RETRY_MAX);
+}
 
 static void idle_stage(struct dcp_retirement *idle, const char *stage)
 {
@@ -571,7 +592,7 @@ static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 	idle_stage(idle, "ready");
 	idle->restart_count++;
 	if (!idle->primary)
-		mod_delayed_work(system_unbound_wq, &idle->work, DCP_IDLE_GRACE);
+		idle_kick(idle);
 	if (idle->primary)
 		idle->logical_off = false;
 	if (idle->primary || dcp->fixed_dp)
@@ -590,6 +611,23 @@ int dcp_retirement_restart_locked(struct apple_dcp *dcp)
 	return idle_restart_locked(dcp, false);
 }
 
+/*
+ * Retry only while the engine can still become eligible on its own. A fixed
+ * port with its sink present waits for the unplug kick instead; a used
+ * engine without a fixed port is never eligible.
+ */
+static bool idle_should_retry(struct apple_dcp *dcp, int ret)
+{
+	struct dcp_retirement *idle = dcp->retirement;
+
+	if ((ret != -EBUSY && ret != -EPROBE_DEFER) || idle->stopping ||
+	    idle->state != DCP_IDLE_READY)
+		return false;
+	if (dcp->fixed_dp)
+		return !dcp_fixed_dp_hpd(dcp);
+	return !READ_ONCE(idle->ever_used);
+}
+
 static void idle_work(struct work_struct *work)
 {
 	struct dcp_retirement *idle = container_of(to_delayed_work(work),
@@ -598,9 +636,8 @@ static void idle_work(struct work_struct *work)
 
 	dcp_lifecycle_lock();
 	ret = idle_retire_locked(idle->dcp);
-	if (ret == -EBUSY && !idle->stopping && !idle->ever_used &&
-	    idle->state == DCP_IDLE_READY)
-		mod_delayed_work(system_unbound_wq, &idle->work, DCP_IDLE_GRACE);
+	if (idle_should_retry(idle->dcp, ret))
+		idle_retry(idle);
 	dcp_lifecycle_unlock();
 }
 
@@ -611,7 +648,7 @@ void dcp_retirement_ready_locked(struct apple_dcp *dcp)
 	dcp->retirement->state = DCP_IDLE_READY;
 	dcp->retirement->stage = "ready";
 	if (!dcp->retirement->primary)
-		mod_delayed_work(system_unbound_wq, &dcp->retirement->work, DCP_IDLE_GRACE);
+		idle_kick(dcp->retirement);
 }
 
 void dcp_retirement_unplug_locked(struct apple_dcp *dcp)
@@ -619,7 +656,7 @@ void dcp_retirement_unplug_locked(struct apple_dcp *dcp)
 	/* Fixed outputs become eligible after HPD and the CRTC are both off. */
 	if (dcp->retirement && !dcp->retirement->primary &&
 	    !dcp->retirement->stopping)
-		mod_delayed_work(system_unbound_wq, &dcp->retirement->work, DCP_IDLE_GRACE);
+		idle_kick(dcp->retirement);
 }
 
 int dcp_retirement_suspend(struct apple_dcp *dcp)
