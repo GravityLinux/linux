@@ -1186,7 +1186,8 @@ void brcmf_bus_cancel_reset_work(struct brcmf_bus *bus_if)
 {
 	mutex_lock(&bus_if->bus_reset_lock);
 	bus_if->removing = true;
-	if (bus_if->drvr)
+	/* bus_reset is only initialized once the firmware is up. */
+	if (bus_if->drvr && bus_if->drvr->bus_reset.func)
 		cancel_work_sync(&bus_if->drvr->bus_reset);
 	mutex_unlock(&bus_if->bus_reset_lock);
 }
@@ -1258,7 +1259,14 @@ static int brcmf_bus_started(struct brcmf_pub *drvr, struct cfg80211_ops *ops)
 	if (ret < 0)
 		goto fail;
 
-	brcmf_feat_attach(drvr);
+	ret = brcmf_feat_attach(drvr);
+	if (ret)
+		goto fail;
+
+	/* Setup event_msgs, enable E_IF */
+	ret = brcmf_fweh_init_events(ifp);
+	if (ret)
+		goto fail;
 
 	ret = brcmf_proto_init_done(drvr);
 	if (ret < 0)
