@@ -1397,6 +1397,7 @@ struct dwc3 {
 	unsigned		do_fifo_resize:1;
 	unsigned		pullups_connected:1;
 	unsigned		setup_packet_pending:1;
+	unsigned		int_as_bulk:1;
 	unsigned		three_stage_setup:1;
 	unsigned		dis_start_transfer_quirk:1;
 	unsigned		usb3_lpm_capable:1;
