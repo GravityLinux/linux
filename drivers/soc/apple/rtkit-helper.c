@@ -109,6 +109,23 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(helper->rtk),
 				     "Failed to intialize RTKit");
 
+	/*
+	 * T8132 MTP crashes if restarted after quiesce, and has no CPU reset.
+	 * U-Boot leaves the session live with its buffers in the SRAM resource.
+	 * Its system endpoints are crashlog, IOReport and OSLog (no syslog).
+	 * Cold boots, old DTs, and other helpers keep the regular wake path.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-mtp") &&
+	    of_property_read_bool(dev->of_node, "apple,rtkit-live-handoff") &&
+	    helper->sram &&
+	    (readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
+	     APPLE_ASC_CPU_CONTROL_RUN)) {
+		static const u8 endpoints[] = { 0x01, 0x04, 0x08 };
+
+		return apple_rtkit_adopt_running(helper->rtk, endpoints,
+						ARRAY_SIZE(endpoints));
+	}
+
 	writel_relaxed(APPLE_ASC_CPU_CONTROL_RUN,
 		       helper->asc_base + APPLE_ASC_CPU_CONTROL);
 
