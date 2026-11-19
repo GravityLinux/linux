@@ -28,9 +28,9 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/mailbox.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
-#include "mailbox.h"
 
 
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
@@ -105,9 +105,10 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
 {
 	unsigned long flags;
+	unsigned long deadline = jiffies + msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT);
+	long remaining;
 	int ret;
 	u32 mbox_ctrl;
-	long t;
 
 	spin_lock_irqsave(&mbox->tx_lock, flags);
 	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
@@ -127,6 +128,13 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			break;
 		}
 		/*
+		 * Several contexts can wait for space at the same time (a
+		 * client's own thread and the RTKit receive work replying to
+		 * the firmware), so the send-empty interrupt is armed only by
+		 * the first of them. Every waiter sleeps until the interrupt
+		 * has disarmed it, then looks at the FIFO again under the
+		 * lock and re-arms it if another sender filled the FIFO first.
+		 *
 		 * The interrupt is level triggered and will keep firing as long as the
 		 * FIFO is empty. It will also keep firing if the FIFO was empty
 		 * at any point in the past until it has been acknowledged at the
@@ -135,24 +143,31 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		 * If the FIFO is already empty before the ack it will fire again
 		 * immediately after the ack.
 		 */
-		if (mbox->hw->has_irq_controls) {
-			writel_relaxed(mbox->hw->irq_bit_send_empty,
-				       mbox->regs + mbox->hw->irq_ack);
+		if (!mbox->tx_irq_armed) {
+			if (mbox->hw->has_irq_controls) {
+				writel_relaxed(mbox->hw->irq_bit_send_empty,
+					       mbox->regs + mbox->hw->irq_ack);
+			}
+			mbox->tx_irq_armed = true;
+			enable_irq(mbox->irq_send_empty);
 		}
-		enable_irq(mbox->irq_send_empty);
-		reinit_completion(&mbox->tx_empty);
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
-		t = wait_for_completion_interruptible_timeout(
-			&mbox->tx_empty,
-			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
+		remaining = time_after(deadline, jiffies) ? deadline - jiffies : 0;
+		if (remaining) {
+			remaining = wait_event_interruptible_timeout(
+				mbox->tx_wait, !READ_ONCE(mbox->tx_irq_armed),
+				remaining);
+			if (remaining < 0)
+				return remaining;
+		}
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
+		if (!remaining && (mbox_ctrl & mbox->hw->control_full)) {
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return -ETIMEDOUT;
+		}
 	}
 
 	writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
@@ -176,8 +191,11 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
-	complete(&mbox->tx_empty);
+	if (mbox->tx_irq_armed) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_armed = false;
+	}
+	wake_up_all(&mbox->tx_wait);
 	spin_unlock(&mbox->tx_lock);
 
 	return IRQ_HANDLED;
@@ -408,7 +426,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 
 	spin_lock_init(&mbox->rx_lock);
 	spin_lock_init(&mbox->tx_lock);
-	init_completion(&mbox->tx_empty);
+	init_waitqueue_head(&mbox->tx_wait);
 
 	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-recv", dev_name(dev));
 	if (!irqname)
