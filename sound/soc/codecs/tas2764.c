@@ -25,6 +25,11 @@
 
 #include "tas2764.h"
 
+/* Laboratory comparison switch; retain existing boards' initialization. */
+static bool legacy_apple_init = true;
+module_param(legacy_apple_init, bool, 0444);
+MODULE_PARM_DESC(legacy_apple_init, "Apply legacy SN012776 BOP/Apple initialization sequences");
+
 enum tas2764_devid {
 	DEVID_TAS2764  = 0,
 	DEVID_SN012776 = 1
@@ -34,6 +39,7 @@ struct tas2764_priv {
 	struct snd_soc_component *component;
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *sdz_gpio;
+	struct regulator *sdz_reg;
 	struct regmap *regmap;
 	struct device *dev;
 	int irq;
@@ -44,6 +50,7 @@ struct tas2764_priv {
 
 	bool dac_powered;
 	bool unmuted;
+	bool protection_failed;
 
 	struct {
 		int tx_mode;
@@ -116,6 +123,13 @@ static void tas2764_reset(struct tas2764_priv *tas2764)
 	snd_soc_component_write(tas2764->component, TAS2764_SW_RST,
 				TAS2764_RST);
 	usleep_range(1000, 2000);
+
+	/* Reset clears SDOUT zero-fill even when the component is re-probed
+	 * without freeing the I2C private data. Force set_tdm_idle() to restore
+	 * it rather than trusting the configuration from the previous probe.
+	 */
+	tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_OFF;
+	tas2764->idle_slot_config.tx_mask = 0;
 }
 
 static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
@@ -124,13 +138,16 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	unsigned int val;
 	int ret;
 
+	if (READ_ONCE(tas2764->protection_failed))
+		return -EIO;
+
 	if (tas2764->dac_powered)
 		val = tas2764->unmuted ?
 			TAS2764_PWR_CTRL_ACTIVE : TAS2764_PWR_CTRL_MUTE;
 	else
 		val = TAS2764_PWR_CTRL_SHUTDOWN;
 
-	if (ENABLED_APPLE_QUIRKS & TAS2764_SHUTDOWN_DANCE)
+	if (legacy_apple_init && (ENABLED_APPLE_QUIRKS & TAS2764_SHUTDOWN_DANCE))
 		return tas2764_do_quirky_pwr_ctrl_change(tas2764, val);
 
 	ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
@@ -157,6 +174,9 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 	if (tas2764->sdz_gpio)
 		gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
 
+	if (tas2764->sdz_reg)
+		regulator_disable(tas2764->sdz_reg);
+
 	regcache_cache_only(tas2764->regmap, true);
 	regcache_mark_dirty(tas2764->regmap);
 
@@ -170,19 +190,29 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
 
-	if (tas2764->sdz_gpio) {
-		gpiod_set_value_cansleep(tas2764->sdz_gpio, 1);
-		usleep_range(1000, 2000);
+	if (READ_ONCE(tas2764->protection_failed))
+		return -EIO;
+
+	ret = tas2764->sdz_reg ? regulator_enable(tas2764->sdz_reg) : 0;
+
+	if (ret) {
+		dev_err(tas2764->dev, "Failed to enable regulator\n");
+		return ret;
 	}
 
-	ret = tas2764_update_pwr_ctrl(tas2764);
+	if (tas2764->sdz_gpio) {
+		gpiod_set_value_cansleep(tas2764->sdz_gpio, 1);
+	}
 
-	if (ret < 0)
-		return ret;
+	usleep_range(1000, 2000);
 
 	regcache_cache_only(tas2764->regmap, false);
 
-	return regcache_sync(tas2764->regmap);
+	ret = regcache_sync(tas2764->regmap);
+	if (ret < 0)
+		return ret;
+
+	return tas2764_update_pwr_ctrl(tas2764);
 }
 #else
 #define tas2764_codec_suspend NULL
@@ -215,7 +245,7 @@ static const struct snd_soc_dapm_widget tas2764_dapm_widgets[] = {
 	SND_SOC_DAPM_DAC("DAC", NULL, SND_SOC_NOPM, 0, 0),
 	SND_SOC_DAPM_OUTPUT("OUT"),
 	SND_SOC_DAPM_SIGGEN("VMON"),
-	SND_SOC_DAPM_SIGGEN("IMON")
+	SND_SOC_DAPM_SIGGEN("IMON"),
 };
 
 static const struct snd_soc_dapm_route tas2764_audio_map[] = {
@@ -266,7 +296,6 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 static int tas2764_set_bitwidth(struct tas2764_priv *tas2764, int bitwidth)
 {
 	struct snd_soc_component *component = tas2764->component;
-	int sense_en;
 	int val;
 	int ret;
 
@@ -300,28 +329,6 @@ static int tas2764_set_bitwidth(struct tas2764_priv *tas2764, int bitwidth)
 	val = snd_soc_component_read(tas2764->component, TAS2764_PWR_CTRL);
 	if (val < 0)
 		return val;
-
-	if (val & (1 << TAS2764_VSENSE_POWER_EN))
-		sense_en = 0;
-	else
-		sense_en = TAS2764_TDM_CFG5_VSNS_ENABLE;
-
-	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_TDM_CFG5,
-					    TAS2764_TDM_CFG5_VSNS_ENABLE,
-					    sense_en);
-	if (ret < 0)
-		return ret;
-
-	if (val & (1 << TAS2764_ISENSE_POWER_EN))
-		sense_en = 0;
-	else
-		sense_en = TAS2764_TDM_CFG6_ISNS_ENABLE;
-
-	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_TDM_CFG6,
-					    TAS2764_TDM_CFG6_ISNS_ENABLE,
-					    sense_en);
-	if (ret < 0)
-		return ret;
 
 	return 0;
 }
@@ -371,9 +378,16 @@ static int tas2764_hw_params(struct snd_pcm_substream *substream,
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
 
-	ret = tas2764_set_bitwidth(tas2764, params_format(params));
-	if (ret < 0)
-		return ret;
+	/*
+	 * The word length is the receive (playback) one. The V/I sense
+	 * capture has its own fixed 16-bit format and must not change it
+	 * under a running playback stream.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		ret = tas2764_set_bitwidth(tas2764, params_format(params));
+		if (ret < 0)
+			return ret;
+	}
 
 	return tas2764_set_samplerate(tas2764, params_rate(params));
 }
@@ -452,7 +466,6 @@ static int tas2764_set_dai_tdm_slot(struct snd_soc_dai *dai,
 				int slots, int slot_width)
 {
 	struct snd_soc_component *component = dai->component;
-	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int left_slot, right_slot;
 	int slots_cfg;
 	int slot_size;
@@ -499,15 +512,26 @@ static int tas2764_set_dai_tdm_slot(struct snd_soc_dai *dai,
 	if (ret < 0)
 		return ret;
 
-	ret = snd_soc_component_update_bits(component, TAS2764_TDM_CFG5,
+	return 0;
+}
+
+static int tas2764_set_ivsense_transmit(struct tas2764_priv *tas2764, int i_slot, int v_slot)
+{
+	int ret;
+
+	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_TDM_CFG5,
+					    TAS2764_TDM_CFG5_VSNS_ENABLE |
 					    TAS2764_TDM_CFG5_50_MASK,
-					    tas2764->v_sense_slot);
+					    TAS2764_TDM_CFG5_VSNS_ENABLE |
+					    v_slot);
 	if (ret < 0)
 		return ret;
 
-	ret = snd_soc_component_update_bits(component, TAS2764_TDM_CFG6,
+	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_TDM_CFG6,
+					    TAS2764_TDM_CFG6_ISNS_ENABLE |
 					    TAS2764_TDM_CFG6_50_MASK,
-					    tas2764->i_sense_slot);
+					    TAS2764_TDM_CFG6_ISNS_ENABLE |
+					    i_slot);
 	if (ret < 0)
 		return ret;
 
@@ -773,10 +797,17 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	tas2764->component = component;
 
+	ret = tas2764->sdz_reg ? regulator_enable(tas2764->sdz_reg) : 0;
+	if (ret != 0) {
+		dev_err(tas2764->dev, "Failed to enable regulator: %d\n", ret);
+		return ret;
+	}
+
 	if (tas2764->sdz_gpio) {
 		gpiod_set_value_cansleep(tas2764->sdz_gpio, 1);
-		usleep_range(1000, 2000);
 	}
+
+	usleep_range(1000, 2000);
 
 	tas2764_reset(tas2764);
 	regmap_reinit_cache(tas2764->regmap, &tas2764_i2c_regmap);
@@ -809,15 +840,13 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 			dev_warn(tas2764->dev, "failed to request IRQ: %d\n", ret);
 	}
 
-	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_TDM_CFG5,
-					    TAS2764_TDM_CFG5_VSNS_ENABLE, 0);
-	if (ret < 0)
-		return ret;
+	if (tas2764->i_sense_slot != -1 && tas2764->v_sense_slot != -1) {
+		ret = tas2764_set_ivsense_transmit(tas2764, tas2764->i_sense_slot,
+						   tas2764->v_sense_slot);
 
-	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_TDM_CFG6,
-					    TAS2764_TDM_CFG6_ISNS_ENABLE, 0);
-	if (ret < 0)
-		return ret;
+		if (ret < 0)
+			return ret;
+	}
 
 	switch (tas2764->devid) {
 	case DEVID_SN012776:
@@ -826,6 +855,9 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 					TAS2764_PWR_CTRL_BOP_SRC);
 		if (ret < 0)
 			return ret;
+
+		if (!legacy_apple_init)
+			break;
 
 		for (i = 0; i < ARRAY_SIZE(sn012776_bop_presets); i++) {
 			ret = snd_soc_component_write(component,
@@ -849,6 +881,130 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	return 0;
 }
+
+static void tas2764_codec_remove(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+
+	if (tas2764->sdz_reg)
+		regulator_disable(tas2764->sdz_reg);
+}
+
+/* The board owns a common physical shutdown line. It must serialize these
+ * calls with PCM control, assert shutdown after cache_only(), and raise the
+ * line before restore(). Never call from an atomic cutoff callback. */
+void tas2764_external_reset(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+
+	regcache_cache_only(tas->regmap, true);
+	regcache_mark_dirty(tas->regmap);
+}
+EXPORT_SYMBOL_GPL(tas2764_external_reset);
+
+int tas2764_external_restore(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	int ret;
+
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+	/* Restore every other setting while the DAC is still shut down. The
+	 * desired DAPM/mute state is applied only after a complete cache sync. */
+	ret = regmap_update_bits(tas->regmap, TAS2764_PWR_CTRL,
+				 TAS2764_PWR_CTRL_MASK, TAS2764_PWR_CTRL_SHUTDOWN);
+	if (ret < 0)
+		return ret;
+	regcache_cache_only(tas->regmap, false);
+	ret = regcache_sync(tas->regmap);
+	if (ret < 0) {
+		tas2764_external_reset(component);
+		return ret;
+	}
+	return tas2764_update_pwr_ctrl(tas);
+}
+EXPORT_SYMBOL_GPL(tas2764_external_restore);
+
+/* Bounded hardware readback; the board must hold the common line high and
+ * serialize against power-down. Never dump hidden pages or the full regmap. */
+int tas2764_read_live_state(struct snd_soc_component *component,
+			    struct tas2764_live_state *state)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	int ret;
+
+#define TAS_READ_STATE(reg, member) do { \
+	ret = regmap_read_bypassed(tas->regmap, reg, &state->member); \
+	if (ret) return ret; \
+} while (0)
+	TAS_READ_STATE(TAS2764_PWR_CTRL, power);
+	TAS_READ_STATE(TAS2764_CHNL_0, analog_gain);
+	TAS_READ_STATE(TAS2764_DVC, attenuation);
+	TAS_READ_STATE(TAS2764_TDM_CFG0, tdm_rate);
+	TAS_READ_STATE(TAS2764_TDM_CFG1, tdm_start);
+	TAS_READ_STATE(TAS2764_TDM_CFG2, tdm_word);
+	TAS_READ_STATE(TAS2764_TDM_CFG3, tdm_slots);
+	TAS_READ_STATE(TAS2764_INT_LIVE0, live_faults);
+#undef TAS_READ_STATE
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tas2764_read_live_state);
+
+/* Machine-level protection owns gain controls before the card is exposed. */
+int tas2764_set_protected_attenuation(struct snd_soc_component *component,
+				    unsigned int attenuation)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	unsigned int actual;
+	int ret;
+
+	/* A protection client requires a physical fail-closed shutdown line. */
+	if (!tas->sdz_gpio)
+		return -EOPNOTSUPP;
+	if (attenuation > TAS2764_DVC_MAX)
+		return -EINVAL;
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+
+	ret = regmap_write(tas->regmap, TAS2764_DVC, attenuation);
+	if (!ret)
+		ret = regmap_read_bypassed(tas->regmap, TAS2764_DVC, &actual);
+	if (!ret && actual != attenuation)
+		ret = -EIO;
+	if (ret) {
+		WRITE_ONCE(tas->protection_failed, true);
+		gpiod_set_value_cansleep(tas->sdz_gpio, 0);
+		dev_err(tas->dev, "protection gain write/readback failed; amplifier disabled\n");
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(tas2764_set_protected_attenuation);
+
+int tas2764_get_protected_attenuation(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	unsigned int value;
+	int ret;
+
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+	ret = regmap_read_bypassed(tas->regmap, TAS2764_DVC, &value);
+	return ret ? ret : value;
+}
+EXPORT_SYMBOL_GPL(tas2764_get_protected_attenuation);
+
+int tas2764_check_fault(struct snd_soc_component *component)
+{
+	struct tas2764_priv *tas = snd_soc_component_get_drvdata(component);
+	unsigned int value;
+	int ret;
+
+	if (READ_ONCE(tas->protection_failed))
+		return -EIO;
+	ret = regmap_read_bypassed(tas->regmap, TAS2764_INT_LIVE0, &value);
+	return ret ? ret : value ? -EIO : 0;
+}
+EXPORT_SYMBOL_GPL(tas2764_check_fault);
 
 static DECLARE_TLV_DB_SCALE(tas2764_digital_tlv, 1100, 50, 0);
 static DECLARE_TLV_DB_SCALE(tas2764_playback_volume, -10050, 50, 1);
@@ -881,6 +1037,7 @@ static const struct snd_kcontrol_new tas2764_snd_controls[] = {
 
 static const struct snd_soc_component_driver soc_component_driver_tas2764 = {
 	.probe			= tas2764_codec_probe,
+	.remove			= tas2764_codec_remove,
 	.suspend		= tas2764_codec_suspend,
 	.resume			= tas2764_codec_resume,
 	.controls		= tas2764_snd_controls,
@@ -951,6 +1108,14 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
 
+	tas2764->sdz_reg = devm_regulator_get_optional(dev, "SDZ");
+	if (IS_ERR(tas2764->sdz_reg)) {
+		if (PTR_ERR(tas2764->sdz_reg) != -ENODEV)
+			return dev_err_probe(dev, PTR_ERR(tas2764->sdz_reg),
+					     "Failed to get SDZ supply\n");
+		tas2764->sdz_reg = NULL;
+	}
+
 	tas2764->reset_gpio = devm_gpiod_get_optional(tas2764->dev, "reset",
 						      GPIOD_OUT_HIGH);
 	if (IS_ERR(tas2764->reset_gpio)) {
@@ -960,7 +1125,7 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 		}
 	}
 
-	tas2764->sdz_gpio = devm_gpiod_get_optional(dev, "shutdown", GPIOD_OUT_HIGH);
+	tas2764->sdz_gpio = devm_gpiod_get_optional(dev, "shutdown", GPIOD_OUT_LOW);
 	if (IS_ERR(tas2764->sdz_gpio)) {
 		if (PTR_ERR(tas2764->sdz_gpio) == -EPROBE_DEFER)
 			return -EPROBE_DEFER;
@@ -971,12 +1136,12 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	ret = fwnode_property_read_u32(dev->fwnode, "ti,imon-slot-no",
 				       &tas2764->i_sense_slot);
 	if (ret)
-		tas2764->i_sense_slot = 0;
+		tas2764->i_sense_slot = -1;
 
 	ret = fwnode_property_read_u32(dev->fwnode, "ti,vmon-slot-no",
 				       &tas2764->v_sense_slot);
 	if (ret)
-		tas2764->v_sense_slot = 2;
+		tas2764->v_sense_slot = -1;
 
 	return 0;
 }
