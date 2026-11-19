@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,t8132-fixed-dp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8132 fixed direct DisplayPort output
+
+maintainers:
+  - Niklas Sheth <hi@niklassheth.com>
+
+description: |
+  A direct DisplayPort output of an ATC, permanently wired to one display
+  engine. The crossbar source is selected once and never changes. The ATC PHY
+  owns the negotiated lane assignment and plug orientation; the USB-C port
+  controller reports DisplayPort HPD through the graph port. USB4 DP-IN
+  adapters and tunneled displays are separate.
+
+properties:
+  compatible:
+    const: apple,t8132-fixed-dp
+
+  apple,atc-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 3
+    description: DFP endpoint index in the ADT display crossbar.
+
+  apple,display-engine:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The display engine wired to this output.
+
+  mux-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 8
+    description: Crossbar source of the display engine's stream.
+
+  mode-switch: true
+
+  phys:
+    maxItems: 1
+
+  phy-names:
+    const: dp-phy
+
+  mux-controls:
+    maxItems: 1
+
+  mux-control-names:
+    const: dp-xbar
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: HPD notification link to the USB-C connector.
+
+required:
+  - compatible
+  - apple,atc-index
+  - apple,display-engine
+  - mux-index
+  - mode-switch
+  - phys
+  - phy-names
+  - mux-controls
+  - mux-control-names
+  - port
+
+additionalProperties: false

@@ -293,7 +293,7 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
-	/* An unassigned direct-DP engine has no PHY until a Type-C HPD. */
+	/* A Type-C engine's DPTX port has no PHY until its first HPD. */
 	if (dptx_bypass_phy || (!dptx->atcphy && dcp_typec_managed(dcp))) {
 		dptx->lane_count = 4;
 		reply->retcode = cpu_to_le32(0);
