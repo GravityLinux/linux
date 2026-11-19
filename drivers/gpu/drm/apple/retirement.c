@@ -382,10 +382,21 @@ static int idle_cpu_off(struct dcp_retirement *idle)
 		if (ret < 0)
 			return ret;
 	}
-	idle_stage(idle, "shared-request-off");
-	ret = idle_shared_lifecycle(idle, false);
-	if (ret)
-		return ret;
+	/*
+	 * The external engines share the display enable, request and power
+	 * words. Clearing an idle external engine's bits there while another
+	 * external engine scans out crashes the active engine's firmware
+	 * (piodma_irq_command_tag_completed_mismatch); setting them, and
+	 * powering the idle engine off with its bits left set, does not, and
+	 * leaving them set costs no measurable power. So an external engine
+	 * keeps its bits; a restart sets them again anyway.
+	 */
+	if (idle->primary) {
+		idle_stage(idle, "shared-request-off");
+		ret = idle_shared_lifecycle(idle, false);
+		if (ret)
+			return ret;
+	}
 	idle_stage(idle, "CPU-off");
 	/* The domain provider owns automatic control and the gate sequencer. */
 	ret = pm_runtime_put_sync_suspend(dcp->cpu_pm_dev);
