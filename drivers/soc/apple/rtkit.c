@@ -821,16 +821,17 @@ EXPORT_SYMBOL_GPL(apple_rtkit_init);
 
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
-	long t;
-
-	t = wait_for_completion_interruptible_timeout(c,
-						      msecs_to_jiffies(1000));
-	if (t < 0)
-		return t;
-	else if (t == 0)
+	/*
+	 * Not interruptible: these waits cover power-state and boot handshakes
+	 * the co-processor completes on its own. Abandoning one because the
+	 * caller has a signal pending (for example a suspend writer that got
+	 * SIGINT) leaves the co-processor mid-transition; the next request
+	 * then crashes it (ANS: "Invalid AP power"), and the device is lost
+	 * until reboot. The wait is bounded anyway.
+	 */
+	if (!wait_for_completion_timeout(c, msecs_to_jiffies(1000)))
 		return -ETIME;
-	else
-		return 0;
+	return 0;
 }
 
 int apple_rtkit_reinit(struct apple_rtkit *rtk)
