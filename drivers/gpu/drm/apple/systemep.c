@@ -97,8 +97,9 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	dev_dbg(dcp->dev, "systemep: mNits event: Nits: %u.%03u, iDAC: %u\n",
 		mnits.millinits / 1000, mnits.millinits % 1000, mnits.idac);
 
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_T8140 ||
-	    dcp->fw_compat == DCP_FIRMWARE_V_27_2_T8142)
+	/* 26.6 firmware reports the panel's actual output, which must not
+	 * overwrite the requested brightness. */
+	if (dcp_fw_is_26_6(dcp))
 		dcp->brightness.actual_nits = mnits.millinits / 1000;
 	else
 		dcp->brightness.nits = mnits.millinits / 1000;
