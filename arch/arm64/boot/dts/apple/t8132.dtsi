@@ -18,6 +18,11 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	aliases {
+		/* WD0 wake alarm; rtc0 stays the SMC RTC */
+		rtc1 = &wdt;
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
