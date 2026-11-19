@@ -17,6 +17,7 @@
 #include <linux/pgalloc.h>
 
 #include <asm/tlb.h>
+#include <linux/p3s.h>
 
 /*
  * If a p?d_bad entry is found while walking page tables, report
@@ -282,7 +283,8 @@ static unsigned long pmdp_get_lockless_start(void) { return 0; }
 static void pmdp_get_lockless_end(unsigned long irqflags) { }
 #endif
 
-pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
+static pte_t *__mm_pte_offset_map(struct mm_struct *mm, pmd_t *pmd,
+				  unsigned long addr, pmd_t *pmdvalp)
 {
 	unsigned long irqflags;
 	pmd_t pmdval;
@@ -302,11 +304,21 @@ pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
 		pmd_clear_bad(pmd);
 		goto nomap;
 	}
+	if (mm) {
+		p3s_assert_matching_pte_shift(mm);
+		return mm_pte_offset_kernel(mm, &pmdval, addr);
+	}
 	return __pte_map(&pmdval, addr);
 nomap:
 	rcu_read_unlock();
 	return NULL;
 }
+
+pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
+{
+	return __mm_pte_offset_map(p3s_current_mm(), pmd, addr, pmdvalp);
+}
+EXPORT_SYMBOL_GPL(__pte_offset_map);
 
 pte_t *pte_offset_map_ro_nolock(struct mm_struct *mm, pmd_t *pmd,
 				unsigned long addr, spinlock_t **ptlp)
@@ -314,7 +326,7 @@ pte_t *pte_offset_map_ro_nolock(struct mm_struct *mm, pmd_t *pmd,
 	pmd_t pmdval;
 	pte_t *pte;
 
-	pte = __pte_offset_map(pmd, addr, &pmdval);
+	pte = __mm_pte_offset_map(mm, pmd, addr, &pmdval);
 	if (likely(pte))
 		*ptlp = pte_lockptr(mm, &pmdval);
 	return pte;
@@ -327,7 +339,7 @@ pte_t *pte_offset_map_rw_nolock(struct mm_struct *mm, pmd_t *pmd,
 	pte_t *pte;
 
 	VM_WARN_ON_ONCE(!pmdvalp);
-	pte = __pte_offset_map(pmd, addr, pmdvalp);
+	pte = __mm_pte_offset_map(mm, pmd, addr, pmdvalp);
 	if (likely(pte))
 		*ptlp = pte_lockptr(mm, pmdvalp);
 	return pte;
@@ -397,7 +409,7 @@ pte_t *pte_offset_map_lock(struct mm_struct *mm, pmd_t *pmd,
 	pmd_t pmdval;
 	pte_t *pte;
 again:
-	pte = __pte_offset_map(pmd, addr, &pmdval);
+	pte = __mm_pte_offset_map(mm, pmd, addr, &pmdval);
 	if (unlikely(!pte))
 		return pte;
 	ptl = pte_lockptr(mm, &pmdval);

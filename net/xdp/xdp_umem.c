@@ -97,6 +97,9 @@ static int xdp_umem_pin_pages(struct xdp_umem *umem, unsigned long address)
 	long npgs;
 	int err;
 
+	if (p3s_4k_unsupported(current->mm))
+		return -EOPNOTSUPP;
+
 	umem->pgs = kvzalloc_objs(*umem->pgs, umem->npgs,
 				  GFP_KERNEL | __GFP_NOWARN);
 	if (!umem->pgs)

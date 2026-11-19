@@ -414,6 +414,9 @@ static int vfio_group_fops_open(struct inode *inode, struct file *filep)
 		container_of(inode->i_cdev, struct vfio_group, cdev);
 	int ret;
 
+	if (p3s_4k_unsupported(current->mm))
+		return -EPERM;
+
 	mutex_lock(&group->group_lock);
 
 	/*

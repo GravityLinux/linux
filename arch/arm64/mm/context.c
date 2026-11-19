@@ -262,6 +262,8 @@ switch_mm_fastpath:
 
 	arm64_apply_bp_hardening();
 
+	mm_switch_tcr(mm);
+
 	/*
 	 * Defer TTBR0_EL1 setting for user threads to uaccess_enable() when
 	 * emulating PAN.
@@ -364,6 +366,7 @@ void cpu_do_switch_mm(phys_addr_t pgd_phys, struct mm_struct *mm)
 	ttbr1 &= ~TTBRx_EL1_ASID_MASK;
 	ttbr1 |= FIELD_PREP(TTBRx_EL1_ASID_MASK, asid);
 
+	mm_switch_tcr(mm);
 	cpu_set_reserved_ttbr0_nosync();
 	write_sysreg(ttbr1, ttbr1_el1);
 	write_sysreg(ttbr0, ttbr0_el1);

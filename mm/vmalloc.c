@@ -4820,14 +4820,18 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 	struct vm_struct *area;
 	unsigned long off;
 	unsigned long end_index;
+	unsigned long uoff;
 
 	if (check_shl_overflow(pgoff, PAGE_SHIFT, &off))
 		return -EINVAL;
 
-	size = PAGE_ALIGN(size);
-
-	if (!PAGE_ALIGNED(uaddr) || !PAGE_ALIGNED(kaddr))
+	if (!mm_pte_aligned(vma->vm_mm, uaddr) || !PAGE_ALIGNED(kaddr))
 		return -EINVAL;
+
+	uoff = (unsigned long)vma_slice_offset(vma, uaddr) << PAGE_SHIFT_4KB;
+	if (check_add_overflow(size, uoff, &size))
+		return -EINVAL;
+	size = PAGE_ALIGN(size);
 
 	area = find_vm_area(kaddr);
 	if (!area)
@@ -4836,10 +4840,11 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 	if (!(area->flags & (VM_USERMAP | VM_DMA_COHERENT)))
 		return -EINVAL;
 
-	if (check_add_overflow(size, off, &end_index) ||
+	if (check_add_overflow(off, (unsigned long)(kaddr - area->addr), &off) ||
+	    check_add_overflow(size, off, &end_index) ||
 	    end_index > get_vm_area_size(area))
 		return -EINVAL;
-	kaddr += off;
+	kaddr = area->addr + off;
 
 	do {
 		struct page *page = vmalloc_to_page(kaddr);
@@ -4849,9 +4854,10 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 		if (ret)
 			return ret;
 
-		uaddr += PAGE_SIZE;
+		uaddr += PAGE_SIZE - uoff;
 		kaddr += PAGE_SIZE;
 		size -= PAGE_SIZE;
+		uoff = 0;
 	} while (size > 0);
 
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);

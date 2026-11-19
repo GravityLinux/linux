@@ -7460,6 +7460,10 @@ static int tracing_buffers_mmap(struct file *filp, struct vm_area_struct *vma)
 	if (iter->tr->flags & (TRACE_ARRAY_FL_MEMMAP | TRACE_ARRAY_FL_VMALLOC))
 		return -ENODEV;
 
+	/* The mapping is laid out in kernel pages */
+	if (p3s_4k_unsupported(vma->vm_mm))
+		return -EOPNOTSUPP;
+
 	ret = get_snapshot_map(iter->tr);
 	if (ret)
 		return ret;

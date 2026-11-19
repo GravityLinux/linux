@@ -67,6 +67,11 @@ VISIBLE_IF_KUNIT size_t binder_alloc_buffer_size(struct binder_alloc *alloc,
 }
 EXPORT_SYMBOL_IF_KUNIT(binder_alloc_buffer_size);
 
+static size_t binder_alloc_nr_pages(const struct binder_alloc *alloc)
+{
+	return DIV_ROUND_UP(alloc->buffer_size, PAGE_SIZE);
+}
+
 static void binder_insert_free_buffer(struct binder_alloc *alloc,
 				      struct binder_buffer *new_buffer)
 {
@@ -581,7 +586,12 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 	 * adjacent in-use buffer. In such case, the page has been already
 	 * removed from the freelist so we trim our range short.
 	 */
-	next_used_page = (buffer->user_data + buffer_size) & PAGE_MASK;
+	/* The mapping's partial last page has no following in-use buffer. */
+	next_used_page = buffer->user_data + buffer_size;
+	if (next_used_page == alloc->vm_start + alloc->buffer_size)
+		next_used_page = PAGE_ALIGN(next_used_page);
+	else
+		next_used_page &= PAGE_MASK;
 	curr_last_page = PAGE_ALIGN(buffer->user_data + size);
 	binder_lru_freelist_del(alloc, PAGE_ALIGN(buffer->user_data),
 				min(next_used_page, curr_last_page));
@@ -917,7 +927,7 @@ int binder_alloc_mmap_handler(struct binder_alloc *alloc,
 	alloc->vm_start = vma->vm_start;
 
 	alloc->pages = kvzalloc_objs(alloc->pages[0],
-				     alloc->buffer_size / PAGE_SIZE);
+				     binder_alloc_nr_pages(alloc));
 	if (!alloc->pages) {
 		ret = -ENOMEM;
 		failure_string = "alloc page array";
@@ -998,7 +1008,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 	if (alloc->pages) {
 		int i;
 
-		for (i = 0; i < alloc->buffer_size / PAGE_SIZE; i++) {
+		for (i = 0; i < binder_alloc_nr_pages(alloc); i++) {
 			struct page *page;
 			bool on_lru;
 
@@ -1075,7 +1085,7 @@ void binder_alloc_print_pages(struct seq_file *m,
 	 * read inconsistent state.
 	 */
 	if (binder_alloc_is_mapped(alloc)) {
-		for (i = 0; i < alloc->buffer_size / PAGE_SIZE; i++) {
+		for (i = 0; i < binder_alloc_nr_pages(alloc); i++) {
 			page = binder_get_installed_page(alloc, i);
 			if (!page)
 				free++;
@@ -1185,7 +1195,9 @@ enum lru_status binder_alloc_free_page(struct list_head *item,
 	if (vma) {
 		trace_binder_unmap_user_start(alloc, index);
 
-		zap_vma_range(vma, page_addr, PAGE_SIZE);
+		zap_vma_range(vma, page_addr,
+			      min_t(unsigned long, PAGE_SIZE,
+				    vma->vm_end - page_addr));
 
 		trace_binder_unmap_user_end(alloc, index);
 	}

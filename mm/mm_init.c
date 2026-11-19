@@ -197,7 +197,7 @@ void mm_compute_batch(int overcommit_policy)
 	u64 memsized_batch;
 	s32 nr = num_present_cpus();
 	s32 batch = max_t(s32, nr*2, 32);
-	unsigned long ram_pages = totalram_pages();
+	unsigned long ram_pages = vm_commit_native_pages(totalram_pages());
 
 	/*
 	 * For policy OVERCOMMIT_NEVER, set batch size to 0.4% of

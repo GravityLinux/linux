@@ -4112,6 +4112,9 @@ static int kvm_vcpu_mmap(struct file *file, struct vm_area_struct *vma)
 	struct kvm_vcpu *vcpu = file->private_data;
 	unsigned long pages = vma_pages(vma);
 
+	if (p3s_4k_unsupported(vma->vm_mm))
+		return -EOPNOTSUPP;
+
 	if ((kvm_page_in_dirty_ring(vcpu->kvm, vma->vm_pgoff) ||
 	     kvm_page_in_dirty_ring(vcpu->kvm, vma->vm_pgoff + pages - 1)) &&
 	    ((vma->vm_flags & VM_EXEC) || !(vma->vm_flags & VM_SHARED)))
@@ -5512,6 +5515,10 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
 	int r, fd;
 	struct kvm *kvm;
 	struct file *file;
+
+	/* Guest memory is resolved in kernel pages */
+	if (p3s_4k_unsupported(current->mm))
+		return -EPERM;
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0)

@@ -228,6 +228,9 @@ static inline bool thp_vma_suitable_order(struct vm_area_struct *vma,
 	unsigned long hpage_size = PAGE_SIZE << order;
 	unsigned long haddr;
 
+	if (vma_is_p3s_4k(vma))
+		return false;
+
 	/* Don't have to check pgoff for anonymous vma */
 	if (!vma_is_anonymous(vma)) {
 		/* vma_start_pgoff() in mm.h so not available. */
@@ -362,6 +365,8 @@ struct thpsize {
 static inline bool vma_thp_disabled(struct vm_area_struct *vma,
 		vm_flags_t vm_flags, bool forced_collapse)
 {
+	if (vma_is_p3s_4k(vma))
+		return true;
 	/* Are THPs disabled for this VMA? */
 	if (vm_flags & VM_NOHUGEPAGE)
 		return true;

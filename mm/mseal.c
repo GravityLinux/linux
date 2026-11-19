@@ -15,6 +15,7 @@
 #include <linux/syscalls.h>
 #include <linux/sched.h>
 #include "internal.h"
+#include <linux/p3s_user_pages.h>
 
 static bool range_contains_unmapped(unsigned long start, unsigned long end)
 {

@@ -3564,8 +3564,9 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 	vm_fault_t ret = 0;
 	bool mapping_locked = false;
 
-	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-	if (unlikely(index >= max_idx))
+	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE_KERNEL);
+	if (unlikely(index >= max_idx) ||
+	    vma_slice_past_eof(vmf->vma, vmf->address, inode))
 		return VM_FAULT_SIGBUS;
 
 	trace_mm_filemap_fault(mapping, index);
@@ -3668,8 +3669,9 @@ retry_find:
 	 * Found the page and have a reference on it.
 	 * We must recheck i_size under page lock.
 	 */
-	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
-	if (unlikely(index >= max_idx)) {
+	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE_KERNEL);
+	if (unlikely(index >= max_idx) ||
+	    vma_slice_past_eof(vmf->vma, vmf->address, inode)) {
 		folio_unlock(folio);
 		folio_put(folio);
 		return VM_FAULT_SIGBUS;

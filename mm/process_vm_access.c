@@ -14,6 +14,7 @@
 #include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
+#include "p3s/process_vm_access.h"
 
 /**
  * process_vm_rw_pages - read/write pages from task specified
@@ -58,6 +59,12 @@ static int process_vm_rw_pages(struct page **pages,
 /* Maximum number of pages that can be stored at a time */
 #define PVM_MAX_USER_PAGES (PVM_MAX_KMALLOC_PAGES * PAGE_SIZE / sizeof(struct page *))
 
+/*
+ * Maximum number of entries for process pages array
+ * which lives on stack
+ */
+#define PVM_MAX_PP_ARRAY_COUNT 16
+
 /**
  * process_vm_rw_single_vec - read/write pages from task specified
  * @addr: start memory address of target process
@@ -91,6 +98,16 @@ static int process_vm_rw_single_vec(unsigned long addr,
 
 	if (vm_write)
 		flags |= FOLL_WRITE;
+
+	if (mm_is_p3s_4k(mm)) {
+		/* process_pages has at least this many entries */
+		unsigned int max_pages = clamp_t(unsigned long, nr_pages,
+						 PVM_MAX_PP_ARRAY_COUNT,
+						 PVM_MAX_USER_PAGES);
+
+		return p3s_process_vm_rw(mm, addr, len, iter, process_pages,
+					 max_pages, vm_write);
+	}
 
 	while (!rc && nr_pages && iov_iter_count(iter)) {
 		int pinned_pages = min_t(unsigned long, nr_pages, PVM_MAX_USER_PAGES);
@@ -130,10 +147,6 @@ static int process_vm_rw_single_vec(unsigned long addr,
 
 	return rc;
 }
-
-/* Maximum number of entries for process pages array
-   which lives on stack */
-#define PVM_MAX_PP_ARRAY_COUNT 16
 
 /**
  * process_vm_rw_core - core of reading/writing pages from task specified
