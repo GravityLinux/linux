@@ -16,6 +16,8 @@
 #include <linux/kthread.h>
 #include <linux/io.h>
 #include <linux/random.h>
+#include <linux/suspend.h>
+#include <linux/completion.h>
 #include <linux/unaligned.h>
 
 #include <soc.h>
@@ -329,6 +331,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_H2D_HOST_D0_INFORM		0x00000010
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
+#define BRCMF_PCIE_SETUP_PM_TIMEOUT		msecs_to_jiffies(10000)
 
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
@@ -427,6 +430,9 @@ struct brcmf_pciedev_info {
 	struct brcmf_mp_device *settings;
 	struct brcmf_otp_params otp;
 	bool fwseed;
+	/* Asynchronous firmware setup started by probe has finished. */
+	struct completion setup_done;
+	struct notifier_block pm_nb;
 #ifdef DEBUG
 	u32 console_interval;
 	bool console_active;
@@ -2591,12 +2597,14 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
 
+	complete_all(&devinfo->setup_done);
 	return;
 
 fail:
 	brcmf_err(bus, "Dongle setup failed\n");
 	brcmf_pcie_bus_console_read(devinfo, true);
 	brcmf_fw_crashed(dev);
+	complete_all(&devinfo->setup_done);
 	device_release_driver(dev);
 }
 
@@ -2808,6 +2816,32 @@ static const struct brcmf_pcie_drvdata drvdata[] = {
 /* Forward declaration for pci_match_id() call */
 static const struct pci_device_id brcmf_pcie_devid_table[];
 
+/*
+ * The firmware is downloaded and the dongle attached from the firmware
+ * loader's callback, after probe has returned. That work touches the device
+ * until it ends, so a system sleep must not start before it has finished:
+ * otherwise the device is put into D3 (and its interfaces are registered under
+ * a suspended parent) while the setup still drives it. Wait here, before tasks
+ * are frozen, so the setup can also still load modules and firmware.
+ */
+static int brcmf_pcie_pm_notifier(struct notifier_block *nb,
+				  unsigned long action, void *data)
+{
+	struct brcmf_pciedev_info *devinfo =
+		container_of(nb, struct brcmf_pciedev_info, pm_nb);
+
+	if (action != PM_SUSPEND_PREPARE && action != PM_HIBERNATION_PREPARE)
+		return NOTIFY_DONE;
+
+	if (!wait_for_completion_timeout(&devinfo->setup_done,
+					 BRCMF_PCIE_SETUP_PM_TIMEOUT)) {
+		brcmf_err(NULL, "firmware setup still running, refusing sleep\n");
+		return notifier_from_errno(-EBUSY);
+	}
+
+	return NOTIFY_OK;
+}
+
 static int
 brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -2923,8 +2957,13 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto fail_brcmf;
 	}
 
+	init_completion(&devinfo->setup_done);
+	devinfo->pm_nb.notifier_call = brcmf_pcie_pm_notifier;
+	register_pm_notifier(&devinfo->pm_nb);
+
 	ret = brcmf_fw_get_firmwares(bus->dev, fwreq, brcmf_pcie_setup);
 	if (ret < 0) {
+		unregister_pm_notifier(&devinfo->pm_nb);
 		kfree(fwreq);
 		goto fail_brcmf;
 	}
@@ -2961,6 +3000,7 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 		return;
 
 	devinfo = bus->bus_priv.pcie->devinfo;
+	unregister_pm_notifier(&devinfo->pm_nb);
 	brcmf_pcie_bus_console_read(devinfo, false);
 	brcmf_pcie_fwcon_timer(devinfo, false);
 
