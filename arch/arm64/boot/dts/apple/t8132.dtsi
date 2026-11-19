@@ -765,6 +765,9 @@
 			apple,iomfb-primary-surface = <0>;
 			apple,iomfb-max-layers = <3>;
 			clocks = <&clk_disp0>;
+			/* The audio controller depends on this engine, not the
+			 * reverse: keep the graph link one-way for fw_devlink. */
+			post-init-providers = <&dpaudio0>;
 			phandle = <&dcp>;
 			status = "disabled";
 
@@ -814,6 +817,9 @@
 			power-domains = <&ps_dispext0_fe>, <&ps_dispext0_cpu>;
 			power-domain-names = "fe", "cpu";
 			clocks = <&clk_dispext0>;
+			/* The audio controller depends on this engine, not the
+			 * reverse: keep the graph link one-way for fw_devlink. */
+			post-init-providers = <&dpaudio1>;
 			apple,dcp-index = <1>;
 			phandle = <&dcpext0>;
 			status = "disabled";
@@ -860,6 +866,9 @@
 			power-domains = <&ps_dispext1_fe>, <&ps_dispext1_cpu>;
 			power-domain-names = "fe", "cpu";
 			clocks = <&clk_dispext1>;
+			/* The audio controller depends on this engine, not the
+			 * reverse: keep the graph link one-way for fw_devlink. */
+			post-init-providers = <&dpaudio2>;
 			apple,dcp-index = <2>;
 			phandle = <&dcpext1>;
 			status = "disabled";
