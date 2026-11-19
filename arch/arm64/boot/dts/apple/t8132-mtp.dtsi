@@ -11,8 +11,10 @@
 	mtp: mtp@394600000 {
 		compatible = "apple,t8132-mtp", "apple,t8132-rtk-helper-asc4",
 			     "apple,mtp", "apple,rtk-helper-asc4";
-		reg = <0x3 0x94600000 0x0 0x4000>;
-		reg-names = "asc";
+		/* SRAM tail above iBoot's __TEXT and __DATA firmware segments. */
+		reg = <0x3 0x94600000 0x0 0x4000>,
+		      <0x3 0x94ccc000 0x0 0x34000>;
+		reg-names = "asc", "sram";
 		mboxes = <&mtp_mbox>;
 		iommus = <&mtp_dart 0>;
 		#helper-cells = <0>;

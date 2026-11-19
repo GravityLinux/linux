@@ -181,6 +181,11 @@
 	};
 };
 
+/* This kernel adopts the MTP session U-Boot leaves running. */
+&mtp {
+	apple,live-handoff-capable;
+};
+
 &mtp_hid {
 	multi-touch {
 		/* Firmware packaging name is board-specific, not an ADT path. */
