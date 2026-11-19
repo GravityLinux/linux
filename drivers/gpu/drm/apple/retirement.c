@@ -28,9 +28,9 @@
 #define DCP_CPU_RUN BIT(4)
 #define DCP_IDLE_GRACE msecs_to_jiffies(70000)
 
-static bool retire_unused;
+static bool retire_unused = true;
 module_param(retire_unused, bool, 0444);
-MODULE_PARM_DESC(retire_unused, "Experimental T8132 unused display-engine retirement (default off)");
+MODULE_PARM_DESC(retire_unused, "Retire unused T8132 display engines (default on)");
 
 bool dcp_retirement_policy_enabled(void)
 {
