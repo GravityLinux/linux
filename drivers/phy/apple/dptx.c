@@ -61,6 +61,8 @@ struct apple_dptx_phy {
 	// TODO: m1n1 port things to clean up
 	u32 active_lanes;
 	bool activation_complete;
+	/* DCP input of the last activation, -1 while deactivated */
+	int active_dcp;
 };
 
 /*
@@ -234,8 +236,10 @@ static int dptx_phy_activate(struct apple_dptx_phy *phy, u32 dcp_index)
 	u32 val_4408;
 
 	dev_dbg(phy->dev, "activate(dcp:%u)\n", dcp_index);
-	if (phy->hw.type == DPTX_PHY_T8122)
+	if (phy->hw.type == DPTX_PHY_T8122) {
+		phy->active_dcp = dcp_index;
 		return dptx_phy_activate_t8122(phy, dcp_index);
+	}
 
 	// MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
 	// MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
@@ -425,6 +429,7 @@ static int dptx_phy_activate(struct apple_dptx_phy *phy, u32 dcp_index)
 
 static int dptx_phy_deactivate(struct apple_dptx_phy *phy)
 {
+	phy->active_dcp = -1;
 	return 0;
 }
 
@@ -758,6 +763,7 @@ static int dptx_phy_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, dptx_phy);
 
 	mutex_init(&dptx_phy->lock);
+	dptx_phy->active_dcp = -1;
 
 	/*
 	 * The generic PHY core only propagates runtime-PM references to the
@@ -791,6 +797,37 @@ static int dptx_phy_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * The PHY's power domain is cut during system sleep, which loses the DCP input
+ * selection and the activation. The display firmware does not ask for a new
+ * activation when it powers the display back on: it goes straight to AUX and
+ * link training, which then fail (DEVICE_NOT_RESPONDING) and the display is
+ * reported unplugged. Redo the activation for the DCP that had it, before the
+ * DCP resumes (the DCP is a PHY consumer, so it resumes after us).
+ */
+static int dptx_phy_resume_noirq(struct device *dev)
+{
+	struct apple_dptx_phy *dptx_phy = dev_get_drvdata(dev);
+	int ret = 0;
+
+	if (dptx_phy->hw.type != DPTX_PHY_T8122)
+		return 0;
+
+	mutex_lock(&dptx_phy->lock);
+	if (dptx_phy->active_dcp >= 0 && dptx_phy->activation_complete) {
+		dev_info(dev, "restoring activation for DCP %d\n",
+			 dptx_phy->active_dcp);
+		ret = dptx_phy_activate_t8122(dptx_phy, dptx_phy->active_dcp);
+	}
+	mutex_unlock(&dptx_phy->lock);
+
+	return ret;
+}
+
+static const struct dev_pm_ops dptx_phy_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, dptx_phy_resume_noirq)
+};
+
 static const struct apple_dptx_phy_hw apple_dptx_hw_t6020 = {
 	.type = DPTX_PHY_T6020,
 };
@@ -815,6 +852,7 @@ static struct platform_driver dptx_phy_driver = {
 	.driver = {
 		.name = "phy-apple-dptx",
 		.of_match_table = dptx_phy_match,
+		.pm = pm_sleep_ptr(&dptx_phy_pm_ops),
 	},
 	.probe = dptx_phy_probe,
 };
