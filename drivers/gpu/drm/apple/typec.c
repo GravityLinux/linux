@@ -21,8 +21,9 @@ struct apple_fixed_dp {
 	struct dentry *debugfs;
 	spinlock_t lock;
 	struct work_struct work;
-	bool hpd, irq, active_hpd;
+	bool hpd, irq, active_hpd, reported;
 	u32 sequence, target, source;
+	unsigned long bound_at;
 	unsigned long mode, active_mode;
 	int error;
 };
@@ -41,6 +42,18 @@ bool dcp_lifecycle_sleeping(void)
 bool dcp_fixed_dp_hpd(struct apple_dcp *dcp)
 {
 	return dcp->fixed_dp && READ_ONCE(dcp->fixed_dp->hpd);
+}
+
+/* Settle time for a bound port whose controller has not reported a state yet. */
+#define FIXED_DP_SETTLE msecs_to_jiffies(2000)
+
+/* Callers hold the lifecycle lock. */
+bool dcp_fixed_dp_settled(struct apple_dcp *dcp)
+{
+	struct apple_fixed_dp *port = dcp->fixed_dp;
+
+	return port && (READ_ONCE(port->reported) ||
+			time_after(jiffies, port->bound_at + FIXED_DP_SETTLE));
 }
 
 static void fixed_dp_work(struct work_struct *work)
@@ -111,6 +124,7 @@ static int fixed_dp_set(struct typec_mux_dev *mux, struct typec_mux_state *state
 		irq = hpd && !!(dp->status & DP_STATUS_IRQ_HPD);
 	}
 	spin_lock_irq(&port->lock);
+	port->reported = true;
 	port->hpd = hpd;
 	port->irq |= irq;
 	port->mode = state->mode;
@@ -216,6 +230,7 @@ static int fixed_dp_probe(struct platform_device *pdev)
 		dcp_lifecycle_unlock();
 		goto deselect;
 	}
+	port->bound_at = jiffies;
 	port->dcp->fixed_dp = port;
 	port->dcp->phy = port->phy;
 	port->dcp->dptx_phy = port->target;

@@ -62,7 +62,7 @@ struct dcp_retirement {
 	unsigned int rpc_count;
 	bool rpc_blocked, ever_used, stopping, pm_held, piodma_held, av_was_open;
 	bool primary, logical_off, manual_disable, resume_retired, hpd_parked;
-	bool retained_client;
+	bool retained_client, expects_port;
 	enum dcp_idle_state state;
 	const char *stage;
 	int error;
@@ -217,6 +217,9 @@ static bool idle_eligible(struct apple_dcp *dcp)
 {
 	struct dcp_retirement *idle = dcp->retirement;
 
+	/* A fixed-port engine is unused only once its port says no sink is there. */
+	if (idle && idle->expects_port && !dcp_fixed_dp_settled(dcp))
+		return false;
 	return idle && !idle->stopping &&
 		(idle->primary ? (READ_ONCE(idle->logical_off) && dcp->crtc &&
 		 !dcp->crtc->base.state->active) :
@@ -875,6 +878,13 @@ int dcp_retirement_init(struct apple_dcp *dcp)
 	idle->primary = (of_machine_is_compatible("apple,j773g") ||
 	       of_machine_is_compatible("apple,j713")) &&
 		of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcp");
+	/*
+	 * An engine wired to a fixed Type-C port is not unused until that port
+	 * has bound and reported whether a sink is present: the port can bind
+	 * seconds after the engine is ready.
+	 */
+	idle->expects_port = !idle->primary &&
+		of_property_present(dcp->dev->of_node, "apple,dp-altmode");
 	idle_stage(idle, "booting");
 	spin_lock_init(&idle->rpc_lock);
 	INIT_DELAYED_WORK(&idle->work, idle_work);

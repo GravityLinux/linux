@@ -385,5 +385,6 @@ static inline bool dcp_typec_managed(const struct apple_dcp *dcp)
 
 void dcp_typec_set_ready(struct apple_dcp *dcp, bool ready);
 bool dcp_fixed_dp_hpd(struct apple_dcp *dcp);
+bool dcp_fixed_dp_settled(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */
