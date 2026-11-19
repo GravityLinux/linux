@@ -213,6 +213,18 @@ static int idle_failure(struct dcp_retirement *idle, int ret)
 	return ret;
 }
 
+/*
+ * The CRTC exists from component bind, but its atomic state only from the first
+ * mode-config reset of the whole display device. Until then the output is not
+ * known to be off, so it does not count as idle.
+ */
+static bool idle_crtc_inactive(struct apple_dcp *dcp)
+{
+	struct drm_crtc_state *state = dcp->crtc ? READ_ONCE(dcp->crtc->base.state) : NULL;
+
+	return state && !state->active;
+}
+
 static bool idle_eligible(struct apple_dcp *dcp)
 {
 	struct dcp_retirement *idle = dcp->retirement;
@@ -221,15 +233,16 @@ static bool idle_eligible(struct apple_dcp *dcp)
 	if (idle && idle->expects_port && !dcp_fixed_dp_settled(dcp))
 		return false;
 	return idle && !idle->stopping &&
-		(idle->primary ? (READ_ONCE(idle->logical_off) && dcp->crtc &&
-		 !dcp->crtc->base.state->active) :
+		(idle->primary ? (READ_ONCE(idle->logical_off) &&
+		 idle_crtc_inactive(dcp)) :
 		 (dcp->fixed_dp ? (!dcp_fixed_dp_hpd(dcp) &&
-		 !dcp->dptxport[0].connected && dcp->crtc &&
-		 !dcp->crtc->base.state->active) :
+		 !dcp->dptxport[0].connected &&
+		 idle_crtc_inactive(dcp)) :
 		 (!READ_ONCE(idle->ever_used) && !dcp->phy))) &&
 		!dcp->crashed && dcp->active &&
 		!dcp->valid_mode && !dcp->during_modeset &&
-		(idle->primary || !READ_ONCE(dcp->connector->connected)) &&
+		(idle->primary ||
+		 (dcp->connector && !READ_ONCE(dcp->connector->connected))) &&
 		!dcp->ch_cmd.depth && !dcp->ch_oobcmd.depth &&
 		!dcp->ch_cb.depth && !dcp->ch_oobcb.depth &&
 		!dcp->ch_async.depth && !dcp->ch_oobasync.depth;
@@ -671,7 +684,7 @@ int dcp_retirement_suspend(struct apple_dcp *dcp)
 	if (!idle || (READ_ONCE(idle->ever_used) && !dcp->fixed_dp) ||
 	    dcp_fixed_dp_hpd(dcp))
 		return 0;
-	if (idle->primary && dcp->crtc && !dcp->crtc->base.state->active &&
+	if (idle->primary && idle_crtc_inactive(dcp) && dcp->connector &&
 	    !READ_ONCE(dcp->connector->connected))
 		WRITE_ONCE(idle->logical_off, true);
 	dcp_lifecycle_lock();
@@ -840,8 +853,8 @@ static ssize_t idle_control_write(struct file *file, const char __user *buf,
 		 * Do not require a modeset solely to exercise its firmware cycle.
 		 */
 		if (dcp_retirement_is_primary(dcp) &&
-		    !dcp_retirement_display_was_used(dcp) && dcp->crtc &&
-		    !dcp->crtc->base.state->active && dcp->connector &&
+		    !dcp_retirement_display_was_used(dcp) &&
+		    idle_crtc_inactive(dcp) && dcp->connector &&
 		    !READ_ONCE(dcp->connector->connected))
 			WRITE_ONCE(dcp->retirement->logical_off, true);
 		ret = idle_retire_locked(dcp);
