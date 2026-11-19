@@ -8,7 +8,9 @@
 #ifndef _APPLE_MAILBOX_H_
 #define _APPLE_MAILBOX_H_
 
+#include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 /* encodes a single 96bit message sent over the single channel */
@@ -41,6 +43,8 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 
 int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
+int apple_mbox_start_retained(struct apple_mbox *mbox);
+void apple_mbox_stop_retained(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 		    bool atomic);
