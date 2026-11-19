@@ -1,0 +1,429 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+//! Retained direct-queue profile from stage_next_workload with fresh command
+//! objects, persistent_startup_queue and fast_sequential. Storage admission,
+//! ownership and publication are deliberately left to the runtime.
+use super::g17p_compute::{self as c, Error, Result};
+
+pub(crate) const DESCRIPTOR_BASE: u64 = 0xfffffc20c0358000;
+pub(crate) const DESCRIPTOR_LOW: u64 = 0x7000340000;
+pub(crate) const CONTEXT_HIGH: u64 = 0xfffffc2000278000;
+pub(crate) const SUPPORT: u64 = 0xfffffc20c08d0000;
+pub(crate) const SUPPORT_STATE: u64 = 0xfffffc2001688000;
+pub(crate) const ZERO: u64 = 0xfffffc2001698000;
+pub(crate) const TRANSPORT_BASE: u64 = 0xfffffc20cf000000;
+pub(crate) const TRANSPORT_INTERVAL: u32 = 128;
+
+/// G17PComputeTransportPool changes just the retired queue's two backing
+/// pointers and mirrored read index; all other firmware-owned bytes survive.
+pub(crate) fn transport_record(
+    record: &mut [u8; 0xc0],
+    old: [u64; 2],
+    done: u32,
+    slot: u32,
+) -> Result<[u64; 2]> {
+    transport_record_at(record, old, done, slot, TRANSPORT_BASE)
+}
+
+pub(crate) fn transport_record_at(
+    record: &mut [u8; 0xc0],
+    old: [u64; 2],
+    done: u32,
+    slot: u32,
+    base: u64,
+) -> Result<[u64; 2]> {
+    if slot > 1
+        || u64::from_le_bytes(record[..8].try_into().unwrap()) != old[0]
+        || u64::from_le_bytes(record[8..16].try_into().unwrap()) != old[1]
+        || u32::from_le_bytes(record[0x1c..0x20].try_into().unwrap()) != done
+    {
+        return Err(Error::Invalid);
+    }
+    let pointers = base
+        .checked_add(slot as u64 * 0x8000)
+        .ok_or(Error::Overflow)?;
+    let ring = pointers + 0x4000;
+    c::u64_at(record, 0, pointers);
+    c::u64_at(record, 8, ring);
+    c::u32_at(record, 0x1c, 0);
+    Ok([pointers, ring])
+}
+
+pub(crate) fn transport_pointers() -> [u8; 0x80] {
+    let mut body = [0; 0x80];
+    c::u32_at(&mut body, 0x50, u32::MAX);
+    c::u32_at(&mut body, 0x60, 0x500);
+    body
+}
+
+/// The two ordinary queue owners constructed by the shim's force_fresh path
+/// after rendering. This is a distinct lifetime from the retained startup
+/// transport above; ordinal one starts queue/grid five at inner index zero.
+pub(crate) const AFTER_RENDER_STATUS: u64 = 0xfffffc2001a00000;
+pub(crate) const AFTER_RENDER_QUEUE: u64 = 0xfffffc20c00003c0;
+pub(crate) const AFTER_RENDER_POINTERS: u64 = 0xfffffc200166d0e0;
+pub(crate) const AFTER_RENDER_RING: u64 = 0xfffffc20c08b50e0;
+pub(crate) const AFTER_RENDER_CONTEXT: u64 = 0xfffffc20002a0000;
+pub(crate) const AFTER_RENDER_OPTIONAL: u64 = 0xfffffc20c0603e40;
+pub(crate) const AFTER_RENDER_EVENT: u64 = 0xfffffc20c05e96c0;
+
+pub(crate) fn after_render_opening_program(preempt: u64, cdm: u64) -> Result<[c::Register; 40]> {
+    c::Program {
+        preempt,
+        cdm,
+        identity: 0x010001d7020001dc,
+        context: 2,
+        ordinal: 0,
+        robustness: 0x1000018000,
+        operand_state: 0x7000220000,
+        usc_exec_base: c::USC_EXEC_BASE,
+        helper_binary: 0,
+        helper_data: 0,
+        helper_cfg: 0,
+        execution_gate: 1,
+    }
+    .build()
+}
+
+pub(crate) fn after_render_second_descriptor(
+    out: &mut [u8],
+    registers: &[c::Register],
+    end: u64,
+    sampler: u64,
+    sampler_count: u32,
+    timestamps: [u64; 2],
+    status: [u64; 2],
+) -> Result {
+    let spec = Retained::new(1)?;
+    c::Descriptor {
+        scheduler: spec.scheduler,
+        low_alias: spec.descriptor_low,
+        cdm_terminator: end.checked_sub(4).ok_or(Error::Invalid)?,
+        sequence: 1,
+        context: 3,
+        grid: 5,
+        dispatch: [0xfffffc20001c8014, 0xfffffc20c07c0014],
+        status,
+        timestamps,
+        shared_control: SUPPORT,
+        zero_page: ZERO,
+        support_control: 0xe0a00001,
+        support_flags: 0,
+        ordinal: 1,
+        queue_submission: 2,
+        queue_ordinal: 0,
+        submission_index: 2,
+        sampler_array: sampler,
+        sampler_count,
+    }
+    .build(out, registers)
+}
+
+pub(crate) fn after_render_second_optional() -> [u8; 0xc0] {
+    c::Optional {
+        context_low: 0x7000500000,
+        context_high: AFTER_RENDER_CONTEXT,
+        grid: 5,
+        ordinal: 0x29,
+        shared_control: SUPPORT,
+        channel_control: 0xfffffc20c07b80c0,
+        uuid: 0x159,
+        field_46: 0,
+        field_1e: 2,
+        field_32: 3,
+        field_56: 2,
+        field_5e: 2,
+        first: true,
+        item_index: 0,
+    }
+    .build()
+}
+
+pub(crate) fn after_render_second_context(out: &mut [u8]) -> Result {
+    c::Context {
+        descriptor: DESCRIPTOR_BASE + 0x1040,
+        queue: AFTER_RENDER_QUEUE,
+        grid: 5,
+        flags: 0x1000000000000000,
+        word_220: 0xffff080200000001,
+        word_330: 0,
+        word_338: 8,
+        word_350: 0x000110038001a084,
+        word_358: 0x000020038001a0bd,
+        word_378: 0x003fffffffffffff,
+        item_index: 0,
+        points: None,
+        event_slot: None,
+        completion: None,
+    }
+    .build(out)
+}
+
+/// Cold source startup uses the compact 36-register program. The four UAPI
+/// USC/helper registers belong to the subsequent caller submission profile.
+pub(crate) fn opening_program(preempt: u64, cdm: u64) -> Result<[c::Register; 36]> {
+    let program = c::Program {
+        preempt,
+        cdm,
+        identity: 0x010001d7020001dc,
+        context: 2,
+        ordinal: 0,
+        robustness: 0x1000018000,
+        operand_state: 0x7000220000,
+        usc_exec_base: c::USC_EXEC_BASE,
+        helper_binary: 0,
+        helper_data: 0,
+        helper_cfg: 0,
+        execution_gate: 1,
+    }
+    .build()?;
+    Ok(core::array::from_fn(|index| {
+        program[if index < 6 { index } else { index + 4 }]
+    }))
+}
+
+pub(crate) struct Retained {
+    pub(crate) ordinal: u32,
+    pub(crate) descriptor: u64,
+    pub(crate) descriptor_low: u64,
+    pub(crate) optional: u64,
+    pub(crate) event: u64,
+    pub(crate) context_record: u64,
+    pub(crate) scheduler: u64,
+    pub(crate) scheduler_slot: u64,
+    pub(crate) dispatch: [u64; 2],
+    pub(crate) status: [u64; 2],
+    pub(crate) identity: u64,
+}
+impl Retained {
+    pub(crate) fn new(ordinal: u32) -> Result<Self> {
+        // The descriptor's submission count is a 24-bit field.
+        if ordinal == 0 || ordinal >= 0xffffff {
+            return Err(Error::Invalid);
+        }
+        let n = ordinal as u64;
+        let descriptor_step = (n % 240) * 0x1040;
+        let (scheduler, scheduler_slot) = match ordinal {
+            1 => (0xfffffc20c0870200, 0xfffffc2001638008),
+            2 => (0xfffffc20c0870300, 0xfffffc200163800c),
+            3 => (0xfffffc20c08c8400, 0xfffffc2001680010),
+            _ => (
+                0xfffffc20c0b00000 + ((n + 1) % 36) * 0x100,
+                0xfffffc2001800000 + ((n + 1) % 36) * 4,
+            ),
+        };
+        let identity = match ordinal {
+            1 => 0x0200021c03000245,
+            2 => 0x020002500300029c,
+            3 => 0x0200020803000247,
+            _ => ((0x02000208 + 2 * (n - 3)) << 32) | (0x03000247 + n - 3),
+        };
+        Ok(Self {
+            ordinal,
+            descriptor: DESCRIPTOR_BASE + descriptor_step,
+            descriptor_low: DESCRIPTOR_LOW + descriptor_step,
+            optional: 0xfffffc20c0605e80 + n * 0xc0,
+            event: 0xfffffc20c05e9600 + n * 0x40,
+            context_record: CONTEXT_HIGH + c::context_offset(ordinal, 256)? as u64,
+            scheduler,
+            scheduler_slot,
+            dispatch: [0xfffffc20001c8008 + n * 8, 0xfffffc20c07c0008 + n * 8],
+            status: [0xfffffc2000024c78, 0xfffffc2000024c80],
+            identity,
+        })
+    }
+    pub(crate) fn program(
+        &self,
+        preempt: u64,
+        cdm: u64,
+        client_slot: u32,
+    ) -> Result<[c::Register; 40]> {
+        let operand_slot = client_slot.min(1) as u64;
+        c::Program {
+            preempt: c::add(preempt, client_slot as u64 * 0x78000)?,
+            cdm,
+            identity: self.identity,
+            context: 3,
+            ordinal: self.ordinal,
+            robustness: 0x1000018000 + operand_slot * 0x8000,
+            operand_state: 0x7000220000 + operand_slot * 0x15c0000,
+            usc_exec_base: c::USC_EXEC_BASE,
+            helper_binary: 0,
+            helper_data: 0,
+            helper_cfg: 0,
+            execution_gate: u64::from(self.ordinal == 3),
+        }
+        .build()
+    }
+    pub(crate) fn scheduler_body(&self) -> [u8; 0x100] {
+        c::Scheduler {
+            slot: self.scheduler_slot,
+            work_id: self.ordinal,
+            phase: 0,
+            job_list: 0,
+            node_id: 0,
+            completion_kind: 0,
+        }
+        .build()
+    }
+    pub(crate) fn descriptor_body(
+        &self,
+        out: &mut [u8],
+        registers: &[c::Register],
+        end: u64,
+        sampler: u64,
+        sampler_count: u32,
+        timestamps: [u64; 2],
+    ) -> Result {
+        c::Descriptor {
+            scheduler: self.scheduler,
+            low_alias: self.descriptor_low,
+            cdm_terminator: end.checked_sub(4).ok_or(Error::Invalid)?,
+            sequence: self.ordinal as u64,
+            context: 3,
+            grid: 4,
+            dispatch: self.dispatch,
+            status: self.status,
+            timestamps,
+            shared_control: SUPPORT,
+            zero_page: ZERO,
+            support_control: 0xe0a00001,
+            support_flags: 0,
+            ordinal: self.ordinal,
+            queue_submission: self.ordinal + 1,
+            queue_ordinal: 0,
+            submission_index: self.ordinal + 1,
+            sampler_array: sampler,
+            sampler_count,
+        }
+        .build(out, registers)
+    }
+    /// Ordinary force_fresh startup keeps queue one after ordinal one,
+    /// omits later optionals and preserves its shared dispatch locations.
+    pub(crate) fn after_render_event(&self) -> u64 {
+        if self.ordinal == 1 {
+            AFTER_RENDER_EVENT
+        } else {
+            0xfffffc20c0d00000 + (self.ordinal as u64 % 256) * 0x40
+        }
+    }
+    pub(crate) fn after_render_dispatch(&self) -> [u64; 2] {
+        // Ordinal one owns the measured startup record. Later commands use
+        // ordinary source fresh dispatch slots, away from that live record.
+        if self.ordinal == 1 {
+            [0xfffffc20001c8014, 0xfffffc20c07c0014]
+        } else {
+            let slot = self.ordinal as u64 % 256;
+            [0xfffffc2001b00000 + slot * 8, 0xfffffc20c0e00000 + slot * 8]
+        }
+    }
+    pub(crate) fn after_render_context_address(&self) -> Result<u64> {
+        Ok(AFTER_RENDER_CONTEXT + c::context_offset(self.ordinal - 1, 256)? as u64)
+    }
+    pub(crate) fn after_render_descriptor(
+        &self,
+        out: &mut [u8],
+        registers: &[c::Register],
+        end: u64,
+        sampler: u64,
+        sampler_count: u32,
+        timestamps: [u64; 2],
+    ) -> Result {
+        c::Descriptor {
+            scheduler: self.scheduler,
+            low_alias: self.descriptor_low,
+            cdm_terminator: end.checked_sub(4).ok_or(Error::Invalid)?,
+            sequence: self.ordinal as u64,
+            context: 3,
+            grid: 5,
+            dispatch: self.after_render_dispatch(),
+            status: self.status,
+            timestamps,
+            shared_control: SUPPORT,
+            zero_page: ZERO,
+            support_control: 0xe0a00001,
+            support_flags: 0,
+            ordinal: self.ordinal,
+            queue_submission: self.ordinal + 1,
+            queue_ordinal: 0,
+            submission_index: self.ordinal + 1,
+            sampler_array: sampler,
+            sampler_count,
+        }
+        .build(out, registers)
+    }
+    pub(crate) fn after_render_context(&self, out: &mut [u8]) -> Result {
+        let step = (self.descriptor - DESCRIPTOR_BASE) / 0x20;
+        c::Context {
+            descriptor: self.descriptor,
+            queue: AFTER_RENDER_QUEUE,
+            grid: 5,
+            flags: 0x1000000000000000,
+            word_220: 0xffff080200000001,
+            word_330: 0,
+            word_338: 8,
+            word_350: 0x000110038001a002 + step,
+            word_358: 0x000020038001a03b + step,
+            word_378: 0x003fffffffffffff,
+            item_index: self.ordinal - 1,
+            points: None,
+            event_slot: None,
+            completion: None,
+        }
+        .build(out)
+    }
+    pub(crate) fn optional_body(&self) -> [u8; 0xc0] {
+        c::Optional {
+            context_low: 0x70004d8000,
+            context_high: CONTEXT_HIGH,
+            grid: 4,
+            ordinal: 0x29 + self.ordinal,
+            shared_control: SUPPORT,
+            channel_control: 0xfffffc20c07b8040,
+            uuid: 0x159,
+            field_46: 0,
+            field_1e: 2,
+            field_32: 3,
+            field_56: 2,
+            field_5e: 2,
+            first: true,
+            item_index: 0,
+        }
+        .build()
+    }
+    pub(crate) fn context_body(&self, out: &mut [u8]) -> Result {
+        let step = (self.descriptor - DESCRIPTOR_BASE) / 0x20;
+        c::Context {
+            descriptor: self.descriptor,
+            queue: 0xfffffc20c0000300,
+            grid: 4,
+            flags: 0x1000000000000000,
+            word_220: 0xffff080200000001,
+            word_330: 0,
+            word_338: 8,
+            word_350: 0x000110038001a002 + step,
+            word_358: 0x000020038001a03b + step,
+            word_378: 0x003fffffffffffff,
+            item_index: self.ordinal,
+            points: None,
+            event_slot: None,
+            completion: None,
+        }
+        .build(out)
+    }
+}
+
+pub(crate) fn channel_control() -> [u8; 0x40] {
+    let mut out = [0; 0x40];
+    for (offset, value) in [
+        (0, 0x00c8010402040202),
+        (8, 0x2ee00000),
+        (0x10, 0x100000),
+        (0x20, 0x0002000000000000),
+        (0x28, 0xa000000000000000),
+        (0x30, 0x02000001),
+    ] {
+        c::u64_at(&mut out, offset, value);
+    }
+    out
+}
