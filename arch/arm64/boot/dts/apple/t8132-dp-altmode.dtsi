@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8132 ADT: each ATC has one direct DP output and two USB4 DP-INs. Only the
+ * direct output (mux control 0) is described here. Each is permanently wired
+ * to one external display engine: ADT HPM0 (ATC0) is left-front and HPM1
+ * (ATC1) left-back; each ATC dpphy is direct DFP port 0, and the external
+ * DCPs are UFP endpoints 1 and 2, stream 0 (crossbar sources 2 and 4).
+ */
+
+&{/soc} {
+	atcphy0_dpxbar: mux@40304c000 {
+		compatible = "apple,t8132-display-crossbar", "apple,t6020-display-crossbar";
+		reg = <0x4 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
+		status = "disabled";
+	};
+
+	dp_altmode0: display-port-0 {
+		compatible = "apple,t8132-fixed-dp";
+		apple,atc-index = <0>;
+		mode-switch;
+		phys = <&atcphy0 PHY_TYPE_DP>;
+		phy-names = "dp-phy";
+		mux-controls = <&atcphy0_dpxbar 0>;
+		mux-control-names = "dp-xbar";
+		status = "disabled";
+		apple,display-engine = <&dcpext0>;
+		mux-index = <2>;
+
+		port {
+			dp_altmode0_hpd: endpoint {
+				remote-endpoint = <&typec0_dp_hpd>;
+			};
+		};
+	};
+
+	atcphy1_dpxbar: mux@40b04c000 {
+		compatible = "apple,t8132-display-crossbar", "apple,t6020-display-crossbar";
+		reg = <0x4 0x0b04c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
+		status = "disabled";
+	};
+
+	dp_altmode1: display-port-1 {
+		compatible = "apple,t8132-fixed-dp";
+		apple,atc-index = <1>;
+		mode-switch;
+		phys = <&atcphy1 PHY_TYPE_DP>;
+		phy-names = "dp-phy";
+		mux-controls = <&atcphy1_dpxbar 0>;
+		mux-control-names = "dp-xbar";
+		status = "disabled";
+		apple,display-engine = <&dcpext1>;
+		mux-index = <4>;
+
+		port {
+			dp_altmode1_hpd: endpoint {
+				remote-endpoint = <&typec1_dp_hpd>;
+			};
+		};
+	};
+
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dp_hpd: endpoint {
+				remote-endpoint = <&dp_altmode0_hpd>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dp_hpd: endpoint {
+				remote-endpoint = <&dp_altmode1_hpd>;
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	apple,connector-type = "DP";
+	apple,dp-altmode;
+};
+
+&dcpext1 {
+	apple,connector-type = "DP";
+	apple,dp-altmode;
+};
+

@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (15-inch, M4, 2025)
+ *
+ * target-type: J715
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8132.dtsi"
+#include "t8132-jxxx.dtsi"
+#include "t8132-j71x.dtsi"
+
+/ {
+	compatible = "apple,j715", "apple,t8132", "apple,arm-platform";
+	model = "Apple MacBook Air (15-inch, M4, 2025)";
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j715", "apple,panel";
+		/* Existing J415-sized geometry; not determined by the J715 ADT. */
+		width-mm = <327>;
+		height-mm = <211>;
+		adj-height-mm = <204>;
+		/* ADT /backlight LmaxProduct = 34406400, in 16.16 nits. */
+		apple,max-brightness = <525>;
+	};
+};
+
+&mtp_hid {
+	multi-touch {
+		/* Firmware packaging name is board-specific, not an ADT path. */
+		firmware-name = "apple/tpmtfw-j715.bin";
+	};
+};
+
+/* ADT /arm-io/wlan module-instance is "kos", not J713's "garden". */
+&wifi0 {
+	brcm,board-type = "apple,kos";
+};
+
+/* Same combo module: Bluetooth board name inferred from wlan, as on J713. */
+&bluetooth0 {
+	brcm,board-type = "apple,kos";
+};
+
+/* Microphone transport matches J713; use this chassis' own AOP identity. */
+&aop_audio {
+	apple,chassis-name = "J715";
+	apple,machine-kind = "MacBook Air";
+};
+
+&mca {
+	/* ADT /arm-io/iop-audio-controller/audio-codec-output: cluster 2. */
+	dmas = <&admac 4>;
+	dma-names = "tx2a";
+};
+
+/ {
+	sound {
+		/* Generic macaudio fallback is jack-only; no speaker config. */
+		compatible = "apple,macaudio";
+		model = "MacBook Air J715 Headphones";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+/*
+ * Speakers MUST stay disabled: J715 has six SN012776 amps, not J713's four,
+ * and no validated speaker protection data. Do not attach these to sound.
+ * ADT /arm-io/i2c3/audio-speaker* compatible/reg, speaker1..5 phandles
+ * and speaker-config supply the addresses and V/I slots below. The shared
+ * SDZ is AP GPIO 15 (audio-speaker function-reset); it is not driven here.
+ */
+&i2c3 {
+	status = "disabled";
+
+	amplifier@38 {
+		compatible = "ti,sn012776";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		ti,vmon-slot-no = <0>;
+		ti,imon-slot-no = <2>;
+		status = "disabled";
+	};
+
+	amplifier@39 {
+		compatible = "ti,sn012776";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		ti,vmon-slot-no = <8>;
+		ti,imon-slot-no = <10>;
+		status = "disabled";
+	};
+
+	amplifier@3a {
+		compatible = "ti,sn012776";
+		reg = <0x3a>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		ti,vmon-slot-no = <16>;
+		ti,imon-slot-no = <18>;
+		status = "disabled";
+	};
+
+	amplifier@3b {
+		compatible = "ti,sn012776";
+		reg = <0x3b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		ti,vmon-slot-no = <4>;
+		ti,imon-slot-no = <6>;
+		status = "disabled";
+	};
+
+	amplifier@3c {
+		compatible = "ti,sn012776";
+		reg = <0x3c>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		ti,vmon-slot-no = <12>;
+		ti,imon-slot-no = <14>;
+		status = "disabled";
+	};
+
+	amplifier@3d {
+		compatible = "ti,sn012776";
+		reg = <0x3d>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		ti,vmon-slot-no = <20>;
+		ti,imon-slot-no = <22>;
+		status = "disabled";
+	};
+};
+
+&isp {
+	/*
+	 * ADT /arm-io/isp sensor-type = 24 (J713 is 23). Mapping that to
+	 * platform-id follows J713 and is unverified. No sensor presets
+	 * are guessed for this different platform. Camera stays disabled.
+	 */
+	apple,platform-id = <24>;
+};
+
+/* External DP wiring is build-tested; physical ports remain unqualified. */
+#include "t8132-air-dp-altmode.dtsi"

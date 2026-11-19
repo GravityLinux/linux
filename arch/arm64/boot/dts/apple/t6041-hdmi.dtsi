@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* EXPERIMENTAL: J616c external controller, verified native 26.6.2 resources.
+ * The fixed HDMI link uses ATC PHY3, not the base M4's dedicated DPTX PHY.
+ */
+#include <dt-bindings/phy/phy.h>
+/ {
+	aliases {
+		dcpext0 = &dcpext0;
+		dispext0_piodma = &dispext0_piodma;
+	};
+};
+
+&{/soc} {
+	pinctrl_aop: pinctrl@510824000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <5 0x10824000 0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_aop 0 0 85>;
+		apple,npins = <85>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 700 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 701 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 702 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 703 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 704 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 705 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 706 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	atcphy3_dpxbar: mux@39b24c000 {
+		compatible = "apple,t6040-display-crossbar", "apple,t6020-display-crossbar";
+		reg = <3 0x9b24c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_phymxwrap>;
+	};
+
+	atcphy3: phy@39b000000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <3 0x9b000000 0 0x60000>,
+		      <3 0x9b200000 0 0x4000>,
+		      <3 0x9b244000 0 0x4000>,
+		      <3 0x9b250000 0 0x4000>;
+		reg-names = "core", "power", "fabric", "common";
+		#phy-cells = <1>;
+		apple,fixed-dp;
+		mode-switch;
+		power-domains = <&ps_atc3_usb_aon>, <&pmp_report_atc3>,
+				<&ps_atc3_phymxwrap>, <&ps_atc3_common_dp>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@2 {
+				reg = <2>;
+				atcphy3_dp: endpoint {
+					remote-endpoint = <&dcpext0_dp>;
+				};
+			};
+		};
+	};
+
+	dispext0_dart: iommu@3a2300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <3 0xa2300000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1165 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	dcpext0_dart: iommu@3a2340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <3 0xa2340000 0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1165 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	dcpext0_mbox: mailbox@3a2e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0xa2e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1218 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1219 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1220 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1221 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	dcpext0: dcp@3a2e00000 {
+		compatible = "apple,t6041-dcpext", "apple,dcpext";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		mboxes = <&dcpext0_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext0_dart 23>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <3 0xa2e00000 0 0x4000>,
+		      <3 0xa0000000 0 0x4000000>,
+		      <3 0xa2240000 0 0x10000>,
+		      <3 0xa23a8000 0 0x4000>,
+		      <3 0xa2800000 0 0x800000>;
+		/* Captured external D003 response: PMGR scratch 0x50482c000. */
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x2c000>;
+		apple,dcp-index = <1>;
+		apple,dptx-phy = <3>;
+		apple,connector-type = "HDMI-A";
+		phys = <&atcphy3 PHY_TYPE_DP>;
+		phy-names = "dp-phy";
+		mux-controls = <&atcphy3_dpxbar 0>;
+		mux-control-names = "dp-xbar";
+		/* dispext0 stream0 is UFP0 in the Max's native crossbar. */
+		mux-index = <0>;
+		hdmi-hpd-gpios = <&pinctrl_aop 36 GPIO_ACTIVE_HIGH>;
+		hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+		dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+		clocks = <&clkref>;
+		phandle = <&dcpext0>;
+		/* m1n1 supplies firmware reservations/version before enabling it. */
+		status = "disabled";
+
+		dispext0_piodma: piodma {
+			iommus = <&dispext0_dart 16>;
+			phandle = <&dispext0_piodma>;
+		};
+
+		port {
+			dcpext0_dp: endpoint {
+				remote-endpoint = <&atcphy3_dp>;
+			};
+		};
+	};
+};
+
+&display {
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
+};
+
+&pmgr1 {
+	ps_fab2_soc: power-controller@338 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x338 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab2_soc";
+		power-domains = <&ps_afi>;
+	};
+	ps_atc3_common: power-controller@408 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x408 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3_common";
+		power-domains = <&ps_fab2_soc>;
+	};
+};
+
+&pmp_report {
+	pmp_report_atc3: report@21 {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <33>;
+		label = "pmp-atc3-common";
+		#power-domain-cells = <0>;
+		power-domains = <&ps_atc3_common>;
+	};
+};
+
+&{/soc} {
+	pmgr3: power-management@508300000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <5 0x08300000 0 0x4000>;
+
+		ps_atc3_common_dp: power-controller@b8 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0xb8 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "atc3_common_dp";
+		};
+		ps_atc3_usb_aon: power-controller@e0 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0xe0 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "atc3_usb_aon";
+		};
+		ps_atc3_phymxwrap: power-controller@168 {
+			compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x168 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "atc3_phymxwrap";
+			power-domains = <&pmp_report_atc3>, <&ps_atc3_usb_aon>;
+		};
+	};
+};

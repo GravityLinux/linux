@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Neo external pipeline: physical resources from the J700 ADT. No sink modes. */
+/ {
+	aliases {
+		dcpext = &dcpext0;
+		dispext0_piodma = &dispext0_piodma;
+	};
+};
+
+&soc {
+	dispext0_dart: iommu@416300000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x4 0x16300000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+		apple,dma-range = <0x100 0 0x10 0>;
+	};
+
+	dcpext0_dart: iommu@416340000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x4 0x16340000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
+		apple,dma-range = <0x100 0 0x10 0>;
+	};
+
+	dcpext0_mbox: mailbox@416e08000 {
+		compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x16e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 751 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 753 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 754 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	pmgr_dcpext_doorbell: power-management@302870000 {
+		reg = <0x3 0x02870000 0 4>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	atc0_dpxbar: mux@40b04c000 {
+		compatible = "apple,t8140-display-crossbar", "apple,t6020-display-crossbar";
+		reg = <0x4 0x0b04c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_common>;
+	};
+
+	dcpext0: dcp@416e00000 {
+		compatible = "apple,t8140-dcpext", "apple,dcpext";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		mboxes = <&dcpext0_mbox>;
+		mbox-names = "mbox";
+		power-domains = <&ps_dispext0_cpu>;
+		iommus = <&dcpext0_dart 23>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <0x4 0x16e00000 0 0x4000>,
+		      <0x4 0x14000000 0 0xafc000>,
+		      <0x4 0x16240000 0 0x10000>,
+		      <0x4 0x163ac000 0 0x4000>,
+		      <0x4 0x16800000 0 0x800000>;
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x28000>;
+		apple,bw-doorbell = <&pmgr_dcpext_doorbell 0 5>;
+		apple,iomfb-surfaces = <1 0 0 0>;
+		apple,dcp-index = <1>;
+		apple,connector-type = "DP";
+		apple,dptx-phy = <0>;
+		apple,typec-connector = <&typec0>;
+		clocks = <&clkref>;
+		phys = <&atcphy0 PHY_TYPE_DP>;
+		phy-names = "dp-phy";
+		mux-controls = <&atc0_dpxbar 0>;
+		mux-control-names = "dp-xbar";
+		/* SoC topology: dispext input 1, stream 0. Not a monitor setting. */
+		mux-index = <2>;
+		phandle = <&dcpext0>;
+		status = "disabled";
+
+		dispext0_piodma: piodma {
+			iommus = <&dispext0_dart 16>;
+			phandle = <&dispext0_piodma>;
+		};
+	};
+};
+
+/* Both display engines consume the DRM master's common scanout address space. */
+&display {
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
+};

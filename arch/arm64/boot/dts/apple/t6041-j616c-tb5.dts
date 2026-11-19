@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Test tree: controller 0 belongs exclusively to the verified USB proxy. */
+#include "t6041-j616c.dts"
+#include "t6041-usb4-right.dtsi"
+&hpm0 { status = "disabled"; };
+&atcphy0 { status = "disabled"; };
+&usb4_0_acio { status = "disabled"; };

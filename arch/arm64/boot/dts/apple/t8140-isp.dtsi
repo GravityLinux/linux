@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Private Neo ISP bring-up, based on this worktree's runtime data captures. */
+/ {
+	aliases { isp = &isp; };
+};
+&soc {
+	isp: isp@320000000 {
+		compatible = "apple,t8140-isp";
+		reg = <0x3 0x20000000 0 0x2000000>,
+		      <0x3 0x22920000 0 0x100>,
+		      <0x3 0x22921000 0 0x100>,
+		      <0x3 0x22920410 0 0x100>,
+		      <0x3 0x228a4000 0 0x1000>,
+		      <0x3 0x63b50000 0 0x10>;
+		reg-names = "coproc", "mbox", "gpio", "mbox2", "boot-control", "watchdog";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 323 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
+			<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>, <&ps_isp_fe>,
+			<&ps_isp_dprx>,
+			<&ps_isp_secure>, <&ps_isp_sts0>, <&ps_isp_sts1>,
+			<&ps_isp_pearl>, <&ps_isp_be>, <&ps_isp_clr>,
+			<&ps_isp_cvd>, <&ps_isp_cvm>;
+		apple,dart-vm-size = <0 0xf0000000>;
+		apple,platform-id = <0x70>;
+		status = "okay";
+		sensor-presets {
+			preset0 {
+				apple,config-index = <1>;
+				apple,input-size = <1920 2160>;
+				apple,output-size = <1920 1080>;
+				apple,crop = <0 0 1920 1080>;
+			};
+		};
+	};
+	isp_dart0: iommu@3228c0000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <3 0x228c0000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,sid-remap = <1 0>, <2 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		apple,dma-range = <0x100 0 1 0>;
+	};
+	isp_dart1: iommu@3228e0000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <3 0x228e0000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,sid-remap = <1 0>, <2 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		apple,dma-range = <0x100 0 1 0>;
+	};
+	isp_dart2: iommu@322900000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <3 0x22900000 0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,sid-remap = <1 0>, <2 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		apple,dma-range = <0x100 0 1 0>;
+	};
+};
+&pmgr {
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core0";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_cpu>;
+	};
+	ps_isp_cpu_core1: power-controller@4010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core1";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_cpu>;
+	};
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_fe>;
+	};
+	ps_isp_secure: power-controller@4028 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_secure";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_fe>;
+	};
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts0";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_fe>;
+	};
+	ps_isp_sts1: power-controller@4038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts1";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_fe>;
+	};
+	ps_isp_pearl: power-controller@4040 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_pearl";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_fe>;
+	};
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_fe>;
+	};
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_be>;
+	};
+	ps_isp_cvd: power-controller@4058 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4058 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvd";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_be>;
+	};
+	ps_isp_cvm: power-controller@4060 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4060 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvm";
+		apple,no-auto-enable;
+		power-domains = <&ps_isp_cvd>;
+	};
+};

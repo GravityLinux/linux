@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J713/J715 ADTs share both external DCPs, ATC0/1 and DP audio channels. */
+#include "t8132-dp-altmode.dtsi"
+
+/ {
+	aliases {
+		dcpext0 = &dcpext0;
+		dcpext1 = &dcpext1;
+		sio = &sio;
+	};
+};
+
+&dcpext0 { status = "okay"; };
+&dcpext1 { status = "okay"; };
+&dcpext0_dart { status = "okay"; };
+&dcpext1_dart { status = "okay"; };
+&dcpext0_mbox { status = "okay"; };
+&dcpext1_mbox { status = "okay"; };
+&dispext0_dart { status = "okay"; };
+&dispext1_dart { status = "okay"; };
+&atcphy0_dpxbar { status = "okay"; };
+&atcphy1_dpxbar { status = "okay"; };
+&dp_altmode0 { status = "okay"; };
+&dp_altmode1 { status = "okay"; };
+&sio_dart { status = "okay"; };
+&sio_mbox { status = "okay"; };
+&sio { status = "okay"; };
+&dpaudio1 { status = "okay"; };
+&dpaudio2 { status = "okay"; };
+
+&display {
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>, <&dispext1_dart 0>;
+};
