@@ -77,6 +77,31 @@ properties:
       Forces this power domain to always be powered up.
     type: boolean
 
+  apple,auto-pm-control:
+    description:
+      Syscon, byte offset and mask for automatic power-state ownership. Clear
+      the mask before software state writes, keep it clear while off, and
+      restore the original value after powering on.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Automatic-PM control syscon
+          - description: Byte offset
+          - description: Automatic ownership bits
+
+  apple,power-gate:
+    description:
+      Reference to a syscon and the byte offset of this domain's power-gate
+      sequencer. On T8132 the companion word is at offset + 0x24. The gate
+      policy must be restored before powering the domain on; otherwise a
+      later idle can discard the coprocessor state. Domains without this
+      property keep the existing power-state-only sequence.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle to the gate-control syscon
+          - description: Byte offset of the domain's first gate word
+
   apple,min-state:
     description:
       Specifies the minimum power state for auto-PM.
@@ -84,6 +109,18 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     minimum: 0
     maximum: 15
+
+  apple,force-disable:
+    description:
+      Forces this device to be disabled (bus access blocked) when the power
+      domain is powered down.
+    type: boolean
+
+  apple,force-reset:
+    description:
+      Forces a reset/error recovery of the power control logic when the power
+      domain is powered down.
+    type: boolean
 
 required:
   - compatible
