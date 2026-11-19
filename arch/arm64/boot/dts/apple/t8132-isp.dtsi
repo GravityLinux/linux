@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8132 (M4) ISP.
+ *
+ * Addresses, interrupts, DART properties and the power topology come from
+ * the J713 ADT (/arm-io/isp, /arm-io/dart-isp, pmgr device table, PMP
+ * soc-device table). The M4 has the same H16 ISP as the M4 Max: the DARTs
+ * sit at the same offsets from the coprocessor and the mailbox offsets of
+ * t6041-isp.dtsi work on J713.
+ *
+ * Only boards with a camera include this file, so the power domains are
+ * left enabled; isp-common.dtsi enables the ISP and its DARTs.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&pmp_report {
+	/* PMP soc-device "ISP" is entry 7; report indices are entry - 1. */
+	pmp_report_isp: report@6 {
+		compatible = "apple,t6000-pmp-v2-report-entry";
+		reg = <0x6>;
+		label = "pmp-isp";
+		/*
+		 * The PMP acknowledges turning this report off but not turning it
+		 * back on (power-on times out), so keep it and ISP_SYS on. ISP_SYS
+		 * also holds dart-isp's DAPF and the ISP boot vector.
+		 */
+		apple,always-on;
+		#power-domain-cells = <0>;
+		power-domains = <&ps_isp_sys>;
+	};
+};
+
+&pmgr {
+	/* ADT ISP_SYS: ps-regs[5] index 6. */
+	ps_isp_sys: power-controller@530 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x530 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+		apple,always-on;
+	};
+
+	/*
+	 * ADT ISPSENS0/1 (ps-regs[1] indices 17 and 18). The ISP node lists them
+	 * in its power-gates, and dart-isp's DAPF does not grant the firmware
+	 * these registers, so the host powers the sensors.
+	 */
+	ps_ispsens0: power-controller@188 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x188 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens0";
+	};
+
+	ps_ispsens1: power-controller@190 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x190 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens1";
+	};
+
+	/*
+	 * The ISP block's own domains at pmgr+0x4000, in ADT order: ISP_CPU,
+	 * CPU_CORE0/1, FE, DPRX, SECURE, then STS0/1, PEARL, BE, CLR, CVD, CVM.
+	 * DAPF grants the firmware all thirteen, but the host must power all
+	 * of them: with only the first six on (as on T6041), firmware 26.6.2
+	 * takes an SError while loading its J713 tunables.
+	 */
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		power-domains = <&pmp_report_isp>;
+	};
+
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
+	};
+
+	ps_isp_cpu_core1: power-controller@4010 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core1";
+		power-domains = <&ps_isp_cpu>;
+	};
+
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		power-domains = <&pmp_report_isp>;
+	};
+
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_secure: power-controller@4028 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_secure";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_sts1: power-controller@4038 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts1";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_pearl: power-controller@4040 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_pearl";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
+	};
+
+	ps_isp_cvd: power-controller@4058 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4058 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvd";
+		power-domains = <&ps_isp_be>;
+	};
+
+	ps_isp_cvm: power-controller@4060 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4060 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvm";
+		power-domains = <&ps_isp_cvd>;
+	};
+};
+
+&soc {
+	isp_dart0: iommu@48e8c0000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e8c0000 0x0 0xc000>,
+		      <0x4 0x8e8d0000 0x0 0x4000>;
+		reg-names = "dart", "dapf";
+		/*
+		 * ADT dart-isp dapf-instance-0: the PMGR ISP block domains,
+		 * PMGR+0x30000, the MCC DSID ranges, the PMP PTD window and the
+		 * ISP bandwidth-request word, plus three ranges of unknown use.
+		 * Without it the firmware faults on its first PMGR access.
+		 */
+		apple,dapf-ranges =
+			/bits/ 64 <0x380704000 0x380704063>,
+			/bits/ 64 <0x380730000 0x380733fff>,
+			/bits/ 64 <0x380e3c000 0x380e3c003>,
+			/bits/ 64 <0x39062c000 0x390648003>,
+			/bits/ 64 <0x501660000 0x501660003>,
+			/bits/ 64 <0x220004000 0x2200162fc>,
+			/bits/ 64 <0x220044000 0x2200562fc>,
+			/bits/ 64 <0x2201c4000 0x2201d62fc>,
+			/bits/ 64 <0x222004000 0x2220162fc>,
+			/bits/ 64 <0x222044000 0x2220562fc>,
+			/bits/ 64 <0x2221c4000 0x2221d62fc>,
+			/bits/ 64 <0x3803c0000 0x3803e4000>,
+			/bits/ 64 <0x382824000 0x382824004>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pmp_report_isp>;
+		/*
+		 * ADT vm-base 0x100_0000_0000, remap list and bypass-15. The window
+		 * is 4 GiB (ADT vm-size 0xe0000000) because the driver hands out
+		 * IOVAs up to heap top + apple,dart-vm-size.
+		 */
+		apple,dma-range = <0x100 0x0 0x1 0x0>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		status = "disabled";
+	};
+
+	isp_dart1: iommu@48e8e0000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e8e0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pmp_report_isp>;
+		apple,dma-range = <0x100 0x0 0x1 0x0>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		status = "disabled";
+	};
+
+	isp_dart2: iommu@48e900000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e900000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&pmp_report_isp>;
+		apple,dma-range = <0x100 0x0 0x1 0x0>;
+		apple,sid-remap = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		apple,bypass-sids = <15>;
+		status = "disabled";
+	};
+
+	isp: isp@48c000000 {
+		compatible = "apple,t8132-isp";
+		reg = <0x4 0x8c000000 0x0 0x2000000>,
+		      <0x4 0x8e924000 0x0 0x100>,
+		      <0x4 0x8e9241d0 0x0 0x100>,
+		      <0x4 0x8e924458 0x0 0x100>;
+		reg-names = "coproc", "mbox", "gpio", "mbox2";
+		interrupt-parent = <&aic>;
+		/* First of the ADT's five ISP interrupts (369-372, 382). */
+		interrupts = <AIC_IRQ 369 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		power-domains = <&ps_isp_cpu>, <&ps_isp_cpu_core0>,
+				<&ps_isp_cpu_core1>, <&ps_isp_fe>,
+				<&ps_isp_dprx>, <&ps_isp_secure>,
+				<&ps_isp_sts0>, <&ps_isp_sts1>,
+				<&ps_isp_pearl>, <&ps_isp_be>,
+				<&ps_isp_clr>, <&ps_isp_cvd>,
+				<&ps_isp_cvm>,
+				<&ps_ispsens0>, <&ps_ispsens1>;
+		apple,pmp-report = <&pmp_report>;
+		apple,dart-vm-size = <0x0 0xe0000000>;
+		apple,temporal-filter = <0>;
+		status = "disabled";
+	};
+};

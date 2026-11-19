@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M4, 2025)
+ *
+ * target-type: J713
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8132.dtsi"
+#include "t8132-jxxx.dtsi"
+#include "t8132-j71x.dtsi"
+
+/ {
+	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
+	model = "Apple MacBook Air (13-inch, M4, 2025)";
+
+	sound {
+		compatible = "apple,j713-macaudio", "apple,macaudio";
+		model = "MacBook Air J713";
+
+		dai-link@0 {
+			link-name = "Speakers";
+			/*
+			 * The MCA receives sense data from both ports at once, and
+			 * a port's line keeps its last level after its amps' slots.
+			 * As in the ADT amp-tx-zd-config, the first amp on each
+			 * port drives zeros in the other port's slots.
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-2 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-slot-tx-idle-mask-2 = <0xff0f0f0f>;
+
+			cpu {
+				sound-dai = <&mca 0>, <&mca 1>;
+			};
+			codec {
+				sound-dai = <&amp_left_woofer>, <&amp_left_tweeter>,
+					    <&amp_right_woofer>, <&amp_right_tweeter>;
+			};
+		};
+
+		dai-link@1 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j713", "apple,panel";
+		/*
+		 * Unverified on J713: dimensions and brightness are taken from
+		 * the M2 MacBook Air 13" (J413), which uses a 13.6" panel of the
+		 * same size.
+		 */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		apple,max-brightness = <525>;
+	};
+};
+
+/*
+ * The J713 radio module is "garden" (ADT /arm-io/wlan module-instance).
+ * m1n1 adds the antenna SKU, MAC address and calibration from the ADT.
+ */
+&wifi0 {
+	brcm,board-type = "apple,garden";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,garden";
+};
+
+&aop_audio {
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
+};
+
+&mca {
+	/* Speakers and their sense on cluster 0, the jack on cluster 2 */
+	dmas = <&admac 0>, <&admac 1>, <&admac 4>;
+	dma-names = "tx0a", "rx0b", "tx2a";
+};
+
+/*
+ * Speakers: four SN012776 amplifiers on i2c3 (ADT audio-speaker*) with one
+ * shared SDZ line (AP GPIO 15). The sound card's codec order gives the ADT
+ * rx_slot TX slots (0x38 0, 0x3b 1, 0x39 2, 0x3c 3); V/I sense slots are the
+ * ADT speaker-config ones. The left pair is on MCA port 0 and the right pair on
+ * port 1, both fed from cluster 0. Output stays at the macaudio safe limit
+ * until speakersafetyd runs.
+ */
+/ {
+	speaker_sdz_supply: regulator-speaker-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "speaker-sdz";
+		gpio = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <2000>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	amp_left_woofer: amplifier@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <0>;
+		ti,imon-slot-no = <2>;
+	};
+
+	amp_left_tweeter: amplifier@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <8>;
+		ti,imon-slot-no = <10>;
+	};
+
+	amp_right_woofer: amplifier@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <4>;
+		ti,imon-slot-no = <6>;
+	};
+
+	amp_right_tweeter: amplifier@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <12>;
+		ti,imon-slot-no = <14>;
+	};
+};
+
+&isp {
+	/*
+	 * ADT isp "sensor-type" is 23. Asahi uses sensor-type as the boot
+	 * argument platform-id; unconfirmed for J713.
+	 */
+	apple,platform-id = <23>;
+
+	sensor-presets {
+		/*
+		 * Assumes the M4 Max's 12 MP Center Stage sensor (0x958): config 0
+		 * reads 3072 x 3024 and a centred 16:9 crop gives 1280x720, as in
+		 * t6041-isp.dtsi. Check against the CONFIG_GET dump at probe.
+		 */
+		preset0 {
+			apple,config-index = <0>;
+			apple,input-size = <3072 3024>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 648 3072 1728>;
+		};
+	};
+};
+
+&mtp_hid {
+	multi-touch {
+		/* Firmware packaging name is board-specific, not an ADT path. */
+		firmware-name = "apple/tpmtfw-j713.bin";
+	};
+};
+
+/* External DP wiring is build-tested; physical ports remain unqualified. */
+#include "t8132-air-dp-altmode.dtsi"
+
+&smc_hwmon {
+	/* Slow SMC temperature estimates; physical sensor locations are unknown. */
+	temperature-TVS0 {
+		label = "Chassis Estimate TVS0";
+		apple,key-id = "TVS0";
+	};
+
+	temperature-TVS1 {
+		label = "Chassis Estimate TVS1";
+		apple,key-id = "TVS1";
+	};
+};
+
+/* Local qualification: enable the camera only on the 13-inch J713. */
+&isp {
+	status = "okay";
+};
+
+&isp_dart0 {
+	status = "okay";
+};
+
+&isp_dart1 {
+	status = "okay";
+};
+
+&isp_dart2 {
+	status = "okay";
+};
+
+&pmp_report_isp {
+	status = "okay";
+};
+
+&ps_isp_sys {
+	status = "okay";
+};
+
+&ps_ispsens0 {
+	status = "okay";
+};
+
+&ps_ispsens1 {
+	status = "okay";
+};
+
+&ps_isp_cpu {
+	status = "okay";
+};
+
+&ps_isp_cpu_core0 {
+	status = "okay";
+};
+
+&ps_isp_cpu_core1 {
+	status = "okay";
+};
+
+&ps_isp_fe {
+	status = "okay";
+};
+
+&ps_isp_dprx {
+	status = "okay";
+};
+
+&ps_isp_secure {
+	status = "okay";
+};
+
+&ps_isp_sts0 {
+	status = "okay";
+};
+
+&ps_isp_sts1 {
+	status = "okay";
+};
+
+&ps_isp_pearl {
+	status = "okay";
+};
+
+&ps_isp_be {
+	status = "okay";
+};
+
+&ps_isp_clr {
+	status = "okay";
+};
+
+&ps_isp_cvd {
+	status = "okay";
+};
+
+&ps_isp_cvm {
+	status = "okay";
+};
+
+/* Scope firmware-ID reporting to the board qualified with this camera. */
+&pmp_report {
+	apple,pmp = <&pmp>;
+};
+
+&pmp_report_isp {
+	/* ISP's firmware record is notification-only, not acknowledged. */
+	/delete-property/ apple,always-on;
+	apple,boot-on;
+};
+
+&ps_isp_sys {
+	/delete-property/ apple,always-on;
+};
+
+/* Experimental explicit ownership for primary-engine screen-off cycling. */
+&dcp {
+	power-domains = <&ps_disp_fe>, <&ps_disp_cpu>;
+	power-domain-names = "fe", "cpu";
+};
+&ps_disp_cpu {
+	status = "okay";
+};
+&ps_disp_fe {
+	/delete-property/ apple,always-on;
+};
+&ps_disp_sys {
+	/delete-property/ apple,always-on;
+};

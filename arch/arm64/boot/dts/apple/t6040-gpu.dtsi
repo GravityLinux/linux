@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* EXPERIMENTAL: GPU resources for the reported 20-core T6040/J773s.
+ * Include from a T6040 base tree providing aic and ps_gfx. This is a GPU
+ * fragment, not a complete Mac mini platform/device tree.
+ */
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+    aliases { gpu = &gpu; };
+    soc {
+        gpu: gpu@288000000 {
+            compatible = "apple,agx-t6040", "apple,agx-g16s";
+            reg = <2 0x88000000 0 0x3758000>, <2 0x8a600000 0 0x4000>;
+            reg-names = "sgx", "asc";
+            power-domains = <&ps_gfx>;
+            mboxes = <&agx_mbox>;
+            mbox-names = "primary";
+            status = "okay";
+        };
+        agx_mbox: mailbox@28a608000 {
+            compatible = "apple,t6040-asc-mailbox", "apple,asc-mailbox-v4";
+            reg = <2 0x8a608000 0 0x4000>;
+            power-domains = <&ps_gfx>;
+            #mbox-cells = <0>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1501 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1502 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1503 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1504 IRQ_TYPE_LEVEL_HIGH>;
+            interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+        };
+    };
+};
+
+/* Firmware does not survive losing its power domain. */
+&ps_gfx { apple,always-on; };
+
+#include "t6041-gpu-memory.dtsi"
+#define GPU_CLUSTER_VOLTAGES <0 0>
+#include "t6041-gpu-config.dtsi"

@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8132 "M4" SoC: AOP (always-on processor) and the LEAP microphone DMA
+ *
+ * From the J713 ADT: /arm-io/aop (iop,ascwrap-v6), its rtbuddy nub with the
+ * aop-audio, aop-voicetrigger, accel, gyro and als services, /arm-io/dart-aop
+ * (= dart_audio), and /arm-io/admac-leap-ns, the DMA parent of the built-in
+ * microphone stream (iop-audio-controller/audio-hp, LEAP RX channel 1).
+ *
+ * The AOP firmware is pre-loaded and left running by iBoot; this only
+ * describes the hardware so the AOP driver can talk to it.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&{/soc} {
+	aop_mbox: mailbox@390608000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x90608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		/* ADT order: 434 433 436 435 (not-empty before empty). */
+		interrupts = <AIC_IRQ 433 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 434 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 435 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 436 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	/*
+	 * LEAP ADMAC. Its power is switched by AOP (ADT
+	 * function-admac_powerswitch); AOP powers it when the audio client
+	 * leaves its off state, so there is no power-domains property and the
+	 * driver must not touch the registers before then.
+	 */
+	aop_admac: dma-controller@393300000 {
+		compatible = "apple,t8132-admac";
+		reg = <0x3 0x93300000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <18>;
+		/* ADT irq-destination-index 0 */
+		interrupts-extended = <&aic AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&dart_audio 10>;
+		status = "disabled";
+	};
+
+	aop: aop@390c00000 {
+		compatible = "apple,t8132-aop", "apple,t6020-aop";
+		/* AOP SRAM (boot arguments), then the ASC CPU control block. */
+		reg = <0x3 0x90c00000 0x0 0x1e0000>,
+		      <0x3 0x90600000 0x0 0x4000>;
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dart_audio 0>;
+		status = "disabled";
+
+		aop_audio: audio {
+			compatible = "apple,t8132-aop-audio", "apple,t6030-aop-audio";
+			dmas = <&aop_admac 1>;
+			dma-names = "dma";
+		};
+
+		aop_las: las {
+			compatible = "apple,t8132-aop-las", "apple,aop-las";
+		};
+	};
+};

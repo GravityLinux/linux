@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Generated from g17p_source_topology.py by tests/import_g17p_topology.py.
+// Address-only source topology. No table or firmware page bodies.
+
+#define NEO_GPU_SOURCE_REGIONS \
+	&neo_source_memory_0 \
+	&neo_source_memory_1 \
+	&neo_source_memory_2 \
+	&neo_source_memory_3 \
+	&neo_source_memory_4 \
+	&neo_source_memory_5 \
+	&neo_source_memory_6 \
+	&neo_source_memory_7 \
+	&neo_source_memory_8 \
+	&neo_source_memory_9 \
+	&neo_source_memory_10 \
+	&neo_source_memory_11 \
+	&neo_source_memory_12 \
+	&neo_source_memory_13 \
+	&neo_source_memory_14 \
+	&neo_source_memory_15 \
+	&neo_source_memory_16 \
+	&neo_source_memory_17 \
+	&neo_source_memory_18 \
+	&neo_source_memory_19 \
+	&neo_source_memory_20 \
+	&neo_source_memory_21 \
+	&neo_source_memory_22 \
+	&neo_source_memory_23
+
+#define NEO_GPU_SOURCE_NAMES \
+	"source-graph-0", \
+	"source-graph-1", \
+	"source-graph-2", \
+	"source-graph-3", \
+	"source-graph-4", \
+	"source-graph-5", \
+	"source-graph-6", \
+	"source-graph-7", \
+	"source-graph-8", \
+	"source-graph-9", \
+	"source-graph-10", \
+	"source-graph-11", \
+	"source-graph-12", \
+	"source-graph-13", \
+	"source-graph-14", \
+	"source-graph-15", \
+	"source-graph-16", \
+	"source-graph-17", \
+	"source-graph-18", \
+	"source-graph-19", \
+	"source-graph-20", \
+	"source-graph-21", \
+	"source-graph-22", \
+	"source-graph-23"
+
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		neo_source_memory_0: gpu-source-memory@10021598000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x21598000 0 0x4000>;
+		};
+
+		neo_source_memory_1: gpu-source-memory@100215d8000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x215d8000 0 0x4000>;
+		};
+
+		neo_source_memory_2: gpu-source-memory@1002d3d4000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x2d3d4000 0 0x4000>;
+		};
+
+		neo_source_memory_3: gpu-source-memory@10034a00000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x34a00000 0 0x158000>;
+		};
+
+		neo_source_memory_4: gpu-source-memory@10034b5c000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x34b5c000 0 0x24000>;
+		};
+
+		neo_source_memory_5: gpu-source-memory@10034bcc000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x34bcc000 0 0x4000>;
+		};
+
+		neo_source_memory_6: gpu-source-memory@10034c3c000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x34c3c000 0 0x4000>;
+		};
+
+		neo_source_memory_7: gpu-source-memory@10034e00000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x34e00000 0 0x340000>;
+		};
+
+		neo_source_memory_8: gpu-source-memory@10035144000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x35144000 0 0x4000>;
+		};
+
+		neo_source_memory_9: gpu-source-memory@100351a0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x351a0000 0 0x14000>;
+		};
+
+		neo_source_memory_10: gpu-source-memory@100351c0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x351c0000 0 0x8000>;
+		};
+
+		neo_source_memory_11: gpu-source-memory@100351d0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x351d0000 0 0x430000>;
+		};
+
+		neo_source_memory_12: gpu-source-memory@100359e0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x359e0000 0 0x20000>;
+		};
+
+		neo_source_memory_13: gpu-source-memory@1005439c000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x5439c000 0 0x4c000>;
+		};
+
+		neo_source_memory_14: gpu-source-memory@100543f0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x543f0000 0 0x8000>;
+		};
+
+		neo_source_memory_15: gpu-source-memory@10054438000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x54438000 0 0x28000>;
+		};
+
+		neo_source_memory_16: gpu-source-memory@10057b90000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x57b90000 0 0x8000>;
+		};
+
+		neo_source_memory_17: gpu-source-memory@10057ba0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x57ba0000 0 0x4000>;
+		};
+
+		neo_source_memory_18: gpu-source-memory@100594e8000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x594e8000 0 0x4000>;
+		};
+
+		neo_source_memory_19: gpu-source-memory@100594f0000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x594f0000 0 0x8000>;
+		};
+
+		neo_source_memory_20: gpu-source-memory@10059530000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x59530000 0 0x4000>;
+		};
+
+		neo_source_memory_21: gpu-source-memory@1005a184000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x5a184000 0 0xc000>;
+		};
+
+		neo_source_memory_22: gpu-source-memory@1005bb44000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x5bb44000 0 0x8000>;
+		};
+
+		neo_source_memory_23: gpu-source-memory@1005c0b8000 {
+			compatible = "apple,neo-gpu-source-memory";
+			status = "okay";
+			no-map;
+			reg = <0x100 0x5c0b8000 0 0x18000>;
+		};
+
+	};
+};

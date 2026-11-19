@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Primary internal-display bringup. The loader supplies native reservations
+ * and firmware properties. External display controllers are a later step.
+ */
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+	};
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* Retained iBoot rate: native 26.6 D408 replies 712 MHz on J616c.
+		 * This describes the boot clock; runtime DVFS is not implemented. */
+		clock-frequency = <712000000>;
+	};
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+};
+
+&{/soc} {
+	disp0_dart: iommu@402300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <4 0x02300000 0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1090 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		/* Native locked three-level tables use the low 36-bit aperture. */
+		status = "disabled";
+	};
+	dcp_dart: iommu@402340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <4 0x02340000 0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1090 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+	};
+	dcp_mbox: mailbox@402e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <4 0x02e08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1143 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1144 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1145 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1146 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+	pmgr_dcp: power-management@504800000 {
+		reg = <5 0x04800000 0 0xbc000>;
+		#apple,bw-scratch-cells = <3>;
+	};
+	dcp: dcp@402e00000 {
+		compatible = "apple,t6041-dcp", "apple,dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 23>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <4 0x02e00000 0 0x4000>,
+		      <4 0x00000000 0 0x4000000>,
+		      <4 0x02240000 0 0x10000>,
+		      <4 0x023a8000 0 0x4000>,
+		      <4 0x02800000 0 0x800000>;
+		/* Native 26.6 D003 replies use PMGR 0x504820000. */
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x20000>;
+		clocks = <&clk_disp0>;
+		phandle = <&dcp>;
+		status = "disabled";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+			phandle = <&disp0_piodma>;
+		};
+		panel {
+			compatible = "apple,panel-mini-led";
+			apple,max-brightness = <500>;
+		};
+	};
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
+		phandle = <&display>;
+	};
+};

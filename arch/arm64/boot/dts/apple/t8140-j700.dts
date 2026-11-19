@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Apple MacBook Neo (A18 Pro, 2026)
+ *
+ * target-type: J700
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8140.dtsi"
+#include "t8140-isp.dtsi"
+#include "t8140-dcp-reference.dtsi"
+#include "t8140-dcpext.dtsi"
+#include "t8140-pmp.dtsi"
+
+/ {
+	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
+	model = "Apple MacBook Neo (A18 Pro, 2026)";
+
+	aliases {
+		wifi0 = &wifi0;
+		bluetooth0 = &bluetooth0;
+		serial0 = &serial0;
+		keyboard = &keyboard;
+		atcphy0 = &atcphy0;
+		//atcphy1 = &atcphy1;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* To be filled by loader */
+	};
+
+	memory@800000000 {
+		device_type = "memory";
+		reg = <0x100 0 0x2 0>; /* To be filled by loader */
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+&port00 {
+	wifi0: wifi@0,0 {
+		compatible = "pci14c3,7932";
+		reg = <0 0 0 0 0>;
+		/* The bootloader supplies the factory address from the ADT. */
+		local-mac-address = [00 00 00 00 00 00];
+	};
+
+	bluetooth0: bluetooth@0,1 {
+		compatible = "pci14c3,793b";
+		reg = <0x100 0 0 0 0>;
+		/* Board bootstrap interval from the J700 ADT. */
+		mediatek,bootstrap-delay-ms = <100>;
+		/* m1n1 supplies the factory address through bluetooth0. */
+		local-bd-address = [00 00 00 00 00 00];
+	};
+};
+
+&mtp {
+	status = "okay";
+};
+&mtp_mbox {
+	status = "okay";
+};
+&mtp_dart {
+	status = "okay";
+};
+&mtp_dockchannel {
+	status = "okay";
+};
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j700.bin";
+	};
+	mtp {
+	};
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+	stm {
+	};
+};
+&i2c0 {
+	status = "okay";
+};
+&i2c2 {
+	status = "okay";
+};
+
+/* SN201202x owns USB-PD discovery and alternate-mode negotiation. Keep both
+ * physical port descriptions separate; only the back port has the DP PHY.
+ * IRQ layout matches the SN201202x transport used on M3/M4: the select IRQ
+ * (13/39) is needed by Linux even though the macOS ADT lists irq/sleep/wake.
+ */
+&nub_spmi_a0 {
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C back-left";
+			power-role = "dual";
+			data-role = "host";
+		};
+	};
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C front-left (USB2)";
+			power-role = "dual";
+			data-role = "host";
+		};
+	};
+};
+
+/* Route live PD orientation and negotiated mode to the back-port PHY. */
+&typec0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@1 {
+			reg = <1>;
+			typec0_ss: endpoint {
+				remote-endpoint = <&atcphy0_typec>;
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			atcphy0_typec: endpoint {
+				remote-endpoint = <&typec0_ss>;
+			};
+		};
+	};
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+&dcp_dart {
+	status = "okay";
+};
+
+/* A separate HPD sink follows the physical lane mux in the connector graph. */
+&typec0 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec0_hpd: endpoint {
+				remote-endpoint = <&dcpext0_hpd>;
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	mode-switch;
+	port {
+		dcpext0_hpd: endpoint {
+			remote-endpoint = <&typec0_hpd>;
+		};
+	};
+};
+
+/* Retain the PMC register fabric used by DCP bandwidth transitions. */
+&ps_pmc {
+	apple,always-on;
+};
+
+/* Independent PD requests keep the shared host alive for either port. */
+&dwc3_0 {
+	apple,shared-host-ports;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	role-port@0 {
+		reg = <0>;
+		usb-role-switch;
+		port { dwc3_hs_back: endpoint { remote-endpoint = <&typec0_hs>; }; };
+	};
+	role-port@1 {
+		reg = <1>;
+		usb-role-switch;
+		port { dwc3_hs_front: endpoint { remote-endpoint = <&typec1_hs>; }; };
+	};
+};
+
+&typec0 {
+	ports {
+		port@0 {
+			reg = <0>;
+			typec0_hs: endpoint { remote-endpoint = <&dwc3_hs_back>; };
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			typec1_hs: endpoint { remote-endpoint = <&dwc3_hs_front>; };
+		};
+	};
+};
+
+/* Adopt the existing receive-only ASC FIFO handoff quirk. */
+&dcp_mbox {
+	apple,reset-recv-fifo-on-start;
+};
+&mtp_mbox {
+	apple,reset-recv-fifo-on-start;
+};
