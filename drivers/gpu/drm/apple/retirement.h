@@ -17,6 +17,7 @@ void dcp_retirement_stop(struct apple_dcp *dcp);
 void dcp_retirement_fini(struct apple_dcp *dcp);
 void dcp_retirement_ready_locked(struct apple_dcp *dcp);
 void dcp_retirement_unplug_locked(struct apple_dcp *dcp);
+void dcp_retirement_crtc_off(struct apple_dcp *dcp);
 void dcp_retirement_note_use(struct apple_dcp *dcp);
 bool dcp_retirement_failed(struct apple_dcp *dcp);
 bool dcp_retirement_is_retired(struct apple_dcp *dcp);

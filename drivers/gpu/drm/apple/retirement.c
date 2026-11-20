@@ -406,6 +406,29 @@ static int idle_cpu_off(struct dcp_retirement *idle)
 	return 0;
 }
 
+/*
+ * After the power-off request RPCs and queued commands only drain; wait a
+ * bounded time for that instead of giving up on the first busy check.
+ */
+static int idle_quiesce_rpc(struct dcp_retirement *idle)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+	int ret;
+
+	for (;;) {
+		ret = idle_block_rpc(idle);
+		if (!ret) {
+			ret = idle_drain_services(idle->dcp);
+			if (!ret)
+				return 0;
+			idle_unblock_rpc(idle);
+		}
+		if (ret != -EBUSY || time_after(jiffies, deadline))
+			return ret;
+		msleep(10);
+	}
+}
+
 static int idle_retire_locked(struct apple_dcp *dcp)
 {
 	struct dcp_retirement *idle = dcp->retirement;
@@ -433,28 +456,39 @@ static int idle_retire_locked(struct apple_dcp *dcp)
 #endif
 	}
 	idle->error = 0;
+	dev_info(dcp->dev, "retirement: powering down engine\n");
 	idle_stage(idle, "quiesce-services");
 	ret = dcp_av_retire(dcp, &idle->av_was_open);
 	if (ret)
 		goto abort_quiesce;
+	/* Last chance to abandon with nothing changed in the firmware. */
+	if (!idle_eligible(dcp)) {
+		ret = -EBUSY;
+		dev_info(dcp->dev,
+			 "retirement: display came back before the power-down, abandoned\n");
+		goto abort_quiesce;
+	}
+	/*
+	 * Point of no return. Once the firmware has been told to turn the
+	 * display and engine off, an abort cannot put it back: a later connect
+	 * on that engine never completes. So the sequence always runs to the
+	 * end from here. A display plugged in meanwhile is picked up by the
+	 * pending HPD work, which restarts the engine (the ordinary plug into
+	 * a retired engine).
+	 */
 	idle_stage(idle, idle->primary ? "display-state-off/A500" : "engine-power/A500");
 	ret = iomfb_retained_display_off_v26_6_0(dcp,
 		(idle->primary || dcp->fixed_dp) && idle->ever_used);
 	if (ret)
 		return idle_failure(idle, ret);
 	idle_stage(idle, "block-RPC");
-	ret = idle_block_rpc(idle);
+	ret = idle_quiesce_rpc(idle);
 	if (ret)
-		goto abort_quiesce;
-	idle_stage(idle, "drain-services");
-	ret = idle_drain_services(dcp);
-	if (ret)
-		goto abort_quiesce;
+		return idle_failure(idle, ret);
 	idle_stage(idle, "check-unclaimed");
-	if (!idle_eligible(dcp)) {
-		ret = -EBUSY;
-		goto abort_quiesce;
-	}
+	if (!idle_eligible(dcp))
+		dev_info(dcp->dev,
+			 "retirement: display came back during power-down, restarting afterwards\n");
 	idle_stage(idle, "AFK-control2");
 	ret = idle_prepare_endpoints(dcp);
 	if (ret)
@@ -550,6 +584,57 @@ static int idle_retire_primary_locked(struct apple_dcp *dcp)
 	return ret;
 }
 
+/*
+ * Power down an engine whose retirement failed part-way, without the
+ * firmware handshakes that did not answer, so that the ordinary restart can
+ * bring it back. Only what this engine still holds is released.
+ */
+static int idle_force_power_down(struct dcp_retirement *idle)
+{
+	struct apple_dcp *dcp = idle->dcp;
+	u32 ctrl;
+	int ret;
+
+	/* idle_failure() already blocked new RPCs. */
+	if (!idle->core_stopped) {
+		idle_stage(idle, "recover-park");
+		apple_rtkit_park(dcp->rtk);
+		ctrl = readl(dcp->coproc_reg + DCP_CPU_CONTROL);
+		idle->saved_run = ctrl;
+		writel(ctrl & ~DCP_CPU_RUN, dcp->coproc_reg + DCP_CPU_CONTROL);
+		if (readl(dcp->coproc_reg + DCP_CPU_CONTROL) & DCP_CPU_RUN)
+			return -EIO;
+		idle->core_stopped = true;
+	}
+	idle_stage(idle, "recover-DART-streams-off");
+	ret = apple_dart_retained_streams(dcp->dev, false);
+	if (!ret)
+		ret = apple_dart_retained_streams(&dcp->piodma->dev, false);
+	if (ret)
+		return ret;
+	if (dcp->cpu_pm_held) {
+		ret = idle_cpu_off(idle);
+		if (ret)
+			return ret;
+	}
+	if (idle->piodma_held) {
+		idle->piodma_held = false;
+		ret = pm_runtime_put_sync_suspend(&dcp->piodma->dev);
+		if (ret < 0)
+			return ret;
+	}
+	if (idle->pm_held) {
+		idle->pm_held = false;
+		ret = pm_runtime_put_sync_suspend(dcp->dev);
+		if (ret < 0)
+			return ret;
+	}
+	idle->error = 0;
+	idle->state = DCP_IDLE_RETIRED;
+	idle_stage(idle, "off");
+	return 0;
+}
+
 static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 {
 	struct dcp_retirement *idle = dcp->retirement;
@@ -557,10 +642,17 @@ static int idle_restart_locked(struct apple_dcp *dcp, bool system_resume)
 
 	if (!idle || idle->state == DCP_IDLE_READY)
 		return 0;
-	if (idle->state != DCP_IDLE_RETIRED)
-		return -EHOSTDOWN;
 	if (!system_resume && dcp_lifecycle_sleeping())
 		return -EBUSY;
+	if (idle->state == DCP_IDLE_FAILED && !dcp->crashed) {
+		dev_info(dcp->dev, "retirement: recovering engine that failed at %s (%d)\n",
+			 idle->stage, idle->error);
+		ret = idle_force_power_down(idle);
+		if (ret)
+			return idle_failure(idle, ret);
+	}
+	if (idle->state != DCP_IDLE_RETIRED)
+		return -EHOSTDOWN;
 	idle->state = DCP_IDLE_WAKING;
 	idle_stage(idle, "SYS/FE-on");
 	ret = pm_runtime_resume_and_get(dcp->dev);
@@ -693,12 +785,33 @@ void dcp_retirement_ready_locked(struct apple_dcp *dcp)
 		idle_kick(dcp->retirement);
 }
 
+/*
+ * The CRTC of a disconnected fixed-port engine has just been turned off:
+ * that was the last thing keeping it from being eligible, so try now
+ * rather than at the next retry. The work takes the lifecycle lock.
+ */
+void dcp_retirement_crtc_off(struct apple_dcp *dcp)
+{
+	struct dcp_retirement *idle = dcp->retirement;
+
+	if (idle && !idle->primary && dcp->fixed_dp && !READ_ONCE(idle->stopping))
+		mod_delayed_work(system_unbound_wq, &idle->work, 0);
+}
+
 void dcp_retirement_unplug_locked(struct apple_dcp *dcp)
 {
-	/* Fixed outputs become eligible after HPD and the CRTC are both off. */
-	if (dcp->retirement && !dcp->retirement->primary &&
-	    !dcp->retirement->stopping)
-		idle_kick(dcp->retirement);
+	struct dcp_retirement *idle = dcp->retirement;
+
+	/*
+	 * Fixed outputs become eligible after HPD and the CRTC are both off;
+	 * the power-down starts at once (no grace period). A replug before
+	 * its point of no return abandons it with nothing changed; after it,
+	 * the power-down finishes and the HPD work restarts the engine.
+	 */
+	if (!idle || idle->primary || idle->stopping)
+		return;
+	dev_dbg(dcp->dev, "retirement: unplug, power-down requested\n");
+	idle_kick(idle);
 }
 
 /*

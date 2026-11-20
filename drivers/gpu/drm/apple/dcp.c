@@ -1613,6 +1613,7 @@ void dcp_poweroff(struct platform_device *pdev)
 			 "keeping IOMFB alive across external connector disconnect\n");
 		dcp->hotplug_keepalive = true;
 		dcp->valid_mode = false;
+		dcp_retirement_crtc_off(dcp);
 		return;
 	}
 

@@ -2,6 +2,7 @@
 /* Copyright The Asahi Linux Contributors */
 
 #include <linux/build_bug.h>
+#include <linux/moduleparam.h>
 
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
@@ -312,6 +313,11 @@ static int retained_transaction(struct apple_dcp *dcp,
 	return ret > 0 ? 0 : -ETIMEDOUT;
 }
 
+static unsigned int retire_display_off_settle_ms = 500;
+module_param(retire_display_off_settle_ms, uint, 0644);
+MODULE_PARM_DESC(retire_display_off_settle_ms,
+		 "Delay between display-off and engine-off when retiring a used T8132 display engine (ms)");
+
 int iomfb_retained_display_off_v26_6_0(struct apple_dcp *dcp, bool prepare_display)
 {
 	const struct dcp_method_entry select = {
@@ -331,8 +337,11 @@ int iomfb_retained_display_off_v26_6_0(struct apple_dcp *dcp, bool prepare_displ
 		ret = dcp_poweroff_sequence(dcp);
 		if (ret)
 			return ret;
-		/* Physical detach separates display-off from engine-off. */
-		msleep(10000);
+		/*
+		 * Let the display-off settle before the engine-off request.
+		 * The value is not established by measurement yet.
+		 */
+		msleep(READ_ONCE(retire_display_off_settle_ms));
 	}
 	return retained_transaction(dcp, &power, request, sizeof(request), 0);
 }
