@@ -585,6 +585,24 @@ void av_service_disconnect(struct apple_dcp *dcp)
 		service->enabled = false;
 }
 
+/*
+ * The display went away: close the audio service and drop the interface.
+ * The firmware announces a new audio interface on the next plug; until
+ * then nothing may open the old one. An open sent to it during the next
+ * plug (dcp_dptx_connect() runs before the new interface is announced) is
+ * rejected and waits for the full timeout, and the plug does not complete.
+ */
+void av_service_unplug(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	av_service_disconnect(dcp);
+	if (!asrv)
+		return;
+	scoped_guard(rwsem_write, &asrv->srv_rwsem)
+		asrv->srv = NULL;
+}
+
 static void av_work_service_start(struct work_struct *work)
 {
 	struct audiosrv_data *audiosrv_data;

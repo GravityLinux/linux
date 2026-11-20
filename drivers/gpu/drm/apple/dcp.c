@@ -667,7 +667,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	disconnected_hpd_event(dcp->connector);
 
 	if (dcp->avep)
-		av_service_disconnect(dcp);
+		av_service_unplug(dcp);
 
 	if (dcp->dptxport[port].enabled)
 		dptxport_set_hpd(dcp->dptxport[port].service, false);
